@@ -1,0 +1,816 @@
+{
+  "fuzzy_prd": "# Real-Time Event Protocol Codec — Engine.IO / Socket.IO Wire Format\n\n## Project Goal\n\nBuild a protocol codec library that turns high-level real-time messaging intents (connect to a namespace, emit an event, reply with an acknowledgement, decode an incoming frame) into the exact bytes of the Engine.IO/Socket.IO transport wire format, and back again. Application developers can speak in terms of *event names, namespaces, argument lists and binary attachments* and let the codec handle the textual frame grammar, attachment placeholder bookkeeping, and handshake URL construction — without ever hand-assembling protocol strings.\n\n---\n\n## Background & Problem\n\nThe Engine.IO/Socket.IO transport encodes every message as a short text frame whose meaning is determined by a numeric prefix (`2`=ping, `3`=pong, `0`=transport open, `40`=connected, `41`=disconnected, `42`=event, `43`=ack, `44`=error, with a `4`-prefixed binary variant `45`/`46` carrying out-of-band attachments). Namespaces, acknowledgement ids and JSON argument arrays are packed into specific positions within that frame, and binary arguments must be lifted out into separate ordered attachment payloads and replaced inline by placeholder objects.\n\nWithout this library, developers are forced to concatenate and parse these frame strings by hand: counting attachments, inserting the `-` separator, deciding when a default port should be dropped from a URL, remembering that protocol v3 and v4 disagree about whether the default namespace gets a connect frame and where auth/query data live. This is repetitive, easy to get subtly wrong, and tightly coupled to protocol-version quirks.\n\nWith this library, the developer describes *what* to send or asks *what was received*, and the codec produces or interprets the precise wire frames — including correct handshake URLs, attachment placeholdering, namespace/id placement and protocol-version differences.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The codec spans several distinct responsibilities (URL construction, outbound encoding, inbound decoding, attachment handling, payload rendering). It MUST NOT be a single \"god file\". Output a clear multi-file layout that separates the codec core from the execution adapter; do not over-engineer, but reflect a production-grade repository.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below are a **black-box contract for the execution adapter**, not the internal data model of the codec. The codec core must be decoupled from stdin/stdout and from the adapter's command JSON. The adapter is solely responsible for translating each JSON command into idiomatic calls on the codec and rendering the result.\n\n3. **Adherence to SOLID Design Principles:** Separate parsing, routing, validation, core encode/decode and output formatting into distinct units (SRP). The codec must be open to new message kinds without modifying existing ones (OCP). Message representations must be substitutable behind a common message abstraction (LSP). Keep the codec interface small and cohesive (ISP). The adapter depends on the codec abstraction, not on concrete I/O (DIP).\n\n4. **Robustness & Interface Design:** The public codec interface must be idiomatic to the target language and hide framing details. Edge cases (empty/unrecognized frames, incomplete binary messages awaiting attachments, unsupported URL scheme) must be modeled explicitly rather than producing corrupt frames. Errors surfaced to stdout must be normalized to language-neutral categories.\n\n---\n\n## Core Features\n\n### Feature 1: Handshake / Connection URL Construction\n\n**As a developer**, I want to turn a server endpoint plus my transport and protocol choices into the exact handshake URL, so I can open a connection without manually assembling query strings or worrying about default ports.\n\n**Expected Behavior / Usage:**\n\nGiven a base server URI (`http`/`https`/`ws`/`wss`), a transport flag (websocket vs long-polling), a protocol version number, an optional mount path, and an optional set of query parameters, produce the full handshake URL. The output scheme follows the transport flag: with the websocket transport an `http(s)` base maps to `ws(s)`, otherwise it stays `http(s)`. A port equal to the scheme's default (80 for the plaintext schemes, 443 for the TLS schemes) is omitted; a port that is *not* the scheme's default is kept verbatim (e.g. plaintext on 80 is dropped, but TLS on 80 is kept). When no mount path is given the path defaults to `/socket.io`; otherwise the provided path is used. The fixed query `EIO=<version>` and `transport=polling|websocket` are always appended, followed by each supplied query parameter as `&key=value`. The result is emitted as `url=<full url>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_handshake_url.json`\n\n```json\n[a specific JSON string to replace byte arrays]\n    \"description\": \"Build the Engine.IO handshake/connection URL from a server endpoint, transport choice (long-polling vs websocket), protocol version, optional mount path and query parameters. Default ports for the scheme are dropped; a non-default port for the scheme is preserved.\",\n    \"cases\": [\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"handshake_url\", \"ws\": false, \"uri\": \"http://localhost\", \"eio\": 4, \"path\": \"\", \"query\": [a specific JSON string to replace byte arrays]\"token\": \"test\"}},\n            \"expected_output\": \"url=http://localhost/socket.io/?EIO=4&transport=polling&token=test\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"handshake_url\", \"ws\": false, \"uri\": \"https://localhost:443\", \"eio\": 4, \"path\": \"/sio\", \"query\": [a specific JSON string to replace byte arrays]\"token\": \"test\"}},\n            \"expected_output\": \"url=https://localhost/sio/?EIO=4&transport=polling&token=test\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"handshake_url\", \"ws\": true, \"uri\": \"ws://localhost:80\", \"eio\": 4, \"path\": \"\", \"query\": [a specific JSON string to replace byte arrays]}},\n            \"expected_output\": \"url=ws://localhost/socket.io/?EIO=4&transport=websocket\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"handshake_url\", \"ws\": false, \"uri\": \"https://localhost:80\", \"eio\": 4, \"path\": \"\", \"query\": [a specific JSON string to replace byte arrays]\"token\": \"test\"}},\n            \"expected_output\": \"url=https://localhost:80/socket.io/?EIO=4&transport=polling&token=test\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Outbound Message Encoding\n\n**As a developer**, I want to encode connection, event and acknowledgement intents into wire frames, so I can hand structured data to the codec and let it produce protocol-correct text and attachment frames.\n\n**Expected Behavior / Usage:**\n\nAll encoders emit one `frame=<text>` line for the text frame. When any argument is binary, the codec lifts each binary value out into an ordered out-of-band attachment, replaces it inline with a placeholder object `[a specific JSON string to replace byte arrays]\"_placeholder\":true,\"num\":N}` (N counts from 0 in argument order), switches the frame's numeric prefix to the binary variant, prefixes the text with `<count>-`, and emits one `attachment=<comma-separated byte values>` line per attachment in order.\n\n*2.1 Encode an event — emit an event-name + arguments frame*\n\nEncode an outbound event from an event name, an optional namespace, and an argument list. The text frame is `42` followed by `<namespace>,` when a namespace is present, then a JSON array whose first element is the event name and whose remaining elements are the arguments. With binary arguments the prefix becomes `45<count>-`. A null/empty namespace is omitted entirely.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_encode_event.json`\n\n```json\n[a specific JSON string to replace byte arrays]\n    \"description\": \"Encode an outbound event message with an event name, optional namespace and an arbitrary argument list. Plain values are inlined as a JSON array prefixed by the event name; binary arguments are replaced by placeholder objects ([a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":N}) and emitted as separate ordered attachment payloads, switching the frame prefix to the binary form.\",\n    \"cases\": [\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_event\", \"eio\": 4, \"event\": \"test\", \"namespace\": \"\", \"data\": []},\n            \"expected_output\": \"frame=42[\\\"test\\\"]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_event\", \"eio\": 4, \"event\": \"test\", \"namespace\": \"/nsp\", \"data\": [true, false, 123]},\n            \"expected_output\": \"frame=42/nsp,[\\\"test\\\",true,false,123]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_event\", \"eio\": 4, \"event\": \"test\", \"namespace\": \"\", \"data\": [[a specific JSON string to replace byte arrays]\"$bytes\": [1, 2, 3]}]},\n            \"expected_output\": \"frame=451-[\\\"test\\\",[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\\nattachment=1,2,3\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_event\", \"eio\": 4, \"event\": \"event\", \"namespace\": \"/test\", \"data\": [123456.789, [a specific JSON string to replace byte arrays]\"User\": \"test\", \"Password\": \"hello\"}, [a specific JSON string to replace byte arrays]\"Size\": 2023, \"Name\": \"test.txt\", \"Bytes\": [a specific JSON string to replace byte arrays]\"$bytes\": [240, 159, 144, 174, 240, 159, 141, 186]}}]},\n            \"expected_output\": \"frame=451-/test,[\\\"event\\\",123456.789,[a specific JSON string to replace byte arrays]\\\"User\\\":\\\"test\\\",\\\"Password\\\":\\\"hello\\\"},[a specific JSON string to replace byte arrays]\\\"Size\\\":2023,\\\"Name\\\":\\\"test.txt\\\",\\\"Bytes\\\":[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}}]\\nattachment=240,159,144,174,240,159,141,186\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Encode an event awaiting acknowledgement — same as 2.1 but with an ack id*\n\nEncode an outbound event that also requests an acknowledgement. Identical to a plain event, except a numeric acknowledgement id is inserted immediately before the JSON argument array (after the namespace, when one is present). Binary arguments behave exactly as in 2.1.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_encode_event_ack.json`\n\n```json\n[a specific JSON string to replace byte arrays]\n    \"description\": \"Encode an outbound event message that also requests an acknowledgement: the same event encoding as a plain event, but the numeric acknowledgement id is inserted directly before the JSON argument array (after the namespace, when present). Binary arguments still become placeholders plus ordered attachments.\",\n    \"cases\": [\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_event_ack\", \"eio\": 4, \"event\": \"event\", \"packet_id\": 0, \"namespace\": null, \"data\": [\"string\", 1, true, null]},\n            \"expected_output\": \"frame=420[\\\"event\\\",\\\"string\\\",1,true,null]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_event_ack\", \"eio\": 4, \"event\": \"event\", \"packet_id\": 23, \"namespace\": \"/test\", \"data\": [\"string\", 1, true, null]},\n            \"expected_output\": \"frame=42/test,23[\\\"event\\\",\\\"string\\\",1,true,null]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_event_ack\", \"eio\": 4, \"event\": \"event\", \"packet_id\": 8964, \"namespace\": \"/test\", \"data\": [123456.789, [a specific JSON string to replace byte arrays]\"User\": \"test\", \"Password\": \"hello\"}, [a specific JSON string to replace byte arrays]\"Size\": 2023, \"Name\": \"test.txt\", \"Bytes\": [a specific JSON string to replace byte arrays]\"$bytes\": [240, 159, 144, 174, 240, 159, 141, 186]}}]},\n            \"expected_output\": \"frame=451-/test,8964[\\\"event\\\",123456.789,[a specific JSON string to replace byte arrays]\\\"User\\\":\\\"test\\\",\\\"Password\\\":\\\"hello\\\"},[a specific JSON string to replace byte arrays]\\\"Size\\\":2023,\\\"Name\\\":\\\"test.txt\\\",\\\"Bytes\\\":[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}}]\\nattachment=240,159,144,174,240,159,141,186\\n\"\n        }\n    ]\n}\n```\n\n*2.3 Encode an acknowledgement reply — emit an id-bearing argument frame with no event name*\n\nEncode an outbound acknowledgement that replies to a previously received id-bearing request. There is no event name: the text frame is `43` followed by `<namespace>,` when present, then the acknowledgement id, then the JSON argument array. With binary arguments the prefix becomes `46<count>-`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_3_encode_ack.json`\n\n```json\n[a specific JSON string to replace byte arrays]\n    \"description\": \"Encode an outbound acknowledgement message replying to a previously received id-bearing request. There is no event name; the argument array is emitted directly, preceded by the acknowledgement id (and namespace when present). Binary arguments become placeholders plus ordered attachments and switch the frame to the binary-ack prefix.\",\n    \"cases\": [\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_ack\", \"eio\": 4, \"packet_id\": 0, \"namespace\": null, \"data\": [\"string\", 1, true, null]},\n            \"expected_output\": \"frame=430[\\\"string\\\",1,true,null]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_ack\", \"eio\": 4, \"packet_id\": 23, \"namespace\": \"/test\", \"data\": [\"string\", 1, true, null]},\n            \"expected_output\": \"frame=43/test,23[\\\"string\\\",1,true,null]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_ack\", \"eio\": 4, \"packet_id\": 8964, \"namespace\": \"/test\", \"data\": [123456.789, [a specific JSON string to replace byte arrays]\"User\": \"test\", \"Password\": \"hello\"}, [a specific JSON string to replace byte arrays]\"Size\": 2023, \"Name\": \"test.txt\", \"Bytes\": [a specific JSON string to replace byte arrays]\"$bytes\": [240, 159, 144, 174, 240, 159, 141, 186]}}]},\n            \"expected_output\": \"frame=461-/test,8964[123456.789,[a specific JSON string to replace byte arrays]\\\"User\\\":\\\"test\\\",\\\"Password\\\":\\\"hello\\\"},[a specific JSON string to replace byte arrays]\\\"Size\\\":2023,\\\"Name\\\":\\\"test.txt\\\",\\\"Bytes\\\":[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}}]\\nattachment=240,159,144,174,240,159,141,186\\n\"\n        }\n    ]\n}\n```\n\n*2.4 Encode a namespace connection — protocol-version-dependent connect frame*\n\nEncode the frame that joins a namespace, which differs by protocol version. Under version 3: the default namespace produces no frame at all (output `frame=null`); a named namespace produces `40<namespace>` optionally followed by `?key=value(&key=value...)` built from the connection query, then a trailing `,`. Under version 4: the default namespace always produces `40`; a named namespace produces `40<namespace>,`; an auth object is serialized inline as JSON appended after the prefix/namespace; the connection query is NOT embedded in this frame (it is carried only by the handshake URL of Feature 1).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_4_encode_connect.json`\n\n```json\n[a specific JSON string to replace byte arrays]\n    \"description\": \"Encode the namespace-connection frame. Under protocol v3 the default namespace produces no frame (none is sent), while a named namespace yields a connect frame that carries the namespace and, optionally, the connection query string. Under protocol v4 the default namespace always produces a connect frame, an auth object is serialized inline as JSON, and connection queries are not embedded in this frame.\",\n    \"cases\": [\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_connect\", \"eio\": 3, \"namespace\": null, \"auth\": null, \"query\": null},\n            \"expected_output\": \"frame=null\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_connect\", \"eio\": 3, \"namespace\": \"/test\", \"auth\": null, \"query\": null},\n            \"expected_output\": \"frame=40/test,\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_connect\", \"eio\": 3, \"namespace\": \"/test\", \"auth\": null, \"query\": [a specific JSON string to replace byte arrays]\"key\": \"value\"}},\n            \"expected_output\": \"frame=40/test?key=value,\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_connect\", \"eio\": 4, \"namespace\": null, \"auth\": null, \"query\": null},\n            \"expected_output\": \"frame=40\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_connect\", \"eio\": 4, \"namespace\": null, \"auth\": [a specific JSON string to replace byte arrays]\"userId\": 1}, \"query\": null},\n            \"expected_output\": \"frame=40[a specific JSON string to replace byte arrays]\\\"userId\\\":1}\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"encode_connect\", \"eio\": 4, \"namespace\": \"/test\", \"auth\": [a specific JSON string to replace byte arrays]\"userId\": 1}, \"query\": null},\n            \"expected_output\": \"frame=40/test,[a specific JSON string to replace byte arrays]\\\"userId\\\":1}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Inbound Frame Decoding\n\n**As a developer**, I want to decode received frames back into structured messages, so I can react to events, acknowledgements, errors and lifecycle signals without parsing protocol strings myself.\n\n**Expected Behavior / Usage:**\n\nDecode one or more received frames into structured messages. Every decoded message is rendered as a `type=<kind>` line followed by kind-specific fields, one `key=value` per line. A `namespace=` line appears only for a non-default namespace; an `id=` line appears only when the frame carried an acknowledgement id. When multiple messages are produced, they are separated by a line containing `---`. Frames that carry no decodable message produce `message=none`.\n\n*3.1 Decode a text frame — single self-contained frame*\n\nDecode a single text frame. The numeric prefix selects the kind: `2`→`ping`, `3`→`pong`, `0`→`opened` (carrying `sid`, `ping_interval`, `ping_timeout`, comma-joined `upgrades`), `40`→`connected` (optional namespace, optional `sid`), `41`→`disconnected` (optional namespace), `42`→`event` (event name, optional namespace, optional id, JSON `data` array with the event-name element removed), `43`→`ack` (optional namespace, id, JSON `data`), `44`→`error` (optional namespace, normalized `error_message`; the v3 form is a bare quoted string, the v4 form is a `[a specific JSON string to replace byte arrays]\"message\":...}` object). Empty or unrecognized frames produce `message=none`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_decode_text.json`\n\n```json\n[a specific JSON string to replace byte arrays]\n    \"description\": \"Decode a single inbound text frame into a structured message. The numeric prefix selects the kind (heartbeat ping/pong, transport opened handshake, namespace connected/disconnected, event, acknowledgement, connect error). Optional namespace, acknowledgement id, event name and JSON argument payload are extracted from their wire positions; unrecognized or empty frames yield no message.\",\n    \"cases\": [\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"2\"}]},\n            \"expected_output\": \"type=ping\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"0[a specific JSON string to replace byte arrays]\\\"sid\\\":\\\"wOuAvDB9Jj6yE0VrAL8N\\\",\\\"upgrades\\\":[\\\"websocket\\\"],\\\"pingInterval\\\":25000,\\\"pingTimeout\\\":30000}\"}]},\n            \"expected_output\": \"type=opened\\nsid=wOuAvDB9Jj6yE0VrAL8N\\nping_interval=25000\\nping_timeout=30000\\nupgrades=websocket\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"40[a specific JSON string to replace byte arrays]\\\"sid\\\":\\\"aMA_EmVTuzpgR16PAc4w\\\"}\"}]},\n            \"expected_output\": \"type=connected\\nsid=aMA_EmVTuzpgR16PAc4w\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"40/test,[a specific JSON string to replace byte arrays]\\\"sid\\\":\\\"aMA_EmVTuzpgR16PAc4w\\\"}\"}]},\n            \"expected_output\": \"type=connected\\nnamespace=/test\\nsid=aMA_EmVTuzpgR16PAc4w\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"42/test,[\\\"hi\\\",\\\"V3: onAny\\\"]\"}]},\n            \"expected_output\": \"type=event\\nevent=hi\\nnamespace=/test\\ndata=[\\\"V3: onAny\\\"]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"42/test,17[\\\"cool\\\"]\"}]},\n            \"expected_output\": \"type=event\\nevent=cool\\nnamespace=/test\\nid=17\\ndata=[]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"431[\\\"nice\\\"]\"}]},\n            \"expected_output\": \"type=ack\\nid=1\\ndata=[\\\"nice\\\"]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"44[a specific JSON string to replace byte arrays]\\\"message\\\":\\\"Authentication error2\\\"}\"}]},\n            \"expected_output\": \"type=error\\nerror_message=Authentication error2\\n\"\n        }\n    ]\n}\n```\n\n*3.2 Decode a binary message — leading text frame plus attachment frames*\n\nDecode a binary message that spans a leading text frame (prefix `45`/`46`) plus one or more raw attachment frames. The text frame declares `<count>-`, optional namespace, optional acknowledgement id and the JSON payload containing binary placeholders. The structured message — kind `binary_event` (event name present) or `binary_ack` (no event name), with `attachment_count` and the placeholder-bearing `data` — is produced ONLY after all declared attachment frames have been received; until the count is satisfied, decoding yields no message (`message=none`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_decode_binary.json`\n\n```json\n[a specific JSON string to replace byte arrays]\n    \"description\": \"Decode an inbound binary message that spans a leading text frame plus one or more raw attachment frames. The text frame declares the attachment count, optional namespace, optional acknowledgement id and the JSON payload (with binary placeholders). The message is only produced once all declared attachment frames have arrived; until then nothing is emitted.\",\n    \"cases\": [\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"451-[\\\"1 params\\\",[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\"}, [a specific JSON string to replace byte arrays]\"bytes\": [0]}]},\n            \"expected_output\": \"type=binary_event\\nevent=1 params\\nattachment_count=1\\ndata=[[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"451-/test,[\\\"1 params\\\",[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\"}, [a specific JSON string to replace byte arrays]\"bytes\": [0]}]},\n            \"expected_output\": \"type=binary_event\\nevent=1 params\\nnamespace=/test\\nattachment_count=1\\ndata=[[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"451-30[\\\"1 params\\\",[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\"}, [a specific JSON string to replace byte arrays]\"bytes\": [0]}]},\n            \"expected_output\": \"type=binary_event\\nevent=1 params\\nid=30\\nattachment_count=1\\ndata=[[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"decode\", \"eio\": 4, \"frames\": [[a specific JSON string to replace byte arrays]\"text\": \"461-6[[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\"}, [a specific JSON string to replace byte arrays]\"bytes\": [0]}]},\n            \"expected_output\": \"type=binary_ack\\nid=6\\nattachment_count=1\\ndata=[[a specific JSON string to replace byte arrays]\\\"_placeholder\\\":true,\\\"num\\\":0}]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Decoded Payload Rendering\n\n**As a developer**, I want to render the argument payload of a decoded message back to a compact JSON string, so I can forward or inspect just the data without the framing.\n\n**Expected Behavior / Usage:**\n\nGiven a decoded message kind and its received JSON text, render the stored arguments array as a compact (no whitespace) JSON string on a `payload=` line. For an `event` message the leading event-name element has already been consumed, so only the remaining arguments are rendered. For an `ack` message the full stored array is rendered as-is.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_extract_payload.json`\n\n```json\n[a specific JSON string to replace byte arrays]\n    \"description\": \"Render the JSON arguments array carried by a decoded message back to a compact JSON string. For an event message the leading event-name element has already been consumed, so only the remaining arguments are rendered; for an acknowledgement message the full stored array is rendered as-is.\",\n    \"cases\": [\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"extract_payload\", \"type\": \"Event\", \"text\": \"[\\\"event\\\",1]\"},\n            \"expected_output\": \"payload=[1]\\n\"\n        },\n        [a specific JSON string to replace byte arrays]\n            \"input\": [a specific JSON string to replace byte arrays]\"op\": \"extract_payload\", \"type\": \"Ack\", \"text\": \"[\\\"event\\\",\\\"hello\\\",[a specific JSON string to replace byte arrays]\\\"user\\\":\\\"admin\\\",\\\"password\\\":\\\"test\\\"}]\"},\n            \"expected_output\": \"payload=[\\\"event\\\",\\\"hello\\\",[a specific JSON string to replace byte arrays]\\\"user\\\":\\\"admin\\\",\\\"password\\\":\\\"test\\\"}]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codec implementing handshake-URL construction, outbound encoding (event, event-with-ack, ack, namespace connect), inbound decoding (text and multi-frame binary) and payload rendering, with the wire-format details and protocol-version differences fully encapsulated. Its physical structure must align with the \"Scale-Driven Code Organization\" constraint.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads a single JSON command from stdin, dispatches to the matching codec operation, and prints the result to stdout exactly matching the per-leaf-feature contracts above (including byte-exact frames, attachment byte lists and normalized error categories). This adapter must be logically and physically separated from the codec core.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/[a specific JSON string to replace byte arrays]filename.stem}@[a specific JSON string to replace byte arrays]case_index.zfill(3)}.txt` (e.g. the first case of `feature1_handshake_url.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_handshake_url@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test, so it can be compared directly against `expected_output`.\n",
+  "oracle_data": {
+    "task_id": "doghappy__socket.io-client-csharp-001",
+    "golden_api_signature": "main(stdin: JSON object routed by op) -> stdout exactly matching public_test_cases expected_output",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "what does $bytes become?",
+          "syntax for binary data?",
+          "replacement string for bytes"
+        ],
+        "oracle_response": "Each byte array must be replaced by a JSON object wrapping the binary data, e.g., {\"data\": <hex_string>} or similar binary-safe format as defined in the IO parsermodule"
+      },
+      {
+        "constraint_id": "FULL_SCOPE",
+        "trigger_keywords": [
+          "full task scope",
+          "all public features",
+          "semantic equivalence"
+        ],
+        "oracle_response": "This generated package must cover the full detailed-PRD behavior represented by all authoritative public test case files, not just a subset mentioned in the fuzzy PRD. Public feature files: feature1_handshake_url, feature2_1_encode_event, feature2_2_encode_event_ack, feature2_3_encode_ack, feature2_4_encode_connect, feature3_1_decode_text, feature3_2_decode_binary, feature4_extract_payload. Feature descriptions include: Build the Engine.IO handshake/connection URL from a server endpoint, transport choice (long-polling vs websocket), protocol version, optional mount path and query parameters. Default ports for the scheme are dropped; a non-default port for the scheme is preserved.; Encode an outbound event message with an event name, optional namespace and an arbitrary argument list. Plain values are inlined as a JSON array prefixed by the event name; binary arguments are replaced by placeholder objects ({\"_placeholder\":true,\"num\":N}) and emitted as separate ordered attachment payloads, switching the frame prefix to the binary form.; Encode an outbound event message that also requests an acknowledgement: the same event encoding as a plain event, but the numeric acknowledgement id is inserted directly before the JSON argument array (after the namespace, when present). Binary arguments still become placeholders plus ordered attachments.; Encode an outbound acknowledgement message replying to a previously received id-bearing request. There is no event name; the argument array is emitted directly, preceded by the acknowledgement id (and namespace when present). Binary arguments become placeholders plus ordered attachments and switch the frame to the binary-ack prefix.; Encode the namespace-connection frame. Under protocol v3 the default namespace produces no frame (none is sent), while a named namespace yields a connect frame that carries the namespace and, optionally, the connection query string. Under protocol v4 the default namespace always produces a connect frame, an auth object is serialized inline as JSON, and connection queries are not embedded in this frame.; Decode a single inbound text frame into a structured message. The numeric prefix selects the kind (heartbeat ping/pong, transport opened handshake, namespace connected/disconnected, event, acknowledgement, connect error). Optional namespace, acknowledgement id, event name and JSON argument payload are extracted from their wire positions; unrecognized or empty frames yield no message.; Decode an inbound binary message that spans a leading text frame plus one or more raw attachment frames. The text frame declares the attachment count, optional namespace, optional acknowledgement id and the JSON payload (with binary placeholders). The message is only produced once all declared attachment frames have arrived; until then nothing is emitted.; Render the JSON arguments array carried by a decoded message back to a compact JSON string. For an event message the leading event-name element has already been consumed, so only the remaining arguments are rendered; for an acknowledgement message the full stored array is rendered as-is."
+      },
+      {
+        "constraint_id": "EXECUTION_CONTRACT",
+        "trigger_keywords": [
+          "dispatcher contract",
+          "same tests",
+          "input fields",
+          "stdout expected_output"
+        ],
+        "oracle_response": "The execution adapter must accept exactly the input shapes used by public_test_cases and emit stdout exactly equal to each expected_output. Observed top-level input fields/values include: op=['decode', 'encode_ack', 'encode_connect', 'encode_event', 'encode_event_ack', 'extract_payload', 'handshake_url'], ws=['False', 'True'], uri=['http://localhost', 'https://localhost:443', 'https://localhost:80', 'ws://localhost:80'], eio=['3', '4'], path=['', '/sio'], query=['None', '{dict}'], event=['event', 'test'], namespace=['', '/nsp', '/test', 'None'], data=['[list]'], packet_id=['0', '23', '8964'], auth=['None', '{dict}'], frames=['[list]'], type=['Ack', 'Event'], text=['[\"event\",\"hello\",{\"user\":\"admin\",\"password\":\"test\"}]', '[\"event\",1]']. Do not require a different discriminator field, different action names, JSON output where line output is expected, or extra PASS/FAIL metadata."
+      },
+      {
+        "constraint_id": "PUBLIC_TEST_CASES_AUTHORITY",
+        "trigger_keywords": [
+          "exact outputs",
+          "public tests authoritative",
+          "expected_output"
+        ],
+        "oracle_response": "The embedded public_test_cases are part of oracle_data and are authoritative for exact input shapes, action/operation names, stdout line order, whitespace, error categories, numeric formatting, and deterministic serialization. If prose, fuzzy_prd, context pointers, or older hidden constraints are vague or conflict with expected_output, the public_test_cases expected_output is the pass-critical contract."
+      },
+      {
+        "constraint_id": "NO_CROSS_TASK_INFERENCE",
+        "trigger_keywords": [
+          "ignore unrelated analogies",
+          "cross task contamination"
+        ],
+        "oracle_response": "Ignore any vague analogy or context pointer that names an unrelated module, pipeline, login flow, audit generator, or previous project. Such wording is non-normative; only this repo’s detailed PRD, FULL_SCOPE, EXECUTION_CONTRACT, and public_test_cases define the task."
+      },
+      {
+        "constraint_id": "TC_feature4_extract_payload",
+        "trigger_keywords": [
+          "feature4_extract_payload",
+          "feature4_extract_payload.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature4_extract_payload:\n{\n  \"description\": \"Render the JSON arguments array carried by a decoded message back to a compact JSON string. For an event message the leading event-name element has already been consumed, so only the remaining arguments are rendered; for an acknowledgement message the full stored array is rendered as-is.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"extract_payload\",\n        \"type\": \"Event\",\n        \"text\": \"[\\\"event\\\",1]\"\n      },\n      \"expected_output\": \"payload=[1]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"extract_payload\",\n        \"type\": \"Ack\",\n        \"text\": \"[\\\"event\\\",\\\"hello\\\",{\\\"user\\\":\\\"admin\\\",\\\"password\\\":\\\"test\\\"}]\"\n      },\n      \"expected_output\": \"payload=[\\\"event\\\",\\\"hello\\\",{\\\"user\\\":\\\"admin\\\",\\\"password\\\":\\\"test\\\"}]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_decode_binary",
+        "trigger_keywords": [
+          "feature3_2_decode_binary",
+          "feature3_2_decode_binary.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature3_2_decode_binary:\n{\n  \"description\": \"Decode an inbound binary message that spans a leading text frame plus one or more raw attachment frames. The text frame declares the attachment count, optional namespace, optional acknowledgement id and the JSON payload (with binary placeholders). The message is only produced once all declared attachment frames have arrived; until then nothing is emitted.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"451-[\\\"1 params\\\",{\\\"_placeholder\\\":true,\\\"num\\\":0}]\"\n          },\n          {\n            \"bytes\": [\n              0\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"type=binary_event\\nevent=1 params\\nattachment_count=1\\ndata=[{\\\"_placeholder\\\":true,\\\"num\\\":0}]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"451-/test,[\\\"1 params\\\",{\\\"_placeholder\\\":true,\\\"num\\\":0}]\"\n          },\n          {\n            \"bytes\": [\n              0\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"type=binary_event\\nevent=1 params\\nnamespace=/test\\nattachment_count=1\\ndata=[{\\\"_placeholder\\\":true,\\\"num\\\":0}]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"451-30[\\\"1 params\\\",{\\\"_placeholder\\\":true,\\\"num\\\":0}]\"\n          },\n          {\n            \"bytes\": [\n              0\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"type=binary_event\\nevent=1 params\\nid=30\\nattachment_count=1\\ndata=[{\\\"_placeholder\\\":true,\\\"num\\\":0}]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"461-6[{\\\"_placeholder\\\":true,\\\"num\\\":0}]\"\n          },\n          {\n            \"bytes\": [\n              0\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"type=binary_ack\\nid=6\\nattachment_count=1\\ndata=[{\\\"_placeholder\\\":true,\\\"num\\\":0}]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_decode_text",
+        "trigger_keywords": [
+          "feature3_1_decode_text",
+          "feature3_1_decode_text.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature3_1_decode_text:\n{\n  \"description\": \"Decode a single inbound text frame into a structured message. The numeric prefix selects the kind (heartbeat ping/pong, transport opened handshake, namespace connected/disconnected, event, acknowledgement, connect error). Optional namespace, acknowledgement id, event name and JSON argument payload are extracted from their wire positions; unrecognized or empty frames yield no message.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"2\"\n          }\n        ]\n      },\n      \"expected_output\": \"type=ping\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"0{\\\"sid\\\":\\\"wOuAvDB9Jj6yE0VrAL8N\\\",\\\"upgrades\\\":[\\\"websocket\\\"],\\\"pingInterval\\\":25000,\\\"pingTimeout\\\":30000}\"\n          }\n        ]\n      },\n      \"expected_output\": \"type=opened\\nsid=wOuAvDB9Jj6yE0VrAL8N\\nping_interval=25000\\nping_timeout=30000\\nupgrades=websocket\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"40{\\\"sid\\\":\\\"aMA_EmVTuzpgR16PAc4w\\\"}\"\n          }\n        ]\n      },\n      \"expected_output\": \"type=connected\\nsid=aMA_EmVTuzpgR16PAc4w\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"40/test,{\\\"sid\\\":\\\"aMA_EmVTuzpgR16PAc4w\\\"}\"\n          }\n        ]\n      },\n      \"expected_output\": \"type=connected\\nnamespace=/test\\nsid=aMA_EmVTuzpgR16PAc4w\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"42/test,[\\\"hi\\\",\\\"V3: onAny\\\"]\"\n          }\n        ]\n      },\n      \"expected_output\": \"type=event\\nevent=hi\\nnamespace=/test\\ndata=[\\\"V3: onAny\\\"]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"42/test,17[\\\"cool\\\"]\"\n          }\n        ]\n      },\n      \"expected_output\": \"type=event\\nevent=cool\\nnamespace=/test\\nid=17\\ndata=[]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"431[\\\"nice\\\"]\"\n          }\n        ]\n      },\n      \"expected_output\": \"type=ack\\nid=1\\ndata=[\\\"nice\\\"]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"eio\": 4,\n        \"frames\": [\n          {\n            \"text\": \"44{\\\"message\\\":\\\"Authentication error2\\\"}\"\n          }\n        ]\n      },\n      \"expected_output\": \"type=error\\nerror_message=Authentication error2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_4_encode_connect",
+        "trigger_keywords": [
+          "feature2_4_encode_connect",
+          "feature2_4_encode_connect.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_4_encode_connect:\n{\n  \"description\": \"Encode the namespace-connection frame. Under protocol v3 the default namespace produces no frame (none is sent), while a named namespace yields a connect frame that carries the namespace and, optionally, the connection query string. Under protocol v4 the default namespace always produces a connect frame, an auth object is serialized inline as JSON, and connection queries are not embedded in this frame.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"encode_connect\",\n        \"eio\": 3,\n        \"namespace\": null,\n        \"auth\": null,\n        \"query\": null\n      },\n      \"expected_output\": \"frame=null\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_connect\",\n        \"eio\": 3,\n        \"namespace\": \"/test\",\n        \"auth\": null,\n        \"query\": null\n      },\n      \"expected_output\": \"frame=40/test,\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_connect\",\n        \"eio\": 3,\n        \"namespace\": \"/test\",\n        \"auth\": null,\n        \"query\": {\n          \"key\": \"value\"\n        }\n      },\n      \"expected_output\": \"frame=40/test?key=value,\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_connect\",\n        \"eio\": 4,\n        \"namespace\": null,\n        \"auth\": null,\n        \"query\": null\n      },\n      \"expected_output\": \"frame=40\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_connect\",\n        \"eio\": 4,\n        \"namespace\": null,\n        \"auth\": {\n          \"userId\": 1\n        },\n        \"query\": null\n      },\n      \"expected_output\": \"frame=40{\\\"userId\\\":1}\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_connect\",\n        \"eio\": 4,\n        \"namespace\": \"/test\",\n        \"auth\": {\n          \"userId\": 1\n        },\n        \"query\": null\n      },\n      \"expected_output\": \"frame=40/test,{\\\"userId\\\":1}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_encode_ack",
+        "trigger_keywords": [
+          "feature2_3_encode_ack",
+          "feature2_3_encode_ack.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_3_encode_ack:\n{\n  \"description\": \"Encode an outbound acknowledgement message replying to a previously received id-bearing request. There is no event name; the argument array is emitted directly, preceded by the acknowledgement id (and namespace when present). Binary arguments become placeholders plus ordered attachments and switch the frame to the binary-ack prefix.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"encode_ack\",\n        \"eio\": 4,\n        \"packet_id\": 0,\n        \"namespace\": null,\n        \"data\": [\n          \"string\",\n          1,\n          true,\n          null\n        ]\n      },\n      \"expected_output\": \"frame=430[\\\"string\\\",1,true,null]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_ack\",\n        \"eio\": 4,\n        \"packet_id\": 23,\n        \"namespace\": \"/test\",\n        \"data\": [\n          \"string\",\n          1,\n          true,\n          null\n        ]\n      },\n      \"expected_output\": \"frame=43/test,23[\\\"string\\\",1,true,null]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_ack\",\n        \"eio\": 4,\n        \"packet_id\": 8964,\n        \"namespace\": \"/test\",\n        \"data\": [\n          123456.789,\n          {\n            \"User\": \"test\",\n            \"Password\": \"hello\"\n          },\n          {\n            \"Size\": 2023,\n            \"Name\": \"test.txt\",\n            \"Bytes\": {\n              \"$bytes\": [\n                240,\n                159,\n                144,\n                174,\n                240,\n                159,\n                141,\n                186\n              ]\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"frame=461-/test,8964[123456.789,{\\\"User\\\":\\\"test\\\",\\\"Password\\\":\\\"hello\\\"},{\\\"Size\\\":2023,\\\"Name\\\":\\\"test.txt\\\",\\\"Bytes\\\":{\\\"_placeholder\\\":true,\\\"num\\\":0}}]\\nattachment=240,159,144,174,240,159,141,186\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_encode_event_ack",
+        "trigger_keywords": [
+          "feature2_2_encode_event_ack",
+          "feature2_2_encode_event_ack.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_2_encode_event_ack:\n{\n  \"description\": \"Encode an outbound event message that also requests an acknowledgement: the same event encoding as a plain event, but the numeric acknowledgement id is inserted directly before the JSON argument array (after the namespace, when present). Binary arguments still become placeholders plus ordered attachments.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"encode_event_ack\",\n        \"eio\": 4,\n        \"event\": \"event\",\n        \"packet_id\": 0,\n        \"namespace\": null,\n        \"data\": [\n          \"string\",\n          1,\n          true,\n          null\n        ]\n      },\n      \"expected_output\": \"frame=420[\\\"event\\\",\\\"string\\\",1,true,null]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_event_ack\",\n        \"eio\": 4,\n        \"event\": \"event\",\n        \"packet_id\": 23,\n        \"namespace\": \"/test\",\n        \"data\": [\n          \"string\",\n          1,\n          true,\n          null\n        ]\n      },\n      \"expected_output\": \"frame=42/test,23[\\\"event\\\",\\\"string\\\",1,true,null]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_event_ack\",\n        \"eio\": 4,\n        \"event\": \"event\",\n        \"packet_id\": 8964,\n        \"namespace\": \"/test\",\n        \"data\": [\n          123456.789,\n          {\n            \"User\": \"test\",\n            \"Password\": \"hello\"\n          },\n          {\n            \"Size\": 2023,\n            \"Name\": \"test.txt\",\n            \"Bytes\": {\n              \"$bytes\": [\n                240,\n                159,\n                144,\n                174,\n                240,\n                159,\n                141,\n                186\n              ]\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"frame=451-/test,8964[\\\"event\\\",123456.789,{\\\"User\\\":\\\"test\\\",\\\"Password\\\":\\\"hello\\\"},{\\\"Size\\\":2023,\\\"Name\\\":\\\"test.txt\\\",\\\"Bytes\\\":{\\\"_placeholder\\\":true,\\\"num\\\":0}}]\\nattachment=240,159,144,174,240,159,141,186\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_encode_event",
+        "trigger_keywords": [
+          "feature2_1_encode_event",
+          "feature2_1_encode_event.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_1_encode_event:\n{\n  \"description\": \"Encode an outbound event message with an event name, optional namespace and an arbitrary argument list. Plain values are inlined as a JSON array prefixed by the event name; binary arguments are replaced by placeholder objects ({\\\"_placeholder\\\":true,\\\"num\\\":N}) and emitted as separate ordered attachment payloads, switching the frame prefix to the binary form.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"encode_event\",\n        \"eio\": 4,\n        \"event\": \"test\",\n        \"namespace\": \"\",\n        \"data\": []\n      },\n      \"expected_output\": \"frame=42[\\\"test\\\"]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_event\",\n        \"eio\": 4,\n        \"event\": \"test\",\n        \"namespace\": \"/nsp\",\n        \"data\": [\n          true,\n          false,\n          123\n        ]\n      },\n      \"expected_output\": \"frame=42/nsp,[\\\"test\\\",true,false,123]\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_event\",\n        \"eio\": 4,\n        \"event\": \"test\",\n        \"namespace\": \"\",\n        \"data\": [\n          {\n            \"$bytes\": [\n              1,\n              2,\n              3\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"frame=451-[\\\"test\\\",{\\\"_placeholder\\\":true,\\\"num\\\":0}]\\nattachment=1,2,3\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode_event\",\n        \"eio\": 4,\n        \"event\": \"event\",\n        \"namespace\": \"/test\",\n        \"data\": [\n          123456.789,\n          {\n            \"User\": \"test\",\n            \"Password\": \"hello\"\n          },\n          {\n            \"Size\": 2023,\n            \"Name\": \"test.txt\",\n            \"Bytes\": {\n              \"$bytes\": [\n                240,\n                159,\n                144,\n                174,\n                240,\n                159,\n                141,\n                186\n              ]\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"frame=451-/test,[\\\"event\\\",123456.789,{\\\"User\\\":\\\"test\\\",\\\"Password\\\":\\\"hello\\\"},{\\\"Size\\\":2023,\\\"Name\\\":\\\"test.txt\\\",\\\"Bytes\\\":{\\\"_placeholder\\\":true,\\\"num\\\":0}}]\\nattachment=240,159,144,174,240,159,141,186\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_handshake_url",
+        "trigger_keywords": [
+          "feature1_handshake_url",
+          "feature1_handshake_url.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature1_handshake_url:\n{\n  \"description\": \"Build the Engine.IO handshake/connection URL from a server endpoint, transport choice (long-polling vs websocket), protocol version, optional mount path and query parameters. Default ports for the scheme are dropped; a non-default port for the scheme is preserved.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"handshake_url\",\n        \"ws\": false,\n        \"uri\": \"http://localhost\",\n        \"eio\": 4,\n        \"path\": \"\",\n        \"query\": {\n          \"token\": \"test\"\n        }\n      },\n      \"expected_output\": \"url=http://localhost/socket.io/?EIO=4&transport=polling&token=test\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"handshake_url\",\n        \"ws\": false,\n        \"uri\": \"https://localhost:443\",\n        \"eio\": 4,\n        \"path\": \"/sio\",\n        \"query\": {\n          \"token\": \"test\"\n        }\n      },\n      \"expected_output\": \"url=https://localhost/sio/?EIO=4&transport=polling&token=test\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"handshake_url\",\n        \"ws\": true,\n        \"uri\": \"ws://localhost:80\",\n        \"eio\": 4,\n        \"path\": \"\",\n        \"query\": {}\n      },\n      \"expected_output\": \"url=ws://localhost/socket.io/?EIO=4&transport=websocket\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"handshake_url\",\n        \"ws\": false,\n        \"uri\": \"https://localhost:80\",\n        \"eio\": 4,\n        \"path\": \"\",\n        \"query\": {\n          \"token\": \"test\"\n        }\n      },\n      \"expected_output\": \"url=https://localhost:80/socket.io/?EIO=4&transport=polling&token=test\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_handshake_url.json": {
+      "description": "Build the Engine.IO handshake/connection URL from a server endpoint, transport choice (long-polling vs websocket), protocol version, optional mount path and query parameters. Default ports for the scheme are dropped; a non-default port for the scheme is preserved.",
+      "cases": [
+        {
+          "input": {
+            "op": "handshake_url",
+            "ws": false,
+            "uri": "http://localhost",
+            "eio": 4,
+            "path": "",
+            "query": {
+              "token": "test"
+            }
+          },
+          "expected_output": "url=http://localhost/socket.io/?EIO=4&transport=polling&token=test\n"
+        },
+        {
+          "input": {
+            "op": "handshake_url",
+            "ws": false,
+            "uri": "https://localhost:443",
+            "eio": 4,
+            "path": "/sio",
+            "query": {
+              "token": "test"
+            }
+          },
+          "expected_output": "url=https://localhost/sio/?EIO=4&transport=polling&token=test\n"
+        },
+        {
+          "input": {
+            "op": "handshake_url",
+            "ws": true,
+            "uri": "ws://localhost:80",
+            "eio": 4,
+            "path": "",
+            "query": {}
+          },
+          "expected_output": "url=ws://localhost/socket.io/?EIO=4&transport=websocket\n"
+        },
+        {
+          "input": {
+            "op": "handshake_url",
+            "ws": false,
+            "uri": "https://localhost:80",
+            "eio": 4,
+            "path": "",
+            "query": {
+              "token": "test"
+            }
+          },
+          "expected_output": "url=https://localhost:80/socket.io/?EIO=4&transport=polling&token=test\n"
+        }
+      ]
+    },
+    "feature2_1_encode_event.json": {
+      "description": "Encode an outbound event message with an event name, optional namespace and an arbitrary argument list. Plain values are inlined as a JSON array prefixed by the event name; binary arguments are replaced by placeholder objects ({\"_placeholder\":true,\"num\":N}) and emitted as separate ordered attachment payloads, switching the frame prefix to the binary form.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode_event",
+            "eio": 4,
+            "event": "test",
+            "namespace": "",
+            "data": []
+          },
+          "expected_output": "frame=42[\"test\"]\n"
+        },
+        {
+          "input": {
+            "op": "encode_event",
+            "eio": 4,
+            "event": "test",
+            "namespace": "/nsp",
+            "data": [
+              true,
+              false,
+              123
+            ]
+          },
+          "expected_output": "frame=42/nsp,[\"test\",true,false,123]\n"
+        },
+        {
+          "input": {
+            "op": "encode_event",
+            "eio": 4,
+            "event": "test",
+            "namespace": "",
+            "data": [
+              {
+                "$bytes": [
+                  1,
+                  2,
+                  3
+                ]
+              }
+            ]
+          },
+          "expected_output": "frame=451-[\"test\",{\"_placeholder\":true,\"num\":0}]\nattachment=1,2,3\n"
+        },
+        {
+          "input": {
+            "op": "encode_event",
+            "eio": 4,
+            "event": "event",
+            "namespace": "/test",
+            "data": [
+              123456.789,
+              {
+                "User": "test",
+                "Password": "hello"
+              },
+              {
+                "Size": 2023,
+                "Name": "test.txt",
+                "Bytes": {
+                  "$bytes": [
+                    240,
+                    159,
+                    144,
+                    174,
+                    240,
+                    159,
+                    141,
+                    186
+                  ]
+                }
+              }
+            ]
+          },
+          "expected_output": "frame=451-/test,[\"event\",123456.789,{\"User\":\"test\",\"Password\":\"hello\"},{\"Size\":2023,\"Name\":\"test.txt\",\"Bytes\":{\"_placeholder\":true,\"num\":0}}]\nattachment=240,159,144,174,240,159,141,186\n"
+        }
+      ]
+    },
+    "feature2_2_encode_event_ack.json": {
+      "description": "Encode an outbound event message that also requests an acknowledgement: the same event encoding as a plain event, but the numeric acknowledgement id is inserted directly before the JSON argument array (after the namespace, when present). Binary arguments still become placeholders plus ordered attachments.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode_event_ack",
+            "eio": 4,
+            "event": "event",
+            "packet_id": 0,
+            "namespace": null,
+            "data": [
+              "string",
+              1,
+              true,
+              null
+            ]
+          },
+          "expected_output": "frame=420[\"event\",\"string\",1,true,null]\n"
+        },
+        {
+          "input": {
+            "op": "encode_event_ack",
+            "eio": 4,
+            "event": "event",
+            "packet_id": 23,
+            "namespace": "/test",
+            "data": [
+              "string",
+              1,
+              true,
+              null
+            ]
+          },
+          "expected_output": "frame=42/test,23[\"event\",\"string\",1,true,null]\n"
+        },
+        {
+          "input": {
+            "op": "encode_event_ack",
+            "eio": 4,
+            "event": "event",
+            "packet_id": 8964,
+            "namespace": "/test",
+            "data": [
+              123456.789,
+              {
+                "User": "test",
+                "Password": "hello"
+              },
+              {
+                "Size": 2023,
+                "Name": "test.txt",
+                "Bytes": {
+                  "$bytes": [
+                    240,
+                    159,
+                    144,
+                    174,
+                    240,
+                    159,
+                    141,
+                    186
+                  ]
+                }
+              }
+            ]
+          },
+          "expected_output": "frame=451-/test,8964[\"event\",123456.789,{\"User\":\"test\",\"Password\":\"hello\"},{\"Size\":2023,\"Name\":\"test.txt\",\"Bytes\":{\"_placeholder\":true,\"num\":0}}]\nattachment=240,159,144,174,240,159,141,186\n"
+        }
+      ]
+    },
+    "feature2_3_encode_ack.json": {
+      "description": "Encode an outbound acknowledgement message replying to a previously received id-bearing request. There is no event name; the argument array is emitted directly, preceded by the acknowledgement id (and namespace when present). Binary arguments become placeholders plus ordered attachments and switch the frame to the binary-ack prefix.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode_ack",
+            "eio": 4,
+            "packet_id": 0,
+            "namespace": null,
+            "data": [
+              "string",
+              1,
+              true,
+              null
+            ]
+          },
+          "expected_output": "frame=430[\"string\",1,true,null]\n"
+        },
+        {
+          "input": {
+            "op": "encode_ack",
+            "eio": 4,
+            "packet_id": 23,
+            "namespace": "/test",
+            "data": [
+              "string",
+              1,
+              true,
+              null
+            ]
+          },
+          "expected_output": "frame=43/test,23[\"string\",1,true,null]\n"
+        },
+        {
+          "input": {
+            "op": "encode_ack",
+            "eio": 4,
+            "packet_id": 8964,
+            "namespace": "/test",
+            "data": [
+              123456.789,
+              {
+                "User": "test",
+                "Password": "hello"
+              },
+              {
+                "Size": 2023,
+                "Name": "test.txt",
+                "Bytes": {
+                  "$bytes": [
+                    240,
+                    159,
+                    144,
+                    174,
+                    240,
+                    159,
+                    141,
+                    186
+                  ]
+                }
+              }
+            ]
+          },
+          "expected_output": "frame=461-/test,8964[123456.789,{\"User\":\"test\",\"Password\":\"hello\"},{\"Size\":2023,\"Name\":\"test.txt\",\"Bytes\":{\"_placeholder\":true,\"num\":0}}]\nattachment=240,159,144,174,240,159,141,186\n"
+        }
+      ]
+    },
+    "feature2_4_encode_connect.json": {
+      "description": "Encode the namespace-connection frame. Under protocol v3 the default namespace produces no frame (none is sent), while a named namespace yields a connect frame that carries the namespace and, optionally, the connection query string. Under protocol v4 the default namespace always produces a connect frame, an auth object is serialized inline as JSON, and connection queries are not embedded in this frame.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode_connect",
+            "eio": 3,
+            "namespace": null,
+            "auth": null,
+            "query": null
+          },
+          "expected_output": "frame=null\n"
+        },
+        {
+          "input": {
+            "op": "encode_connect",
+            "eio": 3,
+            "namespace": "/test",
+            "auth": null,
+            "query": null
+          },
+          "expected_output": "frame=40/test,\n"
+        },
+        {
+          "input": {
+            "op": "encode_connect",
+            "eio": 3,
+            "namespace": "/test",
+            "auth": null,
+            "query": {
+              "key": "value"
+            }
+          },
+          "expected_output": "frame=40/test?key=value,\n"
+        },
+        {
+          "input": {
+            "op": "encode_connect",
+            "eio": 4,
+            "namespace": null,
+            "auth": null,
+            "query": null
+          },
+          "expected_output": "frame=40\n"
+        },
+        {
+          "input": {
+            "op": "encode_connect",
+            "eio": 4,
+            "namespace": null,
+            "auth": {
+              "userId": 1
+            },
+            "query": null
+          },
+          "expected_output": "frame=40{\"userId\":1}\n"
+        },
+        {
+          "input": {
+            "op": "encode_connect",
+            "eio": 4,
+            "namespace": "/test",
+            "auth": {
+              "userId": 1
+            },
+            "query": null
+          },
+          "expected_output": "frame=40/test,{\"userId\":1}\n"
+        }
+      ]
+    },
+    "feature3_1_decode_text.json": {
+      "description": "Decode a single inbound text frame into a structured message. The numeric prefix selects the kind (heartbeat ping/pong, transport opened handshake, namespace connected/disconnected, event, acknowledgement, connect error). Optional namespace, acknowledgement id, event name and JSON argument payload are extracted from their wire positions; unrecognized or empty frames yield no message.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "2"
+              }
+            ]
+          },
+          "expected_output": "type=ping\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "0{\"sid\":\"wOuAvDB9Jj6yE0VrAL8N\",\"upgrades\":[\"websocket\"],\"pingInterval\":25000,\"pingTimeout\":30000}"
+              }
+            ]
+          },
+          "expected_output": "type=opened\nsid=wOuAvDB9Jj6yE0VrAL8N\nping_interval=25000\nping_timeout=30000\nupgrades=websocket\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "40{\"sid\":\"aMA_EmVTuzpgR16PAc4w\"}"
+              }
+            ]
+          },
+          "expected_output": "type=connected\nsid=aMA_EmVTuzpgR16PAc4w\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "40/test,{\"sid\":\"aMA_EmVTuzpgR16PAc4w\"}"
+              }
+            ]
+          },
+          "expected_output": "type=connected\nnamespace=/test\nsid=aMA_EmVTuzpgR16PAc4w\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "42/test,[\"hi\",\"V3: onAny\"]"
+              }
+            ]
+          },
+          "expected_output": "type=event\nevent=hi\nnamespace=/test\ndata=[\"V3: onAny\"]\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "42/test,17[\"cool\"]"
+              }
+            ]
+          },
+          "expected_output": "type=event\nevent=cool\nnamespace=/test\nid=17\ndata=[]\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "431[\"nice\"]"
+              }
+            ]
+          },
+          "expected_output": "type=ack\nid=1\ndata=[\"nice\"]\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "44{\"message\":\"Authentication error2\"}"
+              }
+            ]
+          },
+          "expected_output": "type=error\nerror_message=Authentication error2\n"
+        }
+      ]
+    },
+    "feature3_2_decode_binary.json": {
+      "description": "Decode an inbound binary message that spans a leading text frame plus one or more raw attachment frames. The text frame declares the attachment count, optional namespace, optional acknowledgement id and the JSON payload (with binary placeholders). The message is only produced once all declared attachment frames have arrived; until then nothing is emitted.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "451-[\"1 params\",{\"_placeholder\":true,\"num\":0}]"
+              },
+              {
+                "bytes": [
+                  0
+                ]
+              }
+            ]
+          },
+          "expected_output": "type=binary_event\nevent=1 params\nattachment_count=1\ndata=[{\"_placeholder\":true,\"num\":0}]\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "451-/test,[\"1 params\",{\"_placeholder\":true,\"num\":0}]"
+              },
+              {
+                "bytes": [
+                  0
+                ]
+              }
+            ]
+          },
+          "expected_output": "type=binary_event\nevent=1 params\nnamespace=/test\nattachment_count=1\ndata=[{\"_placeholder\":true,\"num\":0}]\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "451-30[\"1 params\",{\"_placeholder\":true,\"num\":0}]"
+              },
+              {
+                "bytes": [
+                  0
+                ]
+              }
+            ]
+          },
+          "expected_output": "type=binary_event\nevent=1 params\nid=30\nattachment_count=1\ndata=[{\"_placeholder\":true,\"num\":0}]\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "eio": 4,
+            "frames": [
+              {
+                "text": "461-6[{\"_placeholder\":true,\"num\":0}]"
+              },
+              {
+                "bytes": [
+                  0
+                ]
+              }
+            ]
+          },
+          "expected_output": "type=binary_ack\nid=6\nattachment_count=1\ndata=[{\"_placeholder\":true,\"num\":0}]\n"
+        }
+      ]
+    },
+    "feature4_extract_payload.json": {
+      "description": "Render the JSON arguments array carried by a decoded message back to a compact JSON string. For an event message the leading event-name element has already been consumed, so only the remaining arguments are rendered; for an acknowledgement message the full stored array is rendered as-is.",
+      "cases": [
+        {
+          "input": {
+            "op": "extract_payload",
+            "type": "Event",
+            "text": "[\"event\",1]"
+          },
+          "expected_output": "payload=[1]\n"
+        },
+        {
+          "input": {
+            "op": "extract_payload",
+            "type": "Ack",
+            "text": "[\"event\",\"hello\",{\"user\":\"admin\",\"password\":\"test\"}]"
+          },
+          "expected_output": "payload=[\"event\",\"hello\",{\"user\":\"admin\",\"password\":\"test\"}]\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "handshake_url_construction",
+      "input_condition": "op == 'handshake_url'",
+      "output_rule": "Must output a single line starting with `url=<constructed_url>`",
+      "exact_values": [
+        "url="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "handshake_url_construction",
+      "input_condition": "transport is 'websocket' OR 'ws'",
+      "output_rule": "Resulting scheme must be 'ws' or 'wss' matching the input uri scheme",
+      "exact_values": [
+        "ws",
+        "wss"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "handshake_url_construction",
+      "input_condition": "transport is 'polling' OR 'http'",
+      "output_rule": "Resulting scheme must remain 'http' or 'https'",
+      "exact_values": [
+        "http",
+        "https"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "handshake_url_construction",
+      "input_condition": "port matches scheme default (80 for http/ws, 443 for https/wss)",
+      "output_rule": "Port must be omitted from the final URL",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "handshake_url_construction",
+      "input_condition": "port does not match scheme default",
+      "output_rule": "Port must be preserved verbatim in the final URL",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "handshake_url_construction",
+      "input_condition": "path is empty or not provided",
+      "output_rule": "Default path `/socket.io` must be appended",
+      "exact_values": [
+        "/socket.io"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "handshake_url_construction",
+      "input_condition": "path is provided (non-empty)",
+      "output_rule": "Provided path may or may not end with `/`; if it does not, the codec must append `/socket.io`",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "handshake_url_construction",
+      "input_condition": "Always present",
+      "output_rule": "Query string `EIO=<version>` must be appended",
+      "exact_values": [
+        "EIO="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "handshake_url_construction",
+      "input_condition": "Always present",
+      "output_rule": "Query string `transport=<polling|--websocket>` must be appended",
+      "exact_values": [
+        "transport="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "handshake_url_construction",
+      "input_condition": "user-supplied query params provided",
+      "output_rule": "User query params must be appended after standard params",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "encode_event",
+      "input_condition": "op == 'encode_event'",
+      "output_rule": "Must output text lines: frame=... [optionally namespace] [optionally id] [data array]",
+      "exact_values": [
+        "frame="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "encode_event",
+      "input_condition": "any argument contains {'$bytes': [...]}",
+      "output_rule": "Frame prefix must change to binary type (`45` for text binary, `46` for ack binary)",
+      "exact_values": [
+        "45",
+        "46"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "encode_event",
+      "input_condition": "any argument contains {'$bytes': [...]}",
+      "output_rule": "Frame text must be prefixed with `<count>-` where count is number of byte arrays",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "encode_event",
+      "input_condition": "any argument contains {'$bytes': [...]}",
+      "output_rule": "Each byte array must be replaced by `{"
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C014",
+        "replacement": "a specific JSON string to replace byte arrays",
+        "exact_values_to_replace": [
+          "{"
+        ],
+        "trigger_keywords": [
+          "what does $bytes become?",
+          "syntax for binary data?",
+          "replacement string for bytes"
+        ],
+        "oracle_response": "Each byte array must be replaced by a JSON object wrapping the binary data, e.g., {\"data\": <hex_string>} or similar binary-safe format as defined in the IO parsermodule"
+      }
+    ],
+    "vague_refs": []
+  }
+}

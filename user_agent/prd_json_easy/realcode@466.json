@@ -1,0 +1,1028 @@
+{
+  "fuzzy_prd": "# Storage Abstraction Layer & Data-Shaping Utility Toolkit\n\n## Project Goal\n\nBuild a reusable backend-agnostic file storage abstraction together with a small library of pure data-shaping utilities. The storage layer lets an application read, write, and manage files through a single uniform interface while remaining independent of where the bytes actually live (local disk today, a remote object store tomorrow). A manager resolves named \"disks\" from configuration and can be extended with new backend kinds at runtime. Alongside it, a set of standalone helpers handle the small, repetitive data transformations an application needs (number formatting, array coercion, hashing, relation classification, safe JSON parsing, and more).\n\n---\n\n## Background & Problem\n\nApplications routinely store user files (uploads, exports, thumbnails) and need to do so without hard-coding a single storage technology. A good abstraction defines one stable contract for file operations — write, read (as string / buffer / stream), check existence, delete, move, copy, append, prepend, fetch metadata, and list — and lets concrete backends implement it. A central manager reads a configuration describing one or more named disks (each naming a backend \"driver\" plus that backend's settings), lazily instantiates each disk the first time it is used, caches it, and lets callers register entirely new backend kinds or add new disks after startup.\n\nTwo cross-cutting concerns matter. First, **safety**: a local-filesystem backend must confine every path inside its configured root so a caller cannot escape it with absolute paths or parent-directory segments. Second, **predictable errors**: misconfiguration, unsupported operations, and missing files must surface as well-modeled, normalized errors (a stable category, a stable code, an HTTP-style status, and a readable detail) rather than leaking raw runtime faults.\n\nSeparately, the same application accumulates many tiny utility needs — abbreviating large numbers for display, coercing scalars-or-arrays into arrays, pluralizing identifiers, hashing strings to short fingerprints, reordering array elements, deep-transforming nested objects, classifying schema collections and relations, recognizing dynamic placeholder variables, and parsing JSON without prototype-pollution. Each is small, but together they deserve one well-tested home.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., a storage manager, multiple backends, an error hierarchy, and a utility library), it MUST NOT be a single \"god file\". Output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic MUST remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON requests into idiomatic calls on the core domain and for normalizing any thrown error into the neutral textual contract.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, the storage manager, the backends, the error model, and the utilities into distinct logical units.\n   - **Open/Closed Principle (OCP):** New backend kinds must be addable (registered) without modifying the manager.\n   - **Liskov Substitution Principle (LSP):** Every concrete backend must be substitutable wherever the abstract storage contract is expected.\n   - **Interface Segregation Principle (ISP):** Keep interfaces small and cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level code depends on the abstract storage contract, not on any concrete backend.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface must be elegant and idiomatic to the target language, hiding internal complexity.\n   - **Resilience:** Edge cases must be handled gracefully. Errors must be modeled properly (specific exception/result types carrying a category, code, status, and detail) rather than relying on generic faults. Underlying operating-system error text must never leak through the normalized file-operation errors.\n\n---\n\n## Core Features\n\n### Feature 1: Reject Unsupported Operations On A Backend\n\n**As an integrator**, I want a backend that does not implement a given file operation to reject any attempt to use it with a clear, normalized error, so failures are explicit rather than silent no-ops.\n\n**Expected Behavior / Usage:**\n\nA storage backend exposes a fixed set of file operations (append, copy, delete, driver introspection, existence check, read-as-string `get`, read-as-buffer `getBuffer`, `getSignedUrl`, `getStat`, `getStream`, `getUrl`, move, `put`, prepend, and `flatList`). A backend that does not implement a given operation must reject any attempt to use it. The request carries `op: \"storage_base\"`, the `operation` to probe, and a `backend` label. The result is a normalized error: a neutral `error=<category>` line, a stable domain `code`, an HTTP-style `status`, and a `detail` that names both the attempted operation and the backend label.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_unsupported_driver_operations.json`\n\n```json\n{\n    \"description\": \"A storage backend exposes a fixed set of file operations (append, copy, delete, driver introspection, existence check, read-as-string, read-as-buffer, signed-url, stat, read-stream, public-url, move, create/write, prepend, and flat listing). A backend that does not implement a given operation must reject any attempt to use it with a normalized error rather than silently doing nothing. The error is reported as a neutral category line, a stable domain error code, an HTTP-style status, and a human-readable detail that names both the attempted operation and the backend label. The request supplies the operation to probe and a label identifying the backend.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"storage_base\", \"operation\": \"append\", \"backend\": \"CustomDriver\", \"args\": []}, \"expected_output\": \"error=method_not_supported\\ncode=E_METHOD_NOT_SUPPORTED\\nstatus=500\\ndetail=Method append is not supported for the driver CustomDriver\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Storage Manager — Disk Resolution & Backend Registry\n\nThe manager turns a configuration object into usable backends and acts as a registry of backend kinds. The configuration has an optional `default` disk name and a `disks` map; each disk definition names a `driver` (backend kind) and a `config` for that backend. Requests carry `op: \"manager\"`, the `config`, and a list of `steps` to execute (resolve a disk, register a driver, add a disk, introspect, etc.).\n\n#### Feature 2.1: Resolution Errors\n\n**Expected Behavior / Usage:** Resolving a disk fails fast with a normalized error when the configuration is incomplete or references an unknown backend kind: no default disk name available, a referenced disk has no configuration entry, a disk entry omits its driver, or a disk entry names an unregistered driver. The first three are configuration errors (stable config code, status 500). An unregistered driver is a distinct category with status 400 that echoes the offending kind.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_disk_resolution_errors.json`\n\n```json\n{\n    \"description\": \"The storage manager resolves a named disk from a configuration object into a usable storage backend. Resolution fails fast with a normalized error when the configuration is incomplete or references an unknown backend kind. The request supplies the manager configuration (an optional default disk name and a map of disk definitions) and asks the manager to resolve a disk (using the default when no explicit name is given). The covered failures are: no default disk name available, a referenced disk has no configuration entry, a disk entry omits its backend kind, and a disk entry names a backend kind that has not been registered. Configuration errors carry a stable config error code and a status of 500; an unregistered backend kind reports a distinct category with a status of 400 and echoes the offending kind.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"manager\", \"config\": {}, \"steps\": [{\"action\": \"disk\"}]}, \"expected_output\": \"error=invalid_config\\ncode=E_INVALID_CONFIG\\nstatus=500\\ndetail=Make sure to define a default disk name inside config file\\n\"},\n        {\"input\": {\"op\": \"manager\", \"config\": {\"default\": \"local\", \"disks\": {\"local\": {\"driver\": \"foo\", \"config\": {\"root\": \"\"}}}}, \"steps\": [{\"action\": \"disk\"}]}, \"expected_output\": \"error=driver_not_supported\\nstatus=400\\ndriver=foo\\ndetail=Driver foo is not supported\\n\"}\n    ]\n}\n```\n\n#### Feature 2.2: Instantiation & Caching\n\n**Expected Behavior / Usage:** A fully and validly configured disk is instantiated, returned, and its backend kind reported. Resolving the same disk name again returns the very same instance (lazy instantiation + caching).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_disk_instantiation.json`\n\n```json\n{\n    \"description\": \"When a disk is fully and validly configured, the manager instantiates the corresponding backend and returns it, reporting the backend kind that was used. The manager caches instantiated disks: resolving the same disk name more than once returns the very same backend instance rather than constructing a new one each time. The request supplies a valid configuration and asks the manager to resolve a disk and then to confirm that two successive resolutions of the same name yield an identical instance.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"manager\", \"config\": {\"default\": \"local\", \"disks\": {\"local\": {\"driver\": \"local\", \"config\": {\"root\": \"\"}}}}, \"steps\": [{\"action\": \"disk\", \"name\": \"local\"}, {\"action\": \"sameInstance\", \"name\": \"local\"}]}, \"expected_output\": \"disk=local driver=local\\n[a specific cache config — ask the PM for the exact boolean flag]\\n\"}\n    ]\n}\n```\n\n#### Feature 2.3: Registering A Custom Backend Kind\n\n**Expected Behavior / Usage:** A caller can register a new backend kind under a chosen name; disks configured to use that kind then resolve to the freshly registered backend.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_3_custom_driver.json`\n\n```json\n{\n    \"description\": \"The manager is extensible: a caller can register a new backend kind under a chosen name, after which disks configured to use that kind resolve to the freshly registered backend. The request registers a custom backend kind and then resolves a disk whose configuration references that kind; the reported backend kind for the resolved disk must be the registered one (not the built-in default).\",\n    \"cases\": [\n        {\"input\": {\"op\": \"manager\", \"config\": {\"default\": \"local\", \"disks\": {\"local\": {\"driver\": \"foo\", \"config\": {}}}}, \"steps\": [{\"action\": \"registerDriver\", \"name\": \"foo\"}, {\"action\": \"disk\", \"name\": \"local\"}]}, \"expected_output\": \"registered=foo\\ndisk=local driver=foo\\n\"}\n    ]\n}\n```\n\n#### Feature 2.4: Adding A Disk Dynamically\n\n**Expected Behavior / Usage:** A disk can be added after construction. Adding under a fresh name makes it resolvable; adding under a name that already exists is rejected with a normalized configuration error (stable config code, status 500) and the new definition is not applied.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_4_dynamic_disk.json`\n\n```json\n{\n    \"description\": \"Disks can be added to the manager dynamically after construction. Adding a disk under a fresh name makes it resolvable like any configured disk. Adding a disk under a name that already exists is rejected with a normalized configuration error (stable config code, status 500) and the new definition is not applied. The request seeds an initial configuration, then either adds a brand-new disk and resolves it, or attempts to add a disk under an already-used name.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"manager\", \"config\": {\"default\": \"local\", \"disks\": {\"local\": {\"driver\": \"local\", \"config\": {\"root\": \"\"}}}}, \"steps\": [{\"action\": \"addDisk\", \"name\": \"home\", \"config\": {\"driver\": \"local\", \"config\": {\"root\": \"~\"}}}, {\"action\": \"disk\", \"name\": \"home\"}]}, \"expected_output\": \"added=home\\ndisk=home driver=local\\n\"},\n        {\"input\": {\"op\": \"manager\", \"config\": {\"default\": \"local\", \"disks\": {\"local\": {\"driver\": \"local\", \"config\": {\"root\": \"\"}}}}, \"steps\": [{\"action\": \"addDisk\", \"name\": \"local\", \"config\": {\"driver\": \"local\", \"config\": {\"root\": \"\"}}}]}, \"expected_output\": \"error=invalid_config\\ncode=E_INVALID_CONFIG\\nstatus=500\\ndetail=A disk named local is already defined\\n\"}\n    ]\n}\n```\n\n#### Feature 2.5: Registry Introspection\n\n**Expected Behavior / Usage:** The manager can be introspected for the set of disks instantiated so far (starts empty, grows as disks are lazily resolved) and the set of registered backend kinds (always includes the built-in default kind plus any registered by the caller). Both are reported as sorted, comma-separated lists.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_5_registry_introspection.json`\n\n```json\n{\n    \"description\": \"The manager can be introspected for the set of disks that have actually been instantiated so far and for the set of backend kinds that are registered. The set of instantiated disks starts empty and grows only as disks are resolved on demand (lazy instantiation), reported as a sorted, comma-separated list of disk names. The set of registered backend kinds always includes the built-in default kind plus any kinds registered by the caller, reported as a sorted, comma-separated list. The request issues a sequence of resolutions and/or registrations interleaved with introspection requests.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"manager\", \"config\": {\"default\": \"local\", \"disks\": {\"local\": {\"driver\": \"local\", \"config\": {\"root\": \"\"}}, \"home\": {\"driver\": \"local\", \"config\": {\"root\": \"~\"}}}}, \"steps\": [{\"action\": \"listDisks\"}, {\"action\": \"disk\", \"name\": \"local\"}, {\"action\": \"listDisks\"}, {\"action\": \"disk\", \"name\": \"home\"}, {\"action\": \"listDisks\"}]}, \"expected_output\": \"disks=\\ndisk=local driver=local\\ndisks=local\\ndisk=home driver=local\\ndisks=home,local\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Local Filesystem Backend\n\nThe built-in `local` backend performs real file operations relative to a private root directory. Requests carry `op: \"local_fs\"` and a list of `steps`; each case drives a fresh, empty root.\n\n#### Feature 3.1: Write, Read, Exists\n\n**Expected Behavior / Usage:** Files are written and read relative to the root, transparently creating intermediate directories; a read returns the exact stored content; existence checks report whether a path currently exists.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_write_read_exists.json`\n\n```json\n{\n    \"description\": \"The local filesystem backend writes and reads files relative to a root directory, transparently creating any intermediate directories, and reports whether a path currently exists. The request drives a fresh, empty root through a sequence of steps: write a file then read it back (the read returns the exact stored content); write a file in a nested path that does not yet exist (intermediate directories are created on the fly); check existence of a path that was written (true); and check existence of a path that was never written (false).\",\n    \"cases\": [\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"put\", \"location\": \"im_new\", \"content\": \"test-data\"}, {\"action\": \"get\", \"location\": \"im_new\"}]}, \"expected_output\": \"put=im_new\\ncontent=test-data\\n\"},\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"exists\", \"location\": \"i_dont_exist\"}]}, \"expected_output\": \"exists=false\\n\"}\n    ]\n}\n```\n\n#### Feature 3.2: Mutating Operations (Delete / Move / Copy / Append / Prepend)\n\n**Expected Behavior / Usage:** Deleting an existing file reports a deletion occurred and the file is gone afterwards; deleting a missing file reports no deletion (rather than failing). Move relocates a file (new path exists, old does not); copy duplicates it (both exist). Append adds to the end of an existing file; prepend adds to the front, creating the file if it does not yet exist.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_mutation.json`\n\n```json\n{\n    \"description\": \"The local filesystem backend supports mutating operations: delete, move (rename), copy, append, and prepend. Deleting an existing file reports that a deletion occurred and the file no longer exists afterwards; deleting a missing file reports that no deletion occurred (rather than failing). Moving relocates a file so the new path exists and the old path no longer does; copying duplicates a file so both the source and destination exist. Appending adds content to the end of an existing file; prepending adds content to the front. Prepending to a path that does not yet exist creates it with just the given content. The request drives a fresh, empty root through one such scenario per case.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"put\", \"location\": \"i_will_be_deleted\", \"content\": \"\"}, {\"action\": \"delete\", \"location\": \"i_will_be_deleted\"}, {\"action\": \"exists\", \"location\": \"i_will_be_deleted\"}]}, \"expected_output\": \"put=i_will_be_deleted\\nwas_deleted=true\\nexists=false\\n\"},\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"put\", \"location\": \"i_will_be_renamed\", \"content\": \"\"}, {\"action\": \"move\", \"src\": \"i_will_be_renamed\", \"dest\": \"im_renamed\"}, {\"action\": \"exists\", \"location\": \"im_renamed\"}, {\"action\": \"exists\", \"location\": \"i_will_be_renamed\"}]}, \"expected_output\": \"put=i_will_be_renamed\\nmoved=i_will_be_renamed->im_renamed\\nexists=true\\nexists=false\\n\"}\n    ]\n}\n```\n\n#### Feature 3.3: Path Containment\n\n**Expected Behavior / Usage:** Every path is confined to the configured root. A leading absolute separator is treated as relative to the root, not the system root. Leading parent-directory segments that would climb above the root are neutralized (clamped to the root). Parent-directory segments that stay within the root are honored. Content written to a dangerous path round-trips when read back from the safe in-root location it resolved to.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_path_containment.json`\n\n```json\n{\n    \"description\": \"The local filesystem backend confines every path to its configured root directory so that callers cannot escape it. A leading absolute separator is treated as relative to the root rather than the system root. Leading parent-directory segments that would climb above the root are neutralized (clamped to the root). Parent-directory segments that stay within the root are honored normally. Each case writes content to a potentially-dangerous path and then reads it back from the safe in-root location it actually resolved to, confirming the content round-trips and stayed inside the root.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"put\", \"location\": \"/dummy_file\", \"content\": \"test-data\"}, {\"action\": \"get\", \"location\": \"/dummy_file\"}]}, \"expected_output\": \"put=/dummy_file\\ncontent=test-data\\n\"},\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"put\", \"location\": \"../../../dummy_file\", \"content\": \"test-data\"}, {\"action\": \"get\", \"location\": \"dummy_file\"}]}, \"expected_output\": \"put=../../../dummy_file\\ncontent=test-data\\n\"}\n    ]\n}\n```\n\n#### Feature 3.4: Buffer / Stream Reads & Metadata\n\n**Expected Behavior / Usage:** A file's content is also available as a raw byte buffer (length equals the stored byte count) and as a readable stream (chunks concatenate to the stored text). A file can be written by piping the readable stream of an existing file into it. Metadata reports the file's size in bytes and a last-modified timestamp.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_4_stream_metadata.json`\n\n```json\n{\n    \"description\": \"Beyond reading whole-file string content, the local filesystem backend exposes the same data as a byte buffer and as a readable stream, and reports file metadata. Reading a file as a buffer yields the raw bytes (a binary buffer whose length equals the stored byte count). Reading a file as a stream yields the same content as a flowing sequence of chunks that, concatenated, reproduce the stored text. A file can also be written by piping the readable stream of another existing file into it, copying its content across. Requesting metadata for an existing file reports its size in bytes and a last-modified timestamp. Each case drives a fresh, empty root.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"put\", \"location\": \"foo\", \"content\": \"test-data\"}, {\"action\": \"putStream\", \"from\": \"foo\", \"location\": \"bar\"}, {\"action\": \"get\", \"location\": \"bar\"}]}, \"expected_output\": \"put=foo\\nput_stream=bar\\ncontent=test-data\\n\"},\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"put\", \"location\": \"foo\", \"content\": \"test-data\"}, {\"action\": \"getStat\", \"location\": \"foo\"}]}, \"expected_output\": \"put=foo\\nsize=9 modified_is_date=true\\n\"}\n    ]\n}\n```\n\n#### Feature 3.5: Missing-File Error Normalization\n\n**Expected Behavior / Usage:** Reading a file that does not exist normalizes the underlying OS error into a stable, host-language-neutral file-not-found error carrying a category, a stable code, a status, and the requested path — never the raw OS message.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_5_not_found.json`\n\n```json\n{\n    \"description\": \"When the local filesystem backend is asked to read a file that does not exist, the underlying operating-system error is normalized into a stable, host-language-neutral file-not-found error rather than surfacing a raw OS exception. The normalized error carries a stable error category, a stable error code, an HTTP-style status, and echoes back the requested path. The request drives a fresh, empty root and attempts to read a path that was never written.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"get\", \"location\": \"non_existing\"}]}, \"expected_output\": \"error=file_not_found\\ncode=E_FILE_NOT_FOUND\\nstatus=500\\npath=non_existing\\n\"}\n    ]\n}\n```\n\n#### Feature 3.6: Flat Listing With Prefix Filter\n\n**Expected Behavior / Usage:** The backend enumerates every file under the root as a flat list of root-relative paths, optionally filtered by a prefix. An empty prefix returns all files (recursing into nested directories); a prefix restricts the listing to paths beginning with it (which may match a partial segment); a prefix matching nothing yields an empty list. Results are reported sorted and comma-separated.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_6_flat_listing.json`\n\n```json\n{\n    \"description\": \"The local filesystem backend can enumerate every file under the root as a flat list of root-relative paths, optionally filtered by a path prefix. With an empty prefix it returns all files anywhere beneath the root, recursing into nested directories. A prefix restricts the listing to paths that begin with that prefix; the prefix may match a partial path segment, not just whole directory names. A prefix that matches nothing (including one pointing outside any existing content) yields an empty list. An empty root yields an empty list. Each case drives a fresh, empty root, optionally writes some files, then lists them; the resulting paths are reported as a sorted, comma-separated list.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"flatList\", \"prefix\": \"\"}]}, \"expected_output\": \"files=\\n\"},\n        {\"input\": {\"op\": \"local_fs\", \"steps\": [{\"action\": \"put\", \"location\": \"foo.txt\", \"content\": \"x\"}, {\"action\": \"put\", \"location\": \"foo/bar\", \"content\": \"x\"}, {\"action\": \"put\", \"location\": \"other/dir/file.txt\", \"content\": \"x\"}, {\"action\": \"flatList\", \"prefix\": \"\"}]}, \"expected_output\": \"put=foo.txt\\nput=foo/bar\\nput=other/dir/file.txt\\nfiles=foo.txt,foo/bar,other/dir/file.txt\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Compact Number Formatting\n\n**Expected Behavior / Usage:** A formatter renders large numbers compactly by scaling to thousands/millions/billions/trillions and appending a unit suffix. Numbers below one thousand are returned unchanged; larger numbers are divided to the largest fitting magnitude and suffixed. Requests carry `op: \"util\"`, `fn: \"abbreviate_number\"`, a `number`, an optional `decimalPlaces` (default 0), and an optional `units` list. Negative numbers keep their sign; rounding into the next magnitude rolls over to the next unit.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_abbreviate_number.json`\n\n```json\n{\n    \"description\": \"A number formatter renders large numbers in a compact, human-readable form by scaling to thousands, millions, billions, and trillions and appending the matching unit suffix. Numbers below one thousand are returned unchanged (as their plain string form). Numbers at or above one thousand are divided down to the largest fitting magnitude and suffixed (thousands, millions, and so on). The formatter accepts an optional number of decimal places to keep (default zero, i.e. rounded to a whole number) and an optional custom list of unit suffixes to use instead of the defaults. Negative numbers keep their sign. Rounding that pushes a value up to the next magnitude rolls over to the next larger unit.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"abbreviate_number\", \"number\": 7000}, \"expected_output\": \"7K\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"abbreviate_number\", \"number\": -7000}, \"expected_output\": \"-7K\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Coerce To Array\n\n**Expected Behavior / Usage:** A helper (`fn: \"to_array\"`) guarantees an array result: a comma-separated string is split on commas; an existing array passes through unchanged; any other single value is wrapped in a one-element array.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_to_array.json`\n\n```json\n{\n    \"description\": \"A coercion helper guarantees an array result from a value that may or may not already be one. A comma-separated string is split on commas into its individual pieces. A value that is already an array is returned as-is. Any other single value is wrapped in a one-element array. The request supplies one value to normalize, and the resulting array is reported as JSON.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"to_array\", \"value\": \"a,b,c\"}, \"expected_output\": \"[\\\"a\\\",\\\"b\\\",\\\"c\\\"]\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"to_array\", \"value\": \"hello\"}, \"expected_output\": \"[\\\"hello\\\"]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Pluralize / Depluralize\n\n**Expected Behavior / Usage:** `fn: \"pluralize\"` appends a trailing `s`; `fn: \"depluralize\"` removes the final character.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_pluralize.json`\n\n```json\n{\n    \"description\": \"A pair of simple string helpers convert between a singular word and its plural form. Pluralizing appends a trailing 's' to the given word. Depluralizing removes the final character of the given word, recovering the singular form. The request supplies one word and the chosen direction; the transformed word is reported.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"pluralize\", \"value\": \"item\"}, \"expected_output\": \"items\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"depluralize\", \"value\": \"items\"}, \"expected_output\": \"item\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Short String Fingerprint\n\n**Expected Behavior / Usage:** `fn: \"simple_hash\"` turns a string into a short hexadecimal, non-cryptographic fingerprint; the same input always yields the same fingerprint.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_simple_hash.json`\n\n```json\n{\n    \"description\": \"A lightweight, non-cryptographic hash helper turns an arbitrary string into a short hexadecimal fingerprint. The same input always yields the same fingerprint, and different inputs generally yield different fingerprints. The request supplies one string and the resulting hexadecimal hash is reported.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"simple_hash\", \"value\": \"hello\"}, \"expected_output\": \"5e918d2\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 8: Move Element Within Array\n\n**Expected Behavior / Usage:** `fn: \"move_in_array\"` relocates one element from `fromIndex` to `toIndex`, shifting the intervening elements, and returns the reordered array.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_move_in_array.json`\n\n```json\n{\n    \"description\": \"An array helper relocates a single element from one position to another, returning the reordered array. Moving an element to a later position shifts the intervening elements back toward the source; moving it to an earlier position shifts them forward; moving it to its own position leaves the order unchanged. The request supplies an array plus the source and destination indices, and the resulting array is reported as JSON.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"move_in_array\", \"array\": [1, 2, 3, 4, 5, 6], \"fromIndex\": 1, \"toIndex\": 2}, \"expected_output\": \"[1,3,2,4,5,6]\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"move_in_array\", \"array\": [1, 2, 3, 4, 5, 6], \"fromIndex\": 5, \"toIndex\": 3}, \"expected_output\": \"[1,2,3,6,4,5]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 9: Deep Map Over Nested Object\n\n**Expected Behavior / Usage:** `fn: \"deep_map\"` applies a transform to every leaf value of a nested object, preserving keys and nesting. In these cases the transform stringifies each leaf and prepends a fixed `prefix`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_deep_map.json`\n\n```json\n{\n    \"description\": \"A recursive object mapper applies a transform to every leaf value of a (possibly deeply nested) plain object, preserving the original key structure and nesting. Nested objects are traversed in depth, and each scalar leaf is replaced by the transform's result while the surrounding shape is left intact. In these cases the transform stringifies each leaf and prepends a fixed prefix to it. The request supplies the object and the prefix, and the transformed object is reported as JSON.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"deep_map\", \"object\": {\"a\": 1, \"b\": {\"c\": 2}}, \"prefix\": \"x\"}, \"expected_output\": \"{\\\"a\\\":\\\"x1\\\",\\\"b\\\":{\\\"c\\\":\\\"x2\\\"}}\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 10: Classify A Collection Definition\n\n**Expected Behavior / Usage:** `fn: \"collection_type\"` classifies a collection definition: one carrying a database-level `schema` is a concrete `table`; one with no schema but with `meta` is an `alias` (virtual); one with neither is `unknown`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_collection_type.json`\n\n```json\n{\n    \"description\": \"A classifier inspects a collection definition and reports its kind. A collection that carries a database-level schema is a concrete table. A collection that has no schema but does carry metadata is an alias (a purely virtual grouping). A collection with neither schema nor metadata is unknown. The request supplies a collection definition object and the classification is reported.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"collection_type\", \"collection\": {\"schema\": {}, \"meta\": {}}}, \"expected_output\": \"table\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"collection_type\", \"collection\": {\"schema\": null, \"meta\": {}}}, \"expected_output\": \"alias\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 11: Map A Collection To Its Endpoint\n\n**Expected Behavior / Usage:** `fn: \"endpoint_for_collection\"` maps a collection name to its REST path. System collections (identified by a reserved name prefix) map to a top-level path named after the part following that prefix; all other collections map under a generic items route qualified by the collection name.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_endpoint.json`\n\n```json\n{\n    \"description\": \"A routing helper maps a collection name to its REST endpoint path. System collections, identified by a reserved name prefix, map to a top-level path named after the part of the collection following that prefix. All other (user-defined) collections map to a path under the generic items route, qualified by the collection name. The request supplies a collection name and the endpoint path is reported.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"endpoint_for_collection\", \"collection\": \"directus_users\"}, \"expected_output\": \"/users\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"endpoint_for_collection\", \"collection\": \"articles\"}, \"expected_output\": \"/items/articles\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 12: Classify A Relation\n\n**Expected Behavior / Usage:** `fn: \"relation_type\"` decides how a given collection/field viewpoint participates in a relation: many-to-any when the owning side declares a polymorphic target (collection-selector field plus allowed collections); many-to-one when it matches the owning side without those markers; one-to-many when it matches the related side and names the reverse field; otherwise none.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_relation_type.json`\n\n```json\n{\n    \"description\": \"A relational classifier determines how a given collection/field viewpoint participates in a relation definition. When the viewpoint matches the owning side of the relation and the relation declares a polymorphic target (a collection-selector field plus a set of allowed collections), it is a many-to-any. When the viewpoint matches the owning side without those polymorphic markers, it is a many-to-one. When the viewpoint instead matches the related side and names the relation's reverse field, it is a one-to-many. The request supplies a relation definition together with the collection and field forming the viewpoint, and the relationship kind is reported.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"relation_type\", \"relation\": {\"collection\": \"articles\", \"field\": \"author\", \"related_collection\": \"users\"}, \"collection\": \"articles\", \"field\": \"author\"}, \"expected_output\": \"result=m2o\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"relation_type\", \"relation\": {\"collection\": \"articles\", \"field\": \"author\", \"related_collection\": \"users\", \"meta\": {\"one_field\": \"posts\"}}, \"collection\": \"users\", \"field\": \"posts\"}, \"expected_output\": \"result=o2m\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 13: Recognize A Dynamic Variable\n\n**Expected Behavior / Usage:** `fn: \"is_dynamic_variable\"` returns true only for a string starting with one of a fixed set of reserved special-variable prefixes (such as current-timestamp, current-user, current-role placeholders); any other string or non-string is false.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature13_is_dynamic_variable.json`\n\n```json\n{\n    \"description\": \"A predicate decides whether a value is a dynamic-variable reference: a string that begins with one of a fixed set of reserved special-variable prefixes (such as the current timestamp, current user, or current role placeholders). Strings starting with such a prefix are dynamic; any other string, or any non-string value, is not. The request supplies one value and the boolean result is reported.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"is_dynamic_variable\", \"value\": \"$CURRENT_USER\"}, \"expected_output\": \"true\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"is_dynamic_variable\", \"value\": \"regular\"}, \"expected_output\": \"false\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 14: Safe JSON Parsing\n\n**Expected Behavior / Usage:** `fn: \"parse_json\"` parses a JSON text but defends against prototype-pollution by dropping any literal `__proto__` property; ordinary objects, arrays, and scalars parse exactly as standard JSON.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature14_parse_json.json`\n\n```json\n{\n    \"description\": \"A safe JSON parser turns a JSON text into its value, but defends against prototype-pollution by dropping any '__proto__' property encountered during parsing. Ordinary JSON objects, arrays, and scalars parse exactly as standard JSON would; only a literal '__proto__' key is stripped from the result so it cannot tamper with the object prototype. The request supplies a JSON text and the parsed value is reported back as re-serialized JSON.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"util\", \"fn\": \"parse_json\", \"text\": \"{\\\"name\\\":\\\"Directus\\\"}\"}, \"expected_output\": \"{\\\"name\\\":\\\"Directus\\\"}\\n\"},\n        {\"input\": {\"op\": \"util\", \"fn\": \"parse_json\", \"text\": \"{\\\"a\\\":1,\\\"__proto__\\\":{\\\"polluted\\\":true}}\"}, \"expected_output\": \"{\\\"a\\\":1}\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the storage abstraction (an abstract backend contract, a built-in local-filesystem backend, a manager that resolves/caches disks and registers backend kinds, and a normalized error hierarchy) plus the standalone utility library. The physical structure MUST align with the \"Scale-Driven Code Organization\" constraint. The core business logic MUST be decoupled from standard I/O and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program that reads a single JSON request from stdin and prints the result to stdout, matching the per-feature contracts above. The request's `op` selects the subsystem:\n   - `storage_base` — instantiate a backend labelled `backend` that does not implement operations, invoke `operation` with `args`, and render the resulting normalized error.\n   - `manager` — construct the manager from `config`, then run `steps` (`disk`/`sameInstance`/`registerDriver`/`addDisk`/`listDisks`/`listDrivers`), rendering each step's observable result or normalized error.\n   - `local_fs` — create a fresh private root, run filesystem `steps` (`put`/`get`/`exists`/`delete`/`move`/`copy`/`append`/`prepend`/`putStream`/`getBuffer`/`getStat`/`getStream`/`flatList`), rendering each result or normalized error, and clean the root up afterwards.\n   - `util` — dispatch on `fn` to the matching utility and render its result.\n\n   Normalization rules the adapter MUST honor: every modeled error renders as a neutral `error=<category>` line plus, where applicable, `code=`, `status=`, `driver=`, and a `detail=` (or, for filesystem IO errors, a `path=` instead of a detail, so underlying OS messages never leak). Categories and codes are stable strings (e.g. `method_not_supported`/`E_METHOD_NOT_SUPPORTED`, `invalid_config`/`E_INVALID_CONFIG`, `file_not_found`/`E_FILE_NOT_FOUND`, and `driver_not_supported` with status 400).\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the safe failure pattern defined in C006 for stateless operations\n",
+  "oracle_data": {
+    "task_id": "directus__directus-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what boolean flag controls caching?",
+          "is same_instance enabled by default?",
+          "how is duplicate resolution handled?",
+          "toggle for instance reuse"
+        ],
+        "oracle_response": "C007 requires exact_values to be ['same_instance=true']"
+      },
+      {
+        "constraint_id": "C017",
+        "trigger_keywords": [
+          "what drivers are valid?",
+          "list of hardcoded driver types",
+          "driver resolution fails for which names?",
+          "builtin driver enum"
+        ],
+        "oracle_response": "C017 requires exact_values to be ['error=driver_not_supported']"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the safe failure pattern defined in C006 for stateless operations",
+        "actual_meaning": "The result must indicate 'no_deletion' (or a boolean equivalent) rather than throwing an exception when the file is missing, mirroring the error rejection logic in C006 but for a no-op rather than an error."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_collection_type.json": {
+      "description": "A classifier inspects a collection definition and reports its kind. A collection that carries a database-level schema is a concrete table. A collection that has no schema but does carry metadata is an alias (a purely virtual grouping). A collection with neither schema nor metadata is unknown. The request supplies a collection definition object and the classification is reported.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "collection_type",
+            "collection": {
+              "schema": {},
+              "meta": {}
+            }
+          },
+          "expected_output": "table\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "collection_type",
+            "collection": {
+              "schema": null,
+              "meta": {}
+            }
+          },
+          "expected_output": "alias\n"
+        }
+      ]
+    },
+    "feature11_endpoint.json": {
+      "description": "A routing helper maps a collection name to its REST endpoint path. System collections, identified by a reserved name prefix, map to a top-level path named after the part of the collection following that prefix. All other (user-defined) collections map to a path under the generic items route, qualified by the collection name. The request supplies a collection name and the endpoint path is reported.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "endpoint_for_collection",
+            "collection": "directus_users"
+          },
+          "expected_output": "/users\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "endpoint_for_collection",
+            "collection": "articles"
+          },
+          "expected_output": "/items/articles\n"
+        }
+      ]
+    },
+    "feature12_relation_type.json": {
+      "description": "A relational classifier determines how a given collection/field viewpoint participates in a relation definition. When the viewpoint matches the owning side of the relation and the relation declares a polymorphic target (a collection-selector field plus a set of allowed collections), it is a many-to-any. When the viewpoint matches the owning side without those polymorphic markers, it is a many-to-one. When the viewpoint instead matches the related side and names the relation's reverse field, it is a one-to-many. The request supplies a relation definition together with the collection and field forming the viewpoint, and the relationship kind is reported.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "relation_type",
+            "relation": {
+              "collection": "articles",
+              "field": "author",
+              "related_collection": "users"
+            },
+            "collection": "articles",
+            "field": "author"
+          },
+          "expected_output": "result=m2o\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "relation_type",
+            "relation": {
+              "collection": "articles",
+              "field": "author",
+              "related_collection": "users",
+              "meta": {
+                "one_field": "posts"
+              }
+            },
+            "collection": "users",
+            "field": "posts"
+          },
+          "expected_output": "result=o2m\n"
+        }
+      ]
+    },
+    "feature13_is_dynamic_variable.json": {
+      "description": "A predicate decides whether a value is a dynamic-variable reference: a string that begins with one of a fixed set of reserved special-variable prefixes (such as the current timestamp, current user, or current role placeholders). Strings starting with such a prefix are dynamic; any other string, or any non-string value, is not. The request supplies one value and the boolean result is reported.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "is_dynamic_variable",
+            "value": "$CURRENT_USER"
+          },
+          "expected_output": "true\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "is_dynamic_variable",
+            "value": "regular"
+          },
+          "expected_output": "false\n"
+        }
+      ]
+    },
+    "feature14_parse_json.json": {
+      "description": "A safe JSON parser turns a JSON text into its value, but defends against prototype-pollution by dropping any '__proto__' property encountered during parsing. Ordinary JSON objects, arrays, and scalars parse exactly as standard JSON would; only a literal '__proto__' key is stripped from the result so it cannot tamper with the object prototype. The request supplies a JSON text and the parsed value is reported back as re-serialized JSON.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "parse_json",
+            "text": "{\"name\":\"Directus\"}"
+          },
+          "expected_output": "{\"name\":\"Directus\"}\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "parse_json",
+            "text": "{\"a\":1,\"__proto__\":{\"polluted\":true}}"
+          },
+          "expected_output": "{\"a\":1}\n"
+        }
+      ]
+    },
+    "feature1_unsupported_driver_operations.json": {
+      "description": "A storage backend exposes a fixed set of file operations (append, copy, delete, driver introspection, existence check, read-as-string, read-as-buffer, signed-url, stat, read-stream, public-url, move, create/write, prepend, and flat listing). A backend that does not implement a given operation must reject any attempt to use it with a normalized error rather than silently doing nothing. The error is reported as a neutral category line, a stable domain error code, an HTTP-style status, and a human-readable detail that names both the attempted operation and the backend label. The request supplies the operation to probe and a label identifying the backend.",
+      "cases": [
+        {
+          "input": {
+            "op": "storage_base",
+            "operation": "append",
+            "backend": "CustomDriver",
+            "args": []
+          },
+          "expected_output": "error=method_not_supported\ncode=E_METHOD_NOT_SUPPORTED\nstatus=500\ndetail=Method append is not supported for the driver CustomDriver\n"
+        }
+      ]
+    },
+    "feature2_1_disk_resolution_errors.json": {
+      "description": "The storage manager resolves a named disk from a configuration object into a usable storage backend. Resolution fails fast with a normalized error when the configuration is incomplete or references an unknown backend kind. The request supplies the manager configuration (an optional default disk name and a map of disk definitions) and asks the manager to resolve a disk (using the default when no explicit name is given). The covered failures are: no default disk name available, a referenced disk has no configuration entry, a disk entry omits its backend kind, and a disk entry names a backend kind that has not been registered. Configuration errors carry a stable config error code and a status of 500; an unregistered backend kind reports a distinct category with a status of 400 and echoes the offending kind.",
+      "cases": [
+        {
+          "input": {
+            "op": "manager",
+            "config": {},
+            "steps": [
+              {
+                "action": "disk"
+              }
+            ]
+          },
+          "expected_output": "error=invalid_config\ncode=E_INVALID_CONFIG\nstatus=500\ndetail=Make sure to define a default disk name inside config file\n"
+        },
+        {
+          "input": {
+            "op": "manager",
+            "config": {
+              "default": "local",
+              "disks": {
+                "local": {
+                  "driver": "foo",
+                  "config": {
+                    "root": ""
+                  }
+                }
+              }
+            },
+            "steps": [
+              {
+                "action": "disk"
+              }
+            ]
+          },
+          "expected_output": "error=driver_not_supported\nstatus=400\ndriver=foo\ndetail=Driver foo is not supported\n"
+        }
+      ]
+    },
+    "feature2_2_disk_instantiation.json": {
+      "description": "When a disk is fully and validly configured, the manager instantiates the corresponding backend and returns it, reporting the backend kind that was used. The manager caches instantiated disks: resolving the same disk name more than once returns the very same backend instance rather than constructing a new one each time. The request supplies a valid configuration and asks the manager to resolve a disk and then to confirm that two successive resolutions of the same name yield an identical instance.",
+      "cases": [
+        {
+          "input": {
+            "op": "manager",
+            "config": {
+              "default": "local",
+              "disks": {
+                "local": {
+                  "driver": "local",
+                  "config": {
+                    "root": ""
+                  }
+                }
+              }
+            },
+            "steps": [
+              {
+                "action": "disk",
+                "name": "local"
+              },
+              {
+                "action": "sameInstance",
+                "name": "local"
+              }
+            ]
+          },
+          "expected_output": "disk=local driver=local\nsame_instance=true\n"
+        }
+      ]
+    },
+    "feature2_3_custom_driver.json": {
+      "description": "The manager is extensible: a caller can register a new backend kind under a chosen name, after which disks configured to use that kind resolve to the freshly registered backend. The request registers a custom backend kind and then resolves a disk whose configuration references that kind; the reported backend kind for the resolved disk must be the registered one (not the built-in default).",
+      "cases": [
+        {
+          "input": {
+            "op": "manager",
+            "config": {
+              "default": "local",
+              "disks": {
+                "local": {
+                  "driver": "foo",
+                  "config": {}
+                }
+              }
+            },
+            "steps": [
+              {
+                "action": "registerDriver",
+                "name": "foo"
+              },
+              {
+                "action": "disk",
+                "name": "local"
+              }
+            ]
+          },
+          "expected_output": "registered=foo\ndisk=local driver=foo\n"
+        }
+      ]
+    },
+    "feature2_4_dynamic_disk.json": {
+      "description": "Disks can be added to the manager dynamically after construction. Adding a disk under a fresh name makes it resolvable like any configured disk. Adding a disk under a name that already exists is rejected with a normalized configuration error (stable config code, status 500) and the new definition is not applied. The request seeds an initial configuration, then either adds a brand-new disk and resolves it, or attempts to add a disk under an already-used name.",
+      "cases": [
+        {
+          "input": {
+            "op": "manager",
+            "config": {
+              "default": "local",
+              "disks": {
+                "local": {
+                  "driver": "local",
+                  "config": {
+                    "root": ""
+                  }
+                }
+              }
+            },
+            "steps": [
+              {
+                "action": "addDisk",
+                "name": "home",
+                "config": {
+                  "driver": "local",
+                  "config": {
+                    "root": "~"
+                  }
+                }
+              },
+              {
+                "action": "disk",
+                "name": "home"
+              }
+            ]
+          },
+          "expected_output": "added=home\ndisk=home driver=local\n"
+        },
+        {
+          "input": {
+            "op": "manager",
+            "config": {
+              "default": "local",
+              "disks": {
+                "local": {
+                  "driver": "local",
+                  "config": {
+                    "root": ""
+                  }
+                }
+              }
+            },
+            "steps": [
+              {
+                "action": "addDisk",
+                "name": "local",
+                "config": {
+                  "driver": "local",
+                  "config": {
+                    "root": ""
+                  }
+                }
+              }
+            ]
+          },
+          "expected_output": "error=invalid_config\ncode=E_INVALID_CONFIG\nstatus=500\ndetail=A disk named local is already defined\n"
+        }
+      ]
+    },
+    "feature2_5_registry_introspection.json": {
+      "description": "The manager can be introspected for the set of disks that have actually been instantiated so far and for the set of backend kinds that are registered. The set of instantiated disks starts empty and grows only as disks are resolved on demand (lazy instantiation), reported as a sorted, comma-separated list of disk names. The set of registered backend kinds always includes the built-in default kind plus any kinds registered by the caller, reported as a sorted, comma-separated list. The request issues a sequence of resolutions and/or registrations interleaved with introspection requests.",
+      "cases": [
+        {
+          "input": {
+            "op": "manager",
+            "config": {
+              "default": "local",
+              "disks": {
+                "local": {
+                  "driver": "local",
+                  "config": {
+                    "root": ""
+                  }
+                },
+                "home": {
+                  "driver": "local",
+                  "config": {
+                    "root": "~"
+                  }
+                }
+              }
+            },
+            "steps": [
+              {
+                "action": "listDisks"
+              },
+              {
+                "action": "disk",
+                "name": "local"
+              },
+              {
+                "action": "listDisks"
+              },
+              {
+                "action": "disk",
+                "name": "home"
+              },
+              {
+                "action": "listDisks"
+              }
+            ]
+          },
+          "expected_output": "disks=\ndisk=local driver=local\ndisks=local\ndisk=home driver=local\ndisks=home,local\n"
+        }
+      ]
+    },
+    "feature3_1_write_read_exists.json": {
+      "description": "The local filesystem backend writes and reads files relative to a root directory, transparently creating any intermediate directories, and reports whether a path currently exists. The request drives a fresh, empty root through a sequence of steps: write a file then read it back (the read returns the exact stored content); write a file in a nested path that does not yet exist (intermediate directories are created on the fly); check existence of a path that was written (true); and check existence of a path that was never written (false).",
+      "cases": [
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "put",
+                "location": "im_new",
+                "content": "test-data"
+              },
+              {
+                "action": "get",
+                "location": "im_new"
+              }
+            ]
+          },
+          "expected_output": "put=im_new\ncontent=test-data\n"
+        },
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "exists",
+                "location": "i_dont_exist"
+              }
+            ]
+          },
+          "expected_output": "exists=false\n"
+        }
+      ]
+    },
+    "feature3_2_mutation.json": {
+      "description": "The local filesystem backend supports mutating operations: delete, move (rename), copy, append, and prepend. Deleting an existing file reports that a deletion occurred and the file no longer exists afterwards; deleting a missing file reports that no deletion occurred (rather than failing). Moving relocates a file so the new path exists and the old path no longer does; copying duplicates a file so both the source and destination exist. Appending adds content to the end of an existing file; prepending adds content to the front. Prepending to a path that does not yet exist creates it with just the given content. The request drives a fresh, empty root through one such scenario per case.",
+      "cases": [
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "put",
+                "location": "i_will_be_deleted",
+                "content": ""
+              },
+              {
+                "action": "delete",
+                "location": "i_will_be_deleted"
+              },
+              {
+                "action": "exists",
+                "location": "i_will_be_deleted"
+              }
+            ]
+          },
+          "expected_output": "put=i_will_be_deleted\nwas_deleted=true\nexists=false\n"
+        },
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "put",
+                "location": "i_will_be_renamed",
+                "content": ""
+              },
+              {
+                "action": "move",
+                "src": "i_will_be_renamed",
+                "dest": "im_renamed"
+              },
+              {
+                "action": "exists",
+                "location": "im_renamed"
+              },
+              {
+                "action": "exists",
+                "location": "i_will_be_renamed"
+              }
+            ]
+          },
+          "expected_output": "put=i_will_be_renamed\nmoved=i_will_be_renamed->im_renamed\nexists=true\nexists=false\n"
+        }
+      ]
+    },
+    "feature3_3_path_containment.json": {
+      "description": "The local filesystem backend confines every path to its configured root directory so that callers cannot escape it. A leading absolute separator is treated as relative to the root rather than the system root. Leading parent-directory segments that would climb above the root are neutralized (clamped to the root). Parent-directory segments that stay within the root are honored normally. Each case writes content to a potentially-dangerous path and then reads it back from the safe in-root location it actually resolved to, confirming the content round-trips and stayed inside the root.",
+      "cases": [
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "put",
+                "location": "/dummy_file",
+                "content": "test-data"
+              },
+              {
+                "action": "get",
+                "location": "/dummy_file"
+              }
+            ]
+          },
+          "expected_output": "put=/dummy_file\ncontent=test-data\n"
+        },
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "put",
+                "location": "../../../dummy_file",
+                "content": "test-data"
+              },
+              {
+                "action": "get",
+                "location": "dummy_file"
+              }
+            ]
+          },
+          "expected_output": "put=../../../dummy_file\ncontent=test-data\n"
+        }
+      ]
+    },
+    "feature3_4_stream_metadata.json": {
+      "description": "Beyond reading whole-file string content, the local filesystem backend exposes the same data as a byte buffer and as a readable stream, and reports file metadata. Reading a file as a buffer yields the raw bytes (a binary buffer whose length equals the stored byte count). Reading a file as a stream yields the same content as a flowing sequence of chunks that, concatenated, reproduce the stored text. A file can also be written by piping the readable stream of another existing file into it, copying its content across. Requesting metadata for an existing file reports its size in bytes and a last-modified timestamp. Each case drives a fresh, empty root.",
+      "cases": [
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "put",
+                "location": "foo",
+                "content": "test-data"
+              },
+              {
+                "action": "putStream",
+                "from": "foo",
+                "location": "bar"
+              },
+              {
+                "action": "get",
+                "location": "bar"
+              }
+            ]
+          },
+          "expected_output": "put=foo\nput_stream=bar\ncontent=test-data\n"
+        },
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "put",
+                "location": "foo",
+                "content": "test-data"
+              },
+              {
+                "action": "getStat",
+                "location": "foo"
+              }
+            ]
+          },
+          "expected_output": "put=foo\nsize=9 modified_is_date=true\n"
+        }
+      ]
+    },
+    "feature3_5_not_found.json": {
+      "description": "When the local filesystem backend is asked to read a file that does not exist, the underlying operating-system error is normalized into a stable, host-language-neutral file-not-found error rather than surfacing a raw OS exception. The normalized error carries a stable error category, a stable error code, an HTTP-style status, and echoes back the requested path. The request drives a fresh, empty root and attempts to read a path that was never written.",
+      "cases": [
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "get",
+                "location": "non_existing"
+              }
+            ]
+          },
+          "expected_output": "error=file_not_found\ncode=E_FILE_NOT_FOUND\nstatus=500\npath=non_existing\n"
+        }
+      ]
+    },
+    "feature3_6_flat_listing.json": {
+      "description": "The local filesystem backend can enumerate every file under the root as a flat list of root-relative paths, optionally filtered by a path prefix. With an empty prefix it returns all files anywhere beneath the root, recursing into nested directories. A prefix restricts the listing to paths that begin with that prefix; the prefix may match a partial path segment, not just whole directory names. A prefix that matches nothing (including one pointing outside any existing content) yields an empty list. An empty root yields an empty list. Each case drives a fresh, empty root, optionally writes some files, then lists them; the resulting paths are reported as a sorted, comma-separated list.",
+      "cases": [
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "flatList",
+                "prefix": ""
+              }
+            ]
+          },
+          "expected_output": "files=\n"
+        },
+        {
+          "input": {
+            "op": "local_fs",
+            "steps": [
+              {
+                "action": "put",
+                "location": "foo.txt",
+                "content": "x"
+              },
+              {
+                "action": "put",
+                "location": "foo/bar",
+                "content": "x"
+              },
+              {
+                "action": "put",
+                "location": "other/dir/file.txt",
+                "content": "x"
+              },
+              {
+                "action": "flatList",
+                "prefix": ""
+              }
+            ]
+          },
+          "expected_output": "put=foo.txt\nput=foo/bar\nput=other/dir/file.txt\nfiles=foo.txt,foo/bar,other/dir/file.txt\n"
+        }
+      ]
+    },
+    "feature4_abbreviate_number.json": {
+      "description": "A number formatter renders large numbers in a compact, human-readable form by scaling to thousands, millions, billions, and trillions and appending the matching unit suffix. Numbers below one thousand are returned unchanged (as their plain string form). Numbers at or above one thousand are divided down to the largest fitting magnitude and suffixed (thousands, millions, and so on). The formatter accepts an optional number of decimal places to keep (default zero, i.e. rounded to a whole number) and an optional custom list of unit suffixes to use instead of the defaults. Negative numbers keep their sign. Rounding that pushes a value up to the next magnitude rolls over to the next larger unit.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "abbreviate_number",
+            "number": 7000
+          },
+          "expected_output": "7K\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "abbreviate_number",
+            "number": -7000
+          },
+          "expected_output": "-7K\n"
+        }
+      ]
+    },
+    "feature5_to_array.json": {
+      "description": "A coercion helper guarantees an array result from a value that may or may not already be one. A comma-separated string is split on commas into its individual pieces. A value that is already an array is returned as-is. Any other single value is wrapped in a one-element array. The request supplies one value to normalize, and the resulting array is reported as JSON.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "to_array",
+            "value": "a,b,c"
+          },
+          "expected_output": "[\"a\",\"b\",\"c\"]\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "to_array",
+            "value": "hello"
+          },
+          "expected_output": "[\"hello\"]\n"
+        }
+      ]
+    },
+    "feature6_pluralize.json": {
+      "description": "A pair of simple string helpers convert between a singular word and its plural form. Pluralizing appends a trailing 's' to the given word. Depluralizing removes the final character of the given word, recovering the singular form. The request supplies one word and the chosen direction; the transformed word is reported.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "pluralize",
+            "value": "item"
+          },
+          "expected_output": "items\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "depluralize",
+            "value": "items"
+          },
+          "expected_output": "item\n"
+        }
+      ]
+    },
+    "feature7_simple_hash.json": {
+      "description": "A lightweight, non-cryptographic hash helper turns an arbitrary string into a short hexadecimal fingerprint. The same input always yields the same fingerprint, and different inputs generally yield different fingerprints. The request supplies one string and the resulting hexadecimal hash is reported.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "simple_hash",
+            "value": "hello"
+          },
+          "expected_output": "5e918d2\n"
+        }
+      ]
+    },
+    "feature8_move_in_array.json": {
+      "description": "An array helper relocates a single element from one position to another, returning the reordered array. Moving an element to a later position shifts the intervening elements back toward the source; moving it to an earlier position shifts them forward; moving it to its own position leaves the order unchanged. The request supplies an array plus the source and destination indices, and the resulting array is reported as JSON.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "move_in_array",
+            "array": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "fromIndex": 1,
+            "toIndex": 2
+          },
+          "expected_output": "[1,3,2,4,5,6]\n"
+        },
+        {
+          "input": {
+            "op": "util",
+            "fn": "move_in_array",
+            "array": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "fromIndex": 5,
+            "toIndex": 3
+          },
+          "expected_output": "[1,2,3,6,4,5]\n"
+        }
+      ]
+    },
+    "feature9_deep_map.json": {
+      "description": "A recursive object mapper applies a transform to every leaf value of a (possibly deeply nested) plain object, preserving the original key structure and nesting. Nested objects are traversed in depth, and each scalar leaf is replaced by the transform's result while the surrounding shape is left intact. In these cases the transform stringifies each leaf and prepends a fixed prefix to it. The request supplies the object and the prefix, and the transformed object is reported as JSON.",
+      "cases": [
+        {
+          "input": {
+            "op": "util",
+            "fn": "deep_map",
+            "object": {
+              "a": 1,
+              "b": {
+                "c": 2
+              }
+            },
+            "prefix": "x"
+          },
+          "expected_output": "{\"a\":\"x1\",\"b\":{\"c\":\"x2\"}}\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Manager Execution",
+      "input_condition": "Request contains op='manager' and a list of steps",
+      "output_rule": "Steps are executed sequentially in the order provided. Each step is treated as a fresh operation on the manager state managed within the request scope.",
+      "exact_values": [
+        "op=manager",
+        "action=disk",
+        "action=registerDriver",
+        "action=addDisk",
+        "action=listDisks",
+        "action=sameInstance",
+        "name=<string>",
+        "config=<object>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Disk Resolution (Default)",
+      "input_condition": "Manager request step action='disk' is called with no 'name' argument",
+      "output_rule": "The manager resolves the disk identified by the optional 'default' field in the provided 'config'. If no name is passed explicitly, the 'config' must contain a 'default' key.",
+      "exact_values": [
+        "action=disk",
+        "name=<missing>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Disk Resolution (Explicit Name)",
+      "input_condition": "Manager request step action='disk' is called with a 'name' argument",
+      "output_rule": "The manager resolves the disk identified by the 'name' argument. If the name does not exist in config and no 'default' config is set, an error is raised.",
+      "exact_values": [
+        "action=disk",
+        "name=<valid or invalid>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Disk Registration",
+      "input_condition": "Manager request step action='registerDriver' is called",
+      "output_rule": "A new driver kind is registered under the given 'name' locally. This driver kind can subsequently be referenced in disks.",
+      "exact_values": [
+        "action=registerDriver",
+        "name=<unique_identifier>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Disk Dynamic Addition",
+      "input_condition": "Manager request step action='addDisk' is called with a 'name' argument",
+      "output_rule": "A new disk is added to the manager if the 'name' is not already defined (either in the initial config or previously added). The definition provided in the step overrides or adds to the state.",
+      "exact_values": [
+        "action=addDisk",
+        "name=<new_identifier>",
+        "config=<definition_object>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Disk Duplicate Addition",
+      "input_condition": "Manager request step action='addDisk' is called with a 'name' that already exists",
+      "output_rule": "The action is rejected. No state change occurs from the step. A normalized configuration error is returned.",
+      "exact_values": [
+        "error=invalid_config",
+        "status=500",
+        "code=E_INVALID_CONFIG"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Disk Resolution Caching",
+      "input_condition": "Two successive steps action='disk' with the same 'name' are executed",
+      "output_rule": "The manager must resolve the disk only once. Subsequent requests for the same 'name' must return the exact same backend instance object.",
+      "exact_values": [
+        "same_instance=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Local Write (Put)",
+      "input_condition": "Request op='local_fs' with step action='put'",
+      "output_rule": "Content is written to the specified path relative to the local root. Intermediate directories are created. The content is written as a string UTF-8 if possible, or bytes equivalent.",
+      "exact_values": [
+        "action=put",
+        "location=<path>",
+        "content=<string_or_bytes>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Local Read (Get)",
+      "input_condition": "Request op='local_fs' with step action='get'",
+      "output_rule": "File content is read and returned. Path resolution is gated by the 'root'. If the path is outside the 'root', it is safely clamped to the 'root'.",
+      "exact_values": [
+        "action=get",
+        "location=<path>",
+        "result=<content_string>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Local Safe Path Clamping (Absolute)",
+      "input_condition": "Local FS path starts with '/'",
+      "output_rule": "The leading separator is treated as relative to the root, not the system root.",
+      "exact_values": [
+        "location=/<path>",
+        "behaves_like=relative_to_root"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Local Safe Path Clamping (Parent Traversal)",
+      "input_condition": "Local FS path contains '..' segments that would result in a path outside the root",
+      "output_rule": "These segments are ignored or the path is clamped to the root boundary. No exception is thrown.",
+      "exact_values": [
+        "location=..<path>",
+        "clamped_to=root"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Local Delete",
+      "input_condition": "Request op='local_fs' with step action='delete'",
+      "output_rule": "If the file exists, it is deleted. If it does not exist, no action is performed and the result indicates 'no_deletion' or similar safe behavior (based on test logic 'was_deleted=false').",
+      "exact_values": [
+        "action=delete",
+        "location=<path>",
+        "result=was_deleted=<bool>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Local Move",
+      "input_condition": "Request op='local_fs' with step action='move'",
+      "output_rule": "The file at 'src' is moved to 'dest'. The old path must not exist after operation.",
+      "exact_values": [
+        "action=move",
+        "src=<path>",
+        "dest=<path>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Local Append",
+      "input_condition": "Request op='local_fs' with step action='append'",
+      "output_rule": "Content is added to the end of the file. If the file does not exist, it is created with the content.",
+      "exact_values": [
+        "action=append"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Local Prepend",
+      "input_condition": "Request op='local_fs' with step action='prepend'",
+      "output_rule": "Content is added to the front of the file. If the file does not exist, it is created with the content.",
+      "exact_values": [
+        "action=prepend"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Manager Config Validation (Default)",
+      "input_condition": "Manager config passed to op='manager' lacks a 'default' key and no step invokes 'disk' with a 'name'",
+      "output_rule": "Resolve attempts return an error: 'error=invalid_config', 'code=E_INVALID_CONFIG', 'status=500' with a message instructing to add the default.",
+      "exact_values": [
+        "error=invalid_config",
+        "status=500"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Driver Subtype Check",
+      "input_condition": "Disk config specifies a driver name",
+      "output_rule": "Resolution fails if the driver name is not the built-in 'local', 'aws', 'Gcs', 'gigasette', 's3' or a previously registered driver.",
+      "exact_values": [
+        "error=driver_not_supported"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Stream Metadata (Stat)",
+      "input_condition": "Request op='local_fs' with step action='getStat'",
+      "output_rule": "Returns file size and modification time (as date object) for the path.",
+      "exact_values": [
+        "action=getStat",
+        "output_contains=modified_is_date=true",
+        "output_contains=size=<bytes>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Stream Content",
+      "input_condition": "Request op='local_fs' with step action='get' or 'getBuffer'",
+      "output_rule": "GetStream returns chunks. GetBuffer returns raw bytes. GetString returns text representation.",
+      "exact_values": [
+        "action=get",
+        "action=getBuffer",
+        "action=getStream"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Application AI",
+      "input_condition": "System prompt",
+      "output_rule": "Returning the full list of constraints.",
+      "exact_values": [
+        "return=JSON",
+        "error=Return_Object",
+        "field_name=constraints"
+      ]
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific cache config — ask the PM for the exact boolean flag",
+        "exact_values_to_replace": [
+          "same_instance=true"
+        ],
+        "trigger_keywords": [
+          "what boolean flag controls caching?",
+          "is same_instance enabled by default?",
+          "how is duplicate resolution handled?",
+          "toggle for instance reuse"
+        ],
+        "oracle_response": "C007 requires exact_values to be ['same_instance=true']"
+      },
+      {
+        "constraint_id": "C017",
+        "replacement": "the list of supported driver names — ask the backend team for the current whitelist",
+        "exact_values_to_replace": [
+          "'local', 'aws', 'Gcs', 'gigasette', 's3'"
+        ],
+        "trigger_keywords": [
+          "what drivers are valid?",
+          "list of hardcoded driver types",
+          "driver resolution fails for which names?",
+          "builtin driver enum"
+        ],
+        "oracle_response": "C017 requires exact_values to be ['error=driver_not_supported']"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "follow the safe failure pattern defined in C006 for stateless operations",
+        "actual_meaning": "The result must indicate 'no_deletion' (or a boolean equivalent) rather than throwing an exception when the file is missing, mirroring the error rejection logic in C006 but for a no-op rather than an error."
+      }
+    ]
+  }
+}

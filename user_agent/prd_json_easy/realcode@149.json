@@ -1,0 +1,1621 @@
+{
+  "fuzzy_prd": "# Typed Argument Parser - Declarative, Type-Safe Command-Line Argument Parsing\n\n## Project Goal\n\nBuild a command-line argument parser that lets developers declare each argument as a typed field (a name, an optional type, and an optional default) and have parsing, type conversion, validation, defaulting, and required-checking derived automatically from those declarations, so command-line programs gain type safety without hand-written conversion and validation boilerplate.\n\n---\n\n## Background & Problem\n\nWithout this library, developers configure a general-purpose argument parser imperatively: every option is registered with a separate call that repeats its name, its conversion function, its default, and whether it is required. The declared shape of the program's inputs is scattered across procedural setup code, type information is lost (everything arrives as text unless manually converted), and there is no single object whose fields describe the whole input surface. This leads to repetitive, error-prone boilerplate and weak typing.\n\nWith this library, the set of arguments is declared once as typed fields. The parser infers the conversion type, the default, and whether the field is required directly from the declaration; it converts each command-line token to the right type (including collections, optionals, literals/choices, and paths); it validates choices, tuple arity, and required-ness; and it exposes the resolved arguments as a single mapping that can also be repopulated from a mapping. Subcommands, configuration files, dash-style flag names, accumulation actions, and a known-only mode round out the surface.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain. This is a non-trivial domain (type inference, conversion, validation, collections, subcommands, config files); it MUST be organized into clear modules (e.g. type-resolution, conversion/enforcement, the parser core, and the execution adapter) rather than a single monolithic file. Do not over-engineer, but strictly avoid a \"god file\".\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core parsing logic must remain completely decoupled from standard I/O and JSON parsing. The execution adapter alone translates a JSON request into idiomatic calls on the core parser and renders the result.\n\n3. **Adherence to SOLID Design Principles:** Separate type resolution, conversion/validation, parsing/routing, and output formatting into distinct cohesive units; keep the core open for extension (new element types, new actions) but closed for modification; depend on abstractions rather than on I/O details.\n\n4. **Robustness & Interface Design:** The public interface must be elegant and idiomatic to the target language. Errors must be modeled properly (a usage failure, a file-not-found failure, an invalid-type-configuration failure, an invalid-request failure) rather than as generic faults, and must be reported through the neutral error contract below.\n\n---\n\n## Execution Adapter Request & Output Contract\n\nThe execution adapter reads ONE JSON request object from stdin, drives the core parser, and writes the resolved arguments (or a neutral error line) to stdout.\n\n**Request shape** (all keys optional unless noted):\n\n- `arguments`: ordered list of field declarations, each `{\"name\": str, \"type\"?: <annotation string>, \"default\"?: <value>}`. Omitting `type` declares an untyped field; omitting `default` makes an annotated field required. Annotation strings use the conventional type-hint surface, e.g. `\"int\"`, `\"float\"`, `\"str\"`, `\"bool\"`, `\"List\"`, `\"List[int]\"`, `\"Set[int]\"`, `\"Tuple[int, ...]\"`, `\"Tuple[int, str]\"`, `\"Optional[int]\"`, `\"Union[int, float]\"`, `\"Literal['a', 'b']\"`, `\"Path\"`.\n- `configure`: ordered list of additional registrations, each `{\"flags\": [str, ...], \"kwargs\": {...}}`, used for flag aliases, positionals (a flag with no leading dash), default/type overrides (`\"type\"` given as one of `\"int\"|\"float\"|\"str\"|\"bool\"`), and accumulation actions (`\"action\"`, `\"const\"`, `\"nargs\"`).\n- `init`: parser construction options — `\"underscores_to_dashes\"` (bool), `\"explicit_bool\"` (bool), `\"config_files\"` (list of paths), `\"config_files_content\"` (list of file contents, each materialized into a temporary config file).\n- `subparsers`: `{\"settings\": {...}, \"items\": [{\"flag\": str, \"spec\": <nested request>, \"kwargs\"?: {...}}, ...]}` to register subcommands.\n- `argv`: the command-line tokens to parse.\n- `parse`: parsing options — `{\"known_only\": bool}`.\n- `from_dict`: a name-to-value mapping to populate the parser from, instead of parsing `argv`.\n- `parse_twice` / `add_argument_post_init`: lifecycle-misuse probes.\n- `show`: which sections to render, a list drawn from `\"values\"` (the resolved mapping) and `\"extra\"` (the collected unknown tokens). Default is `[\"values\"]`.\n\nValues that need a concrete non-JSON type use tagged objects: `{\"__set__\": [...]}` for a set, `{\"__tuple__\": [...]}` for a tuple, `{\"__path__\": \"...\"}` for a path.\n\n**Output contract** (raw stdout, compared byte-for-byte):\n\n- The resolved mapping renders one `name=<token>` line per field, sorted by field name, each line terminated by a newline. An empty mapping renders no output.\n- A scalar token is type-tagged: `int:<n>`, `float:<repr>`, `str:<text>`, `bool:True`/`bool:False`, `none`, `path:<text>`.\n- A list renders as `[t0, t1, ...]`, a tuple as `(t0, t1, ...)`, and a set as `{t0, t1, ...}` with element tokens sorted lexicographically for determinism.\n- The unknown-token section renders as `[a placeholder for the bracketed array content]...]`.\n- Errors are normalized to a single neutral line: `error=usage` (a parse/usage failure such as a missing required argument, an invalid choice, or a tuple arity/type violation), `error=file_not_found` (a missing config file), `error=invalid_type_configuration` (an un-parseable type declaration such as an ambiguous union or an empty tuple type), or `error=invalid_request` (a lifecycle misuse or a mapping missing a required field). Errors MUST NOT leak any host-language runtime details.\n\n---\n\n## Core Features\n\n### Feature 1: Declaring Arguments and Inferring Types\n\n**As a developer**, I want to declare typed, untyped, and forward-referenced arguments without boilerplate.\n\n**Expected Behavior / Usage:**\n\n*1.1 Typed scalar arguments*\n\nA field is declared by a name, an optional type annotation, and an optional default. When the corresponding flag is absent from the command line the resolved value is the declared default; when the flag is supplied the trailing token is converted to the annotated type. The resolved arguments are rendered as one `name=token` line per field, where `token` is a typed token (see Output Contract).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature01_typed_scalar.json`\n\n```json\n{\n    \"description\": \"Declare a single argument annotated with a scalar type and an inline default value. When the command line does not supply the flag, the parsed value equals the declared default. When the flag is supplied, the parsed value is the string token taken from the command line. The rendered output lists the field name and its typed value.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"greeting\",\n                        \"type\": \"str\",\n                        \"default\": \"sup\"\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"greeting=str:sup\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"greeting\",\n                        \"type\": \"str\",\n                        \"default\": \"sup\"\n                    }\n                ],\n                \"argv\": [\n                    \"--greeting\",\n                    \"yo\"\n                ]\n            },\n            \"expected_output\": \"greeting=str:yo\\n\"\n        }\n    ]\n}\n```\n\n*1.2 Untyped arguments*\n\nAn argument declared with a default but no type keeps its default when absent and, when supplied, takes the command-line text verbatim with no numeric conversion. A flag registered at configuration time with no backing default simply captures the supplied text.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature02_untyped_argument.json`\n\n```json\n{\n    \"description\": \"Arguments may be declared with only a default value and no type annotation, or added at configuration time with no annotation at all. An untyped argument keeps its default when the flag is absent; when supplied on the command line its value is taken verbatim as text (no numeric conversion is inferred). A configuration-time flag with no backing default simply captures the supplied text.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"hi\",\n                        \"default\": 3\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"[e.g., 'name=value:50']\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"hi\",\n                        \"default\": 3\n                    }\n                ],\n                \"argv\": [\n                    \"--hi\",\n                    \"yo\"\n                ]\n            },\n            \"expected_output\": \"hi=str:yo\\n\"\n        }\n    ]\n}\n```\n\n*1.3 String (forward-reference) annotations*\n\nA string annotation is resolved to the equivalent type and drives the same conversion: a scalar numeric string annotation converts the token to a number, and a parameterized collection string annotation converts each whitespace-separated token element-wise. Defaults apply when the flag is absent.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature03_string_annotation.json`\n\n```json\n{\n    \"description\": \"Type annotations may be provided as strings (forward references) rather than as live type objects; they are resolved to the same behavior. A scalar string annotation drives numeric conversion and a parameterized collection string annotation drives element-wise conversion of a whitespace-separated list. Defaults apply when flags are absent.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a_number\",\n                        \"type\": \"int\",\n                        \"default\": 3\n                    },\n                    {\n                        \"name\": \"a_list\",\n                        \"type\": \"List[float]\",\n                        \"default\": [\n                            3.7,\n                            0.3\n                        ]\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"a_list=[float:3.7, float:0.3]\\na_number=int:3\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a_number\",\n                        \"type\": \"int\",\n                        \"default\": 3\n                    },\n                    {\n                        \"name\": \"a_list\",\n                        \"type\": \"List[float]\",\n                        \"default\": [\n                            3.7,\n                            0.3\n                        ]\n                    }\n                ],\n                \"argv\": [\n                    \"--a_number\",\n                    \"42\",\n                    \"--a_list\",\n                    \"3\",\n                    \"4\",\n                    \"0.7\"\n                ]\n            },\n            \"expected_output\": \"a_list=[float:3.0, float:4.0, float:0.7]\\na_number=int:42\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Required and Optional Arguments\n\n**As a developer**, I want to distinguish mandatory inputs from optional ones that may be absent.\n\n**Expected Behavior / Usage:**\n\n*2.1 Required arguments*\n\nAn annotated field with no default is required. If any required field is missing the parse fails with a usage error (rendered as the neutral line `error=usage`). When all required fields are supplied the parse succeeds and converts each value by its annotation.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature04_required_arguments.json`\n\n```json\n{\n    \"description\": \"An annotated argument with no default value is required. If any required argument is missing from the command line the parse fails with a usage error. When every required argument is supplied the parse succeeds and the values are converted according to their annotations.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_str_required\",\n                        \"type\": \"str\"\n                    },\n                    {\n                        \"name\": \"arg_list_str_required\",\n                        \"type\": \"List[str]\"\n                    }\n                ],\n                \"argv\": [\n                    \"--arg_str_required\",\n                    \"tappy\"\n                ]\n            },\n            \"expected_output\": \"error=usage\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_str_required\",\n                        \"type\": \"str\"\n                    },\n                    {\n                        \"name\": \"arg_list_str_required\",\n                        \"type\": \"List[str]\"\n                    }\n                ],\n                \"argv\": [\n                    \"--arg_str_required\",\n                    \"tappy\",\n                    \"--arg_list_str_required\",\n                    \"hi\",\n                    \"there\"\n                ]\n            },\n            \"expected_output\": \"arg_list_str_required=[str:hi, str:there]\\narg_str_required=str:tappy\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Optional-typed arguments*\n\nAn optional field (an inner type combined with the absence of a value) defaults to a none token and, when supplied, converts the token to the inner type. Multiple optional fields of different inner types are converted independently.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature08_optional_types.json`\n\n```json\n{\n    \"description\": \"An optional-typed argument defaults to an empty (none) value and, when supplied, converts the command-line text to the inner type. Several optional arguments of different inner types can coexist; each is converted independently.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"opt_str\",\n                        \"type\": \"Optional[str]\",\n                        \"default\": null\n                    },\n                    {\n                        \"name\": \"opt_int\",\n                        \"type\": \"Optional[int]\",\n                        \"default\": null\n                    },\n                    {\n                        \"name\": \"opt_float\",\n                        \"type\": \"Optional[float]\",\n                        \"default\": null\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"opt_float=none\\nopt_int=none\\nopt_str=none\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"opt_str\",\n                        \"type\": \"Optional[str]\",\n                        \"default\": null\n                    },\n                    {\n                        \"name\": \"opt_int\",\n                        \"type\": \"Optional[int]\",\n                        \"default\": null\n                    },\n                    {\n                        \"name\": \"opt_float\",\n                        \"type\": \"Optional[float]\",\n                        \"default\": null\n                    }\n                ],\n                \"argv\": [\n                    \"--opt_str\",\n                    \"hello\",\n                    \"--opt_int\",\n                    \"77\",\n                    \"--opt_float\",\n                    \"7.7\"\n                ]\n            },\n            \"expected_output\": \"opt_float=float:7.7\\nopt_int=int:77\\nopt_str=str:hello\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Boolean Arguments\n\n**As a developer**, I want to express on/off options either as bare flags or as explicit truth values.\n\n**Expected Behavior / Usage:**\n\n*3.1 Implicit boolean flags*\n\nA boolean field with a default becomes a no-argument flag. Supplying the flag yields the opposite of the default (a true-default reads false when present; a false-default reads true when present). Absent flags keep their defaults.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature05_implicit_bool.json`\n\n```json\n{\n    \"description\": \"A boolean argument with a default value becomes a no-argument flag whose presence flips it to the opposite of its default: a field defaulting to true reads as false when the flag is given, and a field defaulting to false reads as true when the flag is given. When neither flag is present both keep their declared defaults.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_true\",\n                        \"type\": \"bool\",\n                        \"default\": true\n                    },\n                    {\n                        \"name\": \"arg_false\",\n                        \"type\": \"bool\",\n                        \"default\": false\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"arg_false=bool:False\\narg_true=bool:True\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_true\",\n                        \"type\": \"bool\",\n                        \"default\": true\n                    },\n                    {\n                        \"name\": \"arg_false\",\n                        \"type\": \"bool\",\n                        \"default\": false\n                    }\n                ],\n                \"argv\": [\n                    \"--arg_true\",\n                    \"--arg_false\"\n                ]\n            },\n            \"expected_output\": \"arg_false=bool:True\\narg_true=bool:False\\n\"\n        }\n    ]\n}\n```\n\n*3.2 Explicit boolean values*\n\nIn explicit-boolean mode a boolean flag requires a truth-value argument. Truthy spellings (full word, single letter, or `1`) parse to true and falsy spellings (full word, single letter, or `0`) parse to false, in any capitalization. Omitting the value after the flag, or omitting a required boolean entirely, is a usage error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature06_explicit_bool.json`\n\n```json\n{\n    \"description\": \"In explicit-boolean mode a boolean argument expects a literal truth value as its argument. Truthy spellings (full word, single letter, or one) parse to true and falsy spellings (full word, single letter, or zero) parse to false, in any capitalization. Omitting the value after the flag, or omitting a required boolean entirely, is a usage error.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"is_gpu\",\n                        \"type\": \"bool\"\n                    }\n                ],\n                \"init\": {\n                    \"explicit_bool\": true\n                },\n                \"argv\": [\n                    \"--is_gpu\",\n                    \"True\"\n                ]\n            },\n            \"expected_output\": \"is_gpu=bool:True\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"is_gpu\",\n                        \"type\": \"bool\"\n                    }\n                ],\n                \"init\": {\n                    \"explicit_bool\": true\n                },\n                \"argv\": [\n                    \"--is_gpu\",\n                    \"False\"\n                ]\n            },\n            \"expected_output\": \"is_gpu=bool:False\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"is_gpu\",\n                        \"type\": \"bool\"\n                    }\n                ],\n                \"init\": {\n                    \"explicit_bool\": true\n                },\n                \"argv\": [\n                    \"--is_gpu\"\n                ]\n            },\n            \"expected_output\": \"error=usage\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Literal (Choice-Restricted) Arguments\n\n**As a developer**, I want to restrict an argument to a fixed set of typed options.\n\n**Expected Behavior / Usage:**\n\nA literal-typed field accepts only the enumerated options and converts the chosen value to the type of the matching option (string option stays text, numeric option becomes a number, boolean option becomes a boolean). A value outside the allowed set is a usage error; the default is used when the flag is absent.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature07_literal_choices.json`\n\n```json\n{\n    \"description\": \"A literal-typed argument restricts the accepted values to a fixed set of allowed options and converts the chosen value to the type of the matching option (so a string option stays text, a numeric option becomes a number, and a boolean option becomes a boolean). Supplying a value outside the allowed set is a usage error. The default is used when the flag is absent.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_literal\",\n                        \"type\": \"Literal['english', 'A', True, 88.9, 100]\",\n                        \"default\": \"A\"\n                    }\n                ],\n                \"argv\": [\n                    \"--arg_literal\",\n                    \"88.9\"\n                ]\n            },\n            \"expected_output\": \"arg_literal=float:88.9\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_lit\",\n                        \"type\": \"Literal['125', 'no, 3 sir']\"\n                    }\n                ],\n                \"argv\": [\n                    \"--arg_lit\",\n                    \"[any integer not in the allowed set, e.g., '123']\"\n                ]\n            },\n            \"expected_output\": \"error=usage\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Collection Arguments\n\n**As a developer**, I want to gather multiple command-line tokens into typed lists, sets, and tuples.\n\n**Expected Behavior / Usage:**\n\n*5.1 List arguments*\n\nA list field consumes all whitespace-separated tokens after its flag and converts each element to the declared element type (a bare list keeps strings; typed lists convert to integers, floats, or booleans). Element order is preserved and rendered inside `[ ... ]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature09_list_arguments.json`\n\n```json\n{\n    \"description\": \"A list-typed argument consumes all whitespace-separated tokens following its flag and converts each element to the declared element type (bare list keeps strings, and typed lists convert to integers, floats, or booleans). Element order is preserved.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"list_\",\n                        \"type\": \"List\"\n                    },\n                    {\n                        \"name\": \"list_int\",\n                        \"type\": \"List[int]\"\n                    },\n                    {\n                        \"name\": \"list_str\",\n                        \"type\": \"List[str]\"\n                    },\n                    {\n                        \"name\": \"list_bool\",\n                        \"type\": \"List[bool]\"\n                    }\n                ],\n                \"argv\": [\n                    \"--list_\",\n                    \"I\",\n                    \"was\",\n                    \"wondering\",\n                    \"--list_int\",\n                    \"0\",\n                    \"1\",\n                    \"2\",\n                    \"--list_str\",\n                    \"a\",\n                    \"bee\",\n                    \"cd\",\n                    \"ee\",\n                    \"--list_bool\",\n                    \"True\",\n                    \"False\"\n                ]\n            },\n            \"expected_output\": \"list_=[str:I, str:was, str:wondering]\\nlist_bool=[bool:True, bool:False]\\nlist_int=[int:0, int:1, int:2]\\nlist_str=[str:a, str:bee, str:cd, str:ee]\\n\"\n        }\n    ]\n}\n```\n\n*5.2 Set arguments*\n\nA set field consumes the whitespace-separated tokens after its flag, converts each to the declared element type, and keeps only unique values. Membership (not order) is significant; the rendered form lists elements inside `{ ... }` sorted by their token text for determinism.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_set_arguments.json`\n\n```json\n{\n    \"description\": \"A set-typed argument consumes the whitespace-separated tokens after its flag, converts each to the declared element type, and collapses duplicate values into a unique collection (membership only, order not significant).\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"set_int\",\n                        \"type\": \"Set[int]\"\n                    },\n                    {\n                        \"name\": \"set_str\",\n                        \"type\": \"Set[str]\"\n                    }\n                ],\n                \"argv\": [\n                    \"--set_int\",\n                    \"1\",\n                    \"2\",\n                    \"2\",\n                    \"3\",\n                    \"--set_str\",\n                    \"a\",\n                    \"bee\",\n                    \"cd\"\n                ]\n            },\n            \"expected_output\": \"set_int={int:1, int:2, int:3}\\nset_str={str:a, str:bee, str:cd}\\n\"\n        }\n    ]\n}\n```\n\n*5.3 Tuple arguments*\n\nA tuple field fixes its element count and per-position types. A bare tuple keeps an arbitrary number of string elements; a single-element typed tuple yields one converted element; a homogeneous ellipsis tuple converts an arbitrary number of elements to one type; and a fully enumerated tuple converts each position to its own type. Order is preserved and rendered inside `( ... )`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_tuple_arguments.json`\n\n```json\n{\n    \"description\": \"A tuple-typed argument fixes the number and per-position types of its elements. A bare tuple keeps an arbitrary number of string elements; a single-element typed tuple yields one converted element; a homogeneous ellipsis tuple converts an arbitrary number of elements to one type; and a fully enumerated tuple converts each position to its own declared type.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"tup_str\",\n                        \"type\": \"Tuple[str]\"\n                    },\n                    {\n                        \"name\": \"tup_int\",\n                        \"type\": \"Tuple[int]\"\n                    },\n                    {\n                        \"name\": \"tup_float\",\n                        \"type\": \"Tuple[float]\"\n                    },\n                    {\n                        \"name\": \"tup_bool\",\n                        \"type\": \"Tuple[bool]\"\n                    }\n                ],\n                \"argv\": [\n                    \"--tup_str\",\n                    \"hello\",\n                    \"--tup_int\",\n                    \"445\",\n                    \"--tup_float\",\n                    \"7.9\",\n                    \"--tup_bool\",\n                    \"tru\"\n                ]\n            },\n            \"expected_output\": \"tup_bool=(bool:True)\\ntup_float=(float:7.9)\\ntup_int=(int:445)\\ntup_str=(str:hello)\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"tup_int\",\n                        \"type\": \"Tuple[int, ...]\"\n                    },\n                    {\n                        \"name\": \"tup_bool\",\n                        \"type\": \"Tuple[bool, ...]\"\n                    }\n                ],\n                \"argv\": [\n                    \"--tup_int\",\n                    \"2\",\n                    \"3\",\n                    \"4\",\n                    \"--tup_bool\",\n                    \"false\",\n                    \"true\",\n                    \"0\",\n                    \"1\",\n                    \"tru\"\n                ]\n            },\n            \"expected_output\": \"tup_bool=(bool:False, bool:True, bool:False, bool:True, bool:True)\\ntup_int=(int:2, int:3, int:4)\\n\"\n        }\n    ]\n}\n```\n\n*5.4 Tuple validation errors*\n\nA typed tuple enforces element count and per-position types: a non-convertible element, the wrong number of elements, or elements that violate the position types all fail with a usage error. Declaring an empty tuple type is rejected up front (`error=invalid_type_configuration`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_tuple_errors.json`\n\n```json\n{\n    \"description\": \"A typed tuple enforces both the count and the per-position types of its elements. Supplying an element that cannot be converted to its declared type, supplying the wrong number of elements, or supplying elements in an order that violates the position types, all fail with a usage error. Declaring an empty tuple type is rejected up front as an invalid type configuration.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"tup\",\n                        \"type\": \"Tuple[int]\"\n                    }\n                ],\n                \"argv\": [\n                    \"--tup\",\n                    \"tomato\"\n                ]\n            },\n            \"expected_output\": \"error=usage\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"tup\",\n                        \"type\": \"Tuple[()]\"\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"error=invalid_type_configuration\\n\"\n        }\n    ]\n}\n```\n\n*5.5 Non-collection defaults on collection fields*\n\nWhen a collection-typed field is given a default that is not a collection (such as an empty/none value or a bare scalar) and the flag is not supplied, the declared default is returned unchanged with no collection conversion applied.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature13_noncollection_default.json`\n\n```json\n{\n    \"description\": \"If a collection-typed argument is given a default that is not itself a collection (for example an empty/none value or a bare scalar), and the flag is not supplied on the command line, the declared default value is returned unchanged without any collection conversion.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"set_1\",\n                        \"type\": \"Set[str]\",\n                        \"default\": null\n                    },\n                    {\n                        \"name\": \"set_2\",\n                        \"type\": \"Set[int]\",\n                        \"default\": 3.7\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"set_1=none\\nset_2=float:3.7\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"tup_1\",\n                        \"type\": \"Tuple[int, str]\",\n                        \"default\": null\n                    },\n                    {\n                        \"name\": \"tup_2\",\n                        \"type\": \"Tuple[str, int]\",\n                        \"default\": 3\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"tup_1=none\\ntup_2=int:3\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Path-Typed Arguments\n\n**As a developer**, I want to wrap inputs into filesystem-path values, alone or inside containers.\n\n**Expected Behavior / Usage:**\n\nA path type is supported as a scalar element and inside optional, list, set, and tuple containers. Each token is wrapped into a path value; path collections keep their respective semantics (list ordered, set unique, tuple fixed-length). A path token renders as `path:<text>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature14_path_types.json`\n\n```json\n{\n    \"description\": \"A filesystem-path type is supported as a scalar element type and inside optional, list, set, and tuple containers. Each supplied token is wrapped into a path value; collections of paths preserve their respective semantics (list ordered, set unique, tuple fixed-length).\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"path\",\n                        \"type\": \"Path\"\n                    },\n                    {\n                        \"name\": \"optional_path\",\n                        \"type\": \"Optional[Path]\"\n                    },\n                    {\n                        \"name\": \"list_path\",\n                        \"type\": \"List[Path]\"\n                    },\n                    {\n                        \"name\": \"tuple_path\",\n                        \"type\": \"Tuple[Path, Path]\"\n                    }\n                ],\n                \"argv\": [\n                    \"--path\",\n                    \"/path/to/file.txt\",\n                    \"--optional_path\",\n                    \"/path/to/optional/file.txt\",\n                    \"--list_path\",\n                    \"/path/to/list/file1.txt\",\n                    \"/path/to/list/file2.txt\",\n                    \"--tuple_path\",\n                    \"/path/to/tuple/file1.txt\",\n                    \"/path/to/tuple/file2.txt\"\n                ]\n            },\n            \"expected_output\": \"list_path=[path:/path/to/list/file1.txt, path:/path/to/list/file2.txt]\\noptional_path=path:/path/to/optional/file.txt\\npath=path:/path/to/file.txt\\ntuple_path=(path:/path/to/tuple/file1.txt, path:/path/to/tuple/file2.txt)\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Ambiguous Unions Require an Explicit Converter\n\n**As a developer**, I want to be forced to disambiguate multi-type unions instead of guessing.\n\n**Expected Behavior / Usage:**\n\nA general union of two or more concrete types (anything other than an optional, i.e. a type combined with the absence of a value) cannot be parsed automatically. Declaring such a union without an explicit conversion function is rejected as an invalid type configuration (`error=invalid_type_configuration`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature15_union_requires_converter.json`\n\n```json\n{\n    \"description\": \"A general union of two or more concrete types (other than an optional, i.e. a type combined with none) cannot be parsed automatically because the parser cannot know which member type to convert to. Declaring such a union without supplying an explicit conversion function is rejected as an invalid type configuration.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg\",\n                        \"type\": \"Union[int, float]\"\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"error=invalid_type_configuration\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Retrieving and Populating Argument Values\n\n**As a developer**, I want to read all resolved arguments as a mapping and restore them from one.\n\n**Expected Behavior / Usage:**\n\n*8.1 Retrieve as a mapping*\n\nAfter a successful parse the complete set of resolved arguments is available as a mapping. It includes typed fields, untyped fields, optional fields (with their none defaults), collection fields, and any field introduced under a renamed destination at configuration time. This is the default rendered view.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature16_as_dict.json`\n\n```json\n{\n    \"description\": \"After parsing, the full set of resolved arguments can be retrieved as a name-to-value mapping. The mapping includes typed fields, untyped fields, optional fields (with their none defaults), and collection fields, as well as arguments introduced under a renamed destination at configuration time.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"str\"\n                    },\n                    {\n                        \"name\": \"b\",\n                        \"default\": 1\n                    },\n                    {\n                        \"name\": \"c\",\n                        \"type\": \"bool\",\n                        \"default\": true\n                    },\n                    {\n                        \"name\": \"d\",\n                        \"type\": \"Tuple[str, ...]\",\n                        \"default\": {\n                            \"__tuple__\": [\n                                \"hi\",\n                                \"bob\"\n                            ]\n                        }\n                    },\n                    {\n                        \"name\": \"e\",\n                        \"type\": \"Optional[int]\",\n                        \"default\": null\n                    },\n                    {\n                        \"name\": \"f\",\n                        \"type\": \"Set[int]\",\n                        \"default\": {\n                            \"__set__\": [\n                                1\n                            ]\n                        }\n                    }\n                ],\n                \"argv\": [\n                    \"--a\",\n                    \"hi\"\n                ]\n            },\n            \"expected_output\": \"a=str:hi\\nb=int:1\\nc=bool:True\\nd=(str:hi, str:bob)\\ne=none\\nf={int:1}\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"str\"\n                    },\n                    {\n                        \"name\": \"b\",\n                        \"default\": 1\n                    }\n                ],\n                \"configure\": [\n                    {\n                        \"flags\": [\n                            \"-arg_name\",\n                            \"--long_arg_name\"\n                        ]\n                    }\n                ],\n                \"argv\": [\n                    \"--a\",\n                    \"hi\",\n                    \"--long_arg_name\",\n                    \"arg\"\n                ]\n            },\n            \"expected_output\": \"a=str:hi\\nb=int:1\\nlong_arg_name=str:arg\\n\"\n        }\n    ]\n}\n```\n\n*8.2 Populate from a mapping*\n\nPopulating from a mapping reproduces the same retrievable arguments as command-line parsing. If the mapping omits a required field that has no default, population fails with an invalid-request error (`error=invalid_request`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature17_from_dict.json`\n\n```json\n{\n    \"description\": \"A parser can be populated directly from a name-to-value mapping instead of from the command line, reproducing the same retrievable arguments. If the mapping omits a required argument that has no default, population fails with an invalid-request error.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"str\"\n                    },\n                    {\n                        \"name\": \"d\",\n                        \"type\": \"Tuple[str, ...]\"\n                    },\n                    {\n                        \"name\": \"b\",\n                        \"default\": 1\n                    },\n                    {\n                        \"name\": \"c\",\n                        \"type\": \"bool\",\n                        \"default\": true\n                    },\n                    {\n                        \"name\": \"e\",\n                        \"type\": \"Optional[int]\",\n                        \"default\": null\n                    },\n                    {\n                        \"name\": \"f\",\n                        \"type\": \"Set[int]\",\n                        \"default\": {\n                            \"__set__\": [\n                                1\n                            ]\n                        }\n                    }\n                ],\n                \"from_dict\": {\n                    \"a\": \"hi\",\n                    \"d\": {\n                        \"__tuple__\": [\n                            \"a\",\n                            \"b\"\n                        ]\n                    },\n                    \"b\": 1,\n                    \"c\": true,\n                    \"e\": 7,\n                    \"f\": {\n                        \"__set__\": [\n                            1\n                        ]\n                    }\n                }\n            },\n            \"expected_output\": \"a=str:hi\\nb=int:1\\nc=bool:True\\nd=(str:a, str:b)\\ne=int:7\\nf={int:1}\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"str\"\n                    },\n                    {\n                        \"name\": \"b\",\n                        \"default\": 1\n                    }\n                ],\n                \"from_dict\": {\n                    \"b\": 1\n                }\n            },\n            \"expected_output\": \"error=invalid_request\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 9: Ignoring Unknown Arguments\n\n**As a developer**, I want to consume known flags and collect the rest for downstream tools.\n\n**Expected Behavior / Usage:**\n\nIn known-only mode the parser consumes recognized arguments (converting them normally) and gathers every unrecognized token, in order, into a separate extra-arguments list instead of failing. The extra list is rendered as an additional `[a placeholder for the bracketed array content] ... ]` line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature18_known_only.json`\n\n```json\n{\n    \"description\": \"In known-only mode the parser consumes the arguments it recognizes and collects every unrecognized command-line token, in order, into a separate extra-arguments list rather than failing. Recognized arguments are still converted normally.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_int\",\n                        \"type\": \"int\",\n                        \"default\": 2\n                    }\n                ],\n                \"argv\": [\n                    \"--arg_int\",\n                    \"3\"\n                ],\n                \"parse\": {\n                    \"known_only\": true\n                },\n                \"show\": [\n                    \"values\",\n                    \"extra\"\n                ]\n            },\n            \"expected_output\": \"arg_int=int:3\\n[a placeholder for the bracketed array content]]\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_int\",\n                        \"type\": \"int\",\n                        \"default\": 2\n                    }\n                ],\n                \"argv\": [\n                    \"--arg_int\",\n                    \"3\",\n                    \"--arg_float\",\n                    \"3.3\"\n                ],\n                \"parse\": {\n                    \"known_only\": true\n                },\n                \"show\": [\n                    \"values\",\n                    \"extra\"\n                ]\n            },\n            \"expected_output\": \"arg_int=int:3\\n[a placeholder for the bracketed array content]str:--arg_float, str:3.3]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 10: Dash-Style Flag Naming\n\n**As a developer**, I want to spell multi-word flags with dashes while keeping underscore attributes.\n\n**Expected Behavior / Usage:**\n\nWith underscore-to-dash conversion enabled, multi-word flags are spelled with dashes on the command line while resolved attribute names keep underscores. This applies both to annotated fields and to flags registered at configuration time.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature19_underscores_to_dashes.json`\n\n```json\n{\n    \"description\": \"When underscore-to-dash conversion is enabled, multi-word flag names are spelled with dashes on the command line instead of underscores, while the resolved attribute names keep their underscore form. This applies to annotated fields and to flags registered at configuration time.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg\",\n                        \"type\": \"int\",\n                        \"default\": 10\n                    },\n                    {\n                        \"name\": \"arg_u_ment\",\n                        \"type\": \"int\",\n                        \"default\": 10\n                    },\n                    {\n                        \"name\": \"arg_you_mean_\",\n                        \"type\": \"int\",\n                        \"default\": 10\n                    }\n                ],\n                \"init\": {\n                    \"underscores_to_dashes\": true\n                },\n                \"argv\": [\n                    \"--arg\",\n                    \"11\",\n                    \"--arg-u-ment\",\n                    \"12\",\n                    \"--arg-you-mean-\",\n                    \"13\"\n                ]\n            },\n            \"expected_output\": \"arg=int:11\\narg_u_ment=int:12\\narg_you_mean_=int:13\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"foo_arg\",\n                        \"type\": \"str\",\n                        \"default\": \"foo_arg\"\n                    },\n                    {\n                        \"name\": \"foo_arg_2\",\n                        \"type\": \"Optional[int]\",\n                        \"default\": null\n                    }\n                ],\n                \"configure\": [\n                    {\n                        \"flags\": [\n                            \"-f\",\n                            \"--foo-arg\"\n                        ]\n                    },\n                    {\n                        \"flags\": [\n                            \"-f2\",\n                            \"--foo-arg-2\"\n                        ]\n                    }\n                ],\n                \"init\": {\n                    \"underscores_to_dashes\": true\n                },\n                \"argv\": [\n                    \"-f2\",\n                    \"2\"\n                ]\n            },\n            \"expected_output\": \"foo_arg=str:foo_arg\\nfoo_arg_2=int:2\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 11: Configuration Files\n\n**As a developer**, I want to load arguments from files with clear precedence and error handling.\n\n**Expected Behavior / Usage:**\n\n*11.1 Loading and precedence*\n\nArguments can be loaded from configuration files containing command-line-style flag tokens. Command-line arguments override config values, and among multiple config files later files override earlier ones. Config content supports shell-style comments and quoted multi-word values.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature20_config_files.json`\n\n```json\n{\n    \"description\": \"Arguments can be loaded from one or more configuration files, each containing command-line-style flag tokens. Command-line arguments override config values; among multiple config files, later files override earlier ones. Config content supports shell-style comments and quoted multi-word values.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"int\"\n                    },\n                    {\n                        \"name\": \"b\",\n                        \"type\": \"str\",\n                        \"default\": \"b\"\n                    }\n                ],\n                \"init\": {\n                    \"config_files_content\": [\n                        \"--a 1\"\n                    ]\n                },\n                \"argv\": []\n            },\n            \"expected_output\": \"a=int:1\\nb=str:b\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"int\"\n                    },\n                    {\n                        \"name\": \"b\",\n                        \"type\": \"str\",\n                        \"default\": \"b\"\n                    }\n                ],\n                \"init\": {\n                    \"config_files_content\": [\n                        \"--a 1 --b two\"\n                    ]\n                },\n                \"argv\": [\n                    \"--a\",\n                    \"2\"\n                ]\n            },\n            \"expected_output\": \"a=int:2\\nb=str:two\\n\"\n        }\n    ]\n}\n```\n\n*11.2 Configuration errors*\n\nPointing at a nonexistent config path fails with a file-not-found error (`error=file_not_found`); content that cannot be tokenized into valid flags fails with a usage error; and a required field still unprovided after applying all config files and the command line fails with a usage error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature21_config_errors.json`\n\n```json\n{\n    \"description\": \"Configuration-file handling fails cleanly: pointing at a path that does not exist raises a file-not-found error; content that cannot be parsed as valid flag tokens raises a usage error; and a required argument that is still not provided by any config file or the command line raises a usage error.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [],\n                \"init\": {\n                    \"config_files\": [\n                        \"nope\"\n                    ]\n                },\n                \"argv\": []\n            },\n            \"expected_output\": \"error=file_not_found\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"int\"\n                    },\n                    {\n                        \"name\": \"b\",\n                        \"type\": \"str\",\n                        \"default\": \"b\"\n                    }\n                ],\n                \"init\": {\n                    \"config_files_content\": [\n                        \"--b fore\"\n                    ]\n                },\n                \"argv\": []\n            },\n            \"expected_output\": \"error=usage\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 12: Accumulating Actions\n\n**As a developer**, I want to build up values from repeated flags via append, count, and extend.\n\n**Expected Behavior / Usage:**\n\nConfiguration-time fields can opt into accumulation: an append action adds one converted value per occurrence onto the list default; an append-constant action appends a fixed constant per occurrence; a count action tallies occurrences onto a numeric default; and an extend action flattens multiple multi-valued occurrences into the default list.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature22_actions.json`\n\n```json\n{\n    \"description\": \"Configuration-time arguments can opt into accumulation behaviors: an append action collects one converted value per occurrence onto the list default; an append-constant action appends a fixed constant per occurrence; a count action tallies the number of occurrences onto a numeric default; and an extend action flattens multiple multi-valued occurrences into the default list.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg\",\n                        \"type\": \"List[int]\",\n                        \"default\": [\n                            1,\n                            2\n                        ]\n                    }\n                ],\n                \"configure\": [\n                    {\n                        \"flags\": [\n                            \"--arg\"\n                        ],\n                        \"kwargs\": {\n                            \"action\": \"append\"\n                        }\n                    }\n                ],\n                \"argv\": [\n                    \"--arg\",\n                    \"3\",\n                    \"--arg\",\n                    \"4\"\n                ]\n            },\n            \"expected_output\": \"arg=[int:1, int:2, int:3, int:4]\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg\",\n                        \"type\": \"int\",\n                        \"default\": 7\n                    }\n                ],\n                \"configure\": [\n                    {\n                        \"flags\": [\n                            \"--arg\",\n                            \"-a\"\n                        ],\n                        \"kwargs\": {\n                            \"action\": \"count\"\n                        }\n                    }\n                ],\n                \"argv\": [\n                    \"-aaa\",\n                    \"--arg\"\n                ]\n            },\n            \"expected_output\": \"arg=int:11\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 13: Subcommands\n\n**As a developer**, I want to expose distinct command modes each with their own arguments.\n\n**Expected Behavior / Usage:**\n\nA parser can register named subcommands. Selecting a subcommand activates only that subcommand's arguments; top-level arguments remain available before the subcommand token. With no subcommand selected, only top-level arguments are present, and a subcommand's own arguments are absent unless that subcommand is chosen.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature23_subparsers.json`\n\n```json\n{\n    \"description\": \"A parser can register named subcommands, each with its own arguments. Selecting a subcommand on the command line activates only that subcommand's arguments; the top-level arguments remain available before the subcommand token. When no subcommand is selected, only the top-level arguments are present. A subcommand's own arguments are unavailable unless that subcommand is chosen.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"foo\",\n                        \"type\": \"bool\",\n                        \"default\": false\n                    }\n                ],\n                \"subparsers\": {\n                    \"items\": [\n                        {\n                            \"flag\": \"a\",\n                            \"spec\": {\n                                \"arguments\": [\n                                    {\n                                        \"name\": \"bar\",\n                                        \"type\": \"int\"\n                                    }\n                                ]\n                            }\n                        },\n                        {\n                            \"flag\": \"b\",\n                            \"spec\": {\n                                \"arguments\": [\n                                    {\n                                        \"name\": \"baz\",\n                                        \"type\": \"Literal['X', 'Y', 'Z']\"\n                                    }\n                                ]\n                            }\n                        }\n                    ]\n                },\n                \"argv\": [\n                    \"a\",\n                    \"--bar\",\n                    \"1\"\n                ]\n            },\n            \"expected_output\": \"bar=int:1\\nfoo=bool:False\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"foo\",\n                        \"type\": \"bool\",\n                        \"default\": false\n                    }\n                ],\n                \"subparsers\": {\n                    \"items\": [\n                        {\n                            \"flag\": \"a\",\n                            \"spec\": {\n                                \"arguments\": [\n                                    {\n                                        \"name\": \"bar\",\n                                        \"type\": \"int\"\n                                    }\n                                ]\n                            }\n                        },\n                        {\n                            \"flag\": \"b\",\n                            \"spec\": {\n                                \"arguments\": [\n                                    {\n                                        \"name\": \"baz\",\n                                        \"type\": \"Literal['X', 'Y', 'Z']\"\n                                    }\n                                ]\n                            }\n                        }\n                    ]\n                },\n                \"argv\": [\n                    \"--foo\",\n                    \"b\",\n                    \"--baz\",\n                    \"X\"\n                ]\n            },\n            \"expected_output\": \"baz=str:X\\nfoo=bool:True\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 14: Overriding Inferred Settings\n\n**As a developer**, I want to fine-tune a field's inferred default, type, and flag aliases.\n\n**Expected Behavior / Usage:**\n\nRe-declaring an annotated field at configuration time overrides inferred settings: a supplied default replaces the inferred one, and a supplied conversion type replaces the inferred type (a numeric field can be forced to stay text). A flag may expose single-dash and double-dash aliases.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature24_override_inferred.json`\n\n```json\n{\n    \"description\": \"Re-declaring an annotated field at configuration time lets the developer override the inferred settings: a supplied default replaces the inferred one, and a supplied conversion type replaces the inferred type (so a field annotated as numeric can be forced to stay text). Flags may use a single dash, double dash, or both as aliases.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_str\",\n                        \"type\": \"str\",\n                        \"default\": \"hello there\"\n                    }\n                ],\n                \"configure\": [\n                    {\n                        \"flags\": [\n                            \"--arg_str\"\n                        ],\n                        \"kwargs\": {\n                            \"default\": \"yo dude\"\n                        }\n                    }\n                ],\n                \"argv\": []\n            },\n            \"expected_output\": \"arg_str=str:yo dude\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"arg_int\",\n                        \"type\": \"int\",\n                        \"default\": -100\n                    }\n                ],\n                \"configure\": [\n                    {\n                        \"flags\": [\n                            \"--arg_int\"\n                        ],\n                        \"kwargs\": {\n                            \"type\": \"str\"\n                        }\n                    }\n                ],\n                \"argv\": [\n                    \"--arg_int\",\n                    \"yo dude\"\n                ]\n            },\n            \"expected_output\": \"arg_int=str:yo dude\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 15: Lifecycle Errors\n\n**As a developer**, I want to have parser misuse reported rather than silently mishandled.\n\n**Expected Behavior / Usage:**\n\nParsing the command line more than once on the same parser instance is an invalid request, and adding a new argument after the parser has finished initializing is likewise an invalid request (`error=invalid_request`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature25_lifecycle_errors.json`\n\n```json\n{\n    \"description\": \"The parser enforces its usage lifecycle. Parsing the command line more than once on the same parser instance is an invalid request, and adding a new argument after the parser has finished initializing is likewise an invalid request.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"int\",\n                        \"default\": 5\n                    }\n                ],\n                \"argv\": [\n                    \"--a\",\n                    \"6\"\n                ],\n                \"parse_twice\": true\n            },\n            \"expected_output\": \"error=invalid_request\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"int\",\n                        \"default\": 5\n                    }\n                ],\n                \"argv\": [],\n                \"add_argument_post_init\": {\n                    \"flags\": [\n                        \"--arg\"\n                    ]\n                }\n            },\n            \"expected_output\": \"error=invalid_request\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 16: Positional Arguments\n\n**As a developer**, I want to accept order-based inputs that are still typed by their annotation.\n\n**Expected Behavior / Usage:**\n\nA field registered as a positional (no leading dash) at configuration time still draws its conversion type from the matching annotated field, so the positional token is converted to the declared type. Positional names are never rewritten by underscore-to-dash conversion.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature26_positional.json`\n\n```json\n{\n    \"description\": \"An argument can be registered as a positional (no leading dash) at configuration time while still drawing its type from the matching annotated field, so the positional token is converted to the declared type. Positional names are never rewritten by underscore-to-dash conversion.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"a\",\n                        \"type\": \"int\"\n                    }\n                ],\n                \"configure\": [\n                    {\n                        \"flags\": [\n                            \"a\"\n                        ]\n                    }\n                ],\n                \"argv\": [\n                    \"1\"\n                ]\n            },\n            \"expected_output\": \"a=int:1\\n\"\n        },\n        {\n            \"input\": {\n                \"arguments\": [\n                    {\n                        \"name\": \"under_score\",\n                        \"type\": \"int\"\n                    }\n                ],\n                \"configure\": [\n                    {\n                        \"flags\": [\n                            \"under_score\"\n                        ]\n                    }\n                ],\n                \"init\": {\n                    \"underscores_to_dashes\": true\n                },\n                \"argv\": [\n                    \"1\"\n                ]\n            },\n            \"expected_output\": \"under_score=int:1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-module codebase implementing the features above (type resolution, conversion/validation, the parser core), decoupled from standard I/O and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON request from stdin, drives the core parser per the Request & Output Contract above, and prints the resolved mapping (or a neutral error line) to stdout. It must be logically (and ideally physically) separate from the core domain.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{stem}@{index:03d}.txt` containing **only** the raw stdout from the program under test, so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- check the 'configure' section for the 'long_arg_name' mapping\n- refer to the usage_error_categories enum definition\n",
+  "oracle_data": {
+    "task_id": "swansonk14__typed-argument-parser-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "example output",
+          "formatting example",
+          "scalar default",
+          "hidden value",
+          "int:3"
+        ],
+        "oracle_response": "The replacement string is 'hi=int:3', which represents the literal output for an argument 'hi' with an integer default value of 3, formatted without a type prefix because the type annotation was omitted."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "unknown args format",
+          "extra capture output",
+          "hidden array start",
+          "token list placeholder",
+          "pickle mechanism for unknown tokens"
+        ],
+        "oracle_response": "The exact string is 'extra_args=['. This is the literal starting portion of a rendered output line that includes a list of unknown command line tokens (extra args), followed by a comma-separated list of those tokens and a closing bracket."
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "invalid literal example",
+          "wrong choice value",
+          "123 format",
+          "usage error input",
+          "bad literal"
+        ],
+        "oracle_response": "The number '123' is the specific example of an invalid value provided in the context of a Claude (or similar lexer-based) error for a Literal type constraint, where non-5-digit strings do not match the expected set."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "check the 'configure' section for the 'long_arg_name' mapping",
+        "actual_meaning": "The codebase uses a specific configuration object or configuration list (often a subclass like 'subcommand_config' or passed via 'configure' flags) where the actual argument names are overridden by keys named 'long_arg_name' before the standard 'name' field is used for output rendering."
+      },
+      {
+        "vague_reference": "refer to the usage_error_categories enum definition",
+        "actual_meaning": "This field refers to a hardcoded list of valid error category strings (e.g., 'usage', 'file_not_found') defined in an enum or configuration file, explicitly excluding certain types like 'invalid_type_configuration' which should fall into a different handler."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature01_typed_scalar.json": {
+      "description": "Declare a single argument annotated with a scalar type and an inline default value. When the command line does not supply the flag, the parsed value equals the declared default. When the flag is supplied, the parsed value is the string token taken from the command line. The rendered output lists the field name and its typed value.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "greeting",
+                "type": "str",
+                "default": "sup"
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "greeting=str:sup\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "greeting",
+                "type": "str",
+                "default": "sup"
+              }
+            ],
+            "argv": [
+              "--greeting",
+              "yo"
+            ]
+          },
+          "expected_output": "greeting=str:yo\n"
+        }
+      ]
+    },
+    "feature02_untyped_argument.json": {
+      "description": "Arguments may be declared with only a default value and no type annotation, or added at configuration time with no annotation at all. An untyped argument keeps its default when the flag is absent; when supplied on the command line its value is taken verbatim as text (no numeric conversion is inferred). A configuration-time flag with no backing default simply captures the supplied text.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "hi",
+                "default": 3
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "hi=int:3\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "hi",
+                "default": 3
+              }
+            ],
+            "argv": [
+              "--hi",
+              "yo"
+            ]
+          },
+          "expected_output": "hi=str:yo\n"
+        }
+      ]
+    },
+    "feature03_string_annotation.json": {
+      "description": "Type annotations may be provided as strings (forward references) rather than as live type objects; they are resolved to the same behavior. A scalar string annotation drives numeric conversion and a parameterized collection string annotation drives element-wise conversion of a whitespace-separated list. Defaults apply when flags are absent.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a_number",
+                "type": "int",
+                "default": 3
+              },
+              {
+                "name": "a_list",
+                "type": "List[float]",
+                "default": [
+                  3.7,
+                  0.3
+                ]
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "a_list=[float:3.7, float:0.3]\na_number=int:3\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a_number",
+                "type": "int",
+                "default": 3
+              },
+              {
+                "name": "a_list",
+                "type": "List[float]",
+                "default": [
+                  3.7,
+                  0.3
+                ]
+              }
+            ],
+            "argv": [
+              "--a_number",
+              "42",
+              "--a_list",
+              "3",
+              "4",
+              "0.7"
+            ]
+          },
+          "expected_output": "a_list=[float:3.0, float:4.0, float:0.7]\na_number=int:42\n"
+        }
+      ]
+    },
+    "feature04_required_arguments.json": {
+      "description": "An annotated argument with no default value is required. If any required argument is missing from the command line the parse fails with a usage error. When every required argument is supplied the parse succeeds and the values are converted according to their annotations.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_str_required",
+                "type": "str"
+              },
+              {
+                "name": "arg_list_str_required",
+                "type": "List[str]"
+              }
+            ],
+            "argv": [
+              "--arg_str_required",
+              "tappy"
+            ]
+          },
+          "expected_output": "error=usage\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_str_required",
+                "type": "str"
+              },
+              {
+                "name": "arg_list_str_required",
+                "type": "List[str]"
+              }
+            ],
+            "argv": [
+              "--arg_str_required",
+              "tappy",
+              "--arg_list_str_required",
+              "hi",
+              "there"
+            ]
+          },
+          "expected_output": "arg_list_str_required=[str:hi, str:there]\narg_str_required=str:tappy\n"
+        }
+      ]
+    },
+    "feature05_implicit_bool.json": {
+      "description": "A boolean argument with a default value becomes a no-argument flag whose presence flips it to the opposite of its default: a field defaulting to true reads as false when the flag is given, and a field defaulting to false reads as true when the flag is given. When neither flag is present both keep their declared defaults.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_true",
+                "type": "bool",
+                "default": true
+              },
+              {
+                "name": "arg_false",
+                "type": "bool",
+                "default": false
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "arg_false=bool:False\narg_true=bool:True\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_true",
+                "type": "bool",
+                "default": true
+              },
+              {
+                "name": "arg_false",
+                "type": "bool",
+                "default": false
+              }
+            ],
+            "argv": [
+              "--arg_true",
+              "--arg_false"
+            ]
+          },
+          "expected_output": "arg_false=bool:True\narg_true=bool:False\n"
+        }
+      ]
+    },
+    "feature06_explicit_bool.json": {
+      "description": "In explicit-boolean mode a boolean argument expects a literal truth value as its argument. Truthy spellings (full word, single letter, or one) parse to true and falsy spellings (full word, single letter, or zero) parse to false, in any capitalization. Omitting the value after the flag, or omitting a required boolean entirely, is a usage error.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "is_gpu",
+                "type": "bool"
+              }
+            ],
+            "init": {
+              "explicit_bool": true
+            },
+            "argv": [
+              "--is_gpu",
+              "True"
+            ]
+          },
+          "expected_output": "is_gpu=bool:True\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "is_gpu",
+                "type": "bool"
+              }
+            ],
+            "init": {
+              "explicit_bool": true
+            },
+            "argv": [
+              "--is_gpu",
+              "False"
+            ]
+          },
+          "expected_output": "is_gpu=bool:False\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "is_gpu",
+                "type": "bool"
+              }
+            ],
+            "init": {
+              "explicit_bool": true
+            },
+            "argv": [
+              "--is_gpu"
+            ]
+          },
+          "expected_output": "error=usage\n"
+        }
+      ]
+    },
+    "feature07_literal_choices.json": {
+      "description": "A literal-typed argument restricts the accepted values to a fixed set of allowed options and converts the chosen value to the type of the matching option (so a string option stays text, a numeric option becomes a number, and a boolean option becomes a boolean). Supplying a value outside the allowed set is a usage error. The default is used when the flag is absent.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_literal",
+                "type": "Literal['english', 'A', True, 88.9, 100]",
+                "default": "A"
+              }
+            ],
+            "argv": [
+              "--arg_literal",
+              "88.9"
+            ]
+          },
+          "expected_output": "arg_literal=float:88.9\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_lit",
+                "type": "Literal['125', 'no, 3 sir']"
+              }
+            ],
+            "argv": [
+              "--arg_lit",
+              "123"
+            ]
+          },
+          "expected_output": "error=usage\n"
+        }
+      ]
+    },
+    "feature08_optional_types.json": {
+      "description": "An optional-typed argument defaults to an empty (none) value and, when supplied, converts the command-line text to the inner type. Several optional arguments of different inner types can coexist; each is converted independently.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "opt_str",
+                "type": "Optional[str]",
+                "default": null
+              },
+              {
+                "name": "opt_int",
+                "type": "Optional[int]",
+                "default": null
+              },
+              {
+                "name": "opt_float",
+                "type": "Optional[float]",
+                "default": null
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "opt_float=none\nopt_int=none\nopt_str=none\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "opt_str",
+                "type": "Optional[str]",
+                "default": null
+              },
+              {
+                "name": "opt_int",
+                "type": "Optional[int]",
+                "default": null
+              },
+              {
+                "name": "opt_float",
+                "type": "Optional[float]",
+                "default": null
+              }
+            ],
+            "argv": [
+              "--opt_str",
+              "hello",
+              "--opt_int",
+              "77",
+              "--opt_float",
+              "7.7"
+            ]
+          },
+          "expected_output": "opt_float=float:7.7\nopt_int=int:77\nopt_str=str:hello\n"
+        }
+      ]
+    },
+    "feature09_list_arguments.json": {
+      "description": "A list-typed argument consumes all whitespace-separated tokens following its flag and converts each element to the declared element type (bare list keeps strings, and typed lists convert to integers, floats, or booleans). Element order is preserved.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "list_",
+                "type": "List"
+              },
+              {
+                "name": "list_int",
+                "type": "List[int]"
+              },
+              {
+                "name": "list_str",
+                "type": "List[str]"
+              },
+              {
+                "name": "list_bool",
+                "type": "List[bool]"
+              }
+            ],
+            "argv": [
+              "--list_",
+              "I",
+              "was",
+              "wondering",
+              "--list_int",
+              "0",
+              "1",
+              "2",
+              "--list_str",
+              "a",
+              "bee",
+              "cd",
+              "ee",
+              "--list_bool",
+              "True",
+              "False"
+            ]
+          },
+          "expected_output": "list_=[str:I, str:was, str:wondering]\nlist_bool=[bool:True, bool:False]\nlist_int=[int:0, int:1, int:2]\nlist_str=[str:a, str:bee, str:cd, str:ee]\n"
+        }
+      ]
+    },
+    "feature10_set_arguments.json": {
+      "description": "A set-typed argument consumes the whitespace-separated tokens after its flag, converts each to the declared element type, and collapses duplicate values into a unique collection (membership only, order not significant).",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "set_int",
+                "type": "Set[int]"
+              },
+              {
+                "name": "set_str",
+                "type": "Set[str]"
+              }
+            ],
+            "argv": [
+              "--set_int",
+              "1",
+              "2",
+              "2",
+              "3",
+              "--set_str",
+              "a",
+              "bee",
+              "cd"
+            ]
+          },
+          "expected_output": "set_int={int:1, int:2, int:3}\nset_str={str:a, str:bee, str:cd}\n"
+        }
+      ]
+    },
+    "feature11_tuple_arguments.json": {
+      "description": "A tuple-typed argument fixes the number and per-position types of its elements. A bare tuple keeps an arbitrary number of string elements; a single-element typed tuple yields one converted element; a homogeneous ellipsis tuple converts an arbitrary number of elements to one type; and a fully enumerated tuple converts each position to its own declared type.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "tup_str",
+                "type": "Tuple[str]"
+              },
+              {
+                "name": "tup_int",
+                "type": "Tuple[int]"
+              },
+              {
+                "name": "tup_float",
+                "type": "Tuple[float]"
+              },
+              {
+                "name": "tup_bool",
+                "type": "Tuple[bool]"
+              }
+            ],
+            "argv": [
+              "--tup_str",
+              "hello",
+              "--tup_int",
+              "445",
+              "--tup_float",
+              "7.9",
+              "--tup_bool",
+              "tru"
+            ]
+          },
+          "expected_output": "tup_bool=(bool:True)\ntup_float=(float:7.9)\ntup_int=(int:445)\ntup_str=(str:hello)\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "tup_int",
+                "type": "Tuple[int, ...]"
+              },
+              {
+                "name": "tup_bool",
+                "type": "Tuple[bool, ...]"
+              }
+            ],
+            "argv": [
+              "--tup_int",
+              "2",
+              "3",
+              "4",
+              "--tup_bool",
+              "false",
+              "true",
+              "0",
+              "1",
+              "tru"
+            ]
+          },
+          "expected_output": "tup_bool=(bool:False, bool:True, bool:False, bool:True, bool:True)\ntup_int=(int:2, int:3, int:4)\n"
+        }
+      ]
+    },
+    "feature12_tuple_errors.json": {
+      "description": "A typed tuple enforces both the count and the per-position types of its elements. Supplying an element that cannot be converted to its declared type, supplying the wrong number of elements, or supplying elements in an order that violates the position types, all fail with a usage error. Declaring an empty tuple type is rejected up front as an invalid type configuration.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "tup",
+                "type": "Tuple[int]"
+              }
+            ],
+            "argv": [
+              "--tup",
+              "tomato"
+            ]
+          },
+          "expected_output": "error=usage\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "tup",
+                "type": "Tuple[()]"
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "error=invalid_type_configuration\n"
+        }
+      ]
+    },
+    "feature13_noncollection_default.json": {
+      "description": "If a collection-typed argument is given a default that is not itself a collection (for example an empty/none value or a bare scalar), and the flag is not supplied on the command line, the declared default value is returned unchanged without any collection conversion.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "set_1",
+                "type": "Set[str]",
+                "default": null
+              },
+              {
+                "name": "set_2",
+                "type": "Set[int]",
+                "default": 3.7
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "set_1=none\nset_2=float:3.7\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "tup_1",
+                "type": "Tuple[int, str]",
+                "default": null
+              },
+              {
+                "name": "tup_2",
+                "type": "Tuple[str, int]",
+                "default": 3
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "tup_1=none\ntup_2=int:3\n"
+        }
+      ]
+    },
+    "feature14_path_types.json": {
+      "description": "A filesystem-path type is supported as a scalar element type and inside optional, list, set, and tuple containers. Each supplied token is wrapped into a path value; collections of paths preserve their respective semantics (list ordered, set unique, tuple fixed-length).",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "path",
+                "type": "Path"
+              },
+              {
+                "name": "optional_path",
+                "type": "Optional[Path]"
+              },
+              {
+                "name": "list_path",
+                "type": "List[Path]"
+              },
+              {
+                "name": "tuple_path",
+                "type": "Tuple[Path, Path]"
+              }
+            ],
+            "argv": [
+              "--path",
+              "/path/to/file.txt",
+              "--optional_path",
+              "/path/to/optional/file.txt",
+              "--list_path",
+              "/path/to/list/file1.txt",
+              "/path/to/list/file2.txt",
+              "--tuple_path",
+              "/path/to/tuple/file1.txt",
+              "/path/to/tuple/file2.txt"
+            ]
+          },
+          "expected_output": "list_path=[path:/path/to/list/file1.txt, path:/path/to/list/file2.txt]\noptional_path=path:/path/to/optional/file.txt\npath=path:/path/to/file.txt\ntuple_path=(path:/path/to/tuple/file1.txt, path:/path/to/tuple/file2.txt)\n"
+        }
+      ]
+    },
+    "feature15_union_requires_converter.json": {
+      "description": "A general union of two or more concrete types (other than an optional, i.e. a type combined with none) cannot be parsed automatically because the parser cannot know which member type to convert to. Declaring such a union without supplying an explicit conversion function is rejected as an invalid type configuration.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg",
+                "type": "Union[int, float]"
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "error=invalid_type_configuration\n"
+        }
+      ]
+    },
+    "feature16_as_dict.json": {
+      "description": "After parsing, the full set of resolved arguments can be retrieved as a name-to-value mapping. The mapping includes typed fields, untyped fields, optional fields (with their none defaults), and collection fields, as well as arguments introduced under a renamed destination at configuration time.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "str"
+              },
+              {
+                "name": "b",
+                "default": 1
+              },
+              {
+                "name": "c",
+                "type": "bool",
+                "default": true
+              },
+              {
+                "name": "d",
+                "type": "Tuple[str, ...]",
+                "default": {
+                  "__tuple__": [
+                    "hi",
+                    "bob"
+                  ]
+                }
+              },
+              {
+                "name": "e",
+                "type": "Optional[int]",
+                "default": null
+              },
+              {
+                "name": "f",
+                "type": "Set[int]",
+                "default": {
+                  "__set__": [
+                    1
+                  ]
+                }
+              }
+            ],
+            "argv": [
+              "--a",
+              "hi"
+            ]
+          },
+          "expected_output": "a=str:hi\nb=int:1\nc=bool:True\nd=(str:hi, str:bob)\ne=none\nf={int:1}\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "str"
+              },
+              {
+                "name": "b",
+                "default": 1
+              }
+            ],
+            "configure": [
+              {
+                "flags": [
+                  "-arg_name",
+                  "--long_arg_name"
+                ]
+              }
+            ],
+            "argv": [
+              "--a",
+              "hi",
+              "--long_arg_name",
+              "arg"
+            ]
+          },
+          "expected_output": "a=str:hi\nb=int:1\nlong_arg_name=str:arg\n"
+        }
+      ]
+    },
+    "feature17_from_dict.json": {
+      "description": "A parser can be populated directly from a name-to-value mapping instead of from the command line, reproducing the same retrievable arguments. If the mapping omits a required argument that has no default, population fails with an invalid-request error.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "str"
+              },
+              {
+                "name": "d",
+                "type": "Tuple[str, ...]"
+              },
+              {
+                "name": "b",
+                "default": 1
+              },
+              {
+                "name": "c",
+                "type": "bool",
+                "default": true
+              },
+              {
+                "name": "e",
+                "type": "Optional[int]",
+                "default": null
+              },
+              {
+                "name": "f",
+                "type": "Set[int]",
+                "default": {
+                  "__set__": [
+                    1
+                  ]
+                }
+              }
+            ],
+            "from_dict": {
+              "a": "hi",
+              "d": {
+                "__tuple__": [
+                  "a",
+                  "b"
+                ]
+              },
+              "b": 1,
+              "c": true,
+              "e": 7,
+              "f": {
+                "__set__": [
+                  1
+                ]
+              }
+            }
+          },
+          "expected_output": "a=str:hi\nb=int:1\nc=bool:True\nd=(str:a, str:b)\ne=int:7\nf={int:1}\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "str"
+              },
+              {
+                "name": "b",
+                "default": 1
+              }
+            ],
+            "from_dict": {
+              "b": 1
+            }
+          },
+          "expected_output": "error=invalid_request\n"
+        }
+      ]
+    },
+    "feature18_known_only.json": {
+      "description": "In known-only mode the parser consumes the arguments it recognizes and collects every unrecognized command-line token, in order, into a separate extra-arguments list rather than failing. Recognized arguments are still converted normally.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_int",
+                "type": "int",
+                "default": 2
+              }
+            ],
+            "argv": [
+              "--arg_int",
+              "3"
+            ],
+            "parse": {
+              "known_only": true
+            },
+            "show": [
+              "values",
+              "extra"
+            ]
+          },
+          "expected_output": "arg_int=int:3\nextra_args=[]\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_int",
+                "type": "int",
+                "default": 2
+              }
+            ],
+            "argv": [
+              "--arg_int",
+              "3",
+              "--arg_float",
+              "3.3"
+            ],
+            "parse": {
+              "known_only": true
+            },
+            "show": [
+              "values",
+              "extra"
+            ]
+          },
+          "expected_output": "arg_int=int:3\nextra_args=[str:--arg_float, str:3.3]\n"
+        }
+      ]
+    },
+    "feature19_underscores_to_dashes.json": {
+      "description": "When underscore-to-dash conversion is enabled, multi-word flag names are spelled with dashes on the command line instead of underscores, while the resolved attribute names keep their underscore form. This applies to annotated fields and to flags registered at configuration time.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg",
+                "type": "int",
+                "default": 10
+              },
+              {
+                "name": "arg_u_ment",
+                "type": "int",
+                "default": 10
+              },
+              {
+                "name": "arg_you_mean_",
+                "type": "int",
+                "default": 10
+              }
+            ],
+            "init": {
+              "underscores_to_dashes": true
+            },
+            "argv": [
+              "--arg",
+              "11",
+              "--arg-u-ment",
+              "12",
+              "--arg-you-mean-",
+              "13"
+            ]
+          },
+          "expected_output": "arg=int:11\narg_u_ment=int:12\narg_you_mean_=int:13\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "foo_arg",
+                "type": "str",
+                "default": "foo_arg"
+              },
+              {
+                "name": "foo_arg_2",
+                "type": "Optional[int]",
+                "default": null
+              }
+            ],
+            "configure": [
+              {
+                "flags": [
+                  "-f",
+                  "--foo-arg"
+                ]
+              },
+              {
+                "flags": [
+                  "-f2",
+                  "--foo-arg-2"
+                ]
+              }
+            ],
+            "init": {
+              "underscores_to_dashes": true
+            },
+            "argv": [
+              "-f2",
+              "2"
+            ]
+          },
+          "expected_output": "foo_arg=str:foo_arg\nfoo_arg_2=int:2\n"
+        }
+      ]
+    },
+    "feature20_config_files.json": {
+      "description": "Arguments can be loaded from one or more configuration files, each containing command-line-style flag tokens. Command-line arguments override config values; among multiple config files, later files override earlier ones. Config content supports shell-style comments and quoted multi-word values.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "int"
+              },
+              {
+                "name": "b",
+                "type": "str",
+                "default": "b"
+              }
+            ],
+            "init": {
+              "config_files_content": [
+                "--a 1"
+              ]
+            },
+            "argv": []
+          },
+          "expected_output": "a=int:1\nb=str:b\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "int"
+              },
+              {
+                "name": "b",
+                "type": "str",
+                "default": "b"
+              }
+            ],
+            "init": {
+              "config_files_content": [
+                "--a 1 --b two"
+              ]
+            },
+            "argv": [
+              "--a",
+              "2"
+            ]
+          },
+          "expected_output": "a=int:2\nb=str:two\n"
+        }
+      ]
+    },
+    "feature21_config_errors.json": {
+      "description": "Configuration-file handling fails cleanly: pointing at a path that does not exist raises a file-not-found error; content that cannot be parsed as valid flag tokens raises a usage error; and a required argument that is still not provided by any config file or the command line raises a usage error.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [],
+            "init": {
+              "config_files": [
+                "nope"
+              ]
+            },
+            "argv": []
+          },
+          "expected_output": "error=file_not_found\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "int"
+              },
+              {
+                "name": "b",
+                "type": "str",
+                "default": "b"
+              }
+            ],
+            "init": {
+              "config_files_content": [
+                "--b fore"
+              ]
+            },
+            "argv": []
+          },
+          "expected_output": "error=usage\n"
+        }
+      ]
+    },
+    "feature22_actions.json": {
+      "description": "Configuration-time arguments can opt into accumulation behaviors: an append action collects one converted value per occurrence onto the list default; an append-constant action appends a fixed constant per occurrence; a count action tallies the number of occurrences onto a numeric default; and an extend action flattens multiple multi-valued occurrences into the default list.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg",
+                "type": "List[int]",
+                "default": [
+                  1,
+                  2
+                ]
+              }
+            ],
+            "configure": [
+              {
+                "flags": [
+                  "--arg"
+                ],
+                "kwargs": {
+                  "action": "append"
+                }
+              }
+            ],
+            "argv": [
+              "--arg",
+              "3",
+              "--arg",
+              "4"
+            ]
+          },
+          "expected_output": "arg=[int:1, int:2, int:3, int:4]\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg",
+                "type": "int",
+                "default": 7
+              }
+            ],
+            "configure": [
+              {
+                "flags": [
+                  "--arg",
+                  "-a"
+                ],
+                "kwargs": {
+                  "action": "count"
+                }
+              }
+            ],
+            "argv": [
+              "-aaa",
+              "--arg"
+            ]
+          },
+          "expected_output": "arg=int:11\n"
+        }
+      ]
+    },
+    "feature23_subparsers.json": {
+      "description": "A parser can register named subcommands, each with its own arguments. Selecting a subcommand on the command line activates only that subcommand's arguments; the top-level arguments remain available before the subcommand token. When no subcommand is selected, only the top-level arguments are present. A subcommand's own arguments are unavailable unless that subcommand is chosen.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "foo",
+                "type": "bool",
+                "default": false
+              }
+            ],
+            "subparsers": {
+              "items": [
+                {
+                  "flag": "a",
+                  "spec": {
+                    "arguments": [
+                      {
+                        "name": "bar",
+                        "type": "int"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "flag": "b",
+                  "spec": {
+                    "arguments": [
+                      {
+                        "name": "baz",
+                        "type": "Literal['X', 'Y', 'Z']"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "argv": [
+              "a",
+              "--bar",
+              "1"
+            ]
+          },
+          "expected_output": "bar=int:1\nfoo=bool:False\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "foo",
+                "type": "bool",
+                "default": false
+              }
+            ],
+            "subparsers": {
+              "items": [
+                {
+                  "flag": "a",
+                  "spec": {
+                    "arguments": [
+                      {
+                        "name": "bar",
+                        "type": "int"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "flag": "b",
+                  "spec": {
+                    "arguments": [
+                      {
+                        "name": "baz",
+                        "type": "Literal['X', 'Y', 'Z']"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "argv": [
+              "--foo",
+              "b",
+              "--baz",
+              "X"
+            ]
+          },
+          "expected_output": "baz=str:X\nfoo=bool:True\n"
+        }
+      ]
+    },
+    "feature24_override_inferred.json": {
+      "description": "Re-declaring an annotated field at configuration time lets the developer override the inferred settings: a supplied default replaces the inferred one, and a supplied conversion type replaces the inferred type (so a field annotated as numeric can be forced to stay text). Flags may use a single dash, double dash, or both as aliases.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_str",
+                "type": "str",
+                "default": "hello there"
+              }
+            ],
+            "configure": [
+              {
+                "flags": [
+                  "--arg_str"
+                ],
+                "kwargs": {
+                  "default": "yo dude"
+                }
+              }
+            ],
+            "argv": []
+          },
+          "expected_output": "arg_str=str:yo dude\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "arg_int",
+                "type": "int",
+                "default": -100
+              }
+            ],
+            "configure": [
+              {
+                "flags": [
+                  "--arg_int"
+                ],
+                "kwargs": {
+                  "type": "str"
+                }
+              }
+            ],
+            "argv": [
+              "--arg_int",
+              "yo dude"
+            ]
+          },
+          "expected_output": "arg_int=str:yo dude\n"
+        }
+      ]
+    },
+    "feature25_lifecycle_errors.json": {
+      "description": "The parser enforces its usage lifecycle. Parsing the command line more than once on the same parser instance is an invalid request, and adding a new argument after the parser has finished initializing is likewise an invalid request.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "int",
+                "default": 5
+              }
+            ],
+            "argv": [
+              "--a",
+              "6"
+            ],
+            "parse_twice": true
+          },
+          "expected_output": "error=invalid_request\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "int",
+                "default": 5
+              }
+            ],
+            "argv": [],
+            "add_argument_post_init": {
+              "flags": [
+                "--arg"
+              ]
+            }
+          },
+          "expected_output": "error=invalid_request\n"
+        }
+      ]
+    },
+    "feature26_positional.json": {
+      "description": "An argument can be registered as a positional (no leading dash) at configuration time while still drawing its type from the matching annotated field, so the positional token is converted to the declared type. Positional names are never rewritten by underscore-to-dash conversion.",
+      "cases": [
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "a",
+                "type": "int"
+              }
+            ],
+            "configure": [
+              {
+                "flags": [
+                  "a"
+                ]
+              }
+            ],
+            "argv": [
+              "1"
+            ]
+          },
+          "expected_output": "a=int:1\n"
+        },
+        {
+          "input": {
+            "arguments": [
+              {
+                "name": "under_score",
+                "type": "int"
+              }
+            ],
+            "configure": [
+              {
+                "flags": [
+                  "under_score"
+                ]
+              }
+            ],
+            "init": {
+              "underscores_to_dashes": true
+            },
+            "argv": [
+              "1"
+            ]
+          },
+          "expected_output": "under_score=int:1\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Argument Declaration",
+      "input_condition": "User declares an argument via the 'arguments' list.",
+      "output_rule": "Each argument must have a 'name' string. 'type' is optional (defaults to string/implied). 'default' is optional. Omitting 'type' implies 'str'. Omitting 'default' implies required.",
+      "exact_values": [
+        "name"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Untyped Scalar Default Inference",
+      "input_condition": "An argument has a non-string 'default' (e.g., int 3) but no 'type' annotation.",
+      "output_rule": "If the flag is absent, render as <name>=<type:default_value> using the Python type of the default (str:int, str:float).",
+      "exact_values": [
+        "hi=int:3"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Untyped Scalar Input Override",
+      "input_condition": "An untyped or implicitly typed argument is supplied on the command line.",
+      "output_rule": "The command line token is converted verbatim as a string. No numeric conversion occurs even if the default was a number.",
+      "exact_values": [
+        "hi=str:yo"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Output Line Ordering",
+      "input_condition": "Multiple arguments are parsed.",
+      "output_rule": "Output lines MUST be sorted alphabetically by field name.",
+      "exact_values": [
+        null
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Non-Collection Default Handling",
+      "input_condition": "A collection-typed argument (List/Set/Tuple/Opt) has a non-collection 'default' (e.g., null or scalar 3) and the flag is absent.",
+      "output_rule": "Render the declared default value exactly as provided (typed based on its type), NOT as an empty collection.",
+      "exact_values": [
+        "set_1=none",
+        "tup_2=int:3"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "None Mapping Rendering",
+      "input_condition": "An argument resolves to None (either explicitly null default or null inside 'from_dict' for Optional).",
+      "output_rule": "Render as 'name=none' without a type prefix.",
+      "exact_values": [
+        "opt_str=none",
+        "e=none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Unknown Args Formatting",
+      "input_condition": "Subcommands or 'known_only=false' (implied by default behavior of extra capture) produce unknown tokens.",
+      "output_rule": "Render section as 'extra_args=[<token1>, <token2>, ...]' separated by commas and spaces.",
+      "exact_values": [
+        "extra_args=["
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "List Set Tuple Output Formatting",
+      "input_condition": "The resolved value is a List, Set, or Tuple.",
+      "output_rule": "(List: [t0, ...], Set: {t0, ...}, Tuple: (t0, ...)). Elements are type-tagged. Set elements MUST be sorted lexicographically for determinism.",
+      "exact_values": [
+        "list_=[str:I, str:was, str:wondering]",
+        "set_str={str:a, str:bee, str:cd}",
+        "tup_bool=(bool:True)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Error Output Contract",
+      "input_condition": "Any parse, config, or request failure occurs.",
+      "output_rule": "Output exactly one line: 'error=<type>'. Forbidden types: usage, file_not_found, invalid_type_configuration, invalid_request.",
+      "exact_values": [
+        "error=usage",
+        "error=file_not_found",
+        "error=invalid_type_configuration",
+        "error=invalid_request"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Usage Error Conditions",
+      "input_condition": "Missing required argument, invalid choice for Literal, tuple arity mismatch, type conversion failure.",
+      "output_rule": "Output 'error=usage'.",
+      "exact_values": [
+        "error=usage"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Invalid Type Configuration",
+      "input_condition": "Union of concrete types (e.g., Union[int, float]) or empty tuple (Tuple[()]) declared.",
+      "output_rule": "Output 'error=invalid_type_configuration' (for Union) or runtime catch for Tuple(()).",
+      "exact_values": [
+        "error=invalid_type_configuration"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Implicit Boolean Negation",
+      "input_condition": "Boolean type with default NO value (flag) where argTrue has default True, argFalse has default False.",
+      "output_rule": "Providing the flag flips the value: True->False, False->True.",
+      "exact_values": [
+        "arg_false=bool:True",
+        "arg_true=bool:False"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Explicit Boolean Mode",
+      "input_condition": "Explicit boolean mode enabled in 'init'.",
+      "output_rule": "Requires argument value. Truthy tokens (True, true, False, false, 1, 0, etc.) map accordingly. No value provided on flag = usage error.",
+      "exact_values": [
+        "is_gpu=bool:True",
+        "error=usage"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Literal Choice Error",
+      "input_condition": "Value supplied for Literal type is not in the allowed set.",
+      "output_rule": "Output 'error=usage'.",
+      "exact_values": [
+        "123",
+        "error=usage"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Path Type Handling",
+      "input_condition": "Type is 'Path' or 'List[Path]' etc.",
+      "output_rule": "Tokens are converted as string paths. Formatting matches standard Output Contract (e.g., path:/path).",
+      "exact_values": [
+        "path:/path/to/file.txt"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Invalid Request Conditions",
+      "input_condition": "Population via 'from_dict' omits a required field (type=..., no default).",
+      "output_rule": "Output 'error=invalid_request'.",
+      "exact_values": [
+        "error=invalid_request"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Action/Configure Overrides",
+      "input_condition": "'configure' list contains 'flags', 'kwargs', 'action', 'const', 'nargs'.",
+      "output_rule": "Introduce new flags' names, override 'type', or change 'action' logic (implied). 'action' is the operational key.",
+      "exact_values": [
+        "action"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Destination Naming",
+      "input_condition": "'configure' uses 'flags' list with different dash names vs declared names.",
+      "output_rule": "Unknown dependency: Mapping retrieves values by 'long_arg_name' (configured) or 'name' (declared). Output uses configured name.",
+      "exact_values": [
+        "long_arg_name=str:arg"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C002",
+        "replacement": "e.g., 'name=value:50'",
+        "exact_values_to_replace": [
+          "hi=int:3"
+        ],
+        "trigger_keywords": [
+          "example output",
+          "formatting example",
+          "scalar default",
+          "hidden value",
+          "int:3"
+        ],
+        "oracle_response": "The replacement string is 'hi=int:3', which represents the literal output for an argument 'hi' with an integer default value of 3, formatted without a type prefix because the type annotation was omitted."
+      },
+      {
+        "constraint_id": "C007",
+        "replacement": "a placeholder for the bracketed array content",
+        "exact_values_to_replace": [
+          "extra_args=["
+        ],
+        "trigger_keywords": [
+          "unknown args format",
+          "extra capture output",
+          "hidden array start",
+          "token list placeholder",
+          "pickle mechanism for unknown tokens"
+        ],
+        "oracle_response": "The exact string is 'extra_args=['. This is the literal starting portion of a rendered output line that includes a list of unknown command line tokens (extra args), followed by a comma-separated list of those tokens and a closing bracket."
+      },
+      {
+        "constraint_id": "C014",
+        "replacement": "any integer not in the allowed set, e.g., '123'",
+        "exact_values_to_replace": [
+          "123"
+        ],
+        "trigger_keywords": [
+          "invalid literal example",
+          "wrong choice value",
+          "123 format",
+          "usage error input",
+          "bad literal"
+        ],
+        "oracle_response": "The number '123' is the specific example of an invalid value provided in the context of a Claude (or similar lexer-based) error for a Literal type constraint, where non-5-digit strings do not match the expected set."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C018",
+        "vague_phrase": "check the 'configure' section for the 'long_arg_name' mapping",
+        "actual_meaning": "The codebase uses a specific configuration object or configuration list (often a subclass like 'subcommand_config' or passed via 'configure' flags) where the actual argument names are overridden by keys named 'long_arg_name' before the standard 'name' field is used for output rendering."
+      },
+      {
+        "constraint_id": "C009",
+        "vague_phrase": "refer to the usage_error_categories enum definition",
+        "actual_meaning": "This field refers to a hardcoded list of valid error category strings (e.g., 'usage', 'file_not_found') defined in an enum or configuration file, explicitly excluding certain types like 'invalid_type_configuration' which should fall into a different handler."
+      }
+    ]
+  }
+}

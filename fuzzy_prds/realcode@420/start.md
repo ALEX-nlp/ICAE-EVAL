@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up this native library integration thing we've been talking about. Basically we want devs to be able to pass strings into the native side and get them back without having to worry about all the low-level byte stuff themselves. The big pain point right now is that when devs do this manually they keep running into silent corruption issues or crashes on the native side — it's really hard to debug and it's been causing incidents. We want one clean operation that just handles it for them.
+
+The structure should be similar to how we split things out in that JSON adapter pattern we used on the last boundary project — keep the wire format parsing totally separate from the actual transfer logic, same idea here. The native side expects things in a specific byte encoding and the managed runtime doesn't always play nice with that, especially with certain special characters (you know the ones — the emoji stuff and some edge case characters that the runtime technically allows but that break things downstream).
+
+We need a test runner too, should write output files per case so we can diff them easily. The output format for each run needs to be consistent — show the operation, the result, and something that proves the value actually went through the encoding step rather than being passed through directly. Rejections should come back as clean category labels, no stack traces or runtime noise leaking into the output.

@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need to get this Rust builder codegen library wrapped up for the release. It's basically a proc-macro thing that auto-generates those typed construction APIs for structs so devs don't have to write all that boilerplate themselves. The big thing is it needs to be compile-time safe — like, if someone forgets a required field or tries to set a field they're not supposed to touch, it should blow up at compile time, not runtime. We had that issue with the old approach where hidden internal fields were accidentally settable from outside, which caused some really annoying prod bugs last quarter.
+
+Also, the library needs to handle all the Rust-specific stuff — borrows, mutable borrows, generics, lifetimes, the works. And there's that thing we discussed about how some field names conflict with Rust keywords (similar to how we handled it in the auth module refactor), make sure that's covered properly.
+
+There should also be support for optional fields with shorthand setters, boolean flag fields, defaults that depend on other field values, and the ability to clone a partially-built record and finish it in different ways. Custom names for the builder start/finalize methods would be nice too. Basically take the full spec and make sure all those construction patterns work end to end through the test harness we already have set up.
+
+One other thing to make explicit: required fields need to work in any order, not just the happy-path chaining order. We’re still doing the type-state pattern with phantom type parameters tracking what’s been set, so `set_left().set_right()` and `set_right().set_left()` both need to land on the same final `Pair { left, right }`. For `required_fields`, the output stays `record=Pair\nleft=<v>\nright=<v>\n`.
+
+On the borrowed-data side, we do need this to work for records with borrowed fields too. When `bounded` is false, the record is `BorrowedPair` with independent lifetimes, and the builder has to carry those lifetime annotations through correctly so the borrow checker is happy at the call site. For `borrowed_values`, the output is `record=BorrowedPair\nleft=<v>\nright=<v>\nbounded=false\n`.
+
+Also, the record-level defaults bit should apply across the whole record unless a field overrides it individually. For `field_default_value_policy`, the record is `FieldDefaultValues`, with `first=12` as the default, `required_text=<caller>` still required with no default, and `third=13` as the default. The expected result there is `record=FieldDefaultValues\nfirst=12\nrequired_text=bla\nthird=13\n`.
+
+For cloning, yes, this includes cloning a builder before all required fields are filled in and then finishing each clone separately. That’s `clone_partial_builder` with record `CloneBranch`, where `branch` is the index, `x` is the shared seed, `y` is per-branch, and `z` is the default string `"default"`. The two built records get concatenated as `record=CloneBranch\nbranch=0\nx=<seed>\ny=<branch0>\nz=default\nrecord=CloneBranch\nbranch=1\nx=<seed>\ny=<branch1>\nz=default\n`.
+
+On keyword-ish field names, we need to keep handling Rust reserved words by using raw identifiers like `r#type`, `r#fn`, `r#enum`, and `r#union` internally, while the generated API still uses the plain name people expect. That applies to `reserved_word_fields` and also the reserved-keyword field handling described in feature13_reserved_words_as_fields.json. The record is `ReservedWords`, with `function_value` required i32, `type_value` as Option and absent, `enum_value` as Option<()> with default `Some(())` which prints as `present:unit`, and `union_text` as required String. Output is `record=ReservedWords\nfunction_value=1\ntype_value=absent\nenum_value=present:unit\nunion_text=two\n`.
+
+There’s also the transformed setter case: for `transformed_field`, record `TransformedField`, the `point` field is set by passing `x` and `y` separately and storing them as one composite value. Expected output is `record=TransformedField\npoint.x=1\npoint.y=2\n`.
+
+And just to lock down the naming customization part, both the start function and finalize function can be renamed via attributes. The defaults are still `builder()` and `build()`, but `custom_finalize_name` covers record `CustomFinalize` with a custom build-method name, and `custom_start_name` covers record `CustomStart` with a custom builder-start name. In both cases the output is `record=<Name>\nvalue=<v>\n`.
+
+Last thing: trying to call a setter for a skipped field has to fail structurally at compile time, never as a runtime panic. For `compile_rejection`, the invalid action is `set_hidden_field`, and the harness should see `error=hidden_field_not_settable\nfield=hidden\n`.

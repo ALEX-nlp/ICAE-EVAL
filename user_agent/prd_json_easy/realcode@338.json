@@ -1,0 +1,846 @@
+{
+  "fuzzy_prd": "# Source Code Formatter for TypeScript & JavaScript - PRD\n\n## Project Goal\n\nBuild a deterministic source-code formatter for TypeScript and JavaScript (including JSX and CommonJS module variants) that rewrites arbitrary, inconsistently-styled source text into a single canonical layout. Given a snippet of source plus an optional set of style options, the formatter returns the reformatted text. Developers get consistent, opinionated formatting without hand-aligning braces, quotes, commas, and line breaks.\n\n---\n\n## Background & Problem\n\nWithout an automated formatter, developers manually normalize whitespace, indentation, quote style, semicolons, and line wrapping — either by hand or via ad-hoc, conflicting editor settings. This produces noisy diffs (a one-character change buried in a re-indentation), endless style debates in code review, and code that drifts from any agreed convention. Manual formatting is also error-prone: it is easy to introduce a syntactically-significant mistake (e.g. dropping a semicolon where automatic insertion would misbehave) while \"tidying up\".\n\nWith this formatter, a developer feeds in source text and receives a canonical rendering: redundant whitespace collapses, blocks re-indent to a fixed width, strings adopt a chosen quote style, over-long constructs wrap predictably, and the result is stable (formatting an already-formatted file changes nothing). A small set of options lets teams pick their preferred conventions, and the output is identical for everyone regardless of how the input was originally typed.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The formatter is a non-trivial domain (parsing, an intermediate print-instruction model, a width-aware layout engine, and per-construct rendering rules). It MUST NOT be a single \"god file\". Separate, at minimum, the parser front-end, the configuration model, the layout/printing engine, and the per-construct generation rules into distinct modules. Do not over-engineer trivial helpers, but the core must reflect a production-grade, multi-module repository.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases in \"Core Features\" are a **black-box contract for the execution adapter**, not the internal data model. The core formatting engine MUST be decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for decoding a JSON request, invoking the core formatter, and rendering the result (or a normalized error) to stdout.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Keep request decoding, configuration resolution, parsing, layout, per-construct rendering, and output formatting in distinct units.\n   - **Open/Closed Principle (OCP):** Adding a new option or supporting a new syntactic construct should extend the engine, not require rewriting the core.\n   - **Liskov Substitution Principle (LSP):** Rendering rules for related constructs must be substitutable behind a common abstraction.\n   - **Interface Segregation Principle (ISP):** Keep the formatting interface small (essentially: text + options → text).\n   - **Dependency Inversion Principle (DIP):** The core depends on an abstract notion of \"print instructions\", not on a concrete I/O layer.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public formatting entry point should be a single, elegant call taking source text, a logical file name (which selects the dialect), and a configuration value.\n   - **Resilience:** Unparseable input and invalid configuration must be modeled as explicit error outcomes, not crashes. The execution adapter normalizes these into a language-neutral error record (see Feature 14).\n\n---\n\n## Core Features\n\n### Feature 1: Default Whitespace Normalization\n\n**As a developer**, I want messy spacing around operators, separators, and statement terminators collapsed to a canonical form, so I can stop hand-tidying whitespace.\n\n**Expected Behavior / Usage:**\n\nThe request is a JSON object with a `text` field (the source) and an optional `config` object and `file_name` (default dialect is TypeScript). With no options, the formatter applies its default style: exactly one space around binary operators and after commas, no space before a statement-terminating semicolon, no padding inside call parentheses, and a trailing newline at end of output. Input that is already canonical is returned unchanged apart from the guaranteed trailing newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_default_whitespace.json`\n\n```json\n{\n    \"description\": \"Format source with default options: collapse redundant spaces around operators, separators and statement terminators while leaving already-tidy code untouched.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const  t  =  5 ;\"}, \"expected_output\": \"const t = 5;\\n\"},\n        {\"input\": {\"text\": \"testing( 1,   5 );\"}, \"expected_output\": \"testing(1, 5);\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Indentation\n\n**As a developer**, I want block bodies consistently indented, so nesting is visually obvious regardless of how the input was indented.\n\n**Expected Behavior / Usage:**\n\n*2.1 Space Indentation — block bodies indented with spaces at a fixed width*\n\nBy default, every nested block (class body, function body, etc.) is re-indented using spaces. The default indent width is four columns. Opening braces are placed on the same line as their header, members are placed on their own indented lines, and a closing brace returns to the parent indent.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_indent_spaces.json`\n\n```json\n{\n    \"description\": \"Block bodies are re-indented using spaces; the indent width is four columns by default.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"class Test{ prop = 5}\"}, \"expected_output\": \"class Test {\\n    prop = 5;\\n}\\n\"},\n        {\"input\": {\"text\": \"function f(){return 1;}\"}, \"expected_output\": \"function f() {\\n    return 1;\\n}\\n\"}\n    ]\n}\n```\n\n*2.2 Tab Indentation — continued lines indented with tab characters*\n\nWhen tab indentation is enabled (`useTabs: true`), indentation and the indentation of wrapped continuation lines use tab characters. The `indentWidth` option tells the layout engine how many columns one tab represents, which affects when a line is considered too long and must wrap.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_indent_tabs.json`\n\n```json\n{\n    \"description\": \"When tab indentation is enabled, wrapped/continued lines are indented with tab characters sized to the configured indent width.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const test = testingThisOutt + testtt + testingThisOut + testingthi + outt;\", \"config\": {\"useTabs\": true, \"indentWidth\": 4, \"lineWidth\": 40}}, \"expected_output\": \"const test = testingThisOutt + testtt\\n[the tab character used for indentation]+ testingThisOut + testingthi\\n[the tab character used for indentation]+ outt;\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: String Quote Style\n\n**As a developer**, I want a single, configurable quote convention applied to string literals, so quoting is uniform across the codebase.\n\n**Expected Behavior / Usage:**\n\nThe `quoteStyle` option selects how string literals are quoted. There are four modes, split below into leaf functional points. In all modes the formatter never changes a quote character if doing so would require *more* escaping than the original; \"always\" modes still escape the now-conflicting inner quote, while \"prefer\" modes fall back to the original quote character to avoid added escapes.\n\n*3.1 Always Double — convert every string to double quotes*\n\nSingle-quoted literals become double-quoted. A double quote occurring inside the string is escaped with a backslash.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_quote_always_double.json`\n\n```json\n{\n    \"description\": \"With the always-double quote style, single-quoted string literals are converted to double quotes, escaping embedded double quotes as needed.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"'str';\", \"config\": {\"quoteStyle\": \"alwaysDouble\"}}, \"expected_output\": \"\\\"str\\\";\\n\"},\n        {\"input\": {\"text\": \"'\\\"';\", \"config\": {\"quoteStyle\": \"alwaysDouble\"}}, \"expected_output\": \"\\\"\\\\\\\"\\\";\\n\"}\n    ]\n}\n```\n\n*3.2 Always Single — convert every string to single quotes*\n\nDouble-quoted literals become single-quoted. A single quote occurring inside the string is escaped with a backslash.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_quote_always_single.json`\n\n```json\n{\n    \"description\": \"With the always-single quote style, double-quoted string literals are converted to single quotes, escaping embedded single quotes as needed.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"\\\"str\\\";\", \"config\": {\"quoteStyle\": \"alwaysSingle\"}}, \"expected_output\": \"'str';\\n\"},\n        {\"input\": {\"text\": \"\\\"'\\\";\", \"config\": {\"quoteStyle\": \"alwaysSingle\"}}, \"expected_output\": \"'\\\\'';\\n\"}\n    ]\n}\n```\n\n*3.3 Prefer Double — default to double quotes but avoid extra escaping*\n\nStrings default to double quotes, but a string that contains a double quote (and would therefore need escaping) keeps its original single quotes instead.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_quote_prefer_double.json`\n\n```json\n{\n    \"description\": \"The prefer-double quote style uses double quotes by default but keeps the original quoting when switching would require additional escaping.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"'str';\", \"config\": {\"quoteStyle\": \"preferDouble\"}}, \"expected_output\": \"\\\"str\\\";\\n\"},\n        {\"input\": {\"text\": \"'\\\"';\", \"config\": {\"quoteStyle\": \"preferDouble\"}}, \"expected_output\": \"'\\\"';\\n\"}\n    ]\n}\n```\n\n*3.4 Prefer Single — default to single quotes but avoid extra escaping*\n\nStrings default to single quotes, but a string that contains a single quote (and would therefore need escaping) keeps its original double quotes instead.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_4_quote_prefer_single.json`\n\n```json\n{\n    \"description\": \"The prefer-single quote style uses single quotes by default but keeps the original quoting when switching would require additional escaping.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"\\\"str\\\";\", \"config\": {\"quoteStyle\": \"preferSingle\"}}, \"expected_output\": \"'str';\\n\"},\n        {\"input\": {\"text\": \"\\\"'\\\";\", \"config\": {\"quoteStyle\": \"preferSingle\"}}, \"expected_output\": \"\\\"'\\\";\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Property-Name Quoting\n\n**As a developer**, I want object property names quoted only when necessary (or quoted consistently), so object literals read cleanly.\n\n**Expected Behavior / Usage:**\n\nThe `quoteProps` option controls quoting of property names in object literals. `asNeeded` strips quotes from any name that is a valid identifier and leaves quotes on names that require them (e.g. a name beginning with a digit). `consistent` quotes every property name in an object if at least one name in that object requires quotes, and otherwise strips them all. `preserve` leaves every property name's quoting exactly as written.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_quote_props.json`\n\n```json\n{\n    \"description\": \"Property-name quoting is controlled by a mode: as-needed removes quotes from identifier-like names, consistent quotes every name in an object if any one of them requires quotes, and preserve keeps the original quoting.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const o = {\\n    \\\"foo\\\": 1,\\n    \\\"2bar\\\": 2,\\n};\", \"config\": {\"quoteProps\": \"asNeeded\"}}, \"expected_output\": \"const o = {\\n    foo: 1,\\n    \\\"2bar\\\": 2,\\n};\\n\"},\n        {\"input\": {\"text\": \"const o = {\\n    \\\"foo\\\": 1,\\n    \\\"2bar\\\": 2,\\n};\", \"config\": {\"quoteProps\": \"consistent\"}}, \"expected_output\": \"const o = {\\n    \\\"foo\\\": 1,\\n    \\\"2bar\\\": 2,\\n};\\n\"},\n        {\"input\": {\"text\": \"const o = {\\n    \\\"foo\\\": 1,\\n    \\\"2bar\\\": 2,\\n};\", \"config\": {\"quoteProps\": \"preserve\"}}, \"expected_output\": \"const o = {\\n    \\\"foo\\\": 1,\\n    \\\"2bar\\\": 2,\\n};\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Semicolon Insertion\n\n**As a developer**, I want statement terminators handled automatically, so I can rely on a consistent semicolon policy.\n\n**Expected Behavior / Usage:**\n\nThe `semiColons` option selects the statement-terminator policy. `always` appends a semicolon to every statement that takes one. The automatic-insertion mode (`asi`) removes optional semicolons and only emits one where omitting it would change how the source parses (a safety insertion). Switching modes is a pure rewrite — no statements are added or removed.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_semicolons.json`\n\n```json\n{\n    \"description\": \"Statement terminators follow a mode: always appends semicolons, while automatic-insertion mode omits them and only inserts one where required to avoid a parsing hazard.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const a = 1\\nconst b = 2\", \"config\": {\"semiColons\": \"always\"}}, \"expected_output\": \"const a = 1;\\nconst b = 2;\\n\"},\n        {\"input\": {\"text\": \"const a = 1;\\nconst b = 2;\", \"config\": {\"semiColons\": \"asi\"}}, \"expected_output\": \"const a = 1\\nconst b = 2\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Trailing Commas\n\n**As a developer**, I want a configurable trailing-comma policy for array and object literals, so multi-line collections diff cleanly.\n\n**Expected Behavior / Usage:**\n\nThe trailing-comma policy (here demonstrated via the array-literal option `arrayExpression.trailingCommas`) has three modes. `never` removes any trailing comma. `always` keeps a comma after the final element even on a single line. `onlyMultiLine` adds a trailing comma only when the literal is rendered across multiple lines and omits it on a single line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_trailing_commas.json`\n\n```json\n{\n    \"description\": \"Trailing commas in array and object literals follow a mode: never removes them, always keeps one after the final element (including single-line), and only-multi-line adds one solely when the literal is broken across lines.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const t = [\\n    5,\\n    6\\n];\", \"config\": {\"arrayExpression.trailingCommas\": \"always\", \"lineWidth\": 40}}, \"expected_output\": \"const t = [\\n    5,\\n    6,\\n];\\n\"},\n        {\"input\": {\"text\": \"const t = [5, 6,];\", \"config\": {\"arrayExpression.trailingCommas\": \"never\"}}, \"expected_output\": \"const t = [5, 6];\\n\"},\n        {\"input\": {\"text\": \"const t = [\\n    5,\\n    6\\n];\", \"config\": {\"arrayExpression.trailingCommas\": \"onlyMultiLine\", \"lineWidth\": 40}}, \"expected_output\": \"const t = [\\n    5,\\n    6,\\n];\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Arrow-Function Parameter Parentheses\n\n**As a developer**, I want a consistent rule for parentheses around a single arrow-function parameter, so arrow functions look uniform.\n\n**Expected Behavior / Usage:**\n\nThe `arrowFunction.useParentheses` option controls parentheses around a single parameter. `force` always wraps the parameter in parentheses, even a lone identifier. `preferNone` drops parentheses around a lone untyped identifier parameter, but still requires them when the parameter carries a type annotation or when there is no single bare identifier to unwrap.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_arrow_parentheses.json`\n\n```json\n{\n    \"description\": \"Parentheses around a single arrow-function parameter follow a mode: force always wraps the parameter, while prefer-none drops parentheses for a lone untyped identifier parameter but keeps them when the parameter is typed or absent.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const f = a => 5;\", \"config\": {\"arrowFunction.useParentheses\": \"force\"}}, \"expected_output\": \"const f = (a) => 5;\\n\"},\n        {\"input\": {\"text\": \"const f = (a) => 5;\", \"config\": {\"arrowFunction.useParentheses\": \"preferNone\"}}, \"expected_output\": \"const f = a => 5;\\n\"},\n        {\"input\": {\"text\": \"const f = (a: string) => 5;\", \"config\": {\"arrowFunction.useParentheses\": \"preferNone\"}}, \"expected_output\": \"const f = (a: string) => 5;\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 8: Line-Width-Driven Wrapping\n\n**As a developer**, I want constructs that exceed a maximum line width to wrap predictably, so no line runs off the screen.\n\n**Expected Behavior / Usage:**\n\nThe `lineWidth` option sets the column the layout engine tries to stay under. When a construct (such as an array literal or a call argument list) would exceed that width on one line, it is broken: each element goes on its own indented line. A construct that fits within the width stays on a single line. This decision is driven purely by measured width, not by how the input happened to be wrapped.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_line_width_wrapping.json`\n\n```json\n{\n    \"description\": \"When a construct exceeds the configured line width it is broken across multiple indented lines; a call whose arguments fit stays on one line.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const t = [other, other, other, otherTest, other];\", \"config\": {\"arrayExpression.trailingCommas\": \"always\", \"lineWidth\": 40}}, \"expected_output\": \"const t = [\\n    other,\\n    other,\\n    other,\\n    otherTest,\\n    other,\\n];\\n\"},\n        {\"input\": {\"text\": \"call(aaaa, bbbb);\", \"config\": {\"lineWidth\": 40}}, \"expected_output\": \"call(aaaa, bbbb);\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 9: Idempotent Formatting\n\n**As a developer**, I want formatting an already-formatted file to be a no-op, so re-running the formatter never churns the file.\n\n**Expected Behavior / Usage:**\n\nOutput is a fixed point: feeding canonical text back into the formatter returns byte-for-byte identical text. This is the stability guarantee that makes the formatter safe to run on every save or in CI.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_idempotent.json`\n\n```json\n{\n    \"description\": \"Source that is already in canonical form is returned byte-for-byte unchanged.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const t = 5;\\n\"}, \"expected_output\": \"const t = 5;\\n\"},\n        {\"input\": {\"text\": \"class Test {\\n    prop = 5;\\n}\\n\"}, \"expected_output\": \"class Test {\\n    prop = 5;\\n}\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 10: Ignore Directives\n\n**As a developer**, I want to opt specific regions or whole files out of formatting via comments, so hand-tuned layouts survive.\n\n**Expected Behavior / Usage:**\n\n*10.1 Whole-File Ignore — skip the entire file*\n\nWhen the file's leading comment is the whole-file ignore directive (`dprint-ignore-file`, with or without a leading space, as a line or block comment), the formatter returns the entire input verbatim without any reformatting.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_1_ignore_file.json`\n\n```json\n{\n    \"description\": \"A whole-file ignore directive as the first comment causes the entire file to be returned verbatim with no reformatting.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"[the specific comment string that triggers file-level ignore]\\n1 + 2 +         5;\"}, \"expected_output\": \"[the specific comment string that triggers file-level ignore]\\n1 + 2 +         5;\"},\n        {\"input\": {\"text\": \"//dprint-ignore-file\\n1 + 2 +         5;\"}, \"expected_output\": \"//dprint-ignore-file\\n1 + 2 +         5;\"}\n    ]\n}\n```\n\n*10.2 Node-Level Ignore — skip a single statement*\n\nA node-level ignore directive (`dprint-ignore`) placed immediately before a statement preserves that statement's original internal formatting, while every other statement in the file is still formatted normally.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_2_ignore_node.json`\n\n```json\n{\n    \"description\": \"A node-level ignore directive immediately preceding a statement preserves that node's original formatting while the rest of the file is still formatted.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"// dprint-ignore\\ncall(5, 6, 7,\\n    8, 9, 10);\"}, \"expected_output\": \"// dprint-ignore\\ncall(5, 6, 7,\\n    8, 9, 10);\\n\"},\n        {\"input\": {\"text\": \"// dprint-ignore\\nconst t = {  a:1  };\\nconst u = {  a:1  };\"}, \"expected_output\": \"// dprint-ignore\\nconst t = {  a:1  };\\nconst u = { a: 1 };\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 11: Byte-Order-Mark Stripping\n\n**As a developer**, I want a leading byte-order mark removed during formatting, so files are normalized to a BOM-free encoding.\n\n**Expected Behavior / Usage:**\n\nIf the source begins with a Unicode byte-order mark, the mark is removed from the output and the remaining source is formatted as usual. A file whose only \"change\" would be the BOM removal still produces BOM-free output.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_bom_stripping.json`\n\n```json\n{\n    \"description\": \"A leading byte-order mark is stripped from the output while the remaining source is formatted normally.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"\\uFEFFconst t =   5;\"}, \"expected_output\": \"const t = 5;\\n\"},\n        {\"input\": {\"text\": \"\\uFEFFconst t = 5;\\n\"}, \"expected_output\": \"const t = 5;\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 12: Import Declaration Sorting\n\n**As a developer**, I want import statements ordered by their module path, so the import block stays organized automatically.\n\n**Expected Behavior / Usage:**\n\nWhen import sorting is enabled (`module.sortImportDeclarations: caseSensitive`), top-of-file import declarations are reordered by their module specifier string. Case-sensitive ordering compares specifiers by raw code point. The statements' contents are otherwise preserved; only their order changes (plus normal whitespace normalization).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_import_sorting.json`\n\n```json\n{\n    \"description\": \"Import declarations are reordered by their module specifier; case-sensitive ordering sorts by raw code point.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"import { _2 } from \\\"../../a/b\\\";\\nimport { _1 } from \\\"../../a\\\";\\nimport { _3 } from \\\"../c\\\";\", \"config\": {\"module.sortImportDeclarations\": \"caseSensitive\"}}, \"expected_output\": \"import { _1 } from \\\"../../a\\\";\\nimport { _2 } from \\\"../../a/b\\\";\\nimport { _3 } from \\\"../c\\\";\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 13: Dialect Selection by File Name\n\n**As a developer**, I want the formatter to pick the right language dialect from the file name's extension, so JSX, JavaScript, and CommonJS variants are all parsed correctly.\n\n**Expected Behavior / Usage:**\n\nThe optional `file_name` field selects the parsing dialect from its extension. A `.js` extension accepts JSX markup embedded in JavaScript; a `.cjs` (CommonJS) extension likewise accepts JSX. In each case the embedded markup is recognized and formatted rather than rejected as a syntax error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature13_file_type_detection.json`\n\n```json\n{\n    \"description\": \"The file name's extension selects the dialect: JSX syntax is accepted in plain JavaScript and CommonJS module files.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const t = <test></test>;\", \"file_name\": \"file.js\"}, \"expected_output\": \"const t = <test></test>;\\n\"},\n        {\"input\": {\"text\": \"const test     = <Test>Test</Test>;\", \"file_name\": \"test.cjs\"}, \"expected_output\": \"const test = <Test>Test</Test>;\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 14: Error Handling\n\n**As a developer**, I want bad input and bad options reported as structured, language-neutral errors, so the tool fails predictably instead of crashing.\n\n**Expected Behavior / Usage:**\n\nErrors are surfaced as a two-line, language-neutral record on stdout: an `error=<category>` line followed by a `detail=<text>` line. No host-language exception type names, stack traces, or runtime object renderings appear.\n\n*14.1 Unparseable Source — report a parse error*\n\nWhen the source text cannot be parsed as valid TypeScript/JavaScript, the formatter produces no formatted output and instead emits the `parse_error` category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature14_1_parse_error.json`\n\n```json\n{\n    \"description\": \"Source that cannot be parsed yields a language-neutral error record rather than any formatted output.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"const x = ;\"}, \"expected_output\": \"error=parse_error\\ndetail=could not parse source text\\n\"},\n        {\"input\": {\"text\": \"function (\"}, \"expected_output\": \"error=parse_error\\ndetail=could not parse source text\\n\"}\n    ]\n}\n```\n\n*14.2 Invalid Configuration — report an invalid option value*\n\nWhen a configuration option is given an unrecognized value, the formatter produces no formatted output and instead emits the `invalid_config` category, with the offending value echoed in the detail line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature14_2_invalid_config.json`\n\n```json\n{\n    \"description\": \"An unrecognized configuration value yields a language-neutral error record identifying it as an invalid configuration.\",\n    \"cases\": [\n        {\"input\": {\"text\": \"x;\", \"config\": {\"quoteStyle\": \"bogus\"}}, \"expected_output\": \"[the specific error code prefix for config validation failure]\\ndetail=Found invalid value 'bogus'.\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-module formatter implementing the features above — parser front-end, configuration model, width-aware layout engine, and per-construct rendering rules — with the physical structure matching that complexity (no monolithic file).\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads a single JSON request (`{ \"text\": ..., \"config\"?: ..., \"file_name\"?: ... }`) from stdin, invokes the core formatter, and prints either the formatted source text or a normalized error record to stdout, strictly matching the per-leaf-feature contracts above. The adapter is logically and physically separated from the core domain and owns the error-normalization layer.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to choose the directory (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_default_whitespace.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_default_whitespace@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata), so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- matches the behavior described in the double-quote conversion utility\n",
+  "oracle_data": {
+    "task_id": "dprint__dprint-plugin-typescript-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C028",
+        "trigger_keywords": [
+          "what specific char is used?",
+          "how are tabs sized?",
+          "visual indentation mechanism"
+        ],
+        "oracle_response": "the literal tab character string \\t"
+      },
+      {
+        "constraint_id": "C029",
+        "trigger_keywords": [
+          "ignore flag string?",
+          "comment to disable formatting?",
+          "cancellation comment"
+        ],
+        "oracle_response": "the literal string // dprint-ignore-file"
+      },
+      {
+        "constraint_id": "C035",
+        "trigger_keywords": [
+          "config error code?",
+          "validation failure message",
+          "bad key error prefix"
+        ],
+        "oracle_response": "the literal string error=invalid_config"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "matches the behavior described in the double-quote conversion utility",
+        "actual_meaning": "Handle double quotes exactly as they appear in the double-quote conversion logic, including whitespace around escapes."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_1_ignore_file.json": {
+      "description": "A whole-file ignore directive as the first comment causes the entire file to be returned verbatim with no reformatting.",
+      "cases": [
+        {
+          "input": {
+            "text": "// dprint-ignore-file\n1 + 2 +         5;"
+          },
+          "expected_output": "// dprint-ignore-file\n1 + 2 +         5;"
+        },
+        {
+          "input": {
+            "text": "//dprint-ignore-file\n1 + 2 +         5;"
+          },
+          "expected_output": "//dprint-ignore-file\n1 + 2 +         5;"
+        }
+      ]
+    },
+    "feature10_2_ignore_node.json": {
+      "description": "A node-level ignore directive immediately preceding a statement preserves that node's original formatting while the rest of the file is still formatted.",
+      "cases": [
+        {
+          "input": {
+            "text": "// dprint-ignore\ncall(5, 6, 7,\n    8, 9, 10);"
+          },
+          "expected_output": "// dprint-ignore\ncall(5, 6, 7,\n    8, 9, 10);\n"
+        },
+        {
+          "input": {
+            "text": "// dprint-ignore\nconst t = {  a:1  };\nconst u = {  a:1  };"
+          },
+          "expected_output": "// dprint-ignore\nconst t = {  a:1  };\nconst u = { a: 1 };\n"
+        }
+      ]
+    },
+    "feature11_bom_stripping.json": {
+      "description": "A leading byte-order mark is stripped from the output while the remaining source is formatted normally.",
+      "cases": [
+        {
+          "input": {
+            "text": "﻿const t =   5;"
+          },
+          "expected_output": "const t = 5;\n"
+        },
+        {
+          "input": {
+            "text": "﻿const t = 5;\n"
+          },
+          "expected_output": "const t = 5;\n"
+        }
+      ]
+    },
+    "feature12_import_sorting.json": {
+      "description": "Import declarations are reordered by their module specifier; case-sensitive ordering sorts by raw code point.",
+      "cases": [
+        {
+          "input": {
+            "text": "import { _2 } from \"../../a/b\";\nimport { _1 } from \"../../a\";\nimport { _3 } from \"../c\";",
+            "config": {
+              "module.sortImportDeclarations": "caseSensitive"
+            }
+          },
+          "expected_output": "import { _1 } from \"../../a\";\nimport { _2 } from \"../../a/b\";\nimport { _3 } from \"../c\";\n"
+        }
+      ]
+    },
+    "feature13_file_type_detection.json": {
+      "description": "The file name's extension selects the dialect: JSX syntax is accepted in plain JavaScript and CommonJS module files.",
+      "cases": [
+        {
+          "input": {
+            "text": "const t = <test></test>;",
+            "file_name": "file.js"
+          },
+          "expected_output": "const t = <test></test>;\n"
+        },
+        {
+          "input": {
+            "text": "const test     = <Test>Test</Test>;",
+            "file_name": "test.cjs"
+          },
+          "expected_output": "const test = <Test>Test</Test>;\n"
+        }
+      ]
+    },
+    "feature14_1_parse_error.json": {
+      "description": "Source that cannot be parsed yields a language-neutral error record rather than any formatted output.",
+      "cases": [
+        {
+          "input": {
+            "text": "const x = ;"
+          },
+          "expected_output": "error=parse_error\ndetail=could not parse source text\n"
+        },
+        {
+          "input": {
+            "text": "function ("
+          },
+          "expected_output": "error=parse_error\ndetail=could not parse source text\n"
+        }
+      ]
+    },
+    "feature14_2_invalid_config.json": {
+      "description": "An unrecognized configuration value yields a language-neutral error record identifying it as an invalid configuration.",
+      "cases": [
+        {
+          "input": {
+            "text": "x;",
+            "config": {
+              "quoteStyle": "bogus"
+            }
+          },
+          "expected_output": "error=invalid_config\ndetail=Found invalid value 'bogus'.\n"
+        }
+      ]
+    },
+    "feature1_default_whitespace.json": {
+      "description": "Format source with default options: collapse redundant spaces around operators, separators and statement terminators while leaving already-tidy code untouched.",
+      "cases": [
+        {
+          "input": {
+            "text": "const  t  =  5 ;"
+          },
+          "expected_output": "const t = 5;\n"
+        },
+        {
+          "input": {
+            "text": "testing( 1,   5 );"
+          },
+          "expected_output": "testing(1, 5);\n"
+        }
+      ]
+    },
+    "feature2_1_indent_spaces.json": {
+      "description": "Block bodies are re-indented using spaces; the indent width is four columns by default.",
+      "cases": [
+        {
+          "input": {
+            "text": "class Test{ prop = 5}"
+          },
+          "expected_output": "class Test {\n    prop = 5;\n}\n"
+        },
+        {
+          "input": {
+            "text": "function f(){return 1;}"
+          },
+          "expected_output": "function f() {\n    return 1;\n}\n"
+        }
+      ]
+    },
+    "feature2_2_indent_tabs.json": {
+      "description": "When tab indentation is enabled, wrapped/continued lines are indented with tab characters sized to the configured indent width.",
+      "cases": [
+        {
+          "input": {
+            "text": "const test = testingThisOutt + testtt + testingThisOut + testingthi + outt;",
+            "config": {
+              "useTabs": true,
+              "indentWidth": 4,
+              "lineWidth": 40
+            }
+          },
+          "expected_output": "const test = testingThisOutt + testtt\n\t+ testingThisOut + testingthi\n\t+ outt;\n"
+        }
+      ]
+    },
+    "feature3_1_quote_always_double.json": {
+      "description": "With the always-double quote style, single-quoted string literals are converted to double quotes, escaping embedded double quotes as needed.",
+      "cases": [
+        {
+          "input": {
+            "text": "'str';",
+            "config": {
+              "quoteStyle": "alwaysDouble"
+            }
+          },
+          "expected_output": "\"str\";\n"
+        },
+        {
+          "input": {
+            "text": "'\"';",
+            "config": {
+              "quoteStyle": "alwaysDouble"
+            }
+          },
+          "expected_output": "\"\\\"\";\n"
+        }
+      ]
+    },
+    "feature3_2_quote_always_single.json": {
+      "description": "With the always-single quote style, double-quoted string literals are converted to single quotes, escaping embedded single quotes as needed.",
+      "cases": [
+        {
+          "input": {
+            "text": "\"str\";",
+            "config": {
+              "quoteStyle": "alwaysSingle"
+            }
+          },
+          "expected_output": "'str';\n"
+        },
+        {
+          "input": {
+            "text": "\"'\";",
+            "config": {
+              "quoteStyle": "alwaysSingle"
+            }
+          },
+          "expected_output": "'\\'';\n"
+        }
+      ]
+    },
+    "feature3_3_quote_prefer_double.json": {
+      "description": "The prefer-double quote style uses double quotes by default but keeps the original quoting when switching would require additional escaping.",
+      "cases": [
+        {
+          "input": {
+            "text": "'str';",
+            "config": {
+              "quoteStyle": "preferDouble"
+            }
+          },
+          "expected_output": "\"str\";\n"
+        },
+        {
+          "input": {
+            "text": "'\"';",
+            "config": {
+              "quoteStyle": "preferDouble"
+            }
+          },
+          "expected_output": "'\"';\n"
+        }
+      ]
+    },
+    "feature3_4_quote_prefer_single.json": {
+      "description": "The prefer-single quote style uses single quotes by default but keeps the original quoting when switching would require additional escaping.",
+      "cases": [
+        {
+          "input": {
+            "text": "\"str\";",
+            "config": {
+              "quoteStyle": "preferSingle"
+            }
+          },
+          "expected_output": "'str';\n"
+        },
+        {
+          "input": {
+            "text": "\"'\";",
+            "config": {
+              "quoteStyle": "preferSingle"
+            }
+          },
+          "expected_output": "\"'\";\n"
+        }
+      ]
+    },
+    "feature4_quote_props.json": {
+      "description": "Property-name quoting is controlled by a mode: as-needed removes quotes from identifier-like names, consistent quotes every name in an object if any one of them requires quotes, and preserve keeps the original quoting.",
+      "cases": [
+        {
+          "input": {
+            "text": "const o = {\n    \"foo\": 1,\n    \"2bar\": 2,\n};",
+            "config": {
+              "quoteProps": "asNeeded"
+            }
+          },
+          "expected_output": "const o = {\n    foo: 1,\n    \"2bar\": 2,\n};\n"
+        },
+        {
+          "input": {
+            "text": "const o = {\n    \"foo\": 1,\n    \"2bar\": 2,\n};",
+            "config": {
+              "quoteProps": "consistent"
+            }
+          },
+          "expected_output": "const o = {\n    \"foo\": 1,\n    \"2bar\": 2,\n};\n"
+        },
+        {
+          "input": {
+            "text": "const o = {\n    \"foo\": 1,\n    \"2bar\": 2,\n};",
+            "config": {
+              "quoteProps": "preserve"
+            }
+          },
+          "expected_output": "const o = {\n    \"foo\": 1,\n    \"2bar\": 2,\n};\n"
+        }
+      ]
+    },
+    "feature5_semicolons.json": {
+      "description": "Statement terminators follow a mode: always appends semicolons, while automatic-insertion mode omits them and only inserts one where required to avoid a parsing hazard.",
+      "cases": [
+        {
+          "input": {
+            "text": "const a = 1\nconst b = 2",
+            "config": {
+              "semiColons": "always"
+            }
+          },
+          "expected_output": "const a = 1;\nconst b = 2;\n"
+        },
+        {
+          "input": {
+            "text": "const a = 1;\nconst b = 2;",
+            "config": {
+              "semiColons": "asi"
+            }
+          },
+          "expected_output": "const a = 1\nconst b = 2\n"
+        }
+      ]
+    },
+    "feature6_trailing_commas.json": {
+      "description": "Trailing commas in array and object literals follow a mode: never removes them, always keeps one after the final element (including single-line), and only-multi-line adds one solely when the literal is broken across lines.",
+      "cases": [
+        {
+          "input": {
+            "text": "const t = [\n    5,\n    6\n];",
+            "config": {
+              "arrayExpression.trailingCommas": "always",
+              "lineWidth": 40
+            }
+          },
+          "expected_output": "const t = [\n    5,\n    6,\n];\n"
+        },
+        {
+          "input": {
+            "text": "const t = [5, 6,];",
+            "config": {
+              "arrayExpression.trailingCommas": "never"
+            }
+          },
+          "expected_output": "const t = [5, 6];\n"
+        },
+        {
+          "input": {
+            "text": "const t = [\n    5,\n    6\n];",
+            "config": {
+              "arrayExpression.trailingCommas": "onlyMultiLine",
+              "lineWidth": 40
+            }
+          },
+          "expected_output": "const t = [\n    5,\n    6,\n];\n"
+        }
+      ]
+    },
+    "feature7_arrow_parentheses.json": {
+      "description": "Parentheses around a single arrow-function parameter follow a mode: force always wraps the parameter, while prefer-none drops parentheses for a lone untyped identifier parameter but keeps them when the parameter is typed or absent.",
+      "cases": [
+        {
+          "input": {
+            "text": "const f = a => 5;",
+            "config": {
+              "arrowFunction.useParentheses": "force"
+            }
+          },
+          "expected_output": "const f = (a) => 5;\n"
+        },
+        {
+          "input": {
+            "text": "const f = (a) => 5;",
+            "config": {
+              "arrowFunction.useParentheses": "preferNone"
+            }
+          },
+          "expected_output": "const f = a => 5;\n"
+        },
+        {
+          "input": {
+            "text": "const f = (a: string) => 5;",
+            "config": {
+              "arrowFunction.useParentheses": "preferNone"
+            }
+          },
+          "expected_output": "const f = (a: string) => 5;\n"
+        }
+      ]
+    },
+    "feature8_line_width_wrapping.json": {
+      "description": "When a construct exceeds the configured line width it is broken across multiple indented lines; a call whose arguments fit stays on one line.",
+      "cases": [
+        {
+          "input": {
+            "text": "const t = [other, other, other, otherTest, other];",
+            "config": {
+              "arrayExpression.trailingCommas": "always",
+              "lineWidth": 40
+            }
+          },
+          "expected_output": "const t = [\n    other,\n    other,\n    other,\n    otherTest,\n    other,\n];\n"
+        },
+        {
+          "input": {
+            "text": "call(aaaa, bbbb);",
+            "config": {
+              "lineWidth": 40
+            }
+          },
+          "expected_output": "call(aaaa, bbbb);\n"
+        }
+      ]
+    },
+    "feature9_idempotent.json": {
+      "description": "Source that is already in canonical form is returned byte-for-byte unchanged.",
+      "cases": [
+        {
+          "input": {
+            "text": "const t = 5;\n"
+          },
+          "expected_output": "const t = 5;\n"
+        },
+        {
+          "input": {
+            "text": "class Test {\n    prop = 5;\n}\n"
+          },
+          "expected_output": "class Test {\n    prop = 5;\n}\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Global Entry/Adapter",
+      "input_condition": "Top-level input object structure",
+      "output_rule": "Returns a structured response: either 'formatted_output' (string) or 'error' (object with 'code' and 'detail' fields).",
+      "exact_values": [
+        "formatted_output",
+        "error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Global Entry/Adapter",
+      "input_condition": "Optional `text` field presence",
+      "output_rule": "If `text` is missing, results in an invalid configuration or missing data error.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Global Entry/Adapter",
+      "input_condition": "Top-level `config` object presence",
+      "output_rule": "Fields are optional if not present, using dialect defaults.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Dialect Selection",
+      "input_condition": "`file_name` is provided",
+      "output_rule": "Dialect syntax rules are selected based on the file extension.",
+      "exact_values": [
+        "ts",
+        "js",
+        "jsx",
+        "cjs"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Dialect Selection",
+      "input_condition": "Extension is `.js` or no extension",
+      "output_rule": "JSX constructs like `<test></test>` are parsed and formatted even in a JS file.",
+      "exact_values": [
+        "js"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Dialect Selection",
+      "input_condition": "Extension is `.cjs`",
+      "output_rule": "JSX constructs are reserved and not parsed.",
+      "exact_values": [
+        "cjs"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Whitespace Normalization",
+      "input_condition": "Default options (no specific config)",
+      "output_rule": "Exactly one space around binary operators and after commas; no space before statement-terminating semicolon; no padding inside call parentheses.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Whitespace Normalization",
+      "input_condition": "Input already canonical",
+      "output_rule": "Returns input unchanged except for guaranteed trailing newline.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Output Normalization",
+      "input_condition": "Success case",
+      "output_rule": "Output must end with a single trailing newline.",
+      "exact_values": [
+        "\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Indentation",
+      "input_condition": "Default configuration",
+      "output_rule": "Block bodies indented using spaces; default indent width is 4 characters.",
+      "exact_values": [
+        4
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Indentation",
+      "input_condition": "`useTabs: true` is set",
+      "output_rule": "Indentation and wrapped continuation lines use tab characters (`\\t`); `indentWidth` determines space width equivalent for width calculations.",
+      "exact_values": [
+        "\t"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Quote Style",
+      "input_condition": "`quoteStyle: 'alwaysDouble'`",
+      "output_rule": "Converts single-quoted literals to double quotes; escapes embedded double quotes with whitespace.",
+      "exact_values": [
+        "\\\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Quote Style",
+      "input_condition": "`quoteStyle: 'alwaysSingle'`",
+      "output_rule": "Converts double-quoted literals to single quotes; escapes embedded single quotes with whitespace.",
+      "exact_values": [
+        "\\'"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Quote Style",
+      "input_condition": "`quoteStyle: 'preferDouble'`",
+      "output_rule": "Defaults to double quotes, but keeps original quotes if switching would add an escape character.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Quote Style",
+      "input_condition": "`quoteStyle: 'preferSingle'`",
+      "output_rule": "Defaults to single quotes, but keeps original quotes if switching would add an escape character.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Property-Name Quoting",
+      "input_condition": "`quoteProps: 'asNeeded'`",
+      "output_rule": "Strips quotes from valid identifiers; keeps quotes on names requiring them (e.g., numbers).",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Property-Name Quoting",
+      "input_condition": "`quoteProps: 'consistent'`",
+      "output_rule": "Quotes every name in an object if any name requires quoting; removes quotes from all else.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Property-Name Quoting",
+      "input_condition": "`quoteProps: 'preserve'`",
+      "output_rule": "Leaves every property name's quoting exactly as written.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Semicolons",
+      "input_condition": "`semiColons: 'always'`",
+      "output_rule": "Appends a semicolon to every statement.",
+      "exact_values": [
+        ";"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Semicolons",
+      "input_condition": "`semiColons: 'asi'` (automatic semi-inserting)",
+      "output_rule": "Omits optional semicolons; inserts one only to avoid parsing hazards.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Trailing Commas",
+      "input_condition": "`arrayExpression.trailingCommas: 'always'`",
+      "output_rule": "Keeps a trailing comma after the final element, even on a single line.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Trailing Commas",
+      "input_condition": "`arrayExpression.trailingCommas: 'never'`",
+      "output_rule": "Removes any trailing comma.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Trailing Commas",
+      "input_condition": "`arrayExpression.trailingCommas: 'onlyMultiLine'`",
+      "output_rule": "Adds trailing comma only when the literal is broken across multiple lines.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Arrow Function Parameters",
+      "input_condition": "`arrowFunction.useParentheses: 'force'`",
+      "output_rule": "Always wraps a single parameter in parentheses, even a lone identifier.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Arrow Function Parameters",
+      "input_condition": "`arrowFunction.useParentheses: 'preferNone'`",
+      "output_rule": "Drops parentheses around a lone untyped identifier parameter; keeps them if typed or missing single bare identifier.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "Line Width",
+      "input_condition": "Construct exceeds `lineWidth`",
+      "output_rule": "Construct is broken across multiple indented lines; each element goes on its own line.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Line Width",
+      "input_condition": "Construct fits within `lineWidth`",
+      "output_rule": "Construct stays on a single line.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Long Lines",
+      "input_condition": "Default `indentWidth` with tabs",
+      "output_rule": "Tab characters are used for visual indentation on wrapped lines, sized to `indentWidth` columns logic.",
+      "exact_values": [
+        "\t"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "Ignore (File Level)",
+      "input_condition": "Comment line matching `// dprint-ignore-file` is the very first non-whitespace token of the file",
+      "output_rule": "The entire file is returned verbatim with no reformatting.",
+      "exact_values": [
+        "// dprint-ignore-file"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Ignore (Node Level)",
+      "input_condition": "Comment line matching `// dprint-ignore` precedes a specific node in the AST",
+      "output_rule": "That specific node is returned with its original formatting; the rest of the file is formatted normally.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "Ignore Overhead",
+      "input_condition": "Ignore directive exists multiple times",
+      "output_rule": "First match sets ignore status for that node. Subsequent nodes within that ignored block are also untouched.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "BOM Handling",
+      "input_condition": "Input text contains a leading byte-order mark (BOM)",
+      "output_rule": "Leading BOM is stripped from the output.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "Import Sorting",
+      "input_condition": "`module.sortImportDeclarations: 'caseSensitive'` (implicit in default)",
+      "output_rule": "Import declarations are reordered by their module specifier (string) case-sensitively by code point.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "Idempotency",
+      "input_condition": "Input is already in canonical form",
+      "output_rule": "Output is byte-for-byte identical to input (excluding guaranteed trailing newline if input lacked it, or identical whitespace if it had it).",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "Validation",
+      "input_condition": "`config` contains an invalid key or value",
+      "output_rule": "Returns `error=invalid_config` with a detail string identifying the bad value.",
+      "exact_values": [
+        "error=invalid_config"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "Validation",
+      "input_condition": "Input `text` cannot be parsed",
+      "output_rule": "Returns `error=parse_error` with a detail string describing the failure.",
+      "exact_values": [
+        "error=parse_error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "Format",
+      "input_condition": "Error response generation",
+      "output_rule": "Errors always come with a newline at the end of the detail string if included.",
+      "exact_values": [
+        "\n"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C028",
+        "replacement": "the tab character used for indentation",
+        "exact_values_to_replace": [
+          "\\t"
+        ],
+        "trigger_keywords": [
+          "what specific char is used?",
+          "how are tabs sized?",
+          "visual indentation mechanism"
+        ],
+        "oracle_response": "the literal tab character string \\t"
+      },
+      {
+        "constraint_id": "C029",
+        "replacement": "the specific comment string that triggers file-level ignore",
+        "exact_values_to_replace": [
+          "// dprint-ignore-file"
+        ],
+        "trigger_keywords": [
+          "ignore flag string?",
+          "comment to disable formatting?",
+          "cancellation comment"
+        ],
+        "oracle_response": "the literal string // dprint-ignore-file"
+      },
+      {
+        "constraint_id": "C035",
+        "replacement": "the specific error code prefix for config validation failure",
+        "exact_values_to_replace": [
+          "error=invalid_config"
+        ],
+        "trigger_keywords": [
+          "config error code?",
+          "validation failure message",
+          "bad key error prefix"
+        ],
+        "oracle_response": "the literal string error=invalid_config"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "matches the behavior described in the double-quote conversion utility",
+        "actual_meaning": "Handle double quotes exactly as they appear in the double-quote conversion logic, including whitespace around escapes."
+      }
+    ]
+  }
+}

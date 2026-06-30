@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need to build that SEO markup generator library we've been talking about. Basically, devs are spending way too much time copy-pasting the same head tag boilerplate across every page, and half the time they forget to escape user content properly which is a security headache. The idea is a server-side thing where you declare your page info once and it spits out all the markup you need — the usual head stuff, plus the social sharing tags for Facebook/LinkedIn previews, the Twitter card stuff, and the structured data block that search engines love.
+
+It should handle all the edge cases we keep running into — like when you only set a URL but still need the default title/description to show up, or when you have multiple data graphs on one page (though there's a quirk there, ask me about it). The title handling needs to work like we did on that last CMS project where you could combine a page title with the site name, remember that pattern?
+
+Also important: the whole thing needs to read a command from stdin and write the output to stdout, so it slots into our existing pipeline. Make sure unknown or broken commands don't crash the process. We probably want some kind of unified mode too where setting the title once updates everything at the same time. Security-wise, free text fields need to be safe to embed. Let me know if anything is unclear.
+
+Quick follow-up from the questions that came in: there are actually two different default titles depending on where the output is going. The document head meta side uses 'It's Over 9000!' as its default title, and Open Graph plus JSON-LD use 'Over 9000 Thousand!' as their default title. The default description everywhere is 'For those who helped create the Genki Dama'. For the head meta side, the default title separator is ' - '.
+
+On the title pattern, for the head meta channel if a page title is provided, we combine it as '<page title><separator><default title>', with the page title first. If the caller wants to skip that, they can send the title as an object with append_default set to false, and then we just render the page title exactly as given. The separator itself can be changed with a title_separator step, and the default title can be swapped with a default_title step. If they only set default_title and do not send a page title, then just that new default title renders by itself.
+
+A couple behavior details too: if description is passed as boolean false in the meta channel, that means no description meta tag at all, not the string 'false'. The title element should still come out normally. Also, reset: true in the meta channel really wipes all the mutable stuff we may have accumulated, including description overrides, keywords, pagination links (prev/next), canonical URL, AMP link, custom meta tags, alternate language links, and robots directives. After that, output goes back to the baseline of just the title element and the default description meta.
+
+For custom meta tags, the shape is three fields: 'name', 'content', and 'attribute', where 'attribute' defaults to 'name'. So for example, attribute='test' produces <meta test='custom-meta' content='value'>. These custom tags should render after the title/description block, and they can be removed by key with remove_meta.
+
+On escaping, free-text description fields need HTML escaping before markup output. Specifically, double quotes become &quot;, < becomes &lt;, and > becomes &gt;. Non-ASCII characters like é and è stay exactly as-is and do not get escaped or encoded. That applies to the normal meta description tag and the Twitter Card description field. JSON-LD description is different: it goes into the JSON literally without HTML escaping, but normal JSON string escaping still applies.
+
+For Twitter Card images, one image uses 'twitter:image'. If it is a list, then each one gets its own tag using 'twitter:images0', 'twitter:images1', and so on, starting from zero, with the plural 'images' plus the numeric suffix.
+
+Also confirming the error handling expectation: unknown channels and malformed JSON input need to fail gracefully. No crashing, no runtime exception details leaking out. A neutral error category is fine, and a structured error response or empty output is acceptable, but the process should not die with an unhandled exception.
+
+And on that multi-graph quirk I mentioned earlier: the jsonld_multi channel produces no output when given exactly one graph. It only actually renders when there are 2+ graphs.

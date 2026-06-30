@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need to build out the operator contract toolkit we've been discussing. The main idea is that devs shouldn't have to hand-write all the repetitive Kubernetes boilerplate every time they set up a new operator — things like resource definitions, permission rules, event records, and test wiring. Basically, you describe your resources once and the library figures out the rest.
+
+We already have some of the scaffolding from the last CRD generation spike (you can look at how we handled versioning and group naming back then), so try to stay consistent with those patterns rather than reinventing things.
+
+The tricky parts are: making sure schema mappings handle all the edge cases around nullable fields and special Kubernetes types, getting the permission grouping logic right so we don't end up with duplicate rule entries, and making the in-process test harness actually route lifecycle events correctly to the right handlers.
+
+Also — and this is something that came up in last week's retrospective — there's been confusion about what happens when someone looks up a resource that doesn't exist in the cache, or tries to generate a schema for a type the system doesn't understand. We need those failure paths to produce something consistent and actionable rather than just blowing up.
+
+The test runner adapter needs to stay completely separate from the core logic, just like we agreed. Someone will validate everything against the standard test case files once it's wired up.
+
+A couple of extra specifics from the questions that came back. On naming, metadata_name is just the plural resource name plus the API group with a dot in between. So if the resource is TestSpecEntity, the group is kubeops.test.dev, and the plural is testspecentitys, then the metadata name is testspecentitys.kubeops.test.dev. Pluralization stays intentionally dumb here: just lowercase the singular name and append an 's'. No special cases, so TestSpecEntity becomes testspecentitys, not testspecentities. This should stay aligned with the CRD versioning and group naming conventions we already set in the CRD identity and collection generation work, especially the same metadata_name = plural + group behavior and the same storage version assignment approach.
+
+On events, the name needs to be deterministic from the event content, and for the standard test event in namespace 'test-ns', the expected name is MGODYZKPJ7QDVVCN2RUBXNOB6TD6XGCHDT46OMD5QG534WNV7LXIH3XZ4ISN746LUSVT57PH6KZCC7C62Z5QWYO2P4YJJHU6OJ2MRHY. If we're publishing an event and there is already a prior record, meaning existing_count is provided, then count becomes existing_count + 1, the UID carries over from the existing record as existing-uid, and we reuse that same deterministic name. If there is no prior record, then count is 1 and uid is null.
+
+For leader election behavior, if the lease is missing and the write succeeds, we move to 'Leader' and leadership_changes=1. If the lease is missing but the write hits a conflict error, the state is 'Candidate'. Same result if there is a valid lease owned by someone else: 'Candidate'.
+
+On the generated CRDs, the collection should have exactly 5 entries, ignored models stay out of it, and contains_ignored must be false. The five CRDs are AttributeVersionedEntity, TestClusterSpecEntity, TestSpecEntity, TestStatusEntity, and VersionedEntity. Each CRD has exactly one storage version. For VersionedEntity with versions v2, v2beta2, v1, v1beta1, v1alpha1, the storage version is v2. For AttributeVersionedEntity with versions v2 and v1, the storage version is v1. Everything else in that set only has one version, so that single version is also the storage version.
+
+One more thing on the in-process harness so nobody overthinks the expected discovery counts: it should discover and report 21 entities, 1 controller, 1 finalizer, 2 validators, and 1 mutator.
+
+And for output determinism, printer columns need to come out in this exact order: Age (.metadata.creationTimestamp, date, priority 0), Namespace (.metadata.namespace, string, priority 0), NormalInt (.spec.normalInt, integer, priority 1), OtherName (.spec.normalLong, integer, priority 0), NormalString (.spec.normalString, string, priority 0). Also, an intOrString field should output exactly type=null, properties_present=false, preserve_unknown=null, embedded_resource=null, int_or_string=true, item_type=null, item_preserve_unknown=null, item_embedded_resource=null.

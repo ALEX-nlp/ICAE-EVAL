@@ -1,0 +1,1277 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out the random forest engine we've been talking about. The core idea is that a developer should be able to point it at a dataset, say which column is the outcome they care about, and just get a trained model back without doing a bunch of manual setup work. We want to support the usual stuff — classifying categories, predicting numbers, and also that survival analysis thing we discussed (like what we did in the clinical data project last quarter, similar Surv() syntax). There should be a way to describe the problem either with a formula string or by just naming the column directly, both should work the same way. Data can come in as a typed table or as the all-numbers version of the same data, and the engine shouldn't care which one it gets. We also need proper error handling — not just crashes, but meaningful category labels for things like bad sampling settings, wrong split rules for the task type, missing values showing up, that kind of thing. Reproducibility is important so make sure seeding works correctly. We want OOB error, variable importance when asked for, confusion matrix for classification, probability outputs, per-tree prediction shapes, and survival timepoint tracking. Oh and warnings when something like unused categories get dropped during training. The adapter layer should be thin and separate from the actual engine logic — keep I/O concerns out of the core.\n\nOne extra note on the formula side since folks asked: if the left-hand side wraps the response in a user function, like transform(Species) ~ ., that still needs to resolve the same way as the plain version. We should peel out the inner column name, look that up in the data, and infer the task from that column’s type. For predictors, same behavior as the unwrapped form: every other column in table order. The wrapper function name itself is ignored for task inference and predictor resolution. For survival, the left-hand side is Surv(time_col, status_col) ~ . and both named columns are part of the response, not predictors. So the dot means every remaining column after removing both of those, and the inferred task is 'survival'. If removing time and status leaves us with nothing to train on, reject it before training with 'no_covariates', whether the user came in through a formula or named columns.\n\nA couple behavior clarifications around classes and outputs too. If the training subset is missing one or more response levels that do exist in the full dataset, that should be a warning, not a failure, with category 'dropped_unused_response_levels' and a 'levels' field listing the dropped class names. The model still trains on the classes it has, probability estimation uses the surviving class count, and predictions still cover the full original class set, so prediction_levels should list all original classes. Also, if someone asks for importance on a model that was not trained with importance turned on, return error category 'importance_not_available'. That has to be explicitly requested up front, like importance='impurity'. When it is enabled, return one numeric importance value per predictor, keyed by predictor name, in predictor order.\n\nOn a few error cases, let’s be strict early. If the user’s mtry function blows up or returns something unusable while we evaluate it, stop training and emit 'mtry_function_error' with no partial model. If someone requests a prediction output type we do not recognize, like 'class' when that is not a supported type string, reject it with 'invalid_prediction_type' before doing any prediction work. And for anything survival-only like timepoints, cumulative hazard, or survival function, if the model’s inferred task is not survival, return 'not_a_survival_forest' for those accessors.\n\nLast thing on data sources and the survival reference case. A matrix-backed source can’t tell classification from column types alone because everything is numeric, so for classification or probability on that kind of source the task has to be declared explicitly, like a classification_matrix flag or an explicit task parameter. Regression and survival can still be inferred from numeric types. Predictor resolution should still just take every non-response column in table order, same as a typed table source. For the survival reference, we’re talking right-censored survival analysis on the veteran dataset with columns trt, celltype, time, status, karno, diagtime, age, prior. It has 137 rows, status uses 1=event, 0=censored, and using the unique sorted event times where status=1 gives 101 distinct timepoints.",
+  "oracle_data": {
+    "task_id": "RANGER-ENGINE-001",
+    "golden_api_signature": "fit(data_source: DataSource, spec: ProblemSpec, options: TrainOptions) -> TrainResult",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "what error is raised when sampling fraction is zero or negative",
+          "what happens if I pass sample_fraction=0",
+          "what is the valid range for the sampling fraction parameter"
+        ],
+        "oracle_response": "A scalar sampling fraction must lie in the half-open interval (0, 1]. A value of exactly 0, any negative value, or any value greater than 1 is rejected before training begins. The typed error category emitted is 'sample_fraction_out_of_range'. No partial training occurs."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "can I pass a list of per-class sampling fractions for regression",
+          "what error occurs when a vector sampling fraction is used with a non-classification task",
+          "is per-class sampling supported for survival or regression"
+        ],
+        "oracle_response": "A vector (per-class) sampling fraction is only valid when the inferred task is classification. Supplying a vector fraction for regression, survival, or probability tasks is rejected with the error category 'sample_fraction_vector_requires_classification'. The vector length must also exactly equal the number of response classes; a mismatch is rejected with 'sample_fraction_size_mismatch' and reports both the expected count and the provided count."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "what happens when all per-class fractions are zero",
+          "what error is raised if the sampling fraction vector sums to zero",
+          "is a zero-sum fraction vector caught before training"
+        ],
+        "oracle_response": "If a per-class sampling fraction vector is provided and all values are zero (sum equals zero), training is rejected before any trees are grown. The typed error category is 'sample_fraction_sum_zero'."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what error occurs when sampling without replacement requests more samples than a class has",
+          "insufficient samples error format",
+          "how does the engine report that a class does not have enough rows for the requested fraction"
+        ],
+        "oracle_response": "When sampling without replacement (replace=false) and the requested sample count for any class exceeds the number of available rows in that class, training is aborted. The error category is 'insufficient_samples_in_class'. Three additional fields are reported: 'class' (the name of the offending class), 'available' (the row count in that class), and 'requested' (the count that was requested). The class reported is the first class encountered that fails this check."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what error is raised when a splitting rule is used on the wrong task",
+          "can I use the variance split rule on a classification problem",
+          "how does the engine handle splitrule and task mismatches"
+        ],
+        "oracle_response": "Each splitting rule is tied to a specific task family. Using a regression-only rule (e.g. 'variance') on classification data emits error category 'splitrule_requires_regression' and also reports the 'splitrule' value that was supplied. Using a survival-only rule on classification data similarly emits a task-mismatch error category. No cross-family use of splitting rules is permitted."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "how are missing values in predictor columns reported",
+          "what error is raised for NA values in training data",
+          "does the engine distinguish between missing response values and missing predictor values"
+        ],
+        "oracle_response": "Missing values in any predictor column used during training are rejected before fitting begins, with error category 'missing_data_in_predictors' and a 'columns' field listing the offending column names. Missing values in the response column are rejected with a distinct error category. At prediction time, missing values in predictor columns of the new data also emit 'missing_data_in_predictors' with 'columns' listing all affected columns in their original column order."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "what is the shape of per-tree predictions for probability estimation",
+          "how many dimensions does the all-tree probability output have",
+          "what does predictions_shape mean for probability with predict=all"
+        ],
+        "oracle_response": "For a probability estimation task, requesting per-tree predictions (predict='all') returns a three-dimensional array. Its shape is reported as 'observations x classes x trees' (e.g. 150x3x5 for 150 rows, 3 classes, 5 trees). Classification and regression per-tree outputs are two-dimensional (observations x trees). Survival per-tree outputs are also three-dimensional but reported as two separate arrays — survival_shape and chf_shape — each of shape observations x event-times x trees."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "how many unique event times does the survival model report",
+          "what are the evaluation timepoints for a survival forest",
+          "does the timepoints count include censored observations or only events"
+        ],
+        "oracle_response": "A survival forest's evaluation timepoints are the sorted distinct event times observed in the training data — that is, the unique values of the time column where the status indicator equals 1 (event occurred), not the censored times. For the veteran dataset this yields 101 distinct event times. The timepoints are available via the model's timepoint accessor and are verified by comparing against the sorted unique event-time values extracted directly from the training time column filtered by status=1."
+      },
+      {
+        "constraint_id": "C018",
+        "trigger_keywords": [
+          "what does the confusion matrix output look like",
+          "what fields are reported for the confusion matrix operation",
+          "how are row totals verified in the confusion matrix"
+        ],
+        "oracle_response": "The confusion matrix for a classification design is a square matrix with rows representing true classes and columns representing predicted classes. The output reports: 'dims' as RxC (e.g. 3x3), 'true_classes' listing the row class labels in order, 'predicted_classes' listing the column class labels in order, and 'row_totals' giving the count of training observations per true class. For the iris dataset with Species as response, row_totals must be 50,50,50 matching the 50 rows per class."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid op field values",
+          "what values can op take",
+          "list all supported op values",
+          "what actions does the dispatcher handle",
+          "which op strings does the adapter support",
+          "what are the possible op inputs",
+          "tell me all the op names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'op' field. Valid values are: 'error', 'warning', 'fit', 'equivalence', 'determinism', 'predict', 'confusion', 'probabilities', 'death_times', 'importance'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature10_10_survival_no_covariates",
+        "trigger_keywords": [
+          "test cases for feature10 10 survival no covariates",
+          "show me feature10 10 survival no covariates test cases",
+          "what are the feature10 10 survival no covariates test inputs",
+          "give me the feature10_10_survival_no_covariates test file",
+          "test cases for feature 10",
+          "feature10 10 survival no covariates expected output",
+          "what does feature10 10 survival no covariates expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_10_survival_no_covariates:\n{\n  \"description\": \"A survival formula that leaves no predictor columns after consuming the time and status columns is rejected.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"veteran\",\n        \"formula\": \"Surv(time, status) ~ .\",\n        \"num_trees\": 5,\n        \"keep_columns\": [\n          \"time\",\n          \"status\"\n        ]\n      },\n      \"expected_output\": \"error=no_covariates\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_11_importance_not_requested",
+        "trigger_keywords": [
+          "test cases for feature10 11 importance not requested",
+          "show me feature10 11 importance not requested test cases",
+          "what are the feature10 11 importance not requested test inputs",
+          "give me the feature10_11_importance_not_requested test file",
+          "test cases for feature 10",
+          "feature10 11 importance not requested expected output",
+          "what does feature10 11 importance not requested expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_11_importance_not_requested:\n{\n  \"description\": \"Querying variable importance on a model trained without importance scoring is rejected.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"importance_query\": true\n      },\n      \"expected_output\": \"error=importance_not_available\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_12_timepoints_non_survival",
+        "trigger_keywords": [
+          "test cases for feature10 12 timepoints non survival",
+          "show me feature10 12 timepoints non survival test cases",
+          "what are the feature10 12 timepoints non survival test inputs",
+          "give me the feature10_12_timepoints_non_survival test file",
+          "test cases for feature 10",
+          "feature10 12 timepoints non survival expected output",
+          "what does feature10 12 timepoints non survival expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_12_timepoints_non_survival:\n{\n  \"description\": \"Querying survival timepoints on a non-survival model is rejected.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"timepoints_on\": true\n      },\n      \"expected_output\": \"error=not_a_survival_forest\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_13_mtry_function_error",
+        "trigger_keywords": [
+          "test cases for feature10 13 mtry function error",
+          "show me feature10 13 mtry function error test cases",
+          "what are the feature10 13 mtry function error test inputs",
+          "give me the feature10_13_mtry_function_error test file",
+          "test cases for feature 10",
+          "feature10 13 mtry function error expected output",
+          "what does feature10 13 mtry function error expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_13_mtry_function_error:\n{\n  \"description\": \"When the predictor-count selection function raises during evaluation, training is aborted with an mtry-function error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"veteran\",\n        \"formula\": \"Surv(time, status) ~ .\",\n        \"num_trees\": 5,\n        \"mtry_error\": true\n      },\n      \"expected_output\": \"error=mtry_function_error\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_1_sample_fraction_scalar_range",
+        "trigger_keywords": [
+          "test cases for feature10 1 sample fraction scalar range",
+          "show me feature10 1 sample fraction scalar range test cases",
+          "what are the feature10 1 sample fraction scalar range test inputs",
+          "give me the feature10_1_sample_fraction_scalar_range test file",
+          "test cases for feature 10",
+          "feature10 1 sample fraction scalar range expected output",
+          "what does feature10 1 sample fraction scalar range expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_1_sample_fraction_scalar_range:\n{\n  \"description\": \"A scalar sampling fraction outside the half-open interval (0,1] is rejected with an out-of-range error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"sample_fraction\": 0\n      },\n      \"expected_output\": \"error=sample_fraction_out_of_range\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_2_sample_fraction_vector_task",
+        "trigger_keywords": [
+          "test cases for feature10 2 sample fraction vector task",
+          "show me feature10 2 sample fraction vector task test cases",
+          "what are the feature10 2 sample fraction vector task test inputs",
+          "give me the feature10_2_sample_fraction_vector_task test file",
+          "test cases for feature 10",
+          "feature10 2 sample fraction vector task expected output",
+          "what does feature10 2 sample fraction vector task expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_2_sample_fraction_vector_task:\n{\n  \"description\": \"A per-class vector of sampling fractions is only valid for classification; supplying one for a regression response is rejected.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Sepal.Length ~ .\",\n        \"num_trees\": 5,\n        \"sample_fraction\": [\n          0.1,\n          0.2\n        ]\n      },\n      \"expected_output\": \"error=sample_fraction_vector_requires_classification\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_3_sample_fraction_vector_size",
+        "trigger_keywords": [
+          "test cases for feature10 3 sample fraction vector size",
+          "show me feature10 3 sample fraction vector size test cases",
+          "what are the feature10 3 sample fraction vector size test inputs",
+          "give me the feature10_3_sample_fraction_vector_size test file",
+          "test cases for feature 10",
+          "feature10 3 sample fraction vector size expected output",
+          "what does feature10 3 sample fraction vector size expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_3_sample_fraction_vector_size:\n{\n  \"description\": \"A per-class vector of sampling fractions must provide exactly one value per response class; a wrong-length vector is rejected with the expected and provided counts.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"sample_fraction\": [\n          0.1,\n          0.2\n        ]\n      },\n      \"expected_output\": \"error=sample_fraction_size_mismatch\\nexpected=3\\nprovided=2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_4_sample_fraction_vector_sum",
+        "trigger_keywords": [
+          "test cases for feature10 4 sample fraction vector sum",
+          "show me feature10 4 sample fraction vector sum test cases",
+          "what are the feature10 4 sample fraction vector sum test inputs",
+          "give me the feature10_4_sample_fraction_vector_sum test file",
+          "test cases for feature 10",
+          "feature10 4 sample fraction vector sum expected output",
+          "what does feature10 4 sample fraction vector sum expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_4_sample_fraction_vector_sum:\n{\n  \"description\": \"A per-class vector of sampling fractions whose values sum to zero is rejected.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"sample_fraction\": [\n          0,\n          0,\n          0\n        ]\n      },\n      \"expected_output\": \"error=sample_fraction_sum_zero\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_5_insufficient_samples",
+        "trigger_keywords": [
+          "test cases for feature10 5 insufficient samples",
+          "show me feature10 5 insufficient samples test cases",
+          "what are the feature10 5 insufficient samples test inputs",
+          "give me the feature10_5_insufficient_samples test file",
+          "test cases for feature 10",
+          "feature10 5 insufficient samples expected output",
+          "what does feature10 5 insufficient samples expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_5_insufficient_samples:\n{\n  \"description\": \"Sampling without replacement that requests more observations of a class than exist is rejected, reporting the class, the available count, and the requested count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"sample_fraction\": [\n          0.2,\n          0.3,\n          0.4\n        ],\n        \"replace\": false,\n        \"keep_inbag\": true\n      },\n      \"expected_output\": \"error=insufficient_samples_in_class\\nclass=virginica\\navailable=50\\nrequested=60\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_6_splitrule_task_mismatch",
+        "trigger_keywords": [
+          "test cases for feature10 6 splitrule task mismatch",
+          "show me feature10 6 splitrule task mismatch test cases",
+          "what are the feature10 6 splitrule task mismatch test inputs",
+          "give me the feature10_6_splitrule_task_mismatch test file",
+          "test cases for feature 10",
+          "feature10 6 splitrule task mismatch expected output",
+          "what does feature10 6 splitrule task mismatch expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_6_splitrule_task_mismatch:\n{\n  \"description\": \"A splitting rule that is specific to one task family is rejected when used on data of a different family (e.g. a regression-only rule on categorical data, or survival-only rules on categorical data).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"splitrule\": \"variance\"\n      },\n      \"expected_output\": \"error=splitrule_requires_regression\\nsplitrule=variance\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_7_missing_data_training",
+        "trigger_keywords": [
+          "test cases for feature10 7 missing data training",
+          "show me feature10 7 missing data training test cases",
+          "what are the feature10 7 missing data training test inputs",
+          "give me the feature10_7_missing_data_training test file",
+          "test cases for feature 10",
+          "feature10 7 missing data training expected output",
+          "what does feature10 7 missing data training expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_7_missing_data_training:\n{\n  \"description\": \"Missing values in a predictor column used for training are rejected, naming the offending column(s); a missing value in the response is rejected with a distinct response category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"na_cell\": [\n          [\n            25,\n            \"Sepal.Length\"\n          ]\n        ]\n      },\n      \"expected_output\": \"error=missing_data_in_predictors\\ncolumns=Sepal.Length\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_8_missing_data_prediction",
+        "trigger_keywords": [
+          "test cases for feature10 8 missing data prediction",
+          "show me feature10 8 missing data prediction test cases",
+          "what are the feature10 8 missing data prediction test inputs",
+          "give me the feature10_8_missing_data_prediction test file",
+          "test cases for feature 10",
+          "feature10 8 missing data prediction expected output",
+          "what does feature10 8 missing data prediction expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_8_missing_data_prediction:\n{\n  \"description\": \"Missing values in predictor columns of the data passed at prediction time are rejected, naming the offending columns in column order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"predict_after\": true,\n        \"num_trees\": 5,\n        \"na_cell_predict\": [\n          [\n            25,\n            \"Sepal.Length\"\n          ],\n          [\n            4,\n            \"Petal.Width\"\n          ]\n        ]\n      },\n      \"expected_output\": \"error=missing_data_in_predictors\\ncolumns=Sepal.Length, Petal.Width\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_9_invalid_prediction_type",
+        "trigger_keywords": [
+          "test cases for feature10 9 invalid prediction type",
+          "show me feature10 9 invalid prediction type test cases",
+          "what are the feature10 9 invalid prediction type test inputs",
+          "give me the feature10_9_invalid_prediction_type test file",
+          "test cases for feature 10",
+          "feature10 9 invalid prediction type expected output",
+          "what does feature10 9 invalid prediction type expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_9_invalid_prediction_type:\n{\n  \"description\": \"Requesting an unknown prediction output type is rejected.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"predict_after\": true,\n        \"num_trees\": 5,\n        \"predict_type\": \"class\"\n      },\n      \"expected_output\": \"error=invalid_prediction_type\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_dropped_unused_levels",
+        "trigger_keywords": [
+          "test cases for feature11 dropped unused levels",
+          "show me feature11 dropped unused levels test cases",
+          "what are the feature11 dropped unused levels test inputs",
+          "give me the feature11_dropped_unused_levels test file",
+          "test cases for feature 11",
+          "feature11 dropped unused levels expected output",
+          "what does feature11 dropped unused levels expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_dropped_unused_levels:\n{\n  \"description\": \"Training on a subset that omits some response classes warns that unused response levels were dropped, naming them; predictions still span the full set of original classes (or, for probability, the surviving class count).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"warning\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"row_range\": [\n          1,\n          100\n        ],\n        \"report_pred_levels\": true\n      },\n      \"expected_output\": \"warning=dropped_unused_response_levels\\nlevels=virginica\\nprediction_levels=setosa,versicolor,virginica\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_1_formula_classification",
+        "trigger_keywords": [
+          "test cases for feature1 1 formula classification",
+          "show me feature1 1 formula classification test cases",
+          "what are the feature1 1 formula classification test inputs",
+          "give me the feature1_1_formula_classification test file",
+          "test cases for feature 1",
+          "feature1 1 formula classification expected output",
+          "what does feature1 1 formula classification expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_formula_classification:\n{\n  \"description\": \"Resolve a formula whose response is a categorical column into a model design: the inferred learning task, the tree count actually used, and the ordered list of predictor columns (every other column).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1\n      },\n      \"expected_output\": \"task=classification\\nnum_trees=5\\nnum_predictors=4\\npredictors=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_formula_regression",
+        "trigger_keywords": [
+          "test cases for feature1 2 formula regression",
+          "show me feature1 2 formula regression test cases",
+          "what are the feature1 2 formula regression test inputs",
+          "give me the feature1_2_formula_regression test file",
+          "test cases for feature 1",
+          "feature1 2 formula regression expected output",
+          "what does feature1 2 formula regression expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_formula_regression:\n{\n  \"description\": \"Resolve a formula whose response is a continuous numeric column into a regression model design with the remaining columns as predictors.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Sepal.Length ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1\n      },\n      \"expected_output\": \"task=regression\\nnum_trees=5\\nnum_predictors=4\\npredictors=Sepal.Width,Petal.Length,Petal.Width,Species\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_formula_survival",
+        "trigger_keywords": [
+          "test cases for feature1 3 formula survival",
+          "show me feature1 3 formula survival test cases",
+          "what are the feature1 3 formula survival test inputs",
+          "give me the feature1_3_formula_survival test file",
+          "test cases for feature 1",
+          "feature1 3 formula survival expected output",
+          "what does feature1 3 formula survival expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_formula_survival:\n{\n  \"description\": \"Resolve a formula whose response is a right-censored time/event pair into a survival model design; the time and status columns are consumed by the response and excluded from predictors.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"veteran\",\n        \"formula\": \"Surv(time, status) ~ .\",\n        \"num_trees\": 10,\n        \"seed\": 1\n      },\n      \"expected_output\": \"task=survival\\nnum_trees=10\\nnum_predictors=6\\npredictors=trt,celltype,karno,diagtime,age,prior\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_4_formula_probability",
+        "trigger_keywords": [
+          "test cases for feature1 4 formula probability",
+          "show me feature1 4 formula probability test cases",
+          "what are the feature1 4 formula probability test inputs",
+          "give me the feature1_4_formula_probability test file",
+          "test cases for feature 1",
+          "feature1 4 formula probability expected output",
+          "what does feature1 4 formula probability expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_4_formula_probability:\n{\n  \"description\": \"Resolve a formula with a categorical response while requesting class-probability estimation; the task becomes probability estimation over the response classes.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"probability\": true\n      },\n      \"expected_output\": \"task=probability\\nnum_trees=5\\nnum_predictors=4\\npredictors=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_5_lhs_function_response",
+        "trigger_keywords": [
+          "test cases for feature1 5 lhs function response",
+          "show me feature1 5 lhs function response test cases",
+          "what are the feature1 5 lhs function response test inputs",
+          "give me the feature1_5_lhs_function_response test file",
+          "test cases for feature 1",
+          "feature1 5 lhs function response expected output",
+          "what does feature1 5 lhs function response expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_5_lhs_function_response:\n{\n  \"description\": \"Accept a formula whose left-hand side wraps the response column in a user function; the design must still resolve and infer the task from the underlying response.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"iris\",\n        \"formula\": \"transform(Species) ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1\n      },\n      \"expected_output\": \"task=classification\\nnum_trees=5\\nnum_predictors=4\\npredictors=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_named_response_classification",
+        "trigger_keywords": [
+          "test cases for feature2 1 named response classification",
+          "show me feature2 1 named response classification test cases",
+          "what are the feature2 1 named response classification test inputs",
+          "give me the feature2_1_named_response_classification test file",
+          "test cases for feature 2",
+          "feature2 1 named response classification expected output",
+          "what does feature2 1 named response classification expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_named_response_classification:\n{\n  \"description\": \"Build a model design by naming the response column directly (instead of a formula); a categorical response yields a classification design with all other columns as predictors.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"iris\",\n        \"dependent\": \"Species\",\n        \"num_trees\": 5,\n        \"seed\": 1\n      },\n      \"expected_output\": \"task=classification\\nnum_trees=5\\nnum_predictors=4\\npredictors=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_named_response_regression",
+        "trigger_keywords": [
+          "test cases for feature2 2 named response regression",
+          "show me feature2 2 named response regression test cases",
+          "what are the feature2 2 named response regression test inputs",
+          "give me the feature2_2_named_response_regression test file",
+          "test cases for feature 2",
+          "feature2 2 named response regression expected output",
+          "what does feature2 2 named response regression expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_named_response_regression:\n{\n  \"description\": \"Name a numeric response column directly to obtain a regression design.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"iris\",\n        \"dependent\": \"Sepal.Length\",\n        \"num_trees\": 5,\n        \"seed\": 1\n      },\n      \"expected_output\": \"task=regression\\nnum_trees=5\\nnum_predictors=4\\npredictors=Sepal.Width,Petal.Length,Petal.Width,Species\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_named_response_survival",
+        "trigger_keywords": [
+          "test cases for feature2 3 named response survival",
+          "show me feature2 3 named response survival test cases",
+          "what are the feature2 3 named response survival test inputs",
+          "give me the feature2_3_named_response_survival test file",
+          "test cases for feature 2",
+          "feature2 3 named response survival expected output",
+          "what does feature2 3 named response survival expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_named_response_survival:\n{\n  \"description\": \"Name a time column and a separate status column to obtain a survival design; both named columns are excluded from predictors.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"veteran\",\n        \"dependent\": \"time\",\n        \"status\": \"status\",\n        \"num_trees\": 10,\n        \"seed\": 1\n      },\n      \"expected_output\": \"task=survival\\nnum_trees=10\\nnum_predictors=6\\npredictors=trt,celltype,karno,diagtime,age,prior\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_matrix_classification_equivalence",
+        "trigger_keywords": [
+          "test cases for feature3 1 matrix classification equivalence",
+          "show me feature3 1 matrix classification equivalence test cases",
+          "what are the feature3 1 matrix classification equivalence test inputs",
+          "give me the feature3_1_matrix_classification_equivalence test file",
+          "test cases for feature 3",
+          "feature3 1 matrix classification equivalence expected output",
+          "what does feature3 1 matrix classification equivalence expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_matrix_classification_equivalence:\n{\n  \"description\": \"Train two models with the same seed: one on a column-typed table, one on the all-numeric matrix encoding of the same data (declared as a classification task). The externally-observable label assignments must agree on every observation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"equivalence\",\n        \"dataset\": \"iris\",\n        \"dataset_matrix\": \"iris_matrix\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 10,\n        \"classification_matrix\": true,\n        \"compare\": \"predictions\"\n      },\n      \"expected_output\": \"task=classification\\nobservations=150\\ndisagreements=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_matrix_survival_equivalence",
+        "trigger_keywords": [
+          "test cases for feature3 2 matrix survival equivalence",
+          "show me feature3 2 matrix survival equivalence test cases",
+          "what are the feature3 2 matrix survival equivalence test inputs",
+          "give me the feature3_2_matrix_survival_equivalence test file",
+          "test cases for feature 3",
+          "feature3 2 matrix survival equivalence expected output",
+          "what does feature3 2 matrix survival equivalence expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_matrix_survival_equivalence:\n{\n  \"description\": \"Train a survival model with the same seed on a typed table and on its all-numeric matrix encoding; the cumulative-hazard estimates must agree cell-for-cell.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"equivalence\",\n        \"dataset\": \"veteran\",\n        \"dataset_matrix\": \"veteran_matrix\",\n        \"formula\": \"Surv(time, status) ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 10,\n        \"compare\": \"chf\"\n      },\n      \"expected_output\": \"task=survival\\ncells=13837\\ndisagreements=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_matrix_predictor_selection",
+        "trigger_keywords": [
+          "test cases for feature3 3 matrix predictor selection",
+          "show me feature3 3 matrix predictor selection test cases",
+          "what are the feature3 3 matrix predictor selection test inputs",
+          "give me the feature3_3_matrix_predictor_selection test file",
+          "test cases for feature 3",
+          "feature3 3 matrix predictor selection expected output",
+          "what does feature3 3 matrix predictor selection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_matrix_predictor_selection:\n{\n  \"description\": \"When the data source is an all-numeric matrix and the response is named, the predictor set is every other column of the matrix, preserving order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"fit\",\n        \"dataset\": \"iris_matrix\",\n        \"dependent\": \"Sepal.Length\",\n        \"num_trees\": 5,\n        \"seed\": 1\n      },\n      \"expected_output\": \"task=regression\\nnum_trees=5\\nnum_predictors=4\\npredictors=Sepal.Width,Petal.Length,Petal.Width,Species\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_reproducibility",
+        "trigger_keywords": [
+          "test cases for feature4 reproducibility",
+          "show me feature4 reproducibility test cases",
+          "what are the feature4 reproducibility test inputs",
+          "give me the feature4_reproducibility test file",
+          "test cases for feature 4",
+          "feature4 reproducibility expected output",
+          "what does feature4 reproducibility expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_reproducibility:\n{\n  \"description\": \"Training twice from the same seed with identical settings produces identical predictions; the number of disagreeing observations between the two runs must be zero.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"determinism\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 50,\n        \"seed\": 2\n      },\n      \"expected_output\": \"task=classification\\npredictions=150\\ndisagreements=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_predict_all_classification",
+        "trigger_keywords": [
+          "test cases for feature5 1 predict all classification",
+          "show me feature5 1 predict all classification test cases",
+          "what are the feature5 1 predict all classification test inputs",
+          "give me the feature5_1_predict_all_classification test file",
+          "test cases for feature 5",
+          "feature5 1 predict all classification expected output",
+          "what does feature5 1 predict all classification expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_predict_all_classification:\n{\n  \"description\": \"Per-tree prediction for a classification design returns one column per tree: an observations-by-trees matrix.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"predict\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"predict\": \"all\"\n      },\n      \"expected_output\": \"task=classification\\npredictions_shape=150x5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_predict_all_regression",
+        "trigger_keywords": [
+          "test cases for feature5 2 predict all regression",
+          "show me feature5 2 predict all regression test cases",
+          "what are the feature5 2 predict all regression test inputs",
+          "give me the feature5_2_predict_all_regression test file",
+          "test cases for feature 5",
+          "feature5 2 predict all regression expected output",
+          "what does feature5 2 predict all regression expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_predict_all_regression:\n{\n  \"description\": \"Per-tree prediction for a regression design returns an observations-by-trees matrix.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"predict\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Sepal.Length ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"predict\": \"all\"\n      },\n      \"expected_output\": \"task=regression\\npredictions_shape=150x5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_3_predict_all_probability",
+        "trigger_keywords": [
+          "test cases for feature5 3 predict all probability",
+          "show me feature5 3 predict all probability test cases",
+          "what are the feature5 3 predict all probability test inputs",
+          "give me the feature5_3_predict_all_probability test file",
+          "test cases for feature 5",
+          "feature5 3 predict all probability expected output",
+          "what does feature5 3 predict all probability expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_predict_all_probability:\n{\n  \"description\": \"Per-tree prediction for a probability design returns a three-dimensional array of observations by classes by trees.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"predict\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"probability\": true,\n        \"predict\": \"all\"\n      },\n      \"expected_output\": \"task=probability\\npredictions_shape=150x3x5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_4_predict_all_survival",
+        "trigger_keywords": [
+          "test cases for feature5 4 predict all survival",
+          "show me feature5 4 predict all survival test cases",
+          "what are the feature5 4 predict all survival test inputs",
+          "give me the feature5_4_predict_all_survival test file",
+          "test cases for feature 5",
+          "feature5 4 predict all survival expected output",
+          "what does feature5 4 predict all survival expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_4_predict_all_survival:\n{\n  \"description\": \"Per-tree prediction for a survival design returns survival and cumulative-hazard arrays, each observations by event-times by trees.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"predict\",\n        \"dataset\": \"veteran\",\n        \"formula\": \"Surv(time, status) ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"predict\": \"all\"\n      },\n      \"expected_output\": \"task=survival\\nsurvival_shape=137x101x5\\nchf_shape=137x101x5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_5_predict_subset_trees",
+        "trigger_keywords": [
+          "test cases for feature5 5 predict subset trees",
+          "show me feature5 5 predict subset trees test cases",
+          "what are the feature5 5 predict subset trees test inputs",
+          "give me the feature5_5_predict_subset_trees test file",
+          "test cases for feature 5",
+          "feature5 5 predict subset trees expected output",
+          "what does feature5 5 predict subset trees expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_5_predict_subset_trees:\n{\n  \"description\": \"Per-tree prediction restricted to the first K trees returns a matrix whose tree dimension equals K.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"predict\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"predict\": \"all\",\n        \"num_trees_predict\": 3\n      },\n      \"expected_output\": \"task=classification\\npredictions_shape=150x3\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_6_terminal_nodes",
+        "trigger_keywords": [
+          "test cases for feature5 6 terminal nodes",
+          "show me feature5 6 terminal nodes test cases",
+          "what are the feature5 6 terminal nodes test inputs",
+          "give me the feature5_6_terminal_nodes test file",
+          "test cases for feature 5",
+          "feature5 6 terminal nodes expected output",
+          "what does feature5 6 terminal nodes expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_6_terminal_nodes:\n{\n  \"description\": \"Requesting terminal-node identifiers returns an observations-by-trees matrix of node indices.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"predict\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"predict\": \"terminalNodes\"\n      },\n      \"expected_output\": \"task=classification\\npredictions_shape=150x5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_confusion_matrix",
+        "trigger_keywords": [
+          "test cases for feature6 confusion matrix",
+          "show me feature6 confusion matrix test cases",
+          "what are the feature6 confusion matrix test inputs",
+          "give me the feature6_confusion_matrix test file",
+          "test cases for feature 6",
+          "feature6 confusion matrix expected output",
+          "what does feature6 confusion matrix expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_confusion_matrix:\n{\n  \"description\": \"A classification design exposes a square confusion matrix whose rows are the true classes and whose columns are the predicted classes; each row total equals the number of training observations of that true class.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"confusion\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 500,\n        \"seed\": 1\n      },\n      \"expected_output\": \"dims=3x3\\ntrue_classes=setosa,versicolor,virginica\\npredicted_classes=setosa,versicolor,virginica\\nrow_totals=50,50,50\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_probability_outputs",
+        "trigger_keywords": [
+          "test cases for feature7 probability outputs",
+          "show me feature7 probability outputs test cases",
+          "what are the feature7 probability outputs test inputs",
+          "give me the feature7_probability_outputs test file",
+          "test cases for feature 7",
+          "feature7 probability outputs expected output",
+          "what does feature7 probability outputs expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_probability_outputs:\n{\n  \"description\": \"Class-probability predictions form an observations-by-classes matrix whose every row sums to one with all entries in the unit interval.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"probabilities\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"probability\": true\n      },\n      \"expected_output\": \"classes=3\\nrows=150\\nrows_not_summing_to_one=0\\nvalues_out_of_unit_range=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_survival_timepoints",
+        "trigger_keywords": [
+          "test cases for feature8 survival timepoints",
+          "show me feature8 survival timepoints test cases",
+          "what are the feature8 survival timepoints test inputs",
+          "give me the feature8_survival_timepoints test file",
+          "test cases for feature 8",
+          "feature8 survival timepoints expected output",
+          "what does feature8 survival timepoints expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_survival_timepoints:\n{\n  \"description\": \"A survival design reports its evaluation timepoints; these equal the sorted distinct event times observed in training.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"death_times\",\n        \"dataset\": \"veteran\",\n        \"formula\": \"Surv(time, status) ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"time_col\": \"time\"\n      },\n      \"expected_output\": \"count=101\\nequals_sorted_unique_event_times=yes\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_variable_importance",
+        "trigger_keywords": [
+          "test cases for feature9 variable importance",
+          "show me feature9 variable importance test cases",
+          "what are the feature9 variable importance test inputs",
+          "give me the feature9_variable_importance test file",
+          "test cases for feature 9",
+          "feature9 variable importance expected output",
+          "what does feature9 variable importance expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_variable_importance:\n{\n  \"description\": \"When importance scoring is enabled, the design exposes one numeric importance value per predictor, keyed by predictor name.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"importance\",\n        \"dataset\": \"iris\",\n        \"formula\": \"Species ~ .\",\n        \"num_trees\": 5,\n        \"seed\": 1,\n        \"importance\": \"impurity\"\n      },\n      \"expected_output\": \"kind=numeric\\ncount=4\\nnames=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the adapter layer should be thin and separate from the actual engine logic",
+        "actual_meaning": "Architecture constraint in start.md section 2: a thin JSON adapter reads stdin commands and calls core engine entry points, then renders structured results to stdout as key=value lines. The core engine must have no knowledge of stdin/stdout or JSON. This maps to the Separation of Concerns NFR and DIP principle."
+      },
+      {
+        "vague_reference": "meaningful category labels for things like bad sampling settings",
+        "actual_meaning": "The error taxonomy defined in feature10 test cases: sample_fraction_out_of_range, sample_fraction_vector_requires_classification, sample_fraction_size_mismatch (with expected= and provided= fields), sample_fraction_sum_zero, insufficient_samples_in_class (with class=, available=, requested= fields)."
+      },
+      {
+        "vague_reference": "per-tree prediction shapes",
+        "actual_meaning": "Feature 5 test cases define the shapes: classification/regression are 2D (observations x trees), probability is 3D (observations x classes x trees), survival produces two 3D arrays survival_shape and chf_shape each (observations x event-times x trees). Subsetting to first K trees via num_trees_predict reduces the tree dimension."
+      }
+    ],
+    "fallback_response": "That detail isn't something I can clarify from the original discussion — you'll want to check the test case files under rcb_tests/public_test_cases/ or the PRD section in start.md that covers the relevant feature. The contract is defined by the expected_output fields in those JSON test cases."
+  },
+  "public_test_cases": {
+    "feature10_10_survival_no_covariates.json": {
+      "description": "A survival formula that leaves no predictor columns after consuming the time and status columns is rejected.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "veteran",
+            "formula": "Surv(time, status) ~ .",
+            "num_trees": 5,
+            "keep_columns": [
+              "time",
+              "status"
+            ]
+          },
+          "expected_output": "error=no_covariates\n"
+        }
+      ]
+    },
+    "feature10_11_importance_not_requested.json": {
+      "description": "Querying variable importance on a model trained without importance scoring is rejected.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "importance_query": true
+          },
+          "expected_output": "error=importance_not_available\n"
+        }
+      ]
+    },
+    "feature10_12_timepoints_non_survival.json": {
+      "description": "Querying survival timepoints on a non-survival model is rejected.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "timepoints_on": true
+          },
+          "expected_output": "error=not_a_survival_forest\n"
+        }
+      ]
+    },
+    "feature10_13_mtry_function_error.json": {
+      "description": "When the predictor-count selection function raises during evaluation, training is aborted with an mtry-function error category.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "veteran",
+            "formula": "Surv(time, status) ~ .",
+            "num_trees": 5,
+            "mtry_error": true
+          },
+          "expected_output": "error=mtry_function_error\n"
+        }
+      ]
+    },
+    "feature10_1_sample_fraction_scalar_range.json": {
+      "description": "A scalar sampling fraction outside the half-open interval (0,1] is rejected with an out-of-range error category.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "sample_fraction": 0
+          },
+          "expected_output": "error=sample_fraction_out_of_range\n"
+        }
+      ]
+    },
+    "feature10_2_sample_fraction_vector_task.json": {
+      "description": "A per-class vector of sampling fractions is only valid for classification; supplying one for a regression response is rejected.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Sepal.Length ~ .",
+            "num_trees": 5,
+            "sample_fraction": [
+              0.1,
+              0.2
+            ]
+          },
+          "expected_output": "error=sample_fraction_vector_requires_classification\n"
+        }
+      ]
+    },
+    "feature10_3_sample_fraction_vector_size.json": {
+      "description": "A per-class vector of sampling fractions must provide exactly one value per response class; a wrong-length vector is rejected with the expected and provided counts.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "sample_fraction": [
+              0.1,
+              0.2
+            ]
+          },
+          "expected_output": "error=sample_fraction_size_mismatch\nexpected=3\nprovided=2\n"
+        }
+      ]
+    },
+    "feature10_4_sample_fraction_vector_sum.json": {
+      "description": "A per-class vector of sampling fractions whose values sum to zero is rejected.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "sample_fraction": [
+              0,
+              0,
+              0
+            ]
+          },
+          "expected_output": "error=sample_fraction_sum_zero\n"
+        }
+      ]
+    },
+    "feature10_5_insufficient_samples.json": {
+      "description": "Sampling without replacement that requests more observations of a class than exist is rejected, reporting the class, the available count, and the requested count.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "sample_fraction": [
+              0.2,
+              0.3,
+              0.4
+            ],
+            "replace": false,
+            "keep_inbag": true
+          },
+          "expected_output": "error=insufficient_samples_in_class\nclass=virginica\navailable=50\nrequested=60\n"
+        }
+      ]
+    },
+    "feature10_6_splitrule_task_mismatch.json": {
+      "description": "A splitting rule that is specific to one task family is rejected when used on data of a different family (e.g. a regression-only rule on categorical data, or survival-only rules on categorical data).",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "splitrule": "variance"
+          },
+          "expected_output": "error=splitrule_requires_regression\nsplitrule=variance\n"
+        }
+      ]
+    },
+    "feature10_7_missing_data_training.json": {
+      "description": "Missing values in a predictor column used for training are rejected, naming the offending column(s); a missing value in the response is rejected with a distinct response category.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "na_cell": [
+              [
+                25,
+                "Sepal.Length"
+              ]
+            ]
+          },
+          "expected_output": "error=missing_data_in_predictors\ncolumns=Sepal.Length\n"
+        }
+      ]
+    },
+    "feature10_8_missing_data_prediction.json": {
+      "description": "Missing values in predictor columns of the data passed at prediction time are rejected, naming the offending columns in column order.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "predict_after": true,
+            "num_trees": 5,
+            "na_cell_predict": [
+              [
+                25,
+                "Sepal.Length"
+              ],
+              [
+                4,
+                "Petal.Width"
+              ]
+            ]
+          },
+          "expected_output": "error=missing_data_in_predictors\ncolumns=Sepal.Length, Petal.Width\n"
+        }
+      ]
+    },
+    "feature10_9_invalid_prediction_type.json": {
+      "description": "Requesting an unknown prediction output type is rejected.",
+      "cases": [
+        {
+          "input": {
+            "op": "error",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "predict_after": true,
+            "num_trees": 5,
+            "predict_type": "class"
+          },
+          "expected_output": "error=invalid_prediction_type\n"
+        }
+      ]
+    },
+    "feature11_dropped_unused_levels.json": {
+      "description": "Training on a subset that omits some response classes warns that unused response levels were dropped, naming them; predictions still span the full set of original classes (or, for probability, the surviving class count).",
+      "cases": [
+        {
+          "input": {
+            "op": "warning",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "row_range": [
+              1,
+              100
+            ],
+            "report_pred_levels": true
+          },
+          "expected_output": "warning=dropped_unused_response_levels\nlevels=virginica\nprediction_levels=setosa,versicolor,virginica\n"
+        }
+      ]
+    },
+    "feature1_1_formula_classification.json": {
+      "description": "Resolve a formula whose response is a categorical column into a model design: the inferred learning task, the tree count actually used, and the ordered list of predictor columns (every other column).",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 1
+          },
+          "expected_output": "task=classification\nnum_trees=5\nnum_predictors=4\npredictors=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\n"
+        }
+      ]
+    },
+    "feature1_2_formula_regression.json": {
+      "description": "Resolve a formula whose response is a continuous numeric column into a regression model design with the remaining columns as predictors.",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "iris",
+            "formula": "Sepal.Length ~ .",
+            "num_trees": 5,
+            "seed": 1
+          },
+          "expected_output": "task=regression\nnum_trees=5\nnum_predictors=4\npredictors=Sepal.Width,Petal.Length,Petal.Width,Species\n"
+        }
+      ]
+    },
+    "feature1_3_formula_survival.json": {
+      "description": "Resolve a formula whose response is a right-censored time/event pair into a survival model design; the time and status columns are consumed by the response and excluded from predictors.",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "veteran",
+            "formula": "Surv(time, status) ~ .",
+            "num_trees": 10,
+            "seed": 1
+          },
+          "expected_output": "task=survival\nnum_trees=10\nnum_predictors=6\npredictors=trt,celltype,karno,diagtime,age,prior\n"
+        }
+      ]
+    },
+    "feature1_4_formula_probability.json": {
+      "description": "Resolve a formula with a categorical response while requesting class-probability estimation; the task becomes probability estimation over the response classes.",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "probability": true
+          },
+          "expected_output": "task=probability\nnum_trees=5\nnum_predictors=4\npredictors=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\n"
+        }
+      ]
+    },
+    "feature1_5_lhs_function_response.json": {
+      "description": "Accept a formula whose left-hand side wraps the response column in a user function; the design must still resolve and infer the task from the underlying response.",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "iris",
+            "formula": "transform(Species) ~ .",
+            "num_trees": 5,
+            "seed": 1
+          },
+          "expected_output": "task=classification\nnum_trees=5\nnum_predictors=4\npredictors=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\n"
+        }
+      ]
+    },
+    "feature2_1_named_response_classification.json": {
+      "description": "Build a model design by naming the response column directly (instead of a formula); a categorical response yields a classification design with all other columns as predictors.",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "iris",
+            "dependent": "Species",
+            "num_trees": 5,
+            "seed": 1
+          },
+          "expected_output": "task=classification\nnum_trees=5\nnum_predictors=4\npredictors=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\n"
+        }
+      ]
+    },
+    "feature2_2_named_response_regression.json": {
+      "description": "Name a numeric response column directly to obtain a regression design.",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "iris",
+            "dependent": "Sepal.Length",
+            "num_trees": 5,
+            "seed": 1
+          },
+          "expected_output": "task=regression\nnum_trees=5\nnum_predictors=4\npredictors=Sepal.Width,Petal.Length,Petal.Width,Species\n"
+        }
+      ]
+    },
+    "feature2_3_named_response_survival.json": {
+      "description": "Name a time column and a separate status column to obtain a survival design; both named columns are excluded from predictors.",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "veteran",
+            "dependent": "time",
+            "status": "status",
+            "num_trees": 10,
+            "seed": 1
+          },
+          "expected_output": "task=survival\nnum_trees=10\nnum_predictors=6\npredictors=trt,celltype,karno,diagtime,age,prior\n"
+        }
+      ]
+    },
+    "feature3_1_matrix_classification_equivalence.json": {
+      "description": "Train two models with the same seed: one on a column-typed table, one on the all-numeric matrix encoding of the same data (declared as a classification task). The externally-observable label assignments must agree on every observation.",
+      "cases": [
+        {
+          "input": {
+            "op": "equivalence",
+            "dataset": "iris",
+            "dataset_matrix": "iris_matrix",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 10,
+            "classification_matrix": true,
+            "compare": "predictions"
+          },
+          "expected_output": "task=classification\nobservations=150\ndisagreements=0\n"
+        }
+      ]
+    },
+    "feature3_2_matrix_survival_equivalence.json": {
+      "description": "Train a survival model with the same seed on a typed table and on its all-numeric matrix encoding; the cumulative-hazard estimates must agree cell-for-cell.",
+      "cases": [
+        {
+          "input": {
+            "op": "equivalence",
+            "dataset": "veteran",
+            "dataset_matrix": "veteran_matrix",
+            "formula": "Surv(time, status) ~ .",
+            "num_trees": 5,
+            "seed": 10,
+            "compare": "chf"
+          },
+          "expected_output": "task=survival\ncells=13837\ndisagreements=0\n"
+        }
+      ]
+    },
+    "feature3_3_matrix_predictor_selection.json": {
+      "description": "When the data source is an all-numeric matrix and the response is named, the predictor set is every other column of the matrix, preserving order.",
+      "cases": [
+        {
+          "input": {
+            "op": "fit",
+            "dataset": "iris_matrix",
+            "dependent": "Sepal.Length",
+            "num_trees": 5,
+            "seed": 1
+          },
+          "expected_output": "task=regression\nnum_trees=5\nnum_predictors=4\npredictors=Sepal.Width,Petal.Length,Petal.Width,Species\n"
+        }
+      ]
+    },
+    "feature4_reproducibility.json": {
+      "description": "Training twice from the same seed with identical settings produces identical predictions; the number of disagreeing observations between the two runs must be zero.",
+      "cases": [
+        {
+          "input": {
+            "op": "determinism",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 50,
+            "seed": 2
+          },
+          "expected_output": "task=classification\npredictions=150\ndisagreements=0\n"
+        }
+      ]
+    },
+    "feature5_1_predict_all_classification.json": {
+      "description": "Per-tree prediction for a classification design returns one column per tree: an observations-by-trees matrix.",
+      "cases": [
+        {
+          "input": {
+            "op": "predict",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "predict": "all"
+          },
+          "expected_output": "task=classification\npredictions_shape=150x5\n"
+        }
+      ]
+    },
+    "feature5_2_predict_all_regression.json": {
+      "description": "Per-tree prediction for a regression design returns an observations-by-trees matrix.",
+      "cases": [
+        {
+          "input": {
+            "op": "predict",
+            "dataset": "iris",
+            "formula": "Sepal.Length ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "predict": "all"
+          },
+          "expected_output": "task=regression\npredictions_shape=150x5\n"
+        }
+      ]
+    },
+    "feature5_3_predict_all_probability.json": {
+      "description": "Per-tree prediction for a probability design returns a three-dimensional array of observations by classes by trees.",
+      "cases": [
+        {
+          "input": {
+            "op": "predict",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "probability": true,
+            "predict": "all"
+          },
+          "expected_output": "task=probability\npredictions_shape=150x3x5\n"
+        }
+      ]
+    },
+    "feature5_4_predict_all_survival.json": {
+      "description": "Per-tree prediction for a survival design returns survival and cumulative-hazard arrays, each observations by event-times by trees.",
+      "cases": [
+        {
+          "input": {
+            "op": "predict",
+            "dataset": "veteran",
+            "formula": "Surv(time, status) ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "predict": "all"
+          },
+          "expected_output": "task=survival\nsurvival_shape=137x101x5\nchf_shape=137x101x5\n"
+        }
+      ]
+    },
+    "feature5_5_predict_subset_trees.json": {
+      "description": "Per-tree prediction restricted to the first K trees returns a matrix whose tree dimension equals K.",
+      "cases": [
+        {
+          "input": {
+            "op": "predict",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "predict": "all",
+            "num_trees_predict": 3
+          },
+          "expected_output": "task=classification\npredictions_shape=150x3\n"
+        }
+      ]
+    },
+    "feature5_6_terminal_nodes.json": {
+      "description": "Requesting terminal-node identifiers returns an observations-by-trees matrix of node indices.",
+      "cases": [
+        {
+          "input": {
+            "op": "predict",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "predict": "terminalNodes"
+          },
+          "expected_output": "task=classification\npredictions_shape=150x5\n"
+        }
+      ]
+    },
+    "feature6_confusion_matrix.json": {
+      "description": "A classification design exposes a square confusion matrix whose rows are the true classes and whose columns are the predicted classes; each row total equals the number of training observations of that true class.",
+      "cases": [
+        {
+          "input": {
+            "op": "confusion",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 500,
+            "seed": 1
+          },
+          "expected_output": "dims=3x3\ntrue_classes=setosa,versicolor,virginica\npredicted_classes=setosa,versicolor,virginica\nrow_totals=50,50,50\n"
+        }
+      ]
+    },
+    "feature7_probability_outputs.json": {
+      "description": "Class-probability predictions form an observations-by-classes matrix whose every row sums to one with all entries in the unit interval.",
+      "cases": [
+        {
+          "input": {
+            "op": "probabilities",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "probability": true
+          },
+          "expected_output": "classes=3\nrows=150\nrows_not_summing_to_one=0\nvalues_out_of_unit_range=0\n"
+        }
+      ]
+    },
+    "feature8_survival_timepoints.json": {
+      "description": "A survival design reports its evaluation timepoints; these equal the sorted distinct event times observed in training.",
+      "cases": [
+        {
+          "input": {
+            "op": "death_times",
+            "dataset": "veteran",
+            "formula": "Surv(time, status) ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "time_col": "time"
+          },
+          "expected_output": "count=101\nequals_sorted_unique_event_times=yes\n"
+        }
+      ]
+    },
+    "feature9_variable_importance.json": {
+      "description": "When importance scoring is enabled, the design exposes one numeric importance value per predictor, keyed by predictor name.",
+      "cases": [
+        {
+          "input": {
+            "op": "importance",
+            "dataset": "iris",
+            "formula": "Species ~ .",
+            "num_trees": 5,
+            "seed": 1,
+            "importance": "impurity"
+          },
+          "expected_output": "kind=numeric\ncount=4\nnames=Sepal.Length,Sepal.Width,Petal.Length,Petal.Width\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C016",
+      "C017"
+    ],
+    "kept_c": [
+      "C003",
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010",
+      "C018"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 3
+  }
+}

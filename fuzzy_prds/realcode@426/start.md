@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out this Bitcoin chain-state and transaction indexing toolkit we've been talking about. The core idea is that developers should be able to plug in their block/transaction observations and get back clean, queryable results without having to write all that painful reconciliation code themselves. Think of it like the wallet-sync plumbing we did for the Lightning stuff last quarter — same philosophy, just applied to UTXO tracking and chain state.
+
+The main things we need covered: handling chain tip updates including when blocks get reorganized out, inserting individual checkpoints, figuring out how much value is flowing in/out for scripts we care about, tracking whether a script has been 'used' yet, computing fees, resolving conflicts when we have both a loose output record and a full transaction for the same coin, tracking which tx spent which output, deriving scripts in a lookahead window, and finally filtering down to just the canonical transaction history when there are conflicting spends — confirmed vs mempool, newer vs older, that kind of thing.
+
+One important thing: the I/O adapter layer that reads commands and writes results should stay completely separate from the actual business logic — we burned ourselves last time by mixing those together. Also please keep the file structure sensible, not everything crammed into one giant file. Language is Rust. Tests are in the rcb_tests folder if you need to cross-reference expected behavior.

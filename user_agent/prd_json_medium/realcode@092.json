@@ -1,0 +1,907 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out this filesystem abstraction library we've been talking about. The basic idea is that a caller passes in a URL and the library figures out where to get the data — could be local disk, could be over the wire, could be in a bucket, could be a repo, could be in memory. All of these should feel identical from the outside. We've done something similar before with that URL parsing approach we used in the datasource routing work, so just follow that same pattern.\n\nThe tricky parts are around the repo URLs — there's a special double-slash convention for splitting the repo location from the file path inside it, and we need to handle the version pinning via the URL hash. Auth for repos is also a bit fiddly: environment variables can inject credentials, and there's that base64 key thing for SSH. For cloud buckets we need to strip out query params that the storage drivers don't understand and keep only the ones they care about. For config values there's a file indirection pattern (the _FILE suffix thing) that mirrors what we did in the secrets loader.\n\nThe whole thing needs to be split into separate files per backend — no monoliths please. The stdin/stdout JSON dispatch is just a thin wrapper, the core library shouldn't know about it. Let's make sure unknown schemes and bad URLs give back clean typed errors rather than panics.\n\nA couple extra specifics from the questions that came back. For the repo path handling, the split is on the first occurrence of `//` and only that first one. Everything before `//` is the repository location, everything after it becomes the in-repository subpath and gets re-prefixed with a single `/`. If that subpath has a trailing slash, strip it unless that would make it empty, and in that case the subpath should stay `/`. If there is no `//` at all, then the whole path is the repository and the subpath defaults to `/`. If the path starts with `//`, then the repository portion is the empty string and the remainder, with a leading `/`, is the subpath. Also for the routed repo shape, only the subpath portion becomes `root`.\n\nOn the version pinning side, the ref comes from the URL fragment, meaning the part after `#`. If the fragment already starts with `refs/` then use it exactly as-is. If it’s just a bare name and does not start with `refs/`, expand it to `refs/heads/<name>`. If there is no fragment at all, the resulting reference is the empty string and should be reported as `ref=`.\n\nFor scheme routing, anything whose scheme has a `git+` prefix like `git+ssh`, `git+http`, or `git+https` should still go to the version-control backend, and we strip off `git+` to get the underlying transport scheme that we report as `repo_scheme`. Plain `git` and `ssh` also go to that same backend. This should live in the scheme-based router in `router.go` (or equivalent) that looks at `url.URL.Scheme`, strips `git+`, and maps schemes to backend constants, same general pattern as the earlier URL routing work and the repo path split behavior.\n\nAuth details are a little more exact too. If the URL has both username and password in userinfo, pick basic auth with those credentials. If it has only a username and no password over `http`/`https`, then check env: if `GIT_HTTP_TOKEN` is set, use token auth and report only the token as `secret`, without including the username. If instead a password-like env var is set, use basic auth. For `ssh` scheme URLs, if `GIT_SSH_KEY` is set, whether that value is raw PEM or base64-encoded, use SSH key auth and report the connecting user from the URL. `file` URLs and `http`/`https` URLs with no userinfo at all should resolve to `kind=none`. And for the env lookup behavior in general, use the `GetenvWithDefault` / `getenv` pattern: check the env key directly first, then fall back to reading the file path stored in `<KEY>_FILE`, then fall back to the provided default.\n\nFor bucket URLs, we do want the query cleanup to be strict. On `s3`, keep only `region`, `endpoint`, `disableSSL`, and `s3ForcePathStyle`. On `gs`, keep only `access_id` and `private_key_path`. Everything else gets dropped completely. Then re-encode whatever survives in canonical alphabetical order, and if nothing recognized survives, leave the query string off the output URL entirely.",
+  "oracle_data": {
+    "task_id": "FSIMPL-001",
+    "golden_api_signature": "func NewFS(ctx context.Context, u *url.URL) (fs.FS, error)",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "how does the _FILE env var indirection work",
+          "what happens when the file named by KEY_FILE is missing",
+          "precedence order for getenv resolution"
+        ],
+        "oracle_response": "Resolution precedence is: (1) if the exact key is present in the environment, return its value immediately; (2) otherwise, if `<KEY>_FILE` is set in the environment, open and read that file and return its contents trimmed of leading/trailing whitespace; (3) if `<KEY>_FILE` points to a file that does not exist or cannot be read, fall through to the default; (4) return the caller-supplied default, or the empty string if no default was given."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what object-storage schemes are supported",
+          "how is an s3 or gs URL routed",
+          "what is the blob backend root field"
+        ],
+        "oracle_response": "The object-storage (blob) backend handles the schemes `s3`, `gs`, and `azblob`. The router reports `backend=blob`, `scheme=<original scheme>`, and `root=<bucket-relative path>`. The bucket-relative root is the URL path with the leading slash and the bucket-name segment removed — for `s3://foo/bar` the bucket is `foo` and the root is `bar`."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "how should invalid or unparseable URLs be reported",
+          "what error is returned for an unknown scheme",
+          "how are routing errors communicated to callers"
+        ],
+        "oracle_response": "Two distinct error conditions exist. A URL that cannot be parsed at all (malformed syntax) yields `error=invalid_url` with no additional fields. A URL that is syntactically valid but whose scheme is not supported yields `error=unsupported_scheme` together with `scheme=<the offending scheme>`. These are reported as typed, structured errors — not panics or generic strings — so callers can branch on the error kind."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "should the JSON dispatch logic be inside the core library",
+          "where does stdin/stdout parsing live",
+          "how is the execution adapter separated from the filesystem logic"
+        ],
+        "oracle_response": "The core library must have no knowledge of stdin, stdout, or JSON. A dedicated, thin execution adapter (a separate file/package) reads JSON commands from stdin, calls into the core library, and writes the key=value text results to stdout. The core library exposes idiomatic file operations (read, stat, list, glob, sub-tree) returning typed values and typed errors. This separation is mandatory — mixing I/O formatting into the core violates the stated SRP constraint."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "what filesystem operations must every backend support",
+          "what is the minimum interface a backend must implement",
+          "does every backend need to support glob and list"
+        ],
+        "oracle_response": "The uniform read-only filesystem interface includes: `Open`/`Read` (retrieve full file bytes by relative path), `Stat` (name, size, is_dir, and where applicable content-type and mod-time), `ReadDir`/`List` (enumerate entries at a path, each with name and file-or-directory type), and `Glob` (return sorted matching paths for a shell pattern). Not every backend is required to expose every operation if the underlying medium makes it impossible, but each backend must be substitutable wherever the interface is expected without callers needing to know the concrete type."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid op field values",
+          "what values can op take",
+          "list all supported op values",
+          "what actions does the dispatcher handle",
+          "which op strings does the adapter support",
+          "what are the possible op inputs",
+          "tell me all the op names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'op' field. Valid values are: 'git_read', 'git_stat', 'git_list', 'billy_read', 'billy_list', 'route', 'split_path', 'resolve_ref', 'select_auth', 'normalize_url', 'getenv', 'file_read', 'file_stat', 'file_list', 'file_glob', 'http_read', 'http_stat', 'http_content_type', 'http_missing', 'blob_read', 'blob_stat', 'blob_list'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature10_1_git_read",
+        "trigger_keywords": [
+          "test cases for feature10 1 git read",
+          "show me feature10 1 git read test cases",
+          "what are the feature10 1 git read test inputs",
+          "give me the feature10_1_git_read test file",
+          "test cases for feature 10",
+          "feature10 1 git read expected output",
+          "what does feature10 1 git read expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_1_git_read:\n{\n  \"description\": \"Clone a version-control repository on demand and read the committed contents of a file by relative path.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"git_read\",\n        \"path\": \"hello.txt\"\n      },\n      \"expected_output\": \"hello world\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_2_git_stat",
+        "trigger_keywords": [
+          "test cases for feature10 2 git stat",
+          "show me feature10 2 git stat test cases",
+          "what are the feature10 2 git stat test inputs",
+          "give me the feature10_2_git_stat test file",
+          "test cases for feature 10",
+          "feature10 2 git stat expected output",
+          "what does feature10 2 git stat expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_2_git_stat:\n{\n  \"description\": \"Report metadata (name, byte size, directory flag) for a committed file in a version-control-backed filesystem.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"git_stat\",\n        \"path\": \"hello.txt\"\n      },\n      \"expected_output\": \"name=hello.txt\\nsize=11\\nis_dir=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_3_git_list",
+        "trigger_keywords": [
+          "test cases for feature10 3 git list",
+          "show me feature10 3 git list test cases",
+          "what are the feature10 3 git list test inputs",
+          "give me the feature10_3_git_list test file",
+          "test cases for feature 10",
+          "feature10 3 git list expected output",
+          "what does feature10 3 git list expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_3_git_list:\n{\n  \"description\": \"List the entries at a path in a version-control-backed filesystem, reporting each name/type and the total count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"git_list\",\n        \"path\": \".\"\n      },\n      \"expected_output\": \"count=1\\nname=hello.txt type=file\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_1_inmemory_read",
+        "trigger_keywords": [
+          "test cases for feature11 1 inmemory read",
+          "show me feature11 1 inmemory read test cases",
+          "what are the feature11 1 inmemory read test inputs",
+          "give me the feature11_1_inmemory_read test file",
+          "test cases for feature 11",
+          "feature11 1 inmemory read expected output",
+          "what does feature11 1 inmemory read expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_1_inmemory_read:\n{\n  \"description\": \"Read the full byte contents of a file by relative path from a filesystem adapted from an in-memory tree, including deeply nested files.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"billy_read\",\n        \"path\": \"foo\"\n      },\n      \"expected_output\": \"hello world\"\n    },\n    {\n      \"input\": {\n        \"op\": \"billy_read\",\n        \"path\": \"dir/subdir/bar\"\n      },\n      \"expected_output\": \"hello\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_2_inmemory_list",
+        "trigger_keywords": [
+          "test cases for feature11 2 inmemory list",
+          "show me feature11 2 inmemory list test cases",
+          "what are the feature11 2 inmemory list test inputs",
+          "give me the feature11_2_inmemory_list test file",
+          "test cases for feature 11",
+          "feature11 2 inmemory list expected output",
+          "what does feature11 2 inmemory list expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_2_inmemory_list:\n{\n  \"description\": \"List the directory entries of a filesystem adapted from an in-memory tree, reporting each name/type and the total count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"billy_list\",\n        \"path\": \".\"\n      },\n      \"expected_output\": \"count=2\\nname=dir type=dir\\nname=foo type=file\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_url_routing",
+        "trigger_keywords": [
+          "test cases for feature1 url routing",
+          "show me feature1 url routing test cases",
+          "what are the feature1 url routing test inputs",
+          "give me the feature1_url_routing test file",
+          "test cases for feature 1",
+          "feature1 url routing expected output",
+          "what does feature1 url routing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_url_routing:\n{\n  \"description\": \"Resolve a source URL string to a backend category and the routing-relevant fields the router derives from it; reject malformed URLs and unknown schemes.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"route\",\n        \"url\": \"file:///tmp\"\n      },\n      \"expected_output\": \"backend=file\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"route\",\n        \"url\": \"http://example.com/path\"\n      },\n      \"expected_output\": \"backend=http\\nhost=example.com\\npath=/path\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"route\",\n        \"url\": \"git+ssh://localhost:1234/foo/bar.git//baz#refs/tags/foo\"\n      },\n      \"expected_output\": \"backend=git\\nrepo_scheme=ssh\\nroot=/baz\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"route\",\n        \"url\": \"s3://foo/bar\"\n      },\n      \"expected_output\": \"backend=blob\\nscheme=s3\\nroot=bar\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"route\",\n        \"url\": \"unsupported://scheme\"\n      },\n      \"expected_output\": \"error=unsupported_scheme\\nscheme=unsupported\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"route\",\n        \"url\": \"bad*:url//bogus\"\n      },\n      \"expected_output\": \"error=invalid_url\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_repo_path_split",
+        "trigger_keywords": [
+          "test cases for feature2 repo path split",
+          "show me feature2 repo path split test cases",
+          "what are the feature2 repo path split test inputs",
+          "give me the feature2_repo_path_split test file",
+          "test cases for feature 2",
+          "feature2 repo path split expected output",
+          "what does feature2 repo path split expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_repo_path_split:\n{\n  \"description\": \"Split a source path into the repository portion and the in-repository subpath, delimited by a doubled slash; when no delimiter is present the whole path is the repository and the subpath is root.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"split_path\",\n        \"path\": \"/hairyhenderson/gomplate//docs-src/content/functions/aws.yml\"\n      },\n      \"expected_output\": \"repo=/hairyhenderson/gomplate\\nsubpath=/docs-src/content/functions/aws.yml\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"split_path\",\n        \"path\": \"/foo//bar/baz\"\n      },\n      \"expected_output\": \"repo=/foo\\nsubpath=/bar/baz\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"split_path\",\n        \"path\": \"/repo\"\n      },\n      \"expected_output\": \"repo=/repo\\nsubpath=/\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"split_path\",\n        \"path\": \"//foo/bar\"\n      },\n      \"expected_output\": \"repo=\\nsubpath=/foo/bar\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_git_ref_resolution",
+        "trigger_keywords": [
+          "test cases for feature3 git ref resolution",
+          "show me feature3 git ref resolution test cases",
+          "what are the feature3 git ref resolution test inputs",
+          "give me the feature3_git_ref_resolution test file",
+          "test cases for feature 3",
+          "feature3 git ref resolution expected output",
+          "what does feature3 git ref resolution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_git_ref_resolution:\n{\n  \"description\": \"Derive a fully-qualified version-control reference name from a source URL fragment: a bare name becomes a branch reference, a fragment already starting with the reference prefix is preserved verbatim, and no fragment yields an empty reference.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"resolve_ref\",\n        \"url\": \"git://localhost:1234/foo/bar.git//baz\"\n      },\n      \"expected_output\": \"ref=\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_ref\",\n        \"url\": \"git+http://localhost:1234/foo/bar.git//baz#mybranch\"\n      },\n      \"expected_output\": \"ref=refs/heads/mybranch\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_ref\",\n        \"url\": \"git+ssh://localhost:1234/foo/bar.git//baz#refs/tags/foo\"\n      },\n      \"expected_output\": \"ref=refs/tags/foo\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_git_auth_selection",
+        "trigger_keywords": [
+          "test cases for feature4 git auth selection",
+          "show me feature4 git auth selection test cases",
+          "what are the feature4 git auth selection test inputs",
+          "give me the feature4_git_auth_selection test file",
+          "test cases for feature 4",
+          "feature4 git auth selection expected output",
+          "what does feature4 git auth selection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_git_auth_selection:\n{\n  \"description\": \"Choose an authentication method for a version-control source. URL userinfo provides basic credentials; environment variables can supply a password, a bearer token, or a private key; schemes without credentials select no authentication. The chosen method is reported as a neutral kind plus any user/secret fields.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"select_auth\",\n        \"url\": \"file:///bare.git\"\n      },\n      \"expected_output\": \"kind=none\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"select_auth\",\n        \"url\": \"https://user:swordfish@example.com/foo\"\n      },\n      \"expected_output\": \"kind=basic\\nuser=user\\nsecret=swordfish\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"select_auth\",\n        \"url\": \"https://user@example.com/foo\",\n        \"env\": {\n          \"GIT_HTTP_TOKEN\": \"mytoken\"\n        }\n      },\n      \"expected_output\": \"kind=token\\nsecret=mytoken\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"select_auth\",\n        \"url\": \"ssh://git@example.com/foo\",\n        \"env\": {\n          \"GIT_SSH_KEY\": \"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNBKzNmN2hTN2c1VVd3WE9HVlRyTWZobXh5cmpxejdTeHhieDdJMWo4RHZ2d0FBQUpoQUZma09RQlg1CkRnQUFBQXR6YzJndFpXUXlOVFV4T1FBQUFDQSszZjdoUzdnNVVXd1hPR1ZUck1maG14eXJqcXo3U3h4Yng3STFqOER2dncKQUFBRUFhWW1YbHRmVzZuaFJvM2lXR2dsUkI0OGxZcTB6MFEzSTNLeXJkdXRFcjZqN2QvdUZMdURsUmJCYzRaVk9zeCtHYgpIS3VPclB0TEhGdkhzaldQd08rL0FBQUFFMmRoY25SdmJtMUFaMkZ5ZEc5dWJTMTRjSE1CQWc9PQotLS0tLUVORCBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0K\"\n        }\n      },\n      \"expected_output\": \"kind=ssh_key\\nuser=git\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_bucket_url_normalization",
+        "trigger_keywords": [
+          "test cases for feature5 bucket url normalization",
+          "show me feature5 bucket url normalization test cases",
+          "what are the feature5 bucket url normalization test inputs",
+          "give me the feature5_bucket_url_normalization test file",
+          "test cases for feature 5",
+          "feature5 bucket url normalization expected output",
+          "what does feature5 bucket url normalization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_bucket_url_normalization:\n{\n  \"description\": \"Sanitize an object-storage URL by retaining only the query parameters meaningful to the storage backend and discarding all others; the remaining parameters are re-encoded in canonical order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"normalize_url\",\n        \"url\": \"s3://foo/bar/baz?type=hello/world\"\n      },\n      \"expected_output\": \"url=s3://foo/bar/baz\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"normalize_url\",\n        \"url\": \"s3://foo/bar/baz?disableSSL=true&type=text/csv\"\n      },\n      \"expected_output\": \"url=s3://foo/bar/baz?disableSSL=true\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"normalize_url\",\n        \"url\": \"gs://foo/bar/baz?private_key_path=key.json&foo=bar&access_id=abcd\"\n      },\n      \"expected_output\": \"url=gs://foo/bar/baz?access_id=abcd&private_key_path=key.json\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_env_value_resolution",
+        "trigger_keywords": [
+          "test cases for feature6 env value resolution",
+          "show me feature6 env value resolution test cases",
+          "what are the feature6 env value resolution test inputs",
+          "give me the feature6_env_value_resolution test file",
+          "test cases for feature 6",
+          "feature6 env value resolution expected output",
+          "what does feature6 env value resolution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_env_value_resolution:\n{\n  \"description\": \"Resolve a configuration value by key: prefer the directly-set value, otherwise read and trim the contents of the file named by the '<KEY>_FILE' indirection, otherwise fall back to the supplied default (or empty).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"getenv\",\n        \"key\": \"FOOBARBAZ\"\n      },\n      \"expected_output\": \"value=\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"getenv\",\n        \"key\": \"BLAHBLAH\",\n        \"default\": \"default value\"\n      },\n      \"expected_output\": \"value=default value\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"getenv\",\n        \"key\": \"FOO\",\n        \"default\": \"bar\",\n        \"file_content\": \"foo\"\n      },\n      \"expected_output\": \"value=foo\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"getenv\",\n        \"key\": \"FOO\",\n        \"default\": \"bar\",\n        \"file_missing\": true\n      },\n      \"expected_output\": \"value=bar\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_1_local_read",
+        "trigger_keywords": [
+          "test cases for feature7 1 local read",
+          "show me feature7 1 local read test cases",
+          "what are the feature7 1 local read test inputs",
+          "give me the feature7_1_local_read test file",
+          "test cases for feature 7",
+          "feature7 1 local read expected output",
+          "what does feature7 1 local read expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_1_local_read:\n{\n  \"description\": \"Read the full byte contents of a file from the local-directory-backed filesystem by relative path.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"file_read\",\n        \"path\": \"hello.txt\"\n      },\n      \"expected_output\": \"hello world\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"file_read\",\n        \"path\": \"sub/subfile.txt\"\n      },\n      \"expected_output\": \"hi there\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_2_local_stat",
+        "trigger_keywords": [
+          "test cases for feature7 2 local stat",
+          "show me feature7 2 local stat test cases",
+          "what are the feature7 2 local stat test inputs",
+          "give me the feature7_2_local_stat test file",
+          "test cases for feature 7",
+          "feature7 2 local stat expected output",
+          "what does feature7 2 local stat expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_2_local_stat:\n{\n  \"description\": \"Report metadata (name, byte size, directory flag) for a file in the local-directory-backed filesystem.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"file_stat\",\n        \"path\": \"hello.txt\"\n      },\n      \"expected_output\": \"name=hello.txt\\nsize=12\\nis_dir=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_3_local_list",
+        "trigger_keywords": [
+          "test cases for feature7 3 local list",
+          "show me feature7 3 local list test cases",
+          "what are the feature7 3 local list test inputs",
+          "give me the feature7_3_local_list test file",
+          "test cases for feature 7",
+          "feature7 3 local list expected output",
+          "what does feature7 3 local list expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_3_local_list:\n{\n  \"description\": \"List the directory entries at a path in the local-directory-backed filesystem, reporting each entry's name and whether it is a file or directory, plus the total count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"file_list\",\n        \"path\": \".\"\n      },\n      \"expected_output\": \"count=2\\nname=hello.txt type=file\\nname=sub type=dir\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_4_local_glob",
+        "trigger_keywords": [
+          "test cases for feature7 4 local glob",
+          "show me feature7 4 local glob test cases",
+          "what are the feature7 4 local glob test inputs",
+          "give me the feature7_4_local_glob test file",
+          "test cases for feature 7",
+          "feature7 4 local glob expected output",
+          "what does feature7 4 local glob expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_4_local_glob:\n{\n  \"description\": \"Return the sorted set of paths in the local-directory-backed filesystem that match a shell-style glob pattern, plus the match count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"file_glob\",\n        \"pattern\": \"*.txt\"\n      },\n      \"expected_output\": \"count=1\\nmatch=hello.txt\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_1_http_read",
+        "trigger_keywords": [
+          "test cases for feature8 1 http read",
+          "show me feature8 1 http read test cases",
+          "what are the feature8 1 http read test inputs",
+          "give me the feature8_1_http_read test file",
+          "test cases for feature 8",
+          "feature8 1 http read expected output",
+          "what does feature8 1 http read expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_1_http_read:\n{\n  \"description\": \"Fetch the body of a resource from the HTTP-backed filesystem by relative path using a GET request.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"http_read\",\n        \"path\": \"hello.txt\"\n      },\n      \"expected_output\": \"hello world\"\n    },\n    {\n      \"input\": {\n        \"op\": \"http_read\",\n        \"path\": \"sub/subfile.json\"\n      },\n      \"expected_output\": \"{\\\"msg\\\": \\\"hi there\\\"}\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_2_http_stat",
+        "trigger_keywords": [
+          "test cases for feature8 2 http stat",
+          "show me feature8 2 http stat test cases",
+          "what are the feature8 2 http stat test inputs",
+          "give me the feature8_2_http_stat test file",
+          "test cases for feature 8",
+          "feature8 2 http stat expected output",
+          "what does feature8 2 http stat expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_2_http_stat:\n{\n  \"description\": \"Report metadata for an HTTP resource obtained via a HEAD request: name, content length, content type, last-modified time, and directory flag.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"http_stat\",\n        \"path\": \"hello.txt\"\n      },\n      \"expected_output\": \"name=hello.txt\\nsize=11\\ncontent_type=text/plain\\nmod_time=2021-04-01T12:00:00Z\\nis_dir=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_3_http_content_type",
+        "trigger_keywords": [
+          "test cases for feature8 3 http content type",
+          "show me feature8 3 http content type test cases",
+          "what are the feature8 3 http content type test inputs",
+          "give me the feature8_3_http_content_type test file",
+          "test cases for feature 8",
+          "feature8 3 http content type expected output",
+          "what does feature8 3 http content type expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_3_http_content_type:\n{\n  \"description\": \"Negotiate content type with the HTTP backend by sending an Accept header; the server echoes it back and the reported content type reflects the negotiated value.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"http_content_type\",\n        \"path\": \"sub/subfile.json\",\n        \"accept\": \"application/json\"\n      },\n      \"expected_output\": \"content_type=application/json\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_4_http_missing",
+        "trigger_keywords": [
+          "test cases for feature8 4 http missing",
+          "show me feature8 4 http missing test cases",
+          "what are the feature8 4 http missing test inputs",
+          "give me the feature8_4_http_missing test file",
+          "test cases for feature 8",
+          "feature8 4 http missing expected output",
+          "what does feature8 4 http missing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_4_http_missing:\n{\n  \"description\": \"Accessing a non-existent HTTP resource fails with a normalized error carrying the protocol status code rather than content.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"http_missing\",\n        \"path\": \"bogus\"\n      },\n      \"expected_output\": \"error=http_status\\nstatus=404\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_1_blob_read",
+        "trigger_keywords": [
+          "test cases for feature9 1 blob read",
+          "show me feature9 1 blob read test cases",
+          "what are the feature9 1 blob read test inputs",
+          "give me the feature9_1_blob_read test file",
+          "test cases for feature 9",
+          "feature9 1 blob read expected output",
+          "what does feature9 1 blob read expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_1_blob_read:\n{\n  \"description\": \"Read the full contents of an object from a bucket-backed filesystem by key, including objects nested under a key prefix.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"blob_read\",\n        \"path\": \"file1\"\n      },\n      \"expected_output\": \"hello\"\n    },\n    {\n      \"input\": {\n        \"op\": \"blob_read\",\n        \"path\": \"file2\"\n      },\n      \"expected_output\": \"{\\\"value\\\": \\\"goodbye world\\\"}\"\n    },\n    {\n      \"input\": {\n        \"op\": \"blob_read\",\n        \"root\": \"dir2/\",\n        \"path\": \"file3\"\n      },\n      \"expected_output\": \"foo\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_2_blob_stat",
+        "trigger_keywords": [
+          "test cases for feature9 2 blob stat",
+          "show me feature9 2 blob stat test cases",
+          "what are the feature9 2 blob stat test inputs",
+          "give me the feature9_2_blob_stat test file",
+          "test cases for feature 9",
+          "feature9 2 blob stat expected output",
+          "what does feature9 2 blob stat expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_2_blob_stat:\n{\n  \"description\": \"Report metadata (name, size, directory flag, octal permission bits) for an object in a bucket-backed filesystem.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"blob_stat\",\n        \"path\": \"file1\"\n      },\n      \"expected_output\": \"name=file1\\nsize=5\\nis_dir=false\\nmode_octal=644\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_3_blob_list",
+        "trigger_keywords": [
+          "test cases for feature9 3 blob list",
+          "show me feature9 3 blob list test cases",
+          "what are the feature9 3 blob list test inputs",
+          "give me the feature9_3_blob_list test file",
+          "test cases for feature 9",
+          "feature9 3 blob list expected output",
+          "what does feature9 3 blob list expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_3_blob_list:\n{\n  \"description\": \"List the entries under a prefix in a bucket-backed filesystem, distinguishing objects (files) from synthetic sub-prefixes (directories), reporting each name/type and the total count. Listing can also be rooted at a key prefix.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"blob_list\",\n        \"path\": \"dir1\"\n      },\n      \"expected_output\": \"count=2\\nname=file1 type=file\\nname=file2 type=file\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"blob_list\",\n        \"path\": \".\"\n      },\n      \"expected_output\": \"count=5\\nname=dir1 type=dir\\nname=dir2 type=dir\\nname=file1 type=file\\nname=file2 type=file\\nname=file3 type=file\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"blob_list\",\n        \"root\": \"dir2/\",\n        \"path\": \".\"\n      },\n      \"expected_output\": \"count=3\\nname=file3 type=file\\nname=file4 type=file\\nname=sub1 type=dir\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "that base64 key thing for SSH",
+        "actual_meaning": "The `GIT_SSH_KEY` environment variable handling in the auth-selection logic (feature4_git_auth_selection.json): the value may be a raw PEM block or a base64-encoded PEM block; the library must decode it to obtain the private key bytes before selecting `kind=ssh_key`"
+      },
+      {
+        "vague_reference": "the double-slash convention for splitting the repo location from the file path",
+        "actual_meaning": "The `SplitRepoPath` function (or equivalent) tested in feature2_repo_path_split.json: finds the first `//` in the URL path string, assigns everything before it as `repo` and everything after (prefixed with `/`) as `subpath`"
+      },
+      {
+        "vague_reference": "strip out query params that the storage drivers don't understand",
+        "actual_meaning": "The bucket URL normalizer in feature5_bucket_url_normalization.json: per-scheme allowlists (`s3` keeps `region`, `endpoint`, `disableSSL`, `s3ForcePathStyle`; `gs` keeps `access_id`, `private_key_path`) with all other params dropped and survivors re-encoded in sorted order"
+      }
+    ],
+    "fallback_response": "That's not something I have specific guidance on right now. Please check the existing backend implementations and the test fixtures under `rcb_tests/public_test_cases/` for the relevant feature — the expected input/output pairs there are the authoritative contract. If you're still unsure, flag it in the PR and we can discuss."
+  },
+  "public_test_cases": {
+    "feature10_1_git_read.json": {
+      "description": "Clone a version-control repository on demand and read the committed contents of a file by relative path.",
+      "cases": [
+        {
+          "input": {
+            "op": "git_read",
+            "path": "hello.txt"
+          },
+          "expected_output": "hello world"
+        }
+      ]
+    },
+    "feature10_2_git_stat.json": {
+      "description": "Report metadata (name, byte size, directory flag) for a committed file in a version-control-backed filesystem.",
+      "cases": [
+        {
+          "input": {
+            "op": "git_stat",
+            "path": "hello.txt"
+          },
+          "expected_output": "name=hello.txt\nsize=11\nis_dir=false\n"
+        }
+      ]
+    },
+    "feature10_3_git_list.json": {
+      "description": "List the entries at a path in a version-control-backed filesystem, reporting each name/type and the total count.",
+      "cases": [
+        {
+          "input": {
+            "op": "git_list",
+            "path": "."
+          },
+          "expected_output": "count=1\nname=hello.txt type=file\n"
+        }
+      ]
+    },
+    "feature11_1_inmemory_read.json": {
+      "description": "Read the full byte contents of a file by relative path from a filesystem adapted from an in-memory tree, including deeply nested files.",
+      "cases": [
+        {
+          "input": {
+            "op": "billy_read",
+            "path": "foo"
+          },
+          "expected_output": "hello world"
+        },
+        {
+          "input": {
+            "op": "billy_read",
+            "path": "dir/subdir/bar"
+          },
+          "expected_output": "hello"
+        }
+      ]
+    },
+    "feature11_2_inmemory_list.json": {
+      "description": "List the directory entries of a filesystem adapted from an in-memory tree, reporting each name/type and the total count.",
+      "cases": [
+        {
+          "input": {
+            "op": "billy_list",
+            "path": "."
+          },
+          "expected_output": "count=2\nname=dir type=dir\nname=foo type=file\n"
+        }
+      ]
+    },
+    "feature1_url_routing.json": {
+      "description": "Resolve a source URL string to a backend category and the routing-relevant fields the router derives from it; reject malformed URLs and unknown schemes.",
+      "cases": [
+        {
+          "input": {
+            "op": "route",
+            "url": "file:///tmp"
+          },
+          "expected_output": "backend=file\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "url": "http://example.com/path"
+          },
+          "expected_output": "backend=http\nhost=example.com\npath=/path\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "url": "git+ssh://localhost:1234/foo/bar.git//baz#refs/tags/foo"
+          },
+          "expected_output": "backend=git\nrepo_scheme=ssh\nroot=/baz\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "url": "s3://foo/bar"
+          },
+          "expected_output": "backend=blob\nscheme=s3\nroot=bar\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "url": "unsupported://scheme"
+          },
+          "expected_output": "error=unsupported_scheme\nscheme=unsupported\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "url": "bad*:url//bogus"
+          },
+          "expected_output": "error=invalid_url\n"
+        }
+      ]
+    },
+    "feature2_repo_path_split.json": {
+      "description": "Split a source path into the repository portion and the in-repository subpath, delimited by a doubled slash; when no delimiter is present the whole path is the repository and the subpath is root.",
+      "cases": [
+        {
+          "input": {
+            "op": "split_path",
+            "path": "/hairyhenderson/gomplate//docs-src/content/functions/aws.yml"
+          },
+          "expected_output": "repo=/hairyhenderson/gomplate\nsubpath=/docs-src/content/functions/aws.yml\n"
+        },
+        {
+          "input": {
+            "op": "split_path",
+            "path": "/foo//bar/baz"
+          },
+          "expected_output": "repo=/foo\nsubpath=/bar/baz\n"
+        },
+        {
+          "input": {
+            "op": "split_path",
+            "path": "/repo"
+          },
+          "expected_output": "repo=/repo\nsubpath=/\n"
+        },
+        {
+          "input": {
+            "op": "split_path",
+            "path": "//foo/bar"
+          },
+          "expected_output": "repo=\nsubpath=/foo/bar\n"
+        }
+      ]
+    },
+    "feature3_git_ref_resolution.json": {
+      "description": "Derive a fully-qualified version-control reference name from a source URL fragment: a bare name becomes a branch reference, a fragment already starting with the reference prefix is preserved verbatim, and no fragment yields an empty reference.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve_ref",
+            "url": "git://localhost:1234/foo/bar.git//baz"
+          },
+          "expected_output": "ref=\n"
+        },
+        {
+          "input": {
+            "op": "resolve_ref",
+            "url": "git+http://localhost:1234/foo/bar.git//baz#mybranch"
+          },
+          "expected_output": "ref=refs/heads/mybranch\n"
+        },
+        {
+          "input": {
+            "op": "resolve_ref",
+            "url": "git+ssh://localhost:1234/foo/bar.git//baz#refs/tags/foo"
+          },
+          "expected_output": "ref=refs/tags/foo\n"
+        }
+      ]
+    },
+    "feature4_git_auth_selection.json": {
+      "description": "Choose an authentication method for a version-control source. URL userinfo provides basic credentials; environment variables can supply a password, a bearer token, or a private key; schemes without credentials select no authentication. The chosen method is reported as a neutral kind plus any user/secret fields.",
+      "cases": [
+        {
+          "input": {
+            "op": "select_auth",
+            "url": "file:///bare.git"
+          },
+          "expected_output": "kind=none\n"
+        },
+        {
+          "input": {
+            "op": "select_auth",
+            "url": "https://user:swordfish@example.com/foo"
+          },
+          "expected_output": "kind=basic\nuser=user\nsecret=swordfish\n"
+        },
+        {
+          "input": {
+            "op": "select_auth",
+            "url": "https://user@example.com/foo",
+            "env": {
+              "GIT_HTTP_TOKEN": "mytoken"
+            }
+          },
+          "expected_output": "kind=token\nsecret=mytoken\n"
+        },
+        {
+          "input": {
+            "op": "select_auth",
+            "url": "ssh://git@example.com/foo",
+            "env": {
+              "GIT_SSH_KEY": "LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNBKzNmN2hTN2c1VVd3WE9HVlRyTWZobXh5cmpxejdTeHhieDdJMWo4RHZ2d0FBQUpoQUZma09RQlg1CkRnQUFBQXR6YzJndFpXUXlOVFV4T1FBQUFDQSszZjdoUzdnNVVXd1hPR1ZUck1maG14eXJqcXo3U3h4Yng3STFqOER2dncKQUFBRUFhWW1YbHRmVzZuaFJvM2lXR2dsUkI0OGxZcTB6MFEzSTNLeXJkdXRFcjZqN2QvdUZMdURsUmJCYzRaVk9zeCtHYgpIS3VPclB0TEhGdkhzaldQd08rL0FBQUFFMmRoY25SdmJtMUFaMkZ5ZEc5dWJTMTRjSE1CQWc9PQotLS0tLUVORCBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0K"
+            }
+          },
+          "expected_output": "kind=ssh_key\nuser=git\n"
+        }
+      ]
+    },
+    "feature5_bucket_url_normalization.json": {
+      "description": "Sanitize an object-storage URL by retaining only the query parameters meaningful to the storage backend and discarding all others; the remaining parameters are re-encoded in canonical order.",
+      "cases": [
+        {
+          "input": {
+            "op": "normalize_url",
+            "url": "s3://foo/bar/baz?type=hello/world"
+          },
+          "expected_output": "url=s3://foo/bar/baz\n"
+        },
+        {
+          "input": {
+            "op": "normalize_url",
+            "url": "s3://foo/bar/baz?disableSSL=true&type=text/csv"
+          },
+          "expected_output": "url=s3://foo/bar/baz?disableSSL=true\n"
+        },
+        {
+          "input": {
+            "op": "normalize_url",
+            "url": "gs://foo/bar/baz?private_key_path=key.json&foo=bar&access_id=abcd"
+          },
+          "expected_output": "url=gs://foo/bar/baz?access_id=abcd&private_key_path=key.json\n"
+        }
+      ]
+    },
+    "feature6_env_value_resolution.json": {
+      "description": "Resolve a configuration value by key: prefer the directly-set value, otherwise read and trim the contents of the file named by the '<KEY>_FILE' indirection, otherwise fall back to the supplied default (or empty).",
+      "cases": [
+        {
+          "input": {
+            "op": "getenv",
+            "key": "FOOBARBAZ"
+          },
+          "expected_output": "value=\n"
+        },
+        {
+          "input": {
+            "op": "getenv",
+            "key": "BLAHBLAH",
+            "default": "default value"
+          },
+          "expected_output": "value=default value\n"
+        },
+        {
+          "input": {
+            "op": "getenv",
+            "key": "FOO",
+            "default": "bar",
+            "file_content": "foo"
+          },
+          "expected_output": "value=foo\n"
+        },
+        {
+          "input": {
+            "op": "getenv",
+            "key": "FOO",
+            "default": "bar",
+            "file_missing": true
+          },
+          "expected_output": "value=bar\n"
+        }
+      ]
+    },
+    "feature7_1_local_read.json": {
+      "description": "Read the full byte contents of a file from the local-directory-backed filesystem by relative path.",
+      "cases": [
+        {
+          "input": {
+            "op": "file_read",
+            "path": "hello.txt"
+          },
+          "expected_output": "hello world\n"
+        },
+        {
+          "input": {
+            "op": "file_read",
+            "path": "sub/subfile.txt"
+          },
+          "expected_output": "hi there"
+        }
+      ]
+    },
+    "feature7_2_local_stat.json": {
+      "description": "Report metadata (name, byte size, directory flag) for a file in the local-directory-backed filesystem.",
+      "cases": [
+        {
+          "input": {
+            "op": "file_stat",
+            "path": "hello.txt"
+          },
+          "expected_output": "name=hello.txt\nsize=12\nis_dir=false\n"
+        }
+      ]
+    },
+    "feature7_3_local_list.json": {
+      "description": "List the directory entries at a path in the local-directory-backed filesystem, reporting each entry's name and whether it is a file or directory, plus the total count.",
+      "cases": [
+        {
+          "input": {
+            "op": "file_list",
+            "path": "."
+          },
+          "expected_output": "count=2\nname=hello.txt type=file\nname=sub type=dir\n"
+        }
+      ]
+    },
+    "feature7_4_local_glob.json": {
+      "description": "Return the sorted set of paths in the local-directory-backed filesystem that match a shell-style glob pattern, plus the match count.",
+      "cases": [
+        {
+          "input": {
+            "op": "file_glob",
+            "pattern": "*.txt"
+          },
+          "expected_output": "count=1\nmatch=hello.txt\n"
+        }
+      ]
+    },
+    "feature8_1_http_read.json": {
+      "description": "Fetch the body of a resource from the HTTP-backed filesystem by relative path using a GET request.",
+      "cases": [
+        {
+          "input": {
+            "op": "http_read",
+            "path": "hello.txt"
+          },
+          "expected_output": "hello world"
+        },
+        {
+          "input": {
+            "op": "http_read",
+            "path": "sub/subfile.json"
+          },
+          "expected_output": "{\"msg\": \"hi there\"}"
+        }
+      ]
+    },
+    "feature8_2_http_stat.json": {
+      "description": "Report metadata for an HTTP resource obtained via a HEAD request: name, content length, content type, last-modified time, and directory flag.",
+      "cases": [
+        {
+          "input": {
+            "op": "http_stat",
+            "path": "hello.txt"
+          },
+          "expected_output": "name=hello.txt\nsize=11\ncontent_type=text/plain\nmod_time=2021-04-01T12:00:00Z\nis_dir=false\n"
+        }
+      ]
+    },
+    "feature8_3_http_content_type.json": {
+      "description": "Negotiate content type with the HTTP backend by sending an Accept header; the server echoes it back and the reported content type reflects the negotiated value.",
+      "cases": [
+        {
+          "input": {
+            "op": "http_content_type",
+            "path": "sub/subfile.json",
+            "accept": "application/json"
+          },
+          "expected_output": "content_type=application/json\n"
+        }
+      ]
+    },
+    "feature8_4_http_missing.json": {
+      "description": "Accessing a non-existent HTTP resource fails with a normalized error carrying the protocol status code rather than content.",
+      "cases": [
+        {
+          "input": {
+            "op": "http_missing",
+            "path": "bogus"
+          },
+          "expected_output": "error=http_status\nstatus=404\n"
+        }
+      ]
+    },
+    "feature9_1_blob_read.json": {
+      "description": "Read the full contents of an object from a bucket-backed filesystem by key, including objects nested under a key prefix.",
+      "cases": [
+        {
+          "input": {
+            "op": "blob_read",
+            "path": "file1"
+          },
+          "expected_output": "hello"
+        },
+        {
+          "input": {
+            "op": "blob_read",
+            "path": "file2"
+          },
+          "expected_output": "{\"value\": \"goodbye world\"}"
+        },
+        {
+          "input": {
+            "op": "blob_read",
+            "root": "dir2/",
+            "path": "file3"
+          },
+          "expected_output": "foo"
+        }
+      ]
+    },
+    "feature9_2_blob_stat.json": {
+      "description": "Report metadata (name, size, directory flag, octal permission bits) for an object in a bucket-backed filesystem.",
+      "cases": [
+        {
+          "input": {
+            "op": "blob_stat",
+            "path": "file1"
+          },
+          "expected_output": "name=file1\nsize=5\nis_dir=false\nmode_octal=644\n"
+        }
+      ]
+    },
+    "feature9_3_blob_list.json": {
+      "description": "List the entries under a prefix in a bucket-backed filesystem, distinguishing objects (files) from synthetic sub-prefixes (directories), reporting each name/type and the total count. Listing can also be rooted at a key prefix.",
+      "cases": [
+        {
+          "input": {
+            "op": "blob_list",
+            "path": "dir1"
+          },
+          "expected_output": "count=2\nname=file1 type=file\nname=file2 type=file\n"
+        },
+        {
+          "input": {
+            "op": "blob_list",
+            "path": "."
+          },
+          "expected_output": "count=5\nname=dir1 type=dir\nname=dir2 type=dir\nname=file1 type=file\nname=file2 type=file\nname=file3 type=file\n"
+        },
+        {
+          "input": {
+            "op": "blob_list",
+            "root": "dir2/",
+            "path": "."
+          },
+          "expected_output": "count=3\nname=file3 type=file\nname=file4 type=file\nname=sub1 type=dir\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C003",
+      "C004",
+      "C005"
+    ],
+    "kept_c": [
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 3
+  }
+}

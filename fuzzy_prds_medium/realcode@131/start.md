@@ -1,0 +1,15 @@
+## Product Requirement Document
+
+Hey team, we need a pluggable logging thing built out — basically a central hub where you can plug in different log listeners and they all get the same log call forwarded to them. Think of it like the broadcast pattern we used in the notification module a while back, but for logs. The main pain points we keep hearing from devs are: (1) every call site has its own boilerplate for deciding what to log and how to format it, and (2) when we want to swap out logging behavior for tests or crash reporting, we end up touching dozens of files. So we want one static entry point that everyone uses, and the destinations handle their own filtering logic. There's also been complaints about log spam in production — destinations should be able to say 'only give me warnings and above' or 'only give me logs from this specific component.' We also need it to handle attaching exception/error info to messages gracefully. One edge case that bit us before: if someone sets a tag and then the log gets filtered out, that tag should NOT bleed over onto the next log line — same cleanup behavior we had to patch in the auth flow. Long messages that exceed the platform write limit should be split up automatically too. The registry itself needs to reject bad inputs cleanly rather than silently corrupting state.
+
+One other thing to lock down since folks asked: the six severities are fixed and destinations should see the numeric code along with the tag and message every time, with verbose=2, debug=3, info=4, warn=5, error=6, assert=7. Those codes are stable and must never change.
+
+Also, on the one-time tag behavior, we do mean the very next logging call no matter what. If somebody sets an explicit tag and that next call gets skipped because of severity or tag gating, the tag is still considered consumed right there and must not leak onto anything after it. So after a gated-out call that had an explicit tag set, the next delivered call must carry an empty tag unless it sets its own explicit tag.
+
+For empty logs, if a logging call has a message that is null/absent and there’s no accompanying error object either, we should just swallow it quietly. No record gets produced and nothing goes out to any destination.
+
+On formatting, printf-style interpolation only happens when format arguments are actually supplied. If no arguments are provided, or the argument list is absent/empty, then the message goes through verbatim exactly as written, including literal percent sequences like te%st.
+
+For registry safety, invalid mutations should reject cleanly with these stable categories and leave the registry unchanged: plant_into_self, null_tree, null_trees, null_tree_in_array, uproot_not_planted. Each rejection emits error=<category> and that’s it, no partial state changes.
+
+And just to be extra explicit about the hub behavior itself, every log call should fan out to all currently installed LogDestination instances, same broadcast/uproot idea referenced in Feature 1.3 broadcast/uproot semantics in start.md and feature1_3_broadcast_uproot.json.

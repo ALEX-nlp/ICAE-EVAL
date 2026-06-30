@@ -1,0 +1,395 @@
+{
+  "fuzzy_prd": "# Request Rate-Limit Policy Engine — Per-Route Quota Accounting and Enforcement\n\n## Project Goal\n\nBuild a request rate-limiting engine that lets an API gateway cap how many requests each route may serve within a refresh window, so operators can protect upstream services from overload without hand-rolling counting, bucketing, and rejection logic at every entry point.\n\n---\n\n## Background & Problem\n\nA gateway receives incoming HTTP requests and forwards each one to an upstream route. Some routes must be protected by a quota: only a fixed number of requests may pass within a rolling time window before further requests are rejected. Without a shared engine, every gateway deployment re-implements the same fragile machinery — figuring out which route a request belongs to, deciding whether that route is even governed by a quota, bucketing requests so that distinct callers are counted independently, counting down the remaining allowance, and finally rejecting the overflow with the right HTTP status.\n\nThis engine packages that machinery behind one contract. Given a configuration that declares the known routes and the per-route quota policies, it answers three questions for any incoming request: does a policy apply to it, how much allowance is left after counting it, and — once the allowance is gone — is it rejected with the standard \"too many requests\" response. Quota state is held in an in-memory store keyed per caller-identity so that independent callers do not share a bucket.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., route resolution, policy lookup, quota accounting, enforcement), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate route resolution, policy matching, quota accounting, enforcement, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The accounting engine must be open for extension (e.g., alternative quota stores) but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions (e.g., a quota-store abstraction), not low-level implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully (e.g., a request whose route is not governed by any policy). Errors should be modeled properly rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Rate-Limit Applicability\n\n**As a developer**, I want to know whether an incoming request is governed by a quota policy, so I can short-circuit requests that need no limiting and apply quota accounting only where a policy exists.\n\n**Expected Behavior / Usage:**\n\nThe configuration declares an `enabled` flag, a list of known `routes` (each a `{id, path}` pair where `path` is a URL prefix), and a map of `policies` keyed by route id. A policy carries a `limit` (allowed requests per window), a `refreshInterval` (window length in seconds), and a list of identity `types` used to bucket callers. For an incoming `request` (which supplies a `uri`), the engine first resolves the matching route by scanning the declared routes in order and selecting the first whose `path` is a prefix of the request `uri`. If a route matches, the engine looks up a policy by that route's id. Rate limiting applies only when the feature is `enabled` AND a policy governs the resolved route. The output is two lines: `route_matched=<true|false>` reporting whether any route prefix matched the URI, then `should_limit=<true|false>` reporting whether the request will be subject to quota accounting. A request whose URI matches no declared route reports `route_matched=false`; a request whose route matches but has no associated policy reports `route_matched=true` with `should_limit=false`. Use `runs=0` to request applicability only, with no quota accounting.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_policy_applicability.json`\n\n```json\n{\n    \"description\": \"Decide whether an incoming request to a given route is subject to rate limiting. The configuration declares a set of named routes (each with an id and a path prefix) and a map of rate-limit policies keyed by route id. For a request URI, the system first resolves the matching route by longest path-prefix; if a route matches, it looks up a policy by that route's id. Rate limiting applies only when the feature is enabled AND a policy governs the resolved route. The output reports whether a route matched the URI and whether the request will be rate limited.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"config\": {\"enabled\": true, \"behindProxy\": true, \"keyPrefix\": \"rate-limit-application\",\n                    \"policies\": {\"serviceA\": {\"limit\": 2, \"refreshInterval\": 2, \"types\": [\"ORIGIN\", \"URL\", \"USER\"]}},\n                    \"routes\": [{\"id\": \"serviceA\", \"path\": \"/serviceA\"}, {\"id\": \"serviceB\", \"path\": \"/serviceB\"}]},\n                \"request\": {\"uri\": \"/serviceA\", \"remoteAddr\": \"10.0.0.100\"},\n                \"runs\": 0\n            },\n            \"expected_output\": \"route_matched=true\\nshould_limit=true\\n\"\n        },\n        {\n            \"input\": {\n                \"config\": {\"enabled\": true,\n                    \"policies\": {\"serviceA\": {\"limit\": 2, \"refreshInterval\": 2, \"types\": [\"ORIGIN\", \"URL\", \"USER\"]}},\n                    \"routes\": [{\"id\": \"serviceA\", \"path\": \"/serviceA\"}, {\"id\": \"serviceB\", \"path\": \"/serviceB\"}]},\n                \"request\": {\"uri\": \"/serviceB\", \"remoteAddr\": \"127.0.0.1\"},\n                \"runs\": 0\n            },\n            \"expected_output\": \"route_matched=true\\nshould_limit=false\\n\"\n        },\n        {\n            \"input\": {\n                \"config\": {\"enabled\": true,\n                    \"policies\": {\"serviceA\": {\"limit\": 2, \"refreshInterval\": 2, \"types\": [\"ORIGIN\", \"URL\", \"USER\"]}},\n                    \"routes\": [{\"id\": \"serviceA\", \"path\": \"/serviceA\"}, {\"id\": \"serviceB\", \"path\": \"/serviceB\"}]},\n                \"request\": {\"uri\": \"/serviceZ\", \"remoteAddr\": \"10.0.0.100\"},\n                \"runs\": 0\n            },\n            \"expected_output\": \"route_matched=false\\nshould_limit=false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Quota Consumption Accounting\n\n**As a developer**, I want each accounted request to count against its route's quota and report how much allowance remains, so clients can see their dwindling budget within the current window.\n\n**Expected Behavior / Usage:**\n\nWhen a policy applies, the engine accounts the request against an in-memory quota bucket for the caller. A freshly opened window starts with the policy's `limit` as its allowance; each accounted request decrements the remaining allowance by one. Replaying the same request within the same window therefore counts the remaining allowance down from `limit - 1` toward zero. The `runs` field specifies how many times the same request is replayed. The output begins with the applicability lines (`route_matched`, `should_limit`), then emits one line per replay of the form `run=<n> limit=<L> remaining=<R>`, where `<n>` is the 1-based replay index, `<L>` is the policy limit, and `<R>` is the allowance left after that replay. With a limit of 2 and two replays, the remaining values are `1` then `0`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_quota_consumption.json`\n\n```json\n{\n    \"description\": \"Account a request against its rate-limit policy and report the remaining quota. A policy grants a fixed number of allowed requests (its limit) per refresh window. Each accounted request decrements the remaining allowance by one. When the request is replayed within the same window the remaining count counts down from limit-minus-one toward zero. The output reports, for each replay, the configured limit and the remaining allowance after that request.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"config\": {\"enabled\": true, \"behindProxy\": true,\n                    \"policies\": {\"serviceA\": {\"limit\": 2, \"refreshInterval\": 2, \"types\": [\"ORIGIN\", \"URL\", \"USER\"]}},\n                    \"routes\": [{\"id\": \"serviceA\", \"path\": \"/serviceA\"}]},\n                \"request\": {\"uri\": \"/serviceA\", \"remoteAddr\": \"10.0.0.100\"},\n                \"runs\": 2\n            },\n            \"expected_output\": \"route_matched=true\\nshould_limit=true\\nrun=1 limit=2 remaining=1\\nrun=2 limit=2 remaining=0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Quota Exhaustion Enforcement\n\n**As a developer**, I want the request that overruns the quota to be rejected with the standard \"too many requests\" response, so upstream services are shielded once a caller exceeds its budget.\n\n**Expected Behavior / Usage:**\n\nThe engine enforces the quota once it is exhausted. While allowance remains, replayed requests behave exactly as in Feature 2 — each prints `run=<n> limit=<L> remaining=<R>`. The replay that pushes consumption past the configured `limit` is rejected: the remaining allowance reported to the client is clamped at zero (never negative), the request is flagged as having exceeded its quota, and it is answered with the HTTP status for Too Many Requests (`429`). For the rejected replay the output line is extended with two extra fields: `run=<n> limit=<L> remaining=0 exceeded=true [a specific HTTP error code reserved for rate limiting]`. With a limit of 2 and three replays, the first two replays report remaining `1` then `0`, and the third is the rejection line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_limit_enforcement.json`\n\n```json\n{\n    \"description\": \"Enforce the rate-limit policy once its quota is exhausted. While allowance remains, replayed requests simply decrement the remaining count. The request that pushes consumption past the configured limit is rejected: the remaining allowance reported to the client is clamped at zero, the request is flagged as having exceeded its quota, and it is answered with the Too Many Requests HTTP status (429). The output reports the limit and remaining allowance for each replay, and on the rejected replay additionally reports the exceeded flag and the assigned status code.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"config\": {\"enabled\": true, \"behindProxy\": true,\n                    \"policies\": {\"serviceA\": {\"limit\": 2, \"refreshInterval\": 2, \"types\": [\"ORIGIN\", \"URL\", \"USER\"]}},\n                    \"routes\": [{\"id\": \"serviceA\", \"path\": \"/serviceA\"}]},\n                \"request\": {\"uri\": \"/serviceA\", \"remoteAddr\": \"10.0.0.100\", \"headers\": {\"X-FORWARDED-FOR\": \"10.0.0.1\"}},\n                \"runs\": 3\n            },\n            \"expected_output\": \"route_matched=true\\nshould_limit=true\\nrun=1 limit=2 remaining=1\\nrun=2 limit=2 remaining=0\\nrun=3 limit=2 remaining=0 exceeded=true [a specific HTTP error code reserved for rate limiting]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing route resolution, per-route policy matching, in-memory quota accounting, and enforcement, following the \"Scale-Driven Code Organization\" constraint. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin and prints the resulting lines to stdout, matching the per-feature contracts above. The request supplies a `config` (the `enabled` flag, declared `routes`, and per-route `policies`), an incoming `request` (at minimum a `uri`; optionally a `remoteAddr` and request `headers`), and a `runs` count. The adapter resolves applicability, then — when applicable and `runs > 0` — accounts the request `runs` times, printing the per-replay quota lines and, on the rejected replay, the `exceeded=true [a specific HTTP error code reserved for rate limiting]` fields. A `runs` of `0` requests applicability output only.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- check the reset logic in the timestamp_handler module\n",
+  "oracle_data": {
+    "task_id": "marcosbarbero__spring-cloud-zuul-ratelimit-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "HTTP status code",
+          "rate limit response",
+          "429 status",
+          "quota exceeded code",
+          "limit exceeded header"
+        ],
+        "oracle_response": "The status code is 429."
+      },
+      {
+        "constraint_id": "C013",
+        "trigger_keywords": [
+          "str status=429",
+          "append 429",
+          "rate limit string",
+          "exhausted status",
+          "limit status=429"
+        ],
+        "oracle_response": "The string is status=429."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "check the reset logic in the timestamp_handler module",
+        "actual_meaning": "This constraint refers to a time-based expiration mechanism (refreshInterval) that resets the current run allowance, though the specific duration and data structures are not defined in the provided table."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_policy_applicability.json": {
+      "description": "Decide whether an incoming request to a given route is subject to rate limiting. The configuration declares a set of named routes (each with an id and a path prefix) and a map of rate-limit policies keyed by route id. For a request URI, the system first resolves the matching route by longest path-prefix; if a route matches, it looks up a policy by that route's id. Rate limiting applies only when the feature is enabled AND a policy governs the resolved route. The output reports whether a route matched the URI and whether the request will be rate limited.",
+      "cases": [
+        {
+          "input": {
+            "config": {
+              "enabled": true,
+              "behindProxy": true,
+              "keyPrefix": "rate-limit-application",
+              "policies": {
+                "serviceA": {
+                  "limit": 2,
+                  "refreshInterval": 2,
+                  "types": [
+                    "ORIGIN",
+                    "URL",
+                    "USER"
+                  ]
+                }
+              },
+              "routes": [
+                {
+                  "id": "serviceA",
+                  "path": "/serviceA"
+                },
+                {
+                  "id": "serviceB",
+                  "path": "/serviceB"
+                }
+              ]
+            },
+            "request": {
+              "uri": "/serviceA",
+              "remoteAddr": "10.0.0.100"
+            },
+            "runs": 0
+          },
+          "expected_output": "route_matched=true\nshould_limit=true\n"
+        },
+        {
+          "input": {
+            "config": {
+              "enabled": true,
+              "policies": {
+                "serviceA": {
+                  "limit": 2,
+                  "refreshInterval": 2,
+                  "types": [
+                    "ORIGIN",
+                    "URL",
+                    "USER"
+                  ]
+                }
+              },
+              "routes": [
+                {
+                  "id": "serviceA",
+                  "path": "/serviceA"
+                },
+                {
+                  "id": "serviceB",
+                  "path": "/serviceB"
+                }
+              ]
+            },
+            "request": {
+              "uri": "/serviceB",
+              "remoteAddr": "127.0.0.1"
+            },
+            "runs": 0
+          },
+          "expected_output": "route_matched=true\nshould_limit=false\n"
+        },
+        {
+          "input": {
+            "config": {
+              "enabled": true,
+              "policies": {
+                "serviceA": {
+                  "limit": 2,
+                  "refreshInterval": 2,
+                  "types": [
+                    "ORIGIN",
+                    "URL",
+                    "USER"
+                  ]
+                }
+              },
+              "routes": [
+                {
+                  "id": "serviceA",
+                  "path": "/serviceA"
+                },
+                {
+                  "id": "serviceB",
+                  "path": "/serviceB"
+                }
+              ]
+            },
+            "request": {
+              "uri": "/serviceZ",
+              "remoteAddr": "10.0.0.100"
+            },
+            "runs": 0
+          },
+          "expected_output": "route_matched=false\nshould_limit=false\n"
+        }
+      ]
+    },
+    "feature2_quota_consumption.json": {
+      "description": "Account a request against its rate-limit policy and report the remaining quota. A policy grants a fixed number of allowed requests (its limit) per refresh window. Each accounted request decrements the remaining allowance by one. When the request is replayed within the same window the remaining count counts down from limit-minus-one toward zero. The output reports, for each replay, the configured limit and the remaining allowance after that request.",
+      "cases": [
+        {
+          "input": {
+            "config": {
+              "enabled": true,
+              "behindProxy": true,
+              "policies": {
+                "serviceA": {
+                  "limit": 2,
+                  "refreshInterval": 2,
+                  "types": [
+                    "ORIGIN",
+                    "URL",
+                    "USER"
+                  ]
+                }
+              },
+              "routes": [
+                {
+                  "id": "serviceA",
+                  "path": "/serviceA"
+                }
+              ]
+            },
+            "request": {
+              "uri": "/serviceA",
+              "remoteAddr": "10.0.0.100"
+            },
+            "runs": 2
+          },
+          "expected_output": "route_matched=true\nshould_limit=true\nrun=1 limit=2 remaining=1\nrun=2 limit=2 remaining=0\n"
+        }
+      ]
+    },
+    "feature3_limit_enforcement.json": {
+      "description": "Enforce the rate-limit policy once its quota is exhausted. While allowance remains, replayed requests simply decrement the remaining count. The request that pushes consumption past the configured limit is rejected: the remaining allowance reported to the client is clamped at zero, the request is flagged as having exceeded its quota, and it is answered with the Too Many Requests HTTP status (429). The output reports the limit and remaining allowance for each replay, and on the rejected replay additionally reports the exceeded flag and the assigned status code.",
+      "cases": [
+        {
+          "input": {
+            "config": {
+              "enabled": true,
+              "behindProxy": true,
+              "policies": {
+                "serviceA": {
+                  "limit": 2,
+                  "refreshInterval": 2,
+                  "types": [
+                    "ORIGIN",
+                    "URL",
+                    "USER"
+                  ]
+                }
+              },
+              "routes": [
+                {
+                  "id": "serviceA",
+                  "path": "/serviceA"
+                }
+              ]
+            },
+            "request": {
+              "uri": "/serviceA",
+              "remoteAddr": "10.0.0.100",
+              "headers": {
+                "X-FORWARDED-FOR": "10.0.0.1"
+              }
+            },
+            "runs": 3
+          },
+          "expected_output": "route_matched=true\nshould_limit=true\nrun=1 limit=2 remaining=1\nrun=2 limit=2 remaining=0\nrun=3 limit=2 remaining=0 exceeded=true status=429\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Route Matching Logic",
+      "input_condition": "request.uri is checked against configured routes where routes are dicts with 'id' and 'path' (URL prefix)",
+      "output_rule": "Select the matched route based on the longest path-prefix match. If multiple prefix matches exist (e.g., '/a' and '/a/b'), the most specific (longest) path is selected. If no route path is a prefix of the request uri, route_matched is false.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Policy Applicability",
+      "input_condition": "A matched route exists, but the 'policies' config map does not contain the route's 'id'",
+      "output_rule": "route_matched is true, but should_limit is false. No quota accounting occurs.",
+      "exact_values": [
+        "should_limit=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Global Enable Check",
+      "input_condition": "request runs > 0, and the request matches a route that has a policy, but the top-level config 'enabled' is false.",
+      "output_rule": "Route matching occurs (route_matched=true), but no accounting is performed. The output would typically reflect that no limit applies or the run is ignored depending on implementation, but the PRD implies behavior only when enabled=true.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Accounting Logic",
+      "input_condition": "runs > 0, route_matched=true, should_limit=true. Current remaining allowance > 0.",
+      "output_rule": "For each run (n >= 1): decrement the allowance by 1. Print 'run=<n> limit=<L> remaining=<R>'. Limit L is from policy config.",
+      "exact_values": [
+        "remaining=<R>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Exhaustion Handling",
+      "input_condition": "runs > limit (where limit is policy 'limit'). Current run index (n) corresponds to the request that exceeds the quota.",
+      "output_rule": "The remaining allowance is clamped to 0. Add 'exceeded=true' and 'status=429' to the output line. Print 'run=<n> limit=<L> remaining=0 exceeded=true status=429'.",
+      "exact_values": [
+        "remaining=0",
+        "exceeded=true",
+        "status=429"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Output Line Formatting",
+      "input_condition": "Accounting run without exhaustion",
+      "output_rule": "Lines must contain newline characters. Format: 'run=<n> limit=<L> remaining=<R>' where n is 1-based index.",
+      "exact_values": [
+        "run=",
+        "limit=",
+        "remaining="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Output Line Formatting",
+      "input_condition": "Exhaustion run",
+      "output_rule": "Lines must contain newline characters. Format: 'run=<n> limit=<L> remaining=0 exceeded=true status=429'",
+      "exact_values": [
+        "remaining=0",
+        "exceeded=true",
+        "status=429"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Apply vs Account Command",
+      "input_condition": "Config 'runs' equals 0 (or ignored mode)",
+      "output_rule": "Only print applicability lines: 'route_matched=<bool>' and 'should_limit=<bool>'. Do NOT print 'run=...' lines. Do NOT decrement quota.",
+      "exact_values": [
+        "runs=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Deterministic Matching Order",
+      "input_condition": "Multiple routes could match a path prefix (e.g., / and /api, request /api/user)",
+      "output_rule": "The system must select the route with the longest matching path prefix. The first match in the config list is not sufficient if shorter matches exist.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Policy Dependency",
+      "input_condition": "Route matched, feature enabled, but route id missing from policies map",
+      "output_rule": "should_limit is explicitly false. No error is thrown, just no limiting.",
+      "exact_values": [
+        "should_limit=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Quota Reset Behavior (Implied by Reset Window)",
+      "input_condition": "run > 0, but a reset event has occurred (time-based logic in full implementation)",
+      "output_rule": "The PRD specifies 'refreshInterval' but the test cases are all within the same window. Assuming single-window execution for these tests: allowance resets if window expires. If running infinite loop without window check, allowance depletes.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Buffer Overflow Handling",
+      "input_condition": "Request hits limit exactly (remaining becomes 0)",
+      "output_rule": "Next run starts with remaining=0. If a subsequent request is processed (and limit enforcement isn't triggered immediately on 0), it hits exhaustion condition.",
+      "exact_values": [
+        "remaining=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "HTTP Status Injection",
+      "input_condition": "Request exceeds quota (exceeded=true)",
+      "output_rule": "The string 'status=429' is appended to the output line.",
+      "exact_values": [
+        "status=429"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C005",
+        "replacement": "a specific HTTP error code reserved for rate limiting",
+        "exact_values_to_replace": [
+          "status=429"
+        ],
+        "trigger_keywords": [
+          "HTTP status code",
+          "rate limit response",
+          "429 status",
+          "quota exceeded code",
+          "limit exceeded header"
+        ],
+        "oracle_response": "The status code is 429."
+      },
+      {
+        "constraint_id": "C013",
+        "replacement": "a specific HTTP error code reserved for rate limiting",
+        "exact_values_to_replace": [
+          "status=429"
+        ],
+        "trigger_keywords": [
+          "str status=429",
+          "append 429",
+          "rate limit string",
+          "exhausted status",
+          "limit status=429"
+        ],
+        "oracle_response": "The string is status=429."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C011",
+        "vague_phrase": "check the reset logic in the timestamp_handler module",
+        "actual_meaning": "This constraint refers to a time-based expiration mechanism (refreshInterval) that resets the current run allowance, though the specific duration and data structures are not defined in the provided table."
+      }
+    ]
+  }
+}

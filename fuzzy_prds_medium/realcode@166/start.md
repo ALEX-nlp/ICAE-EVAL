@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+We need a small library for managing the contents of signed authentication tokens used across our platform. The library should handle four main concerns: checking whether a compact token string is structurally well formed, providing an immutable container for the named data fields carried inside a token, validating that a set of data fields is complete and temporally fresh, and assembling a complete set of data fields from whatever partial information the caller provides.
+
+For the structural check, the library should accept a compact string only when it contains the exact right number of dot-separated sections — anything fewer or greater should be rejected immediately.
+
+For the immutable container, developers should be able to read data by field name, retrieve multiple field values at once, check whether certain fields exist or contain specific values, and fetch a field by its well-known semantic role (such as subject, issuer, or token identity). Any attempt to modify or remove entries from the container must be blocked, consistent with how we handle immutability in the permissions module.
+
+For validation, the library must verify that all required standard fields are present and that the relevant timestamps are within the valid window — expiration cannot have passed, and future-dated fields are not accepted.
+
+For assembly, the library should auto-populate any standard fields the caller leaves out, using a configurable lifetime in minutes that defaults to sixty. The token identity field must be derived deterministically from the subject and the not-before values when not explicitly supplied. Caller-supplied fields must appear first in the output, maintaining their original order, with auto-generated fields appended after.
+
+A couple extra specifics from the team’s questions: on the compact token format, we only accept it when there are exactly 3 dot-separated segments, like 'foo.bar.baz'. If there are fewer or more than 3 segments, we reject it with error=token_invalid. Also, for the payload itself, structural validation only passes when all six required claims are present: iss, iat, exp, nbf, sub, jti. If even one is missing, that also comes back as error=token_invalid.
+
+On payload assembly, the default TTL is 60 minutes. exp should be calculated from the reference current time, now, plus 60 minutes, unless the caller overrides that by sending a ttl field in the make_payload request. And for jti, when the caller does not provide it, we generate it as md5('jti.<sub>.<nbf>'), using the assembled sub and nbf values. The concrete example here is sub=1 and nbf=123, which gives jti = md5('jti.1.123') = 'd1f6bff329cfc64b2503d2fc3e259583'.
+
+One other detail on output formatting: the payload is serialized with PHP's json_encode and forward slashes stay escaped, so 'http://example.com/foo' shows up as 'http:\/\/example.com\/foo' in the JSON output. The emitted payload is a JSON object with no extra whitespace, followed by a newline. And on immutability, the Payload class implements ArrayAccess and blocks writes and unsets by throwing a PayloadException from offsetSet() and offsetUnset(); in the adapter that gets surfaced as 'error=immutable'.

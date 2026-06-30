@@ -1,0 +1,890 @@
+{
+  "fuzzy_prd": "# Transactional Email Toolkit — Templated Mail Composition & MIME Assembly Library\n\n## Project Goal\n\nBuild a server-side email toolkit that lets application developers describe an outbound email declaratively — sender, recipients, subject, body, attachments, inline images and custom headers — and turn it into a ready-to-send transport message, while also rendering the email body from server-side HTML templates through a choice of interchangeable templating engines. The toolkit removes the need to hand-assemble MIME messages or hand-wire a templating engine for every project.\n\n---\n\n## Background & Problem\n\nWithout this toolkit, developers who need to send transactional email are forced to work directly against the low-level mail transport API: manually creating MIME messages, setting each recipient class (primary, carbon-copy, blind-copy) by hand, juggling multipart bodies whenever an attachment is present, remembering the exact header names for read-receipt and disposition-notification, and detecting attachment content types themselves. In parallel they must bolt a templating engine onto the project just to interpolate a few values into an HTML body, learning each engine's idiosyncratic file-extension and loader rules. This leads to repetitive, error-prone boilerplate that is copied between services and drifts out of sync.\n\nWith this toolkit, the developer constructs a small set of validated value objects (an email, its attachments, its inline pictures), hands them to a converter that produces a correct transport message, and renders bodies through a uniform templating interface that hides each engine's wiring. Mandatory fields are enforced at construction time, content types are detected automatically, and template references are validated before rendering — so mistakes surface as clear, typed errors instead of malformed messages.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility domain (value-object modeling and validation, MIME assembly, content-type detection, and pluggable template rendering). It MUST NOT be a single \"god file\". Output a clear, multi-module/multi-package directory tree that separates the email domain model, the transport-message assembly, the content-type utilities, and each templating engine integration. Do not over-engineer trivial helpers, but keep each responsibility in its own cohesive unit.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below are a **black-box contract for the execution adapter**, not the internal data model. The core library must expose idiomatic value objects and services and must know nothing about JSON, stdin, or stdout. A thin execution adapter is solely responsible for translating JSON commands into idiomatic calls on the core and rendering the results.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility:** Keep model validation, MIME assembly, content detection, template resolution, and output formatting in distinct units.\n   - **Open/Closed:** Adding a new templating engine MUST NOT require modifying existing engines or the email model — engines plug in behind a common rendering abstraction.\n   - **Liskov Substitution:** Every templating engine must be substitutable behind the common rendering interface; every attachment/email implementation behind its interface.\n   - **Interface Segregation:** Keep the rendering interface, the email interface, and the attachment interface small and focused.\n   - **Dependency Inversion:** High-level email assembly depends on abstractions (an email contract, an attachment contract, a rendering contract), not concrete engines or transport classes.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface (builders for value objects, a single render method per engine) must be elegant and hide internal complexity.\n   - **Resilience:** Mandatory-field violations, invalid template references, and template-processing failures must be modeled as specific, typed error conditions rather than generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Email Value Object\n\n**As a developer**, I want to compose an email from its individual parts with mandatory fields enforced up front, so I can catch incomplete messages before they ever reach the mail server.\n\n**Expected Behavior / Usage:**\n\nThe caller supplies a sender address, one or more primary recipients, a subject, and a body; optionally carbon-copy and blind-copy recipient lists and a map of custom headers. Sender, primary recipients, subject and body are mandatory — if any one is missing, construction fails with a normalized `error=missing_required_field` line plus a `field=<name>` line naming the absent part (`from`, `to`, `subject`, or `body`). On success the email echoes back its sender, the semicolon-joined recipient lists for each class (carbon-copy and blind-copy render empty when not supplied), the subject and body, the count of custom headers, and each custom header as `custom_header.<key>=<value>` sorted by key. When no custom headers are supplied the header set is empty (count `0`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_email_model.json`\n\n```json\n{\n    \"description\": \"Compose a logical email value object from its parts. Sender, at least one primary recipient, subject and body are mandatory; omitting any of them is reported as a missing-required-field error naming the absent part. Supplied recipients and custom headers are echoed back; when no custom headers are given the email exposes an empty header set.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"email.build\", \"from\": \"marco@urbs.aeterna\", \"to\": [\"roberto@gmail.com\", \"titus@de.natura\"], \"cc\": [\"info@de.natura\"], \"subject\": \"Laelius de amicitia\", \"body\": \"Firmamentum autem stabilitatis.\", \"customHeaders\": {\"K2\": \"V2\", \"K1\": \"V1\"}},\n            \"expected_output\": \"from=marco@urbs.aeterna\\nto=roberto@gmail.com;titus@de.natura\\ncc=info@de.natura\\nbcc=\\nsubject=Laelius de amicitia\\nbody=Firmamentum autem stabilitatis.\\ncustom_header_count=2\\ncustom_header.K1=V1\\ncustom_header.K2=V2\\n\"\n        },\n        {\n            \"input\": {\"op\": \"email.build\", \"from\": \"marco@urbs.aeterna\", \"to\": [\"roberto@gmail.com\"], \"subject\": \"Hello\", \"body\": \"Body text\"},\n            \"expected_output\": \"from=marco@urbs.aeterna\\nto=roberto@gmail.com\\ncc=\\nbcc=\\nsubject=Hello\\nbody=Body text\\ncustom_header_count=0\\n\"\n        },\n        {\n            \"input\": {\"op\": \"email.build\", \"to\": [\"roberto@gmail.com\"], \"subject\": \"Hello\", \"body\": \"Body text\"},\n            \"expected_output\": \"error=missing_required_field\\nfield=from\\n\"\n        },\n        {\n            \"input\": {\"op\": \"email.build\", \"from\": \"marco@urbs.aeterna\", \"to\": [\"roberto@gmail.com\"], \"body\": \"Body text\"},\n            \"expected_output\": \"error=missing_required_field\\nfield=subject\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Inline Picture Descriptor\n\n**As a developer**, I want to describe an image that should be embedded inside the email body and referenced from a template placeholder, so I can produce rich HTML emails with logos and graphics.\n\n**Expected Behavior / Usage:**\n\nAn inline-picture descriptor binds three coordinates: the image kind (one of the supported kinds — see Feature 4), the backing file path, and the template placeholder name that the body refers to. All three are mandatory; omitting any one fails with `error=missing_required_field` and a `field=<name>` line (`imageType`, `file`, or `templateName`). On success the descriptor exposes the image kind, the resolved MIME `content_type` for that kind, the placeholder name, and the file path.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_inline_picture.json`\n\n```json\n{\n    \"description\": \"Describe an image to be embedded inline in an email body and referenced from a template placeholder. The descriptor requires three coordinates - the image kind, the backing file path, and the template placeholder name - and exposes the resolved MIME content type for the chosen image kind. Omitting any coordinate is reported as a missing-required-field error.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"inline_picture.build\", \"imageType\": \"PNG\", \"file\": \"/images/logo.png\", \"templateName\": \"logo.ftl\"},\n            \"expected_output\": \"image_type=PNG\\ncontent_type=image/png\\ntemplate_name=logo.ftl\\nfile=/images/logo.png\\n\"\n        },\n        {\n            \"input\": {\"op\": \"inline_picture.build\", \"imageType\": \"JPEG\", \"templateName\": \"logo.ftl\"},\n            \"expected_output\": \"error=missing_required_field\\nfield=file\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Named Attachment with Content-Type Detection\n\n**As a developer**, I want to wrap arbitrary bytes as a named attachment whose MIME type is resolved automatically, so I can attach files without manually classifying their content.\n\n**Expected Behavior / Usage:**\n\nAn attachment binds a file name and a payload of bytes; both are mandatory and omitting the data fails with `error=missing_required_field` / `field=attachmentData`. The attachment exposes its payload as a readable resource (`resource_exists=true` and the byte length as `resource_size`). For the content type, an explicitly supplied media type is honoured verbatim; otherwise the type is auto-detected from the byte content together with the file name (for example, a real JPEG image resolves to `image/jpeg`). Output reports the attachment name, the resource existence flag and size, and the resolved `content_type`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_attachment.json`\n\n```json\n{\n    \"description\": \"Wrap binary content as a named email attachment. Name and data are mandatory. The attachment exposes its bytes as a readable resource and resolves a MIME content type: an explicitly supplied type is honoured, otherwise the type is auto-detected from the byte content together with the file name. Omitting the data is reported as a missing-required-field error.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"attachment.build\", \"attachmentName\": \"report.csv\", \"dataText\": \"col1,col2\\n1,2\\n3,4\", \"mediaType\": \"text/plain\"},\n            \"expected_output\": \"attachment_name=report.csv\\nresource_exists=true\\nresource_size=17\\ncontent_type=text/plain\\n\"\n        },\n        {\n            \"input\": {\"op\": \"attachment.build\", \"attachmentName\": \"Attachment.jpg\", \"sampleImage\": true},\n            \"expected_output\": \"attachment_name=Attachment.jpg\\nresource_exists=true\\n[a hard-coded size and content type for the sample image flag — verify exact bytes in the image loader]\\n[a hard-coded size and content type for the sample image flag — verify exact bytes in the image loader]\\n\"\n        },\n        {\n            \"input\": {\"op\": \"attachment.build\", \"attachmentName\": \"report.csv\"},\n            \"expected_output\": \"error=missing_required_field\\nfield=attachmentData\\n\"\n        }\n    ]\n}\n```\n\nThe `dataText` field supplies the attachment payload as UTF-8 text (escaped newlines count as single bytes, so `col1,col2\\n1,2\\n3,4` is 17 bytes); the `sampleImage` flag substitutes a bundled real JPEG image so that content-type auto-detection can be exercised against genuine image bytes.\n\n---\n\n### Feature 4: Supported Image-Kind Catalog\n\n**As a developer**, I want to enumerate the inline image kinds the toolkit supports along with their extensions and MIME types, so I can validate user-supplied images against a known set.\n\n**Expected Behavior / Usage:**\n\nThe catalog lists each supported image kind with its lowercase file extension and its wire MIME content type, rendered as `<KIND> extension=<ext> content_type=<mime>`. The whole catalog can be listed (in catalog order), or a single kind can be looked up by name. The supported kinds are `GIF` (`gif`, `image/gif`), `JPG` (`jpg`, `image/jpeg`), `JPEG` (`jpeg`, `image/jpeg`) and `PNG` (`png`, `image/png`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_image_type.json`\n\n```json\n{\n    \"description\": \"Expose the catalog of inline image kinds supported by the library. Each kind maps to a lowercase file extension and a wire MIME content type. The whole catalog can be listed, or a single kind can be looked up by name.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"image_type.list\"},\n            \"expected_output\": \"GIF extension=gif content_type=image/gif\\nJPG extension=jpg [a hard-coded size and content type for the sample image flag — verify exact bytes in the image loader]\\nJPEG extension=jpeg [a hard-coded size and content type for the sample image flag — verify exact bytes in the image loader]\\nPNG extension=png content_type=image/png\\n\"\n        },\n        {\n            \"input\": {\"op\": \"image_type.get\", \"name\": \"JPEG\"},\n            \"expected_output\": \"JPEG extension=jpeg [a hard-coded size and content type for the sample image flag — verify exact bytes in the image loader]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Transport MIME Message Assembly\n\n**As a developer**, I want to convert a logical email into a transport MIME message with all recipient classes and special headers placed correctly, so I can hand a correct message to any standard mail sender.\n\n**Expected Behavior / Usage:**\n\nGiven a logical email, the assembler produces a transport message and the framework-observable result is reported: the sender (`from`), the reply-to address (when reply-to is not explicitly set it defaults to the sender), the primary / carbon-copy / blind-copy recipients (`to` / `cc` / `bcc`, each semicolon-joined and empty when absent), the `subject`, and a `multipart` flag that is `true` exactly when one or more attachments are present and `false` otherwise. When the message is not multipart its text body is reported as `body`. Read-receipt and disposition-notification requests are emitted as the wire headers `header_return_receipt` and `header_disposition_notification_to` (empty when not requested). Any custom headers supplied on the email are passed through and reported as `custom_header.<key>=<value>`, sorted by key.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_mime_message.json`\n\n```json\n{\n    \"description\": \"Assemble a logical email into a transport MIME message and report the framework-observable headers it produced. Sender, reply-to, every recipient class (primary, carbon-copy, blind-copy), subject and body are mapped onto the message; read-receipt and disposition-notification headers are emitted when requested; arbitrary custom headers are passed through. The message is marked multipart exactly when one or more attachments are present.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"mime.assemble\", \"from\": \"cicero@mala.currunt\", \"replyTo\": \"tullius@urbs.aeterna\", \"to\": [\"roberto@gmail.com\"], \"cc\": [\"tito@de.natura\"], \"bcc\": [\"caius@urbs.aeterna\"], \"subject\": \"Laelius de amicitia\", \"body\": \"Firmamentum autem stabilitatis.\", \"receiptTo\": \"caligola@urbs.aeterna\", \"depositionNotificationTo\": \"caligola@urbs.aeterna\", \"customHeaders\": {\"key1\": \"value1\", \"key2\": \"value2\"}},\n            \"expected_output\": \"from=cicero@mala.currunt\\nreply_to=tullius@urbs.aeterna\\nto=roberto@gmail.com\\ncc=tito@de.natura\\nbcc=caius@urbs.aeterna\\nsubject=Laelius de amicitia\\nmultipart=false\\nbody=Firmamentum autem stabilitatis.\\nheader_return_receipt=caligola@urbs.aeterna\\nheader_disposition_notification_to=caligola@urbs.aeterna\\ncustom_header.key1=value1\\ncustom_header.key2=value2\\n\"\n        },\n        {\n            \"input\": {\"op\": \"mime.assemble\", \"from\": \"cicero@mala.currunt\", \"to\": [\"roberto@gmail.com\"], \"subject\": \"With files\", \"body\": \"see attached\", \"attachments\": [{\"name\": \"test1.csv\", \"text\": \"col1,col2\\n1,2\"}, {\"name\": \"test2.csv\", \"text\": \"a,b\"}]},\n            \"expected_output\": \"from=cicero@mala.currunt\\nreply_to=cicero@mala.currunt\\nto=roberto@gmail.com\\ncc=\\nbcc=\\nsubject=With files\\nmultipart=true\\nheader_return_receipt=\\nheader_disposition_notification_to=\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Pluggable Template Rendering\n\n**As a developer**, I want to render the email body from a server-side HTML template through a uniform interface regardless of which engine backs it, so I can pick an engine per project without changing how I render.\n\n**Expected Behavior / Usage:**\n\nEach engine merges a named template with a model of named values and returns the rendered document verbatim. Every engine enforces the same two validation rules before rendering: a blank template reference is rejected, and a template whose file extension does not match the engine's expected extension is rejected — both surface as `error=invalid_template_name` together with an `engine=<name>` line. A template that exists but cannot be parsed or compiled surfaces as `error=template_processing_failed` with the same `engine` line. Engines differ only in their expected file extension and their placeholder syntax; the rendering contract, the validation behavior, and the error categories are identical across all of them. Each engine below is an independent functional point with its own rendered output and its own expected extension.\n\n*6.1 Expression-and-directive engine — templates with the `ftl` extension*\n\nThis engine substitutes `${name}`-style placeholders. A valid template merged with a model yields the rendered document; a blank reference or a non-`ftl` extension yields `invalid_template_name`; a template with a malformed directive yields `template_processing_failed`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_template_freemarker.json`\n\n```json\n{\n    \"description\": \"Render a server-side HTML template using the expression-and-directive engine whose templates carry the 'ftl' extension. A valid template merged with a model substitutes the model values and returns the rendered document verbatim. A blank template reference or one whose extension is not 'ftl' is rejected as an invalid template name; a syntactically broken template surfaces as a template-processing failure.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"freemarker\", \"template\": \"email_template.ftl\", \"model\": {\"name\": \"Titus\"}},\n            \"expected_output\": \"<!doctype html>\\n<html>\\n<body>\\n<p>\\n    Ciao <em>Titus</em>!\\n</p>\\n</body>\\n</html>\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"freemarker\", \"template\": \"    \", \"model\": {}},\n            \"expected_output\": \"error=invalid_template_name\\nengine=freemarker\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"freemarker\", \"template\": \"file.unknownext\", \"model\": {}},\n            \"expected_output\": \"error=invalid_template_name\\nengine=freemarker\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"freemarker\", \"template\": \"wrong_email_template.ftl\", \"model\": {}},\n            \"expected_output\": \"error=template_processing_failed\\nengine=freemarker\\n\"\n        }\n    ]\n}\n```\n\n*6.2 Logic-less engine — templates with the `html` extension*\n\nThis engine substitutes `{{name}}`-style placeholders and performs no embedded logic. A valid template merged with a model yields the rendered document; a blank reference or a non-`html` extension yields `invalid_template_name`; a template that cannot be loaded or compiled yields `template_processing_failed`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_template_mustache.json`\n\n```json\n{\n    \"description\": \"Render a server-side HTML template using the logic-less mustache engine whose templates carry the 'html' extension. A valid template merged with a model substitutes the model values and returns the rendered document verbatim. A blank template reference or one whose extension is not 'html' is rejected as an invalid template name; a template that cannot be loaded or compiled surfaces as a template-processing failure.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"mustache\", \"template\": \"email_template.html\", \"model\": {\"name\": \"Titus\"}},\n            \"expected_output\": \"<!doctype html>\\n<html>\\n<body>\\n<p>\\n    Ciao <em>Titus</em>!\\n</p>\\n</body>\\n</html>\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"mustache\", \"template\": \"   \", \"model\": {}},\n            \"expected_output\": \"error=invalid_template_name\\nengine=mustache\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"mustache\", \"template\": \"file.unknownext\", \"model\": {}},\n            \"expected_output\": \"error=invalid_template_name\\nengine=mustache\\n\"\n        }\n    ]\n}\n```\n\n*6.3 Inheritance-capable engine — templates with the `html` extension*\n\nThis engine substitutes `{{ name }}`-style placeholders and supports template inheritance. A valid template merged with a model yields the rendered document; a blank reference or a non-`html` extension yields `invalid_template_name`; a syntactically broken template yields `template_processing_failed`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_template_pebble.json`\n\n```json\n{\n    \"description\": \"Render a server-side HTML template using the inheritance-capable engine whose templates carry the 'html' extension. A valid template merged with a model substitutes the model values and returns the rendered document verbatim. A blank template reference or one whose extension is not 'html' is rejected as an invalid template name; a syntactically broken template surfaces as a template-processing failure.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"pebble\", \"template\": \"email_template.html\", \"model\": {\"name\": \"Titus\"}},\n            \"expected_output\": \"<!doctype html>\\n<html>\\n<body>\\n<p>\\n    Ciao <em>Titus</em>!\\n</p>\\n</body>\\n</html>\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"pebble\", \"template\": \"  \", \"model\": {}},\n            \"expected_output\": \"error=invalid_template_name\\nengine=pebble\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"pebble\", \"template\": \"file.unknownext\", \"model\": {}},\n            \"expected_output\": \"error=invalid_template_name\\nengine=pebble\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"pebble\", \"template\": \"wrong_email_template.html\", \"model\": {}},\n            \"expected_output\": \"error=template_processing_failed\\nengine=pebble\\n\"\n        }\n    ]\n}\n```\n\n*6.4 Natural-templating engine — templates with the `html` extension*\n\nThis engine carries expressions in HTML attributes, substituting both element text content and hyperlink targets, so the raw template is still valid HTML. A valid template merged with a model yields the rendered document with attribute expressions resolved into plain text and `href` targets; a blank reference or a non-`html` extension yields `invalid_template_name`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_4_template_thymeleaf.json`\n\n```json\n{\n    \"description\": \"Render a server-side HTML template using the natural-templating engine whose templates carry the 'html' extension and support attribute-level expressions for both text content and hyperlink targets. A valid template merged with a model substitutes the model values and returns the rendered document verbatim. A blank template reference or one whose extension is not 'html' is rejected as an invalid template name.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"thymeleaf\", \"template\": \"email_template.html\", \"model\": {\"name\": \"Titus\", \"activationLink\": \"http://www.something.com/segment?key=val\"}},\n            \"expected_output\": \"<html>\\n<body>\\n<p>\\n    Ciao <em>Titus</em>!\\n</p>\\n<p>\\n    <a href=\\\"http://www.something.com/segment?key=val\\\">Click Here</a> for activaing your account\\n</p>\\n</body>\\n</html>\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"thymeleaf\", \"template\": \"   \", \"model\": {}},\n            \"expected_output\": \"error=invalid_template_name\\nengine=thymeleaf\\n\"\n        },\n        {\n            \"input\": {\"op\": \"template.merge\", \"engine\": \"thymeleaf\", \"template\": \"file.unknownext\", \"model\": {}},\n            \"expected_output\": \"error=invalid_template_name\\nengine=thymeleaf\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the email value objects (email, attachment, inline picture, image-kind catalog), the transport MIME assembler, the content-type detector, and the pluggable template-rendering services described above. Its physical structure MUST follow the \"Scale-Driven Code Organization\" constraint: distinct modules/packages for the domain model, the transport assembly/utilities, and each templating engine integration.\n\n2. **The Execution/Test Adapter:** A runnable program that acts as a client to the core system. It reads a single JSON command from stdin, invokes the appropriate core logic, and prints the language-neutral result to stdout, strictly matching the per-feature contracts above. All error conditions are rendered as normalized category lines (`error=...` with independent detail fields) — no host-language exception identity ever appears on stdout. This adapter MUST be logically and physically separated from the core domain.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_email_model.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_email_model@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- echo the attachment mediaType exactly as received from the upstream service\n- mirror the field format used for replyTo when the disposition header is configured\n",
+  "oracle_data": {
+    "task_id": "ozimov__spring-boot-email-tools-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C038",
+        "trigger_keywords": [
+          "how is sampleImage content_type detected?",
+          "what size does sampleImage have?",
+          "does sampleImage default to JPEG?",
+          "magic number for sampleImage resource"
+        ],
+        "oracle_response": "The sample flag forces content_type=image/jpeg and resource_size=59665 bytes, bypassing auto-detection."
+      },
+      {
+        "constraint_id": "C015",
+        "trigger_keywords": [
+          "how is JPEG content_type derived?",
+          "what happens if bytes are JPEG but type is missing?",
+          "MIME auto-detection for JPEG"
+        ],
+        "oracle_response": "If a file is identified as JPEG via binary analysis, the exact content_type used in output is image/jpeg."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "are custom headers sorted alphabetically?",
+          "what order do custom_header lines appear in?",
+          "is there a specific sort rule for headers?"
+        ],
+        "oracle_response": "Custom headers are strictly sorted in ascending lexicographical order by the <key> portion."
+      },
+      {
+        "constraint_id": "TC_feature1_email_model",
+        "trigger_keywords": [
+          "test cases for feature1 email model",
+          "show me feature1 email model test cases",
+          "what are the feature1 email model inputs and outputs",
+          "give me the feature1_email_model test file",
+          "feature1 email model expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_email_model:\n{\n  \"description\": \"Compose a logical email value object from its parts. Sender, at least one primary recipient, subject and body are mandatory; omitting any of them is reported as a missing-required-field error naming the absent part. Supplied recipients and custom headers are echoed back; when no custom headers are given the email exposes an empty header set.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"email.build\",\n        \"from\": \"marco@urbs.aeterna\",\n        \"to\": [\n          \"roberto@gmail.com\",\n          \"titus@de.natura\"\n        ],\n        \"cc\": [\n          \"info@de.natura\"\n        ],\n        \"subject\": \"Laelius de amicitia\",\n        \"body\": \"Firmamentum autem stabilitatis.\",\n        \"customHeaders\": {\n          \"K2\": \"V2\",\n          \"K1\": \"V1\"\n        }\n      },\n      \"expected_output\": \"from=marco@urbs.aeterna\\nto=roberto@gmail.com;titus@de.natura\\ncc=info@de.natura\\nbcc=\\nsubject=Laelius de amicitia\\nbody=Firmamentum autem stabilitatis.\\ncustom_header_count=2\\ncustom_header.K1=V1\\ncustom_header.K2=V2\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"email.build\",\n        \"from\": \"marco@urbs.aeterna\",\n        \"to\": [\n          \"roberto@gmail.com\"\n        ],\n        \"subject\": \"Hello\",\n        \"body\": \"Body text\"\n      },\n      \"expected_output\": \"from=marco@urbs.aeterna\\nto=roberto@gmail.com\\ncc=\\nbcc=\\nsubject=Hello\\nbody=Body text\\ncustom_header_count=0\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"email.build\",\n        \"to\": [\n          \"roberto@gmail.com\"\n        ],\n        \"subject\": \"Hello\",\n        \"body\": \"Body text\"\n      },\n      \"expected_output\": \"error=missing_required_field\\nfield=from\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"email.build\",\n        \"from\": \"marco@urbs.aeterna\",\n        \"to\": [\n          \"roberto@gmail.com\"\n        ],\n        \"body\": \"Body text\"\n      },\n      \"expected_output\": \"error=missing_required_field\\nfield=subject\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_attachment",
+        "trigger_keywords": [
+          "test cases for feature3 attachment",
+          "show me feature3 attachment test cases",
+          "what are the feature3 attachment inputs and outputs",
+          "give me the feature3_attachment test file",
+          "feature3 attachment expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_attachment:\n{\n  \"description\": \"Wrap binary content as a named email attachment. Name and data are mandatory. The attachment exposes its bytes as a readable resource and resolves a MIME content type: an explicitly supplied type is honoured, otherwise the type is auto-detected from the byte content together with the file name. Omitting the data is reported as a missing-required-field error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"attachment.build\",\n        \"attachmentName\": \"report.csv\",\n        \"dataText\": \"col1,col2\\n1,2\\n3,4\",\n        \"mediaType\": \"text/plain\"\n      },\n      \"expected_output\": \"attachment_name=report.csv\\nresource_exists=true\\nresource_size=17\\ncontent_type=text/plain\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"attachment.build\",\n        \"attachmentName\": \"Attachment.jpg\",\n        \"sampleImage\": true\n      },\n      \"expected_output\": \"attachment_name=Attachment.jpg\\nresource_exists=true\\nresource_size=59665\\ncontent_type=image/jpeg\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"attachment.build\",\n        \"attachmentName\": \"report.csv\"\n      },\n      \"expected_output\": \"error=missing_required_field\\nfield=attachmentData\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "echo the attachment mediaType exactly as received from the upstream service",
+        "actual_meaning": "Use the raw content-type string provided in the input JSON without validation or transformation."
+      },
+      {
+        "vague_reference": "mirror the field format used for replyTo when the disposition header is configured",
+        "actual_meaning": "The output string for header_return_receipt must follow the exact pattern used for reply_to (e.g., 'header_return_receipt=<value>')."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_email_model.json": {
+      "description": "Compose a logical email value object from its parts. Sender, at least one primary recipient, subject and body are mandatory; omitting any of them is reported as a missing-required-field error naming the absent part. Supplied recipients and custom headers are echoed back; when no custom headers are given the email exposes an empty header set.",
+      "cases": [
+        {
+          "input": {
+            "op": "email.build",
+            "from": "marco@urbs.aeterna",
+            "to": [
+              "roberto@gmail.com",
+              "titus@de.natura"
+            ],
+            "cc": [
+              "info@de.natura"
+            ],
+            "subject": "Laelius de amicitia",
+            "body": "Firmamentum autem stabilitatis.",
+            "customHeaders": {
+              "K2": "V2",
+              "K1": "V1"
+            }
+          },
+          "expected_output": "from=marco@urbs.aeterna\nto=roberto@gmail.com;titus@de.natura\ncc=info@de.natura\nbcc=\nsubject=Laelius de amicitia\nbody=Firmamentum autem stabilitatis.\ncustom_header_count=2\ncustom_header.K1=V1\ncustom_header.K2=V2\n"
+        },
+        {
+          "input": {
+            "op": "email.build",
+            "from": "marco@urbs.aeterna",
+            "to": [
+              "roberto@gmail.com"
+            ],
+            "subject": "Hello",
+            "body": "Body text"
+          },
+          "expected_output": "from=marco@urbs.aeterna\nto=roberto@gmail.com\ncc=\nbcc=\nsubject=Hello\nbody=Body text\ncustom_header_count=0\n"
+        },
+        {
+          "input": {
+            "op": "email.build",
+            "to": [
+              "roberto@gmail.com"
+            ],
+            "subject": "Hello",
+            "body": "Body text"
+          },
+          "expected_output": "error=missing_required_field\nfield=from\n"
+        },
+        {
+          "input": {
+            "op": "email.build",
+            "from": "marco@urbs.aeterna",
+            "to": [
+              "roberto@gmail.com"
+            ],
+            "body": "Body text"
+          },
+          "expected_output": "error=missing_required_field\nfield=subject\n"
+        }
+      ]
+    },
+    "feature2_inline_picture.json": {
+      "description": "Describe an image to be embedded inline in an email body and referenced from a template placeholder. The descriptor requires three coordinates - the image kind, the backing file path, and the template placeholder name - and exposes the resolved MIME content type for the chosen image kind. Omitting any coordinate is reported as a missing-required-field error.",
+      "cases": [
+        {
+          "input": {
+            "op": "inline_picture.build",
+            "imageType": "PNG",
+            "file": "/images/logo.png",
+            "templateName": "logo.ftl"
+          },
+          "expected_output": "image_type=PNG\ncontent_type=image/png\ntemplate_name=logo.ftl\nfile=/images/logo.png\n"
+        },
+        {
+          "input": {
+            "op": "inline_picture.build",
+            "imageType": "JPEG",
+            "templateName": "logo.ftl"
+          },
+          "expected_output": "error=missing_required_field\nfield=file\n"
+        }
+      ]
+    },
+    "feature3_attachment.json": {
+      "description": "Wrap binary content as a named email attachment. Name and data are mandatory. The attachment exposes its bytes as a readable resource and resolves a MIME content type: an explicitly supplied type is honoured, otherwise the type is auto-detected from the byte content together with the file name. Omitting the data is reported as a missing-required-field error.",
+      "cases": [
+        {
+          "input": {
+            "op": "attachment.build",
+            "attachmentName": "report.csv",
+            "dataText": "col1,col2\n1,2\n3,4",
+            "mediaType": "text/plain"
+          },
+          "expected_output": "attachment_name=report.csv\nresource_exists=true\nresource_size=17\ncontent_type=text/plain\n"
+        },
+        {
+          "input": {
+            "op": "attachment.build",
+            "attachmentName": "Attachment.jpg",
+            "sampleImage": true
+          },
+          "expected_output": "attachment_name=Attachment.jpg\nresource_exists=true\nresource_size=59665\ncontent_type=image/jpeg\n"
+        },
+        {
+          "input": {
+            "op": "attachment.build",
+            "attachmentName": "report.csv"
+          },
+          "expected_output": "error=missing_required_field\nfield=attachmentData\n"
+        }
+      ]
+    },
+    "feature4_image_type.json": {
+      "description": "Expose the catalog of inline image kinds supported by the library. Each kind maps to a lowercase file extension and a wire MIME content type. The whole catalog can be listed, or a single kind can be looked up by name.",
+      "cases": [
+        {
+          "input": {
+            "op": "image_type.list"
+          },
+          "expected_output": "GIF extension=gif content_type=image/gif\nJPG extension=jpg content_type=image/jpeg\nJPEG extension=jpeg content_type=image/jpeg\nPNG extension=png content_type=image/png\n"
+        },
+        {
+          "input": {
+            "op": "image_type.get",
+            "name": "JPEG"
+          },
+          "expected_output": "JPEG extension=jpeg content_type=image/jpeg\n"
+        }
+      ]
+    },
+    "feature5_mime_message.json": {
+      "description": "Assemble a logical email into a transport MIME message and report the framework-observable headers it produced. Sender, reply-to, every recipient class (primary, carbon-copy, blind-copy), subject and body are mapped onto the message; read-receipt and disposition-notification headers are emitted when requested; arbitrary custom headers are passed through. The message is marked multipart exactly when one or more attachments are present.",
+      "cases": [
+        {
+          "input": {
+            "op": "mime.assemble",
+            "from": "cicero@mala.currunt",
+            "replyTo": "tullius@urbs.aeterna",
+            "to": [
+              "roberto@gmail.com"
+            ],
+            "cc": [
+              "tito@de.natura"
+            ],
+            "bcc": [
+              "caius@urbs.aeterna"
+            ],
+            "subject": "Laelius de amicitia",
+            "body": "Firmamentum autem stabilitatis.",
+            "receiptTo": "caligola@urbs.aeterna",
+            "depositionNotificationTo": "caligola@urbs.aeterna",
+            "customHeaders": {
+              "key1": "value1",
+              "key2": "value2"
+            }
+          },
+          "expected_output": "from=cicero@mala.currunt\nreply_to=tullius@urbs.aeterna\nto=roberto@gmail.com\ncc=tito@de.natura\nbcc=caius@urbs.aeterna\nsubject=Laelius de amicitia\nmultipart=false\nbody=Firmamentum autem stabilitatis.\nheader_return_receipt=caligola@urbs.aeterna\nheader_disposition_notification_to=caligola@urbs.aeterna\ncustom_header.key1=value1\ncustom_header.key2=value2\n"
+        },
+        {
+          "input": {
+            "op": "mime.assemble",
+            "from": "cicero@mala.currunt",
+            "to": [
+              "roberto@gmail.com"
+            ],
+            "subject": "With files",
+            "body": "see attached",
+            "attachments": [
+              {
+                "name": "test1.csv",
+                "text": "col1,col2\n1,2"
+              },
+              {
+                "name": "test2.csv",
+                "text": "a,b"
+              }
+            ]
+          },
+          "expected_output": "from=cicero@mala.currunt\nreply_to=cicero@mala.currunt\nto=roberto@gmail.com\ncc=\nbcc=\nsubject=With files\nmultipart=true\nheader_return_receipt=\nheader_disposition_notification_to=\n"
+        }
+      ]
+    },
+    "feature6_1_template_freemarker.json": {
+      "description": "Render a server-side HTML template using the expression-and-directive engine whose templates carry the 'ftl' extension. A valid template merged with a model substitutes the model values and returns the rendered document verbatim. A blank template reference or one whose extension is not 'ftl' is rejected as an invalid template name; a syntactically broken template surfaces as a template-processing failure.",
+      "cases": [
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "freemarker",
+            "template": "email_template.ftl",
+            "model": {
+              "name": "Titus"
+            }
+          },
+          "expected_output": "<!doctype html>\n<html>\n<body>\n<p>\n    Ciao <em>Titus</em>!\n</p>\n</body>\n</html>\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "freemarker",
+            "template": "    ",
+            "model": {}
+          },
+          "expected_output": "error=invalid_template_name\nengine=freemarker\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "freemarker",
+            "template": "file.unknownext",
+            "model": {}
+          },
+          "expected_output": "error=invalid_template_name\nengine=freemarker\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "freemarker",
+            "template": "wrong_email_template.ftl",
+            "model": {}
+          },
+          "expected_output": "error=template_processing_failed\nengine=freemarker\n"
+        }
+      ]
+    },
+    "feature6_2_template_mustache.json": {
+      "description": "Render a server-side HTML template using the logic-less mustache engine whose templates carry the 'html' extension. A valid template merged with a model substitutes the model values and returns the rendered document verbatim. A blank template reference or one whose extension is not 'html' is rejected as an invalid template name; a template that cannot be loaded or compiled surfaces as a template-processing failure.",
+      "cases": [
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "mustache",
+            "template": "email_template.html",
+            "model": {
+              "name": "Titus"
+            }
+          },
+          "expected_output": "<!doctype html>\n<html>\n<body>\n<p>\n    Ciao <em>Titus</em>!\n</p>\n</body>\n</html>\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "mustache",
+            "template": "   ",
+            "model": {}
+          },
+          "expected_output": "error=invalid_template_name\nengine=mustache\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "mustache",
+            "template": "file.unknownext",
+            "model": {}
+          },
+          "expected_output": "error=invalid_template_name\nengine=mustache\n"
+        }
+      ]
+    },
+    "feature6_3_template_pebble.json": {
+      "description": "Render a server-side HTML template using the inheritance-capable engine whose templates carry the 'html' extension. A valid template merged with a model substitutes the model values and returns the rendered document verbatim. A blank template reference or one whose extension is not 'html' is rejected as an invalid template name; a syntactically broken template surfaces as a template-processing failure.",
+      "cases": [
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "pebble",
+            "template": "email_template.html",
+            "model": {
+              "name": "Titus"
+            }
+          },
+          "expected_output": "<!doctype html>\n<html>\n<body>\n<p>\n    Ciao <em>Titus</em>!\n</p>\n</body>\n</html>\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "pebble",
+            "template": "  ",
+            "model": {}
+          },
+          "expected_output": "error=invalid_template_name\nengine=pebble\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "pebble",
+            "template": "file.unknownext",
+            "model": {}
+          },
+          "expected_output": "error=invalid_template_name\nengine=pebble\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "pebble",
+            "template": "wrong_email_template.html",
+            "model": {}
+          },
+          "expected_output": "error=template_processing_failed\nengine=pebble\n"
+        }
+      ]
+    },
+    "feature6_4_template_thymeleaf.json": {
+      "description": "Render a server-side HTML template using the natural-templating engine whose templates carry the 'html' extension and support attribute-level expressions for both text content and hyperlink targets. A valid template merged with a model substitutes the model values and returns the rendered document verbatim. A blank template reference or one whose extension is not 'html' is rejected as an invalid template name.",
+      "cases": [
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "thymeleaf",
+            "template": "email_template.html",
+            "model": {
+              "name": "Titus",
+              "activationLink": "http://www.something.com/segment?key=val"
+            }
+          },
+          "expected_output": "<html>\n<body>\n<p>\n    Ciao <em>Titus</em>!\n</p>\n<p>\n    <a href=\"http://www.something.com/segment?key=val\">Click Here</a> for activaing your account\n</p>\n</body>\n</html>\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "thymeleaf",
+            "template": "   ",
+            "model": {}
+          },
+          "expected_output": "error=invalid_template_name\nengine=thymeleaf\n"
+        },
+        {
+          "input": {
+            "op": "template.merge",
+            "engine": "thymeleaf",
+            "template": "file.unknownext",
+            "model": {}
+          },
+          "expected_output": "error=invalid_template_name\nengine=thymeleaf\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "email.build",
+      "input_condition": "email.build operation",
+      "output_rule": "Return formatted email representation or missing field error",
+      "exact_values": [
+        "from",
+        "to",
+        "subject",
+        "body",
+        "customHeaders"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "email.build",
+      "input_condition": "All required fields (from, to, subject, body) present",
+      "output_rule": "Return string with keys: from, to, cc, bcc, subject, body, custom_header_count, custom_header.<key>=<value>",
+      "exact_values": [
+        "from=<value>",
+        "to=<addr1>;<addr2>...",
+        "cc=<addr>...",
+        "bcc=",
+        "subject=<value>",
+        "body=<value>",
+        "custom_header_count=<int>",
+        "custom_header.<key>=<value>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "email.build",
+      "input_condition": "Missing 'from' address",
+      "output_rule": "Return error string",
+      "exact_values": [
+        "error=missing_required_field",
+        "field=from"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "email.build",
+      "input_condition": "Missing 'to' list",
+      "output_rule": "Return error string",
+      "exact_values": [
+        "error=missing_required_field",
+        "field=to"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "email.build",
+      "input_condition": "Missing 'subject'",
+      "output_rule": "Return error string",
+      "exact_values": [
+        "error=missing_required_field",
+        "field=subject"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "email.build",
+      "input_condition": "Missing 'body'",
+      "output_rule": "Return error string",
+      "exact_values": [
+        "error=missing_required_field",
+        "field=body"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "email.build",
+      "input_condition": "Custom headers present",
+      "output_rule": "Include custom_header_count and sorted custom_header lines",
+      "exact_values": [
+        "custom_header_count=<int>",
+        "custom_header.<key>=<value> (sorted by key)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "email.build",
+      "input_condition": "No custom headers",
+      "output_rule": "Include custom_header_count=0, no custom_header lines",
+      "exact_values": [
+        "custom_header_count=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "inline_picture.build",
+      "input_condition": "inline_picture.build operation",
+      "output_rule": "Return string or missing field error",
+      "exact_values": [
+        "image_type=PNG",
+        "content_type=image/png",
+        "template_name=logo.ftl",
+        "file=/images/logo.png"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "inline_picture.build",
+      "input_condition": "Missing 'file' path",
+      "output_rule": "Return error string",
+      "exact_values": [
+        "error=missing_required_field",
+        "field=file"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "inline_picture.build",
+      "input_condition": "Missing 'imageType' or 'templateName'",
+      "output_rule": "Return error string",
+      "exact_values": [
+        "error=missing_required_field",
+        "field=<imageType|templateName>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "attachment.build",
+      "input_condition": "attachment.build operation",
+      "output_rule": "Return string or missing field error",
+      "exact_values": [
+        "attachment_name=<name>",
+        "resource_exists=true",
+        "resource_size=<int>",
+        "content_type=<type>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "attachment.build",
+      "input_condition": "Missing 'attachmentData'",
+      "output_rule": "Return error string",
+      "exact_values": [
+        "error=missing_required_field",
+        "field=attachmentData"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "attachment.build",
+      "input_condition": "Explicit mediaType provided",
+      "output_rule": "Use explicit mediaType verbatim",
+      "exact_values": [
+        "content_type=<explicit_media_type>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "attachment.build",
+      "input_condition": "No explicit mediaType provided",
+      "output_rule": "Auto-detect content_type from bytes and filename",
+      "exact_values": [
+        "content_type=image/jpeg (for JPEG)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "image_type.list",
+      "input_condition": "image_type.list operation",
+      "output_rule": "Return catalog of supported kinds",
+      "exact_values": [
+        "GIF extension=gif content_type=image/gif",
+        "JPG extension=jpg content_type=image/jpeg",
+        "JPEG extension=jpeg content_type=image/jpeg",
+        "PNG extension=png content_type=image/png"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "image_type.get",
+      "input_condition": "image_type.get with name=<KIND>",
+      "output_rule": "Return single line for that kind",
+      "exact_values": [
+        "<KIND> extension=<ext> content_type=<mime>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "mime.assemble",
+      "input_condition": "mime.assemble operation",
+      "output_rule": "Return string of assembled headers/data",
+      "exact_values": [
+        "from=",
+        "reply_to=",
+        "to=",
+        "cc=",
+        "bcc=",
+        "subject=",
+        "multipart=true/false",
+        "body=",
+        "header_return_receipt=",
+        "header_disposition_notification_to=",
+        "custom_header.<key>=<value>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "mime.assemble",
+      "input_condition": "No attachments present",
+      "output_rule": "Set multipart=false, do not include attachment headers",
+      "exact_values": [
+        "multipart=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "mime.assemble",
+      "input_condition": "Attachments present",
+      "output_rule": "Set multipart=true",
+      "exact_values": [
+        "multipart=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "mime.assemble",
+      "input_condition": "replyTo field provided",
+      "output_rule": "Use replyTo value",
+      "exact_values": [
+        "reply_to=<replyTo_value>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "mime.assemble",
+      "input_condition": "replyTo field missing",
+      "output_rule": "Default reply_to to sender (from)",
+      "exact_values": [
+        "reply_to=<from>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "template.merge (freemarker/mustache/pebble/thymeleaf)",
+      "input_condition": "Template reference is blank/whitespace only",
+      "output_rule": "Return error",
+      "exact_values": [
+        "error=invalid_template_name",
+        "engine=<engine_name>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "template.merge (freemarker/mustache/pebble/thymeleaf)",
+      "input_condition": "Template extension does not match engine default",
+      "output_rule": "Return error",
+      "exact_values": [
+        "error=invalid_template_name",
+        "engine=<engine_name>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "template.merge (freemarker)",
+      "input_condition": "Template 'wrong_email_template.ftl' (invalid syntax/structure)",
+      "output_rule": "Return error for processing failure",
+      "exact_values": [
+        "error=template_processing_failed",
+        "engine=freemarker"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "template.merge (pebble)",
+      "input_condition": "Template 'wrong_email_template.html' (invalid for pebble)",
+      "output_rule": "Return error for processing failure",
+      "exact_values": [
+        "error=template_processing_failed",
+        "engine=pebble"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "template.merge",
+      "input_condition": "freemarker engine",
+      "output_rule": "Substitute ${name} placeholders",
+      "exact_values": [
+        "{template} data rendered with ${name}"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "template.merge",
+      "input_condition": "mustache engine",
+      "output_rule": "Render template using {{ 'name' }} syntax",
+      "exact_values": [
+        "{template} rendered with {{ 'name' }}"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "template.merge",
+      "input_condition": "thymeleaf engine",
+      "output_rule": "Support attribute-level expressions <a href=\"${activationLink}\">...",
+      "exact_values": [
+        "<a href=\"${activationLink}\">...</a>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "email.build",
+      "input_condition": "Empty 'to' list",
+      "output_rule": "Echo 'to=' followed by nothing",
+      "exact_values": [
+        "to="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "email.build",
+      "input_condition": "Empty 'cc' list",
+      "output_rule": "Echo 'cc=' followed by nothing",
+      "exact_values": [
+        "cc="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "email.build",
+      "input_condition": "Empty 'bcc' list",
+      "output_rule": "Echo 'bcc=' followed by nothing",
+      "exact_values": [
+        "bcc="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "mime.assemble",
+      "input_condition": "receiptTo field provided",
+      "output_rule": "Include header_return_receipt=<val>",
+      "exact_values": [
+        "header_return_receipt=<val>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "mime.assemble",
+      "input_condition": "receiptTo field missing or empty",
+      "output_rule": "Echo 'header_return_receipt=' followed by nothing",
+      "exact_values": [
+        "header_return_receipt="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "mime.assemble",
+      "input_condition": "depositionNotificationTo field provided",
+      "output_rule": "Include header_disposition_notification_to=<val>",
+      "exact_values": [
+        "header_disposition_notification_to=<val>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "mime.assemble",
+      "input_condition": "depositionNotificationTo field missing or empty",
+      "output_rule": "Echo 'header_disposition_notification_to=' followed by nothing",
+      "exact_values": [
+        "header_disposition_notification_to="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "attachment.build",
+      "input_condition": "Both 'attachmentName' and 'dataText' present (text)",
+      "output_rule": "resource_exists=true, resource_size=<byte_count>",
+      "exact_values": [
+        "resource_exists=true",
+        "resource_size=<int>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "attachment.build",
+      "input_condition": "'sampleImage' flag provided",
+      "output_rule": "Treat as image bytes, auto-detect filetype",
+      "exact_values": [
+        "content_type=image/jpeg",
+        "resource_size=59665"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C038",
+        "replacement": "a hard-coded size and content type for the sample image flag — verify exact bytes in the image loader",
+        "exact_values_to_replace": [
+          "content_type=image/jpeg",
+          "resource_size=59665"
+        ],
+        "trigger_keywords": [
+          "how is sampleImage content_type detected?",
+          "what size does sampleImage have?",
+          "does sampleImage default to JPEG?",
+          "magic number for sampleImage resource"
+        ],
+        "oracle_response": "The sample flag forces content_type=image/jpeg and resource_size=59665 bytes, bypassing auto-detection."
+      },
+      {
+        "constraint_id": "C015",
+        "replacement": "media type sniffing rule for JPEG variants — confirm MIME export logic",
+        "exact_values_to_replace": [
+          "content_type=image/jpeg (for JPEG)"
+        ],
+        "trigger_keywords": [
+          "how is JPEG content_type derived?",
+          "what happens if bytes are JPEG but type is missing?",
+          "MIME auto-detection for JPEG"
+        ],
+        "oracle_response": "If a file is identified as JPEG via binary analysis, the exact content_type used in output is image/jpeg."
+      },
+      {
+        "constraint_id": "C007",
+        "replacement": "sorting algorithm for custom header keys — check validation utility",
+        "exact_values_to_replace": [
+          "custom_header.<key>=<value> (sorted by key)"
+        ],
+        "trigger_keywords": [
+          "are custom headers sorted alphabetically?",
+          "what order do custom_header lines appear in?",
+          "is there a specific sort rule for headers?"
+        ],
+        "oracle_response": "Custom headers are strictly sorted in ascending lexicographical order by the <key> portion."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C014",
+        "vague_phrase": "echo the attachment mediaType exactly as received from the upstream service",
+        "actual_meaning": "Use the raw content-type string provided in the input JSON without validation or transformation."
+      },
+      {
+        "constraint_id": "C033",
+        "vague_phrase": "mirror the field format used for replyTo when the disposition header is configured",
+        "actual_meaning": "The output string for header_return_receipt must follow the exact pattern used for reply_to (e.g., 'header_return_receipt=<value>')."
+      }
+    ]
+  }
+}

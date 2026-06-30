@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to get this Rust builder codegen library wrapped up for the release. It's basically a proc-macro thing that auto-generates those typed construction APIs for structs so devs don't have to write all that boilerplate themselves. The big thing is it needs to be compile-time safe — like, if someone forgets a required field or tries to set a field they're not supposed to touch, it should blow up at compile time, not runtime. We had that issue with the old approach where hidden internal fields were accidentally settable from outside, which caused some really annoying prod bugs last quarter.
+
+Also, the library needs to handle all the Rust-specific stuff — borrows, mutable borrows, generics, lifetimes, the works. And there's that thing we discussed about how some field names conflict with Rust keywords (similar to how we handled it in the auth module refactor), make sure that's covered properly.
+
+There should also be support for optional fields with shorthand setters, boolean flag fields, defaults that depend on other field values, and the ability to clone a partially-built record and finish it in different ways. Custom names for the builder start/finalize methods would be nice too. Basically take the full spec and make sure all those construction patterns work end to end through the test harness we already have set up.

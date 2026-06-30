@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a structured logging serializer library that our downstream pipeline can actually consume without us maintaining a bunch of fragile regex rules. Right now every service is hand-rolling their own JSON and the dashboards keep breaking because field names are inconsistent or timestamps are in different formats. We talked about this in the last infra sync — basically the same approach we used for that ECS alignment work, just applied here as a reusable library.
+
+The library needs to take in log event data (time, severity, message, some optional context stuff) and spit out one clean JSON line per event. Timestamps should always look the same. Severity labels should line up visually in the output. We also need to support attaching key/value context to events — most keys should be namespaced to avoid collisions, but some well-known correlation keys (like trace and transaction identifiers) should be promoted to top-level. Tags should be supported too as an array. Errors need their own structured fields.
+
+Also really important: the thing needs to handle bad inputs gracefully — no raw stack traces or internal error objects leaking into stdout. There should be a clean, consistent error reporting format that downstream tooling can parse. The adapter layer that reads commands and writes output must be separate from the actual serialization logic. Ping me if unclear on what 'consistent error format' means here, I can dig up the notes.

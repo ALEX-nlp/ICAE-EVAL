@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a message routing engine for our pub/sub system. Basically the idea is that when a message gets published, we need to figure out which subscribers should get it based on some pattern matching logic — similar to what we did for that exchange connector filtering stuff a while back. The core of it is that messages have a kind of hierarchical tag (built from their own fields), and subscribers register patterns that may include wildcards. We need the engine to answer yes/no on whether a given pattern covers a given message.
+
+There are a few rough edges I want to make sure we nail: the wildcard behavior needs to handle both 'skip one segment' and 'skip everything from here' cases. Also there's something about how we look up which part of a pattern belongs to a specific named field on the message — this needs to work even when the field positions aren't consecutive numbers. And if a message field is empty/missing, we shouldn't silently ignore it — there should be some kind of clean error that tells us exactly which field caused the issue.
+
+We also need a CLI test runner that can point at different folders of test cases without overwriting previous results. The actual routing logic should be totally separate from any JSON/stdin wiring — keep those concerns apart. Let me know if anything is unclear, but try to dig into the existing test cases to get the specifics.

@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that argument parsing utility we've been talking about. Basically devs are tired of writing the same boilerplate token-walking code every time they spin up a new CLI tool — it's brittle, inconsistent, and nobody wants to maintain it. The idea is you declare your args once and the library handles the rest: figuring out what's optional vs positional, dealing with those weird concatenated short flag cases like we handled in the auth CLI last quarter, converting values to the right types, yelling at users when they do something wrong, and spitting out decent help text automatically.
+
+The JSON-in/JSON-out adapter layer needs to stay totally separate from the core logic — same principle we used on the config service, keep the I/O plumbing away from the business rules. Output should be sorted bindings, one per line, and errors should be plain English with no runtime type names leaking through.
+
+Also needs to handle subcommands (think git-style), mutual exclusion groups, and the double-dash end-of-options separator. The help/usage rendering has to be auto-generated but also overridable. There's some nuance around how greedy positionals yield tokens to later required ones — make sure that's solid. Reach out if anything's unclear, there are test cases in the repo that cover the edge cases pretty thoroughly.

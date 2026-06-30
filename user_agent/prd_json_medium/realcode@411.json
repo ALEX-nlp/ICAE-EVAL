@@ -1,0 +1,393 @@
+{
+  "fuzzy_prd": "Hey team, picking this up from the last sprint planning — we need to ship the shader cross-compilation adapter. The basic idea is: a developer drops in one compiled shader artifact and our tool spits out whatever the target platform needs. We've had complaints from the graphics team that they're maintaining like four different hand-written versions of the same shader and they keep drifting out of sync, so this is supposed to fix that pain point.\n\nThe tool should read a JSON command from stdin and write results to stdout. We support a handful of output targets — the usual suspects the graphics team uses day-to-day. One thing that keeps coming up in reviews: when something goes wrong (bad input, garbage assembly, etc.), it should NOT crash or leak any internal runtime stuff — just return a clean, predictable error shape every time, whatever the target was.\n\nAlso, remember that compatibility handling we did for the browser-side shader environment? Same idea here — if the shader was authored for that environment, we need to normalize it before processing. Check how we handled the environment transform logic in the existing pipeline, it's similar.\n\nOutput format matters a lot — the graphics team's CI is parsing stdout directly, so the exact shape of success AND error responses needs to be locked down. Binary targets are a special case too, since you obviously can't print raw bytes — figure out what observable signals make sense there.\n\nArchitecture-wise, keep things modular — adding a new output target later shouldn't require touching the core engine.\n\nOne follow-up from the questions in chat: the stdout shape needs to be really literal. For textual targets (glsl, hlsl, msl), a successful response is exactly a line `status=success`, a line `target=<target>`, a line `---`, then the verbatim generated source code. For the binary target (vulkan), a successful response is `status=success`, `target=vulkan`, `magic=0x07230203`, `word_count=<N>` — no source text, no raw bytes printed.\n\nOn the failure side, all validation or assembly failures must emit exactly three lines: `error=invalid_module`, `stage=cross_compile`, `target=<requested_target>`. No stack traces, no internal diagnostics, no partial output — regardless of which target was requested.\n\nAlso just to lock down the supported values, the target values are `glsl`, `hlsl`, `msl`, and `vulkan`. Each maps to a distinct translator. `glsl` produces GLSL source, `hlsl` produces HLSL source, `msl` produces Metal Shading Language source, and `vulkan` produces a Vulkan SPIR-V binary represented by its magic number and word count.\n\nFor the browser-authored path, when the JSON input includes `source_env`: `webgpu`, the engine must first transform the module from the WebGPU environment (using SPV_KHR_vulkan_memory_model / VulkanKHR memory model) into the standard Vulkan environment, then re-validate the transformed module, and only then cross-compile to the requested target. The success output shape is identical to non-webgpu inputs for each target type. If `source_env` is absent or null, no transform is applied. The transform itself is the WebGPU-to-Vulkan environment transform triggered by `source_env`: `webgpu` in the JSON input, which strips VulkanMemoryModelKHR capability and SPV_KHR_vulkan_memory_model extension and switches the memory model from VulkanKHR to GLSL450.\n\nAnd for the couple of concrete output checks people asked for: for the standard test SPIR-V assembly (the vertex color pass-through shader with ESSL 310), the Vulkan binary output must report `word_count=92`. For the minimal WebGPU-sourced shader (entry-only, no interface variables), after WebGPU-to-Vulkan transform, `word_count=39`.",
+  "oracle_data": {
+    "task_id": "shaderc-cross-compile-adapter-001",
+    "golden_api_signature": "cross_compile(assembly: str, target: str, source_env: str | None) -> CompilationResult",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "GLSL version in output",
+          "how is the GLSL version determined",
+          "version directive in generated GLSL"
+        ],
+        "oracle_response": "The GLSL version line in the generated output is derived from the source module. A module with 'OpSource ESSL 310' yields '#version 310 es'. A module with no explicit source version hint (e.g., after a WebGPU transform) yields '#version 450'."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "MSL output structure",
+          "Metal Shading Language preamble",
+          "what does the generated MSL look like"
+        ],
+        "oracle_response": "Generated MSL must begin with '#include <metal_stdlib>' and '#include <simd/simd.h>', followed by 'using namespace metal;'. For a vertex shader with interface variables, it emits 'main0_out' and 'main0_in' structs with [[user(locn0)]] and [[attribute(0)]] attributes respectively, then the vertex entry point 'vertex main0_out main0(main0_in in [[stage_in]])'. For a minimal WebGPU-sourced shader with no interface variables, it emits 'vertex void shader()' with an empty body."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "HLSL output structure",
+          "what does the generated HLSL look like",
+          "vert_main function in HLSL"
+        ],
+        "oracle_response": "The generated HLSL wraps the vertex shader logic in an inner function named 'vert_main()' and exposes a 'void main()' that calls it. It also emits 'uniform float4 gl_HalfPixel;' at the top. The vert_main body adjusts gl_Position using gl_HalfPixel. This applies for both direct compilation and WebGPU-sourced modules compiled to HLSL."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "input format",
+          "JSON input schema",
+          "what fields does the JSON command accept"
+        ],
+        "oracle_response": "The JSON input object must have: 'target' (string, required) — one of glsl/hlsl/msl/vulkan; 'assembly' (string, required) — the SPIR-V textual assembly listing; 'source_env' (string, optional) — set to 'webgpu' to trigger environment transform, otherwise absent or null."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "code structure requirements",
+          "how should the codebase be organized",
+          "separation of concerns for architecture"
+        ],
+        "oracle_response": "The implementation must NOT be a single file. Required separation: (1) a core engine module handling validation and orchestration, (2) per-target translator units (one per target: glsl, hlsl, msl, vulkan) behind a common translation abstraction, (3) an execution adapter that owns only JSON stdin/stdout parsing and bridges to the core engine. The JSON I/O contract is a black-box testing contract for the adapter only — the engine must be fully decoupled from JSON and stdio. Adding a new target must not require modifying the engine core."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_compile_to_glsl",
+        "trigger_keywords": [
+          "test cases for feature1 compile to glsl",
+          "show me feature1 compile to glsl test cases",
+          "what are the feature1 compile to glsl test inputs",
+          "give me the feature1_compile_to_glsl test file",
+          "test cases for feature 1",
+          "feature1 compile to glsl expected output",
+          "what does feature1 compile to glsl expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_compile_to_glsl:\n{\n  \"description\": \"Validate a SPIR-V module and cross-compile it into a GLSL program. The input is a SPIR-V assembly listing for the requested textual target; on success the output is a header line block followed by the verbatim generated GLSL source.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"glsl\",\n        \"assembly\": \"               OpCapability Shader\\n          %1 = OpExtInstImport \\\"GLSL.std.450\\\"\\n               OpMemoryModel Logical GLSL450\\n               OpEntryPoint Vertex %main \\\"main\\\" %outColor %vtxColor\\n               OpSource ESSL 310\\n               OpName %main \\\"main\\\"\\n               OpName %outColor \\\"outColor\\\"\\n               OpName %vtxColor \\\"vtxColor\\\"\\n               OpDecorate %outColor Location 0\\n               OpDecorate %vtxColor Location 0\\n       %void = OpTypeVoid\\n          %3 = OpTypeFunction %void\\n      %float = OpTypeFloat 32\\n    %v4float = OpTypeVector %float 4\\n%_ptr_Output_v4float = OpTypePointer Output %v4float\\n   %outColor = OpVariable %_ptr_Output_v4float Output\\n%_ptr_Input_v4float = OpTypePointer Input %v4float\\n   %vtxColor = OpVariable %_ptr_Input_v4float Input\\n       %main = OpFunction %void None %3\\n          %5 = OpLabel\\n         %12 = OpLoad %v4float %vtxColor\\n               OpStore %outColor %12\\n               OpReturn\\n               OpFunctionEnd\\n\"\n      },\n      \"expected_output\": \"status=success\\ntarget=glsl\\n---\\n#version 310 es\\n\\nlayout(location = 0) out vec4 outColor;\\nlayout(location = 0) in vec4 vtxColor;\\n\\nvoid main()\\n{\\n    outColor = vtxColor;\\n}\\n\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_compile_to_hlsl",
+        "trigger_keywords": [
+          "test cases for feature2 compile to hlsl",
+          "show me feature2 compile to hlsl test cases",
+          "what are the feature2 compile to hlsl test inputs",
+          "give me the feature2_compile_to_hlsl test file",
+          "test cases for feature 2",
+          "feature2 compile to hlsl expected output",
+          "what does feature2 compile to hlsl expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_compile_to_hlsl:\n{\n  \"description\": \"Validate a SPIR-V module and cross-compile it into an HLSL program. On success the output is the header block followed by the verbatim generated HLSL source.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"hlsl\",\n        \"assembly\": \"               OpCapability Shader\\n          %1 = OpExtInstImport \\\"GLSL.std.450\\\"\\n               OpMemoryModel Logical GLSL450\\n               OpEntryPoint Vertex %main \\\"main\\\" %outColor %vtxColor\\n               OpSource ESSL 310\\n               OpName %main \\\"main\\\"\\n               OpName %outColor \\\"outColor\\\"\\n               OpName %vtxColor \\\"vtxColor\\\"\\n               OpDecorate %outColor Location 0\\n               OpDecorate %vtxColor Location 0\\n       %void = OpTypeVoid\\n          %3 = OpTypeFunction %void\\n      %float = OpTypeFloat 32\\n    %v4float = OpTypeVector %float 4\\n%_ptr_Output_v4float = OpTypePointer Output %v4float\\n   %outColor = OpVariable %_ptr_Output_v4float Output\\n%_ptr_Input_v4float = OpTypePointer Input %v4float\\n   %vtxColor = OpVariable %_ptr_Input_v4float Input\\n       %main = OpFunction %void None %3\\n          %5 = OpLabel\\n         %12 = OpLoad %v4float %vtxColor\\n               OpStore %outColor %12\\n               OpReturn\\n               OpFunctionEnd\\n\"\n      },\n      \"expected_output\": \"status=success\\ntarget=hlsl\\n---\\nuniform float4 gl_HalfPixel;\\n\\nvoid vert_main()\\n{\\n    gl_Position.x = gl_Position.x - gl_HalfPixel.x * gl_Position.w;\\n    gl_Position.y = gl_Position.y + gl_HalfPixel.y * gl_Position.w;\\n}\\n\\nvoid main()\\n{\\n    vert_main();\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_compile_to_msl",
+        "trigger_keywords": [
+          "test cases for feature3 compile to msl",
+          "show me feature3 compile to msl test cases",
+          "what are the feature3 compile to msl test inputs",
+          "give me the feature3_compile_to_msl test file",
+          "test cases for feature 3",
+          "feature3 compile to msl expected output",
+          "what does feature3 compile to msl expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_compile_to_msl:\n{\n  \"description\": \"Validate a SPIR-V module and cross-compile it into a Metal Shading Language program. On success the output is the header block followed by the verbatim generated MSL source.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"msl\",\n        \"assembly\": \"               OpCapability Shader\\n          %1 = OpExtInstImport \\\"GLSL.std.450\\\"\\n               OpMemoryModel Logical GLSL450\\n               OpEntryPoint Vertex %main \\\"main\\\" %outColor %vtxColor\\n               OpSource ESSL 310\\n               OpName %main \\\"main\\\"\\n               OpName %outColor \\\"outColor\\\"\\n               OpName %vtxColor \\\"vtxColor\\\"\\n               OpDecorate %outColor Location 0\\n               OpDecorate %vtxColor Location 0\\n       %void = OpTypeVoid\\n          %3 = OpTypeFunction %void\\n      %float = OpTypeFloat 32\\n    %v4float = OpTypeVector %float 4\\n%_ptr_Output_v4float = OpTypePointer Output %v4float\\n   %outColor = OpVariable %_ptr_Output_v4float Output\\n%_ptr_Input_v4float = OpTypePointer Input %v4float\\n   %vtxColor = OpVariable %_ptr_Input_v4float Input\\n       %main = OpFunction %void None %3\\n          %5 = OpLabel\\n         %12 = OpLoad %v4float %vtxColor\\n               OpStore %outColor %12\\n               OpReturn\\n               OpFunctionEnd\\n\"\n      },\n      \"expected_output\": \"status=success\\ntarget=msl\\n---\\n#include <metal_stdlib>\\n#include <simd/simd.h>\\n\\nusing namespace metal;\\n\\nstruct main0_out\\n{\\n    float4 outColor [[user(locn0)]];\\n};\\n\\nstruct main0_in\\n{\\n    float4 vtxColor [[attribute(0)]];\\n};\\n\\nvertex main0_out main0(main0_in in [[stage_in]])\\n{\\n    main0_out out = {};\\n    out.outColor = in.vtxColor;\\n    return out;\\n}\\n\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_compile_to_vulkan",
+        "trigger_keywords": [
+          "test cases for feature4 compile to vulkan",
+          "show me feature4 compile to vulkan test cases",
+          "what are the feature4 compile to vulkan test inputs",
+          "give me the feature4_compile_to_vulkan test file",
+          "test cases for feature 4",
+          "feature4 compile to vulkan expected output",
+          "what does feature4 compile to vulkan expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_compile_to_vulkan:\n{\n  \"description\": \"Validate a SPIR-V module and re-emit it as a Vulkan SPIR-V binary module. Unlike the textual targets, the result is a binary word stream; the output reports the binary container magic number and the number of 32-bit words produced.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"vulkan\",\n        \"assembly\": \"               OpCapability Shader\\n          %1 = OpExtInstImport \\\"GLSL.std.450\\\"\\n               OpMemoryModel Logical GLSL450\\n               OpEntryPoint Vertex %main \\\"main\\\" %outColor %vtxColor\\n               OpSource ESSL 310\\n               OpName %main \\\"main\\\"\\n               OpName %outColor \\\"outColor\\\"\\n               OpName %vtxColor \\\"vtxColor\\\"\\n               OpDecorate %outColor Location 0\\n               OpDecorate %vtxColor Location 0\\n       %void = OpTypeVoid\\n          %3 = OpTypeFunction %void\\n      %float = OpTypeFloat 32\\n    %v4float = OpTypeVector %float 4\\n%_ptr_Output_v4float = OpTypePointer Output %v4float\\n   %outColor = OpVariable %_ptr_Output_v4float Output\\n%_ptr_Input_v4float = OpTypePointer Input %v4float\\n   %vtxColor = OpVariable %_ptr_Input_v4float Input\\n       %main = OpFunction %void None %3\\n          %5 = OpLabel\\n         %12 = OpLoad %v4float %vtxColor\\n               OpStore %outColor %12\\n               OpReturn\\n               OpFunctionEnd\\n\"\n      },\n      \"expected_output\": \"status=success\\ntarget=vulkan\\nmagic=0x07230203\\nword_count=92\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_reject_invalid_module",
+        "trigger_keywords": [
+          "test cases for feature5 reject invalid module",
+          "show me feature5 reject invalid module test cases",
+          "what are the feature5 reject invalid module test inputs",
+          "give me the feature5_reject_invalid_module test file",
+          "test cases for feature 5",
+          "feature5 reject invalid module expected output",
+          "what does feature5 reject invalid module expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_reject_invalid_module:\n{\n  \"description\": \"Reject a source that is not a valid SPIR-V module. Whether the input is empty or syntactically meaningless, and regardless of the requested target, the request is rejected with a normalized error category instead of producing any program output.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"glsl\",\n        \"assembly\": \"\"\n      },\n      \"expected_output\": \"error=invalid_module\\nstage=cross_compile\\ntarget=glsl\\n\"\n    },\n    {\n      \"input\": {\n        \"target\": \"glsl\",\n        \"assembly\": \"this is not valid spirv assembly\"\n      },\n      \"expected_output\": \"error=invalid_module\\nstage=cross_compile\\ntarget=glsl\\n\"\n    },\n    {\n      \"input\": {\n        \"target\": \"vulkan\",\n        \"assembly\": \"this is not valid spirv assembly\"\n      },\n      \"expected_output\": \"error=invalid_module\\nstage=cross_compile\\ntarget=vulkan\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_webgpu_to_glsl",
+        "trigger_keywords": [
+          "test cases for feature6 1 webgpu to glsl",
+          "show me feature6 1 webgpu to glsl test cases",
+          "what are the feature6 1 webgpu to glsl test inputs",
+          "give me the feature6_1_webgpu_to_glsl test file",
+          "test cases for feature 6",
+          "feature6 1 webgpu to glsl expected output",
+          "what does feature6 1 webgpu to glsl expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_webgpu_to_glsl:\n{\n  \"description\": \"Cross-compile a module authored for the WebGPU execution environment into GLSL. The module is first transformed from WebGPU to the Vulkan environment, then validated and cross-compiled; on success the output is the header block followed by the generated GLSL source.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"glsl\",\n        \"assembly\": \"          OpCapability Shader\\n          OpCapability VulkanMemoryModelKHR\\n          OpExtension \\\"SPV_KHR_vulkan_memory_model\\\"\\n          OpMemoryModel Logical VulkanKHR\\n          OpEntryPoint Vertex %func \\\"shader\\\"\\n%void   = OpTypeVoid\\n%void_f = OpTypeFunction %void\\n%func   = OpFunction %void None %void_f\\n%label  = OpLabel\\n          OpReturn\\n          OpFunctionEnd\\n\",\n        \"source_env\": \"webgpu\"\n      },\n      \"expected_output\": \"status=success\\ntarget=glsl\\n---\\n#version 450\\n\\nvoid main()\\n{\\n}\\n\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_2_webgpu_to_hlsl",
+        "trigger_keywords": [
+          "test cases for feature6 2 webgpu to hlsl",
+          "show me feature6 2 webgpu to hlsl test cases",
+          "what are the feature6 2 webgpu to hlsl test inputs",
+          "give me the feature6_2_webgpu_to_hlsl test file",
+          "test cases for feature 6",
+          "feature6 2 webgpu to hlsl expected output",
+          "what does feature6 2 webgpu to hlsl expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_2_webgpu_to_hlsl:\n{\n  \"description\": \"Cross-compile a WebGPU-environment module into HLSL via a WebGPU-to-Vulkan transform followed by validation and cross-compilation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"hlsl\",\n        \"assembly\": \"          OpCapability Shader\\n          OpCapability VulkanMemoryModelKHR\\n          OpExtension \\\"SPV_KHR_vulkan_memory_model\\\"\\n          OpMemoryModel Logical VulkanKHR\\n          OpEntryPoint Vertex %func \\\"shader\\\"\\n%void   = OpTypeVoid\\n%void_f = OpTypeFunction %void\\n%func   = OpFunction %void None %void_f\\n%label  = OpLabel\\n          OpReturn\\n          OpFunctionEnd\\n\",\n        \"source_env\": \"webgpu\"\n      },\n      \"expected_output\": \"status=success\\ntarget=hlsl\\n---\\nuniform float4 gl_HalfPixel;\\n\\nvoid vert_main()\\n{\\n    gl_Position.x = gl_Position.x - gl_HalfPixel.x * gl_Position.w;\\n    gl_Position.y = gl_Position.y + gl_HalfPixel.y * gl_Position.w;\\n}\\n\\nvoid main()\\n{\\n    vert_main();\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_3_webgpu_to_msl",
+        "trigger_keywords": [
+          "test cases for feature6 3 webgpu to msl",
+          "show me feature6 3 webgpu to msl test cases",
+          "what are the feature6 3 webgpu to msl test inputs",
+          "give me the feature6_3_webgpu_to_msl test file",
+          "test cases for feature 6",
+          "feature6 3 webgpu to msl expected output",
+          "what does feature6 3 webgpu to msl expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_3_webgpu_to_msl:\n{\n  \"description\": \"Cross-compile a WebGPU-environment module into Metal Shading Language via a WebGPU-to-Vulkan transform followed by validation and cross-compilation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"msl\",\n        \"assembly\": \"          OpCapability Shader\\n          OpCapability VulkanMemoryModelKHR\\n          OpExtension \\\"SPV_KHR_vulkan_memory_model\\\"\\n          OpMemoryModel Logical VulkanKHR\\n          OpEntryPoint Vertex %func \\\"shader\\\"\\n%void   = OpTypeVoid\\n%void_f = OpTypeFunction %void\\n%func   = OpFunction %void None %void_f\\n%label  = OpLabel\\n          OpReturn\\n          OpFunctionEnd\\n\",\n        \"source_env\": \"webgpu\"\n      },\n      \"expected_output\": \"status=success\\ntarget=msl\\n---\\n#include <metal_stdlib>\\n#include <simd/simd.h>\\n\\nusing namespace metal;\\n\\nvertex void shader()\\n{\\n}\\n\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_4_webgpu_to_vulkan",
+        "trigger_keywords": [
+          "test cases for feature6 4 webgpu to vulkan",
+          "show me feature6 4 webgpu to vulkan test cases",
+          "what are the feature6 4 webgpu to vulkan test inputs",
+          "give me the feature6_4_webgpu_to_vulkan test file",
+          "test cases for feature 6",
+          "feature6 4 webgpu to vulkan expected output",
+          "what does feature6 4 webgpu to vulkan expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_4_webgpu_to_vulkan:\n{\n  \"description\": \"Transform a WebGPU-environment module to the Vulkan environment and re-emit it as a Vulkan SPIR-V binary; the output reports the binary magic number and word count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"target\": \"vulkan\",\n        \"assembly\": \"          OpCapability Shader\\n          OpCapability VulkanMemoryModelKHR\\n          OpExtension \\\"SPV_KHR_vulkan_memory_model\\\"\\n          OpMemoryModel Logical VulkanKHR\\n          OpEntryPoint Vertex %func \\\"shader\\\"\\n%void   = OpTypeVoid\\n%void_f = OpTypeFunction %void\\n%func   = OpFunction %void None %void_f\\n%label  = OpLabel\\n          OpReturn\\n          OpFunctionEnd\\n\",\n        \"source_env\": \"webgpu\"\n      },\n      \"expected_output\": \"status=success\\ntarget=vulkan\\nmagic=0x07230203\\nword_count=39\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "binary targets are a special case — figure out what observable signals make sense",
+        "actual_meaning": "For target='vulkan', since raw binary bytes cannot be meaningfully printed, the output contract reports 'magic=0x07230203' (the SPIR-V container magic number) and 'word_count=<N>' (the number of 32-bit words in the assembled binary), as specified in Feature 4 and feature4_compile_to_vulkan.json"
+      },
+      {
+        "vague_reference": "the exact shape of success AND error responses needs to be locked down",
+        "actual_meaning": "Success: 'status=success\\ntarget=<t>\\n---\\n<source>\\n' for textual targets; 'status=success\\ntarget=vulkan\\nmagic=0x07230203\\nword_count=N\\n' for binary. Error: exactly 'error=invalid_module\\nstage=cross_compile\\ntarget=<t>\\n' — no other fields, no runtime diagnostics, as defined in Feature 5 and feature5_reject_invalid_module.json"
+      }
+    ],
+    "fallback_response": "I don't have specific details on that aspect in my notes right now — can you check the existing pipeline implementation or the test case files for that behavior? The test cases in rcb_tests/public_test_cases/ are the canonical contract for output shapes."
+  },
+  "public_test_cases": {
+    "feature1_compile_to_glsl.json": {
+      "description": "Validate a SPIR-V module and cross-compile it into a GLSL program. The input is a SPIR-V assembly listing for the requested textual target; on success the output is a header line block followed by the verbatim generated GLSL source.",
+      "cases": [
+        {
+          "input": {
+            "target": "glsl",
+            "assembly": "               OpCapability Shader\n          %1 = OpExtInstImport \"GLSL.std.450\"\n               OpMemoryModel Logical GLSL450\n               OpEntryPoint Vertex %main \"main\" %outColor %vtxColor\n               OpSource ESSL 310\n               OpName %main \"main\"\n               OpName %outColor \"outColor\"\n               OpName %vtxColor \"vtxColor\"\n               OpDecorate %outColor Location 0\n               OpDecorate %vtxColor Location 0\n       %void = OpTypeVoid\n          %3 = OpTypeFunction %void\n      %float = OpTypeFloat 32\n    %v4float = OpTypeVector %float 4\n%_ptr_Output_v4float = OpTypePointer Output %v4float\n   %outColor = OpVariable %_ptr_Output_v4float Output\n%_ptr_Input_v4float = OpTypePointer Input %v4float\n   %vtxColor = OpVariable %_ptr_Input_v4float Input\n       %main = OpFunction %void None %3\n          %5 = OpLabel\n         %12 = OpLoad %v4float %vtxColor\n               OpStore %outColor %12\n               OpReturn\n               OpFunctionEnd\n"
+          },
+          "expected_output": "status=success\ntarget=glsl\n---\n#version 310 es\n\nlayout(location = 0) out vec4 outColor;\nlayout(location = 0) in vec4 vtxColor;\n\nvoid main()\n{\n    outColor = vtxColor;\n}\n\n"
+        }
+      ]
+    },
+    "feature2_compile_to_hlsl.json": {
+      "description": "Validate a SPIR-V module and cross-compile it into an HLSL program. On success the output is the header block followed by the verbatim generated HLSL source.",
+      "cases": [
+        {
+          "input": {
+            "target": "hlsl",
+            "assembly": "               OpCapability Shader\n          %1 = OpExtInstImport \"GLSL.std.450\"\n               OpMemoryModel Logical GLSL450\n               OpEntryPoint Vertex %main \"main\" %outColor %vtxColor\n               OpSource ESSL 310\n               OpName %main \"main\"\n               OpName %outColor \"outColor\"\n               OpName %vtxColor \"vtxColor\"\n               OpDecorate %outColor Location 0\n               OpDecorate %vtxColor Location 0\n       %void = OpTypeVoid\n          %3 = OpTypeFunction %void\n      %float = OpTypeFloat 32\n    %v4float = OpTypeVector %float 4\n%_ptr_Output_v4float = OpTypePointer Output %v4float\n   %outColor = OpVariable %_ptr_Output_v4float Output\n%_ptr_Input_v4float = OpTypePointer Input %v4float\n   %vtxColor = OpVariable %_ptr_Input_v4float Input\n       %main = OpFunction %void None %3\n          %5 = OpLabel\n         %12 = OpLoad %v4float %vtxColor\n               OpStore %outColor %12\n               OpReturn\n               OpFunctionEnd\n"
+          },
+          "expected_output": "status=success\ntarget=hlsl\n---\nuniform float4 gl_HalfPixel;\n\nvoid vert_main()\n{\n    gl_Position.x = gl_Position.x - gl_HalfPixel.x * gl_Position.w;\n    gl_Position.y = gl_Position.y + gl_HalfPixel.y * gl_Position.w;\n}\n\nvoid main()\n{\n    vert_main();\n}\n"
+        }
+      ]
+    },
+    "feature3_compile_to_msl.json": {
+      "description": "Validate a SPIR-V module and cross-compile it into a Metal Shading Language program. On success the output is the header block followed by the verbatim generated MSL source.",
+      "cases": [
+        {
+          "input": {
+            "target": "msl",
+            "assembly": "               OpCapability Shader\n          %1 = OpExtInstImport \"GLSL.std.450\"\n               OpMemoryModel Logical GLSL450\n               OpEntryPoint Vertex %main \"main\" %outColor %vtxColor\n               OpSource ESSL 310\n               OpName %main \"main\"\n               OpName %outColor \"outColor\"\n               OpName %vtxColor \"vtxColor\"\n               OpDecorate %outColor Location 0\n               OpDecorate %vtxColor Location 0\n       %void = OpTypeVoid\n          %3 = OpTypeFunction %void\n      %float = OpTypeFloat 32\n    %v4float = OpTypeVector %float 4\n%_ptr_Output_v4float = OpTypePointer Output %v4float\n   %outColor = OpVariable %_ptr_Output_v4float Output\n%_ptr_Input_v4float = OpTypePointer Input %v4float\n   %vtxColor = OpVariable %_ptr_Input_v4float Input\n       %main = OpFunction %void None %3\n          %5 = OpLabel\n         %12 = OpLoad %v4float %vtxColor\n               OpStore %outColor %12\n               OpReturn\n               OpFunctionEnd\n"
+          },
+          "expected_output": "status=success\ntarget=msl\n---\n#include <metal_stdlib>\n#include <simd/simd.h>\n\nusing namespace metal;\n\nstruct main0_out\n{\n    float4 outColor [[user(locn0)]];\n};\n\nstruct main0_in\n{\n    float4 vtxColor [[attribute(0)]];\n};\n\nvertex main0_out main0(main0_in in [[stage_in]])\n{\n    main0_out out = {};\n    out.outColor = in.vtxColor;\n    return out;\n}\n\n"
+        }
+      ]
+    },
+    "feature4_compile_to_vulkan.json": {
+      "description": "Validate a SPIR-V module and re-emit it as a Vulkan SPIR-V binary module. Unlike the textual targets, the result is a binary word stream; the output reports the binary container magic number and the number of 32-bit words produced.",
+      "cases": [
+        {
+          "input": {
+            "target": "vulkan",
+            "assembly": "               OpCapability Shader\n          %1 = OpExtInstImport \"GLSL.std.450\"\n               OpMemoryModel Logical GLSL450\n               OpEntryPoint Vertex %main \"main\" %outColor %vtxColor\n               OpSource ESSL 310\n               OpName %main \"main\"\n               OpName %outColor \"outColor\"\n               OpName %vtxColor \"vtxColor\"\n               OpDecorate %outColor Location 0\n               OpDecorate %vtxColor Location 0\n       %void = OpTypeVoid\n          %3 = OpTypeFunction %void\n      %float = OpTypeFloat 32\n    %v4float = OpTypeVector %float 4\n%_ptr_Output_v4float = OpTypePointer Output %v4float\n   %outColor = OpVariable %_ptr_Output_v4float Output\n%_ptr_Input_v4float = OpTypePointer Input %v4float\n   %vtxColor = OpVariable %_ptr_Input_v4float Input\n       %main = OpFunction %void None %3\n          %5 = OpLabel\n         %12 = OpLoad %v4float %vtxColor\n               OpStore %outColor %12\n               OpReturn\n               OpFunctionEnd\n"
+          },
+          "expected_output": "status=success\ntarget=vulkan\nmagic=0x07230203\nword_count=92\n"
+        }
+      ]
+    },
+    "feature5_reject_invalid_module.json": {
+      "description": "Reject a source that is not a valid SPIR-V module. Whether the input is empty or syntactically meaningless, and regardless of the requested target, the request is rejected with a normalized error category instead of producing any program output.",
+      "cases": [
+        {
+          "input": {
+            "target": "glsl",
+            "assembly": ""
+          },
+          "expected_output": "error=invalid_module\nstage=cross_compile\ntarget=glsl\n"
+        },
+        {
+          "input": {
+            "target": "glsl",
+            "assembly": "this is not valid spirv assembly"
+          },
+          "expected_output": "error=invalid_module\nstage=cross_compile\ntarget=glsl\n"
+        },
+        {
+          "input": {
+            "target": "vulkan",
+            "assembly": "this is not valid spirv assembly"
+          },
+          "expected_output": "error=invalid_module\nstage=cross_compile\ntarget=vulkan\n"
+        }
+      ]
+    },
+    "feature6_1_webgpu_to_glsl.json": {
+      "description": "Cross-compile a module authored for the WebGPU execution environment into GLSL. The module is first transformed from WebGPU to the Vulkan environment, then validated and cross-compiled; on success the output is the header block followed by the generated GLSL source.",
+      "cases": [
+        {
+          "input": {
+            "target": "glsl",
+            "assembly": "          OpCapability Shader\n          OpCapability VulkanMemoryModelKHR\n          OpExtension \"SPV_KHR_vulkan_memory_model\"\n          OpMemoryModel Logical VulkanKHR\n          OpEntryPoint Vertex %func \"shader\"\n%void   = OpTypeVoid\n%void_f = OpTypeFunction %void\n%func   = OpFunction %void None %void_f\n%label  = OpLabel\n          OpReturn\n          OpFunctionEnd\n",
+            "source_env": "webgpu"
+          },
+          "expected_output": "status=success\ntarget=glsl\n---\n#version 450\n\nvoid main()\n{\n}\n\n"
+        }
+      ]
+    },
+    "feature6_2_webgpu_to_hlsl.json": {
+      "description": "Cross-compile a WebGPU-environment module into HLSL via a WebGPU-to-Vulkan transform followed by validation and cross-compilation.",
+      "cases": [
+        {
+          "input": {
+            "target": "hlsl",
+            "assembly": "          OpCapability Shader\n          OpCapability VulkanMemoryModelKHR\n          OpExtension \"SPV_KHR_vulkan_memory_model\"\n          OpMemoryModel Logical VulkanKHR\n          OpEntryPoint Vertex %func \"shader\"\n%void   = OpTypeVoid\n%void_f = OpTypeFunction %void\n%func   = OpFunction %void None %void_f\n%label  = OpLabel\n          OpReturn\n          OpFunctionEnd\n",
+            "source_env": "webgpu"
+          },
+          "expected_output": "status=success\ntarget=hlsl\n---\nuniform float4 gl_HalfPixel;\n\nvoid vert_main()\n{\n    gl_Position.x = gl_Position.x - gl_HalfPixel.x * gl_Position.w;\n    gl_Position.y = gl_Position.y + gl_HalfPixel.y * gl_Position.w;\n}\n\nvoid main()\n{\n    vert_main();\n}\n"
+        }
+      ]
+    },
+    "feature6_3_webgpu_to_msl.json": {
+      "description": "Cross-compile a WebGPU-environment module into Metal Shading Language via a WebGPU-to-Vulkan transform followed by validation and cross-compilation.",
+      "cases": [
+        {
+          "input": {
+            "target": "msl",
+            "assembly": "          OpCapability Shader\n          OpCapability VulkanMemoryModelKHR\n          OpExtension \"SPV_KHR_vulkan_memory_model\"\n          OpMemoryModel Logical VulkanKHR\n          OpEntryPoint Vertex %func \"shader\"\n%void   = OpTypeVoid\n%void_f = OpTypeFunction %void\n%func   = OpFunction %void None %void_f\n%label  = OpLabel\n          OpReturn\n          OpFunctionEnd\n",
+            "source_env": "webgpu"
+          },
+          "expected_output": "status=success\ntarget=msl\n---\n#include <metal_stdlib>\n#include <simd/simd.h>\n\nusing namespace metal;\n\nvertex void shader()\n{\n}\n\n"
+        }
+      ]
+    },
+    "feature6_4_webgpu_to_vulkan.json": {
+      "description": "Transform a WebGPU-environment module to the Vulkan environment and re-emit it as a Vulkan SPIR-V binary; the output reports the binary magic number and word count.",
+      "cases": [
+        {
+          "input": {
+            "target": "vulkan",
+            "assembly": "          OpCapability Shader\n          OpCapability VulkanMemoryModelKHR\n          OpExtension \"SPV_KHR_vulkan_memory_model\"\n          OpMemoryModel Logical VulkanKHR\n          OpEntryPoint Vertex %func \"shader\"\n%void   = OpTypeVoid\n%void_f = OpTypeFunction %void\n%func   = OpFunction %void None %void_f\n%label  = OpLabel\n          OpReturn\n          OpFunctionEnd\n",
+            "source_env": "webgpu"
+          },
+          "expected_output": "status=success\ntarget=vulkan\nmagic=0x07230203\nword_count=39\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C003",
+      "C004",
+      "C005"
+    ],
+    "kept_c": [
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 1,
+    "kept_cp": 2
+  }
+}

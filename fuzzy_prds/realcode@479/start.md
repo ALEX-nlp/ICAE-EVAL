@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need a new internal tool for the data platform squad — basically a mini query engine that can take columnar data (think arrays of values per column) and run expressions over them in batch. the idea is you describe what computation you want as a tree of nodes (like conditions, math ops, membership checks, pattern matching etc), and the system compiles that once and evaluates it over a whole batch at a time. we need two modes: one that produces a new computed column (projection), and one that gives back the row positions that pass some condition (filtering). these two should also be chainable — filter first, then project only the surviving rows.
+
+we talked about this being similar to what the old ETL team did with their expression evaluator last quarter, so maybe reuse that pattern where you separate the tree-building logic from the actual evaluation runtime. also there was that thing we did in the login module around input validation — same vibe, reject bad inputs early with a clear error category rather than letting garbage through.
+
+null/missing values in input columns need to be handled gracefully — they should flow through and appear as nulls in output. also make sure the output format is consistent and machine-readable since downstream tools will parse it. the whole thing should be structured across multiple files, not one big blob. let me know if you have questions, i'll try to get more details from the data team.

@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to build out this data interchange toolkit thing that our distributed compute pipeline depends on. Basically it's a small library that can handle a bunch of low-level operations — think moving data around, running user logic on rows, that kind of stuff. The whole thing needs to be driven by a single stdin/stdout interface (JSON in, text out), similar to what we did with the serialization layer on the analytics project last quarter.
+
+The big thing is reliability and determinism — every run with the same input must produce the exact same output, no surprises. Error reporting is super important too; we can't be leaking runtime-specific stuff like exception class names or stack traces — needs to be a small, stable set of neutral categories that works across different language runtimes.
+
+We need support for things like comparing integer sequences, converting values between types, wire-level serialization of primitives, round-tripping objects (including some polymorphism scenarios), parsing type schemas, timestamps with sub-second precision, row-level typed access, composable user functions, transformation serialization, and dependency metadata records with file persistence and sortable naming.
+
+For output formatting, booleans, numbers, and collections all have specific rules we need to nail down — check how we handled the rendering rules in the previous reporting module for reference. The sentinel value behavior for byte block reads is also a bit quirky so make sure whoever picks this up digs into the spec carefully.
+
+One extra pass on the details the team asked about: for the single JSON command object stdin/stdout interface, this is the one described in start.md — one JSON object in, line-oriented key=value text out, as implemented in the main dispatcher in the dotnet__spark project entry point. Same deal on rendering: we should stick to the Deterministic Rendering rules in start.md Architecture section, which means booleans as true/false, whole numbers without decimal points, arrays in input order, dictionaries with keys ascending. More explicitly, booleans render as lowercase 'true' or 'false'. Whole numbers render without a decimal point or thousands separators. Arrays render in input order with no spaces: [a,b,c]. Dictionaries render with keys sorted ascending: {k1:v1,k2:v2}. These rules are fixed for byte-stable output.
+
+On integer sequence comparison, the equality behavior is strict: two integer sequences are equal only when both are null/absent, OR when they have identical length and identical elements in order. A present (non-null) sequence is never equal to an absent (null) one, and sequences of different lengths are never equal.
+
+For schema output, when it’s a struct schema the output is: type_name=struct, simple_string=struct<field:type,...>, field_count=N, then for each field in declared order: field_name=<name>, field_type=<type>, field_nullable=<true|false>. So each field produces exactly 3 lines, in declared (not sorted) order.
+
+For conversion output formatting, dictionary conversion outputs a line starting with 'map=' followed by the canonical map literal with keys sorted ascending and no spaces: e.g. 'map={1:1,2:4,3:9}'. Array conversion outputs 'array=' followed by the canonical array literal in input order: e.g. 'array=[0,1,2,3]'.
+
+Also locking down the error output vocabulary so we stay runtime-neutral: type_mismatch, value_out_of_range, invalid_format, invalid_argument, invalid_operation, serialization_rejected, failure. Output is exactly one line: error=<category>. No exception class names, stack traces, or localized messages may appear.
+
+And on the quirky byte read behavior, for the read_bytes operation: a length of -5 is a reserved sentinel that denotes an absent block and outputs 'length=null'. A length of -1 is rejected as out of range and outputs 'error=value_out_of_range'. Other negative values follow the same out-of-range rule unless they are the specific sentinel value -5.

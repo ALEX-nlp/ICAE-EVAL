@@ -1,0 +1,3 @@
+## Product Requirement Document
+
+We need the full Kubernetes discovery/observation behavior covered by the tests: refreshing namespaces, applying namespace watch events, refreshing served resources with selectors and capability filters, and applying resource-definition change events. Resource-definition events are one feature, not the entire task. The adapter should route by action and emit deterministic namespace/resource readiness, notification, ambiguity, warnings, and API-call traces.

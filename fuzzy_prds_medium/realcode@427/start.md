@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need to build that routing rule engine thing we discussed last sprint. Basically services are tired of copy-pasting the same header-inspection and traffic-splitting logic everywhere — every team is rolling their own version and they keep getting the weights wrong or forgetting edge cases when configs change live. We want a clean library that takes in some declarative rules and a request context and just tells you where to send the traffic.
+
+The engine needs to support the usual stuff: picking a provider (like that CSE integration we wired up in the old gateway project), validating that nobody accidentally over-allocates traffic weights, matching headers with the operators the platform team already standardized, doing weighted picks in a stable/deterministic way, translating those dark-launch rollout objects the config service spits out, and reloading rules automatically when the config store fires an event.
+
+One thing that keeps biting us is the weight fallback behavior — refer to how we handled the 'remainder goes to latest' pattern in the distribution module, same idea here. Also the config key prefixes are the ones already in use by the ServiceComb config namespace, so keep those consistent.
+
+Output format for the CLI adapter needs to match what the test harness expects exactly. Tests live under rcb_tests/ and there's a test.sh entry point. Please make sure the code is properly split up — last time someone dumped everything in one file and it was a nightmare to review.
+
+A couple quick follow-ups from the questions that came in. On the provider side, the only supported identifier is 'cse'. If anything else gets passed as the plugin name, we should return available=false and error=router_unavailable. The CLI output there needs to be exactly plugin=<name>\navailable=<true|false>\nerror=<none|router_unavailable>\n.
+
+For rule validation, a routing rule is valid when its total candidate weight is at most 100. A total exactly equal to 100 is valid, and a total strictly greater than 100 is invalid. The validation output should report valid=true or valid=false and then one line per rule in the form service=<name> rule_index=<i> total_weight=<n>\n. Also on evaluation order, rules for a destination are checked in descending precedence order, so higher numeric precedence goes before lower, and the first matching rule wins. If no rule matches, including the case where there just are no rules for that destination, the call still succeeds with selected=false and no tag lines are emitted.
+
+For matching, the supported header operators are exact, regex, greater, and the negation variants. exact is string equality, regex is full regex match, and greater is numeric greater-than comparison. The match block can also include source for caller service name and sourceTags for subset matching against the caller tag map. One small naming gotcha: the feature3 match input uses 'httpHeaders' as the key for header conditions, not 'headers'.
+
+On the weight fallback behavior, when the total weight of all route candidates is less than 100, the remaining share, meaning 100 minus total, goes to a fallback candidate with version tag 'latest'. That fallback needs to show up as the last entry in the distribution output as version=latest count=<remainder>\n. If weights sum exactly to 100, then no fallback is emitted. Same idea for feature 4 weighted distribution pool logic: when sum of route weights < 100, the difference is allocated to a synthetic route candidate with tags {version: latest}, appended last in the output.
+
+And for config loading, please keep the prefixes exactly as 'servicecomb.routeRule.' for YAML route rules and 'servicecomb.darklaunch.policy.' for JSON rollout policies, matching what’s shown in feature6_configuration_rule_loading.json initial config map.

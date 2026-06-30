@@ -1,0 +1,458 @@
+## Product Requirement Document
+
+# EVM Execution & JSON-RPC Primitives Engine - Product Requirements
+
+## Project Goal
+
+Build a blockchain execution engine and value-primitives library that allows developers to model an EVM-compatible chain — accounts, blocks, transactions, gas, and storage — and execute transactions against pluggable state backends without re-implementing the low-level wire formats, hashing rules, and execution bookkeeping by hand. The engine exposes a small, idiomatic core domain plus a thin execution adapter that turns external JSON commands into core operations.
+
+---
+
+## Background & Problem
+
+Without this engine, developers building an EVM-compatible node are forced to hand-roll every value primitive (addresses, hashes, gas, sequence numbers, native-token amounts), re-derive block hashes from first principles, hand-parse the keyword-or-hex block selectors that JSON-RPC clients send, and wire a virtual machine to a storage backend with all of the account/slot tracking that entails. Each of these is individually subtle — a wrong hex padding rule, an off-by-one in parent-hash linkage, or a dropped decimal scale silently corrupts consensus — and the boilerplate is repeated across every storage backend and every RPC surface.
+
+With this engine, developers get a coherent set of strongly-typed primitives with canonical, round-trippable wire encodings; deterministic block-header derivation; a forgiving but well-defined block-selector parser; lossless conversions between database-style scaled decimals and integer quantities; decoders for externally-sourced blocks and receipts; and a transaction executor that runs against an in-memory state seeded with funded well-known accounts and reports the outcome and gas consumed. The painful, error-prone parts are solved once and reused everywhere.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This is a multi-responsibility system (value primitives, hashing/derivation, parsers, a virtual-machine execution path, and pluggable storage). It MUST NOT be a single "god file"; output a clear, multi-file directory tree (e.g. `src/` for the core domain split by concern, plus a separate adapter entry point and `tests/`) that reflects a production-grade repository. Do not over-engineer, but strictly avoid monolithic files.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core domain must remain completely decoupled from stdin/stdout and JSON command parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls on the core domain and for translating any native errors the core raises into the neutral error contract described below.
+
+3. **Adherence to SOLID Design Principles:**
+   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct units.
+   - **Open/Closed Principle (OCP):** The execution path must be open for extension (e.g. additional storage backends or VM implementations) but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Storage backends and VM implementations must be perfectly substitutable behind their abstractions.
+   - **Interface Segregation Principle (ISP):** Keep the storage / VM interfaces small and cohesive.
+   - **Dependency Inversion Principle (DIP):** The executor must depend on storage and VM abstractions, not concrete I/O implementations.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target language, hiding internal complexity behind well-named value types.
+   - **Resilience:** The system must handle edge cases gracefully. Errors must be modeled properly (specific error types / result values) rather than generic faults.
+   - **Language-Neutral Error Contract:** Every error surfaced to stdout MUST be normalized to a neutral category line of the form `error=<category>` with any offending parameter on its own field line (e.g. `selector=<raw>`, `field=<name>`, `value=<raw>`). The stdout contract MUST NOT leak host-language exception class names, runtime message suffixes, or object-repr renderings.
+
+---
+
+## Core Features
+
+> **Adapter command convention.** The execution adapter reads a single JSON object from stdin. The `cmd` field selects the operation; the remaining fields are its arguments. The adapter writes a flat, newline-terminated `key=value` record to stdout. Every line, including the last, ends with a newline.
+
+### Feature 1: Block Header Derivation
+
+**As a developer**, I want to derive a block header deterministically from a block height and a timestamp, so I can produce consensus-consistent block identifiers without re-implementing the hashing and parent-linkage rules.
+
+**Expected Behavior / Usage:**
+
+Given a block height (as a 0x-prefixed hex string) and an integer timestamp, produce a header that reports three fields: the decimal height, the block `hash`, and the `parent_hash`. The block hash is a deterministic 32-byte digest derived solely from the height (the timestamp does not affect it). The parent hash is the derived hash of the immediately preceding height; for the genesis block at height 0 there is no predecessor, so the parent hash is the all-zero 32-byte hash. Hashes are rendered as 0x-prefixed 64-hex-digit strings.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_block_header_derivation.json`
+
+```json
+{
+    "description": "Derive a block header from a block height and a timestamp. The output reports the height, the deterministic block hash computed from the height, and the parent hash (the hash of the previous height, or the all-zero hash for the genesis block at height 0).",
+    "cases": [
+        {
+            "input": {
+                "cmd": "block_header",
+                "number": "0x0",
+                "timestamp": 1234567890
+            },
+            "expected_output": "number=0\nhash=0x011b4d03dd8c01f1049143cf9c4c817e4b167f1d1b83e5c6f0f10d89ba1e7bce\nparent_hash=0x0000000000000000000000000000000000000000000000000000000000000000\n"
+        },
+        {
+            "input": {
+                "cmd": "block_header",
+                "number": "0x1",
+                "timestamp": 1234567891
+            },
+            "expected_output": "number=1\nhash=0x6c31fc15422ebad28aaf9089c306702f67540b53c7eea8b7d2941044b027100f\nparent_hash=0x011b4d03dd8c01f1049143cf9c4c817e4b167f1d1b83e5c6f0f10d89ba1e7bce\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Block Selector Parsing
+
+**As a developer**, I want to parse the loosely-typed block selector that RPC clients send into a strongly-typed selection, so downstream code can branch on a clean tagged value instead of re-checking string shapes everywhere.
+
+**Expected Behavior / Usage:**
+
+The selector is a single string. The keyword `latest` resolves to a latest selection. The keyword `pending` is treated as an alias for latest (this system has no separate pending state). The keyword `earliest` resolves to an earliest selection. A hex string that is exactly 64 hex digits, or 66 characters including the `0x` prefix, resolves to a hash selection and echoes the canonical hash. Any other value is interpreted as a numeric height selection and echoes the decimal height. Input that is neither a recognized keyword, a valid hash, nor a valid height yields a neutral error echoing the raw selector. Comparison of keywords is case-insensitive.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_block_selector.json`
+
+```json
+{
+    "description": "Parse a block selector string into a tagged selection. The keywords 'latest' and 'pending' both resolve to the latest selection; 'earliest' resolves to the earliest selection; a 64- or 66-character hex string resolves to a hash selection; any other hex value resolves to a numeric height selection. Unparseable input yields a neutral error.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "block_selector",
+                "selector": "latest"
+            },
+            "expected_output": "selection=latest\n"
+        },
+        {
+            "input": {
+                "cmd": "block_selector",
+                "selector": "pending"
+            },
+            "expected_output": "selection=latest\n"
+        },
+        {
+            "input": {
+                "cmd": "block_selector",
+                "selector": "0x2"
+            },
+            "expected_output": "selection=number\nnumber=2\n"
+        },
+        {
+            "input": {
+                "cmd": "block_selector",
+                "selector": "0x011b4d03dd8c01f1049143cf9c4c817e4b167f1d1b83e5c6f0f10d89ba1e7bce"
+            },
+            "expected_output": "selection=hash\nhash=0x011b4d03dd8c01f1049143cf9c4c817e4b167f1d1b83e5c6f0f10d89ba1e7bce\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 3: Scaled-Decimal to Integer Conversion
+
+**As a developer**, I want to convert database-style scaled decimal quantities into the integer value types used throughout the engine, so I can round-trip values through a numeric column without losing or misplacing magnitude.
+
+**Expected Behavior / Usage:**
+
+*3.1 Native-token amount — convert a scaled decimal into an unsigned integer native-token amount*
+
+A decimal value is supplied as a string and converted into an unsigned integer native-token amount. A decimal written with a positive power-of-ten scale (for example `1E+4`) is expanded to its full integer form (`10000`); a plain integer string passes through unchanged. A value that is not a whole number (it has a fractional remainder) cannot be represented as an integer amount and yields a neutral out-of-range error echoing the raw value.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_1_decimal_to_wei.json`
+
+```json
+{
+    "description": "Convert a scaled decimal quantity into an unsigned integer native-token amount. A decimal expressed with a positive power-of-ten scale is expanded to its full integer form. A fractional value that is not a whole number cannot be represented and yields a neutral out-of-range error.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "decimal_to_integer",
+                "kind": "wei",
+                "value": "1E+4"
+            },
+            "expected_output": "value=10000\n"
+        },
+        {
+            "input": {
+                "cmd": "decimal_to_integer",
+                "kind": "wei",
+                "value": "255"
+            },
+            "expected_output": "value=255\n"
+        }
+    ]
+}
+```
+
+---
+
+*3.2 Transaction sequence number — convert a scaled decimal into an unsigned integer sequence number*
+
+A decimal value is supplied as a string and converted into an unsigned integer transaction sequence number using the same scale-expansion rule as the native-token amount: a positive power-of-ten scale is expanded to its full integer form, and a plain integer string passes through unchanged.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_2_decimal_to_nonce.json`
+
+```json
+{
+    "description": "Convert a scaled decimal quantity into an unsigned integer transaction sequence number. A decimal expressed with a positive power-of-ten scale is expanded to its full integer form.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "decimal_to_integer",
+                "kind": "nonce",
+                "value": "1E+4"
+            },
+            "expected_output": "value=10000\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: External Block Decoding
+
+**As a developer**, I want to decode an externally-sourced JSON block document into the engine's block model, so I can ingest blocks from upstream nodes and inspect their basic shape.
+
+**Expected Behavior / Usage:**
+
+Given a JSON block document (the standard node representation with a `number` height field and a `transactions` array of transaction objects), decode it and report the block height as a decimal integer and the count of transactions it contains. Structurally invalid JSON yields a neutral decode error.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_block_decoding.json`
+
+```json
+{
+    "description": "Decode a JSON-encoded block document and report its height (as a decimal integer) and the number of transactions it contains.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "decode_block",
+                "block": "{\n  \"author\": \"0x7bd89e22065e65fc9e2b8015e1119e53815f4fa9\",\n  \"difficulty\": \"0x0\",\n  \"extraData\": \"0x\",\n  \"gasLimit\": \"0x989680\",\n  \"gasUsed\": \"0x1a1933\",\n  \"hash\": \"0x938752fb64673fce23ca299a6c6818669aea3de8889224c8bcf16a507a98b3c0\",\n  \"logsBloom\": \"0x00400800000000800000000000040800000000000180001001000100800080000000402060020000000003002000000000040040000000008400020600140024040001020000001000000008000100002000000100800000000420820000004000020008060000000082010041002800080000000008000200080010000000004401000851000080000020000000000040000000000000001010000020600000410000220100000402080000000000002002820000000000000000000000000000000002000000100000000200141000010104080000110000440008004020001001000020000004000000000000100800000202100c00000080008010008080\",\n  \"miner\": \"0x7bd89e22065e65fc9e2b8015e1119e53815f4fa9\",\n  \"nonce\": \"0x0000000000000000\",\n  \"number\": \"0x37c13aa\",\n  \"parentHash\": \"0xa089c1c840b8c58470e5fb790e9f8fbeb12239fab19b22c8d59e2ed510093dbe\",\n  \"receiptsRoot\": \"0x7814697e943a5fdaabea7dde1555dbf6fbd27a83f9e5b0fda4a4c1a815946dd5\",\n  \"sha3Uncles\": \"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347\",\n  \"size\": \"0xab3\",\n  \"stateRoot\": \"0xce5f38c7cfd159516b2ae656cace439e7c1ac59884f5f118286e79a98d12dbee\",\n  \"timestamp\": \"0x65c2c08f\",\n  \"totalDifficulty\": \"0x0\",\n  \"transactions\": [\n    {\n      \"accessList\": null,\n      \"blockHash\": \"0x938752fb64673fce23ca299a6c6818669aea3de8889224c8bcf16a507a98b3c0\",\n      \"blockNumber\": \"0x37c13aa\",\n      \"chainId\": \"0x7d9\",\n      \"creates\": null,\n      \"from\": \"0x2ea765ad326d24851781fd7d81c4a7193d5dc903\",\n      \"gas\": \"0x61a80\",\n      \"gasPrice\": \"0x0\",\n      \"hash\": \"0x807e0889673025c10dc0f95d35217e59b2f3acf98912a3eaba375fa15e3534d4\",\n      \"input\": \"0xe3541348000000000000000000000000df76192480b1082a898063e32991fa5108247c860000000000000000000000000000000000000000000000000000000000f4240045303231373334343732303234303230363233323832374c506f4d5879504174\",\n      \"nonce\": \"0xa73ad\",\n      \"publicKey\": \"0xf2251d2f56cc48d79a2700d654e6e5763bf8bd6a33b2dc02ad104b0d255326bff6ae31289468adf0c9983b1b91d6d48d5564952b7930151788ac59526c36679a\",\n      \"r\": \"0x4fe10abce1987e7bcc13d5b90837df22320b1aeb818fdd4d79ecf01b6b1fffbc\",\n      \"raw\": \"0xf8ca830a73ad8083061a80941f94a163c329bec14c73ca46c66150e3c47dbedc80b864e3541348000000000000000000000000df76192480b1082a898063e32991fa5108247c860000000000000000000000000000000000000000000000000000000000f4240045303231373334343732303234303230363233323832374c506f4d5879504174820fd5a04fe10abce1987e7bcc13d5b90837df22320b1aeb818fdd4d79ecf01b6b1fffbca0036ec7073a863e863bd88301d75a7e19f182108f3624447b2d19fac43f110e0b\",\n      \"s\": \"0x36ec7073a863e863bd88301d75a7e19f182108f3624447b2d19fac43f110e0b\",\n      \"standardV\": \"0x0\",\n      \"to\": \"0x1f94a163c329bec14c73ca46c66150e3c47dbedc\",\n      \"transactionIndex\": \"0xb\",\n      \"type\": \"0x0\",\n      \"v\": \"0xfd5\",\n      \"value\": \"0x0\"\n    }\n  ],\n  \"transactionsRoot\": \"0xa4513dd3b91d6ed0b90c41701df5066dadd53efaeec189b972855a3131fa7b63\",\n  \"uncles\": []\n}\n"
+            },
+            "expected_output": "number=58463146\ntransaction_count=1\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 5: Transaction Receipt Decoding
+
+**As a developer**, I want to decode a batch of externally-sourced JSON transaction receipts into a lookup keyed by transaction hash, so I can correlate receipts with the transactions in a block.
+
+**Expected Behavior / Usage:**
+
+Given a list of JSON receipt documents (each carrying a `transactionHash` field), decode each one and index it into a set keyed by its transaction hash. Report the number of distinct transactions indexed, followed by one line per indexed transaction hash (hashes are rendered as 0x-prefixed 64-hex-digit strings and listed in ascending order). Structurally invalid JSON yields a neutral decode error.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_receipt_decoding.json`
+
+```json
+{
+    "description": "Decode a list of JSON-encoded transaction receipts into a set keyed by transaction hash, then report how many distinct transactions were indexed and list their transaction hashes.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "decode_receipt",
+                "receipts": [
+                    "{\n  \"transactionHash\": \"0x5a493d5b9e4f36a7569407988e2f9506334de3a7ce3b451c594ab1496cc5e13f\",\n  \"transactionIndex\": \"0x5\",\n  \"blockHash\": \"0x4c66dfac45f38e70b3f4147833bb2a9cd39c6d2bcf14df2e7961af59cb19a0b9\",\n  \"blockNumber\": \"0x37a4cb3\",\n  \"from\": \"0xbae210bd5e97315275648ab7e7c341146064c903\",\n  \"to\": \"0x1f94a163c329bec14c73ca46c66150e3c47dbedc\",\n  \"gasUsed\": \"0x35cef\",\n  \"cumulativeGasUsed\": \"0xc7244\",\n  \"contractAddress\": null,\n  \"logs\": [],\n  \"logsBloom\": \"0x00000000000000000000000000000000000000000000004000000000000000000000000000000080000002000000000000000000000000000000000000200000000001000000000000000008000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000080010002000004000000050000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000008000000000000000100000000002000200000000000000140000000000000000100000000000000000000001000000000000000000000000000000000012000000000000000000000000\",\n  \"status\": \"0x1\"\n}\n"
+                ]
+            },
+            "expected_output": "transaction_count=1\ntransaction_hash=0x5a493d5b9e4f36a7569407988e2f9506334de3a7ce3b451c594ab1496cc5e13f\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 6: Transaction Execution
+
+**As a developer**, I want to execute a transaction through the virtual machine against a state backend and observe its outcome and gas usage, so I can validate end-to-end execution wiring including state seeding, account lookup, the VM, and result bookkeeping.
+
+**Expected Behavior / Usage:**
+
+A fresh in-memory state is initialized and seeded with a fixed set of funded well-known accounts, addressed by their zero-based index in the seeded set. A zero-value transfer is executed: the sender is the account at `from_account`; if `to_account` is supplied the recipient is the account at that index, otherwise the transaction has no recipient. The output reports the execution result category (`success`, `reverted`, or `halted`) and the gas consumed as a decimal integer. A plain value transfer to an existing account consumes the base transfer cost (`21000`); a transaction with no recipient is treated as an empty contract creation and consumes the base creation cost (`53000`). This contract requires real virtual-machine execution — a stub that bypasses the VM cannot reproduce the gas figures or the result category.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature6_transaction_execution.json`
+
+```json
+{
+    "description": "Execute a zero-value transfer through the virtual machine against a freshly initialized in-memory state seeded with funded well-known accounts. The sender and recipient are chosen by their index in the seeded account set. The output reports the execution result category and the gas consumed: a plain value transfer between two accounts consumes the base transfer cost, while a transaction with no recipient (treated as an empty contract creation) consumes the base creation cost.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "execute_transaction",
+                "from_account": 5,
+                "to_account": 0
+            },
+            "expected_output": "result=success\ngas=21000\n"
+        },
+        {
+            "input": {
+                "cmd": "execute_transaction",
+                "from_account": 5
+            },
+            "expected_output": "result=success\ngas=53000\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 7: Value Wire-Format Round-Trip
+
+**As a developer**, I want each value primitive to decode from and re-encode to a single canonical wire form, so serialized values survive a storage/transport round-trip byte-for-byte and clients always see one stable representation.
+
+**Expected Behavior / Usage:**
+
+Each leaf below decodes a value of the given type from its wire form and re-emits the canonical encoding as `encoded=<wire form>`. The contract is round-trip stability: decoding then re-encoding always yields the canonical form. Malformed input for a given type yields a neutral invalid-value error.
+
+*7.1 Account address — fixed-width 20-byte identifier*
+
+An account address decodes from a lowercase 0x-prefixed hex string and re-encodes as a 0x-prefixed 40-hex-digit string (fixed width, zero-padded on the left). Malformed hex yields a neutral invalid-value error.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_1_roundtrip_address.json`
+
+```json
+{
+    "description": "Decode an account address from its lowercase hex string wire form and re-emit the canonical encoding. A 20-byte address is rendered as a 0x-prefixed 40-hex-digit string. Malformed hex yields a neutral invalid-value error.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "encode_value",
+                "type": "address",
+                "value": "0x00000000000000000000000000000000000000ff"
+            },
+            "expected_output": "encoded=\"0x00000000000000000000000000000000000000ff\"\n"
+        }
+    ]
+}
+```
+
+---
+
+*7.2 Hash — fixed-width 32-byte digest*
+
+A 32-byte hash decodes from a 0x-prefixed hex string and re-encodes as a 0x-prefixed 64-hex-digit string (fixed width).
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_2_roundtrip_hash.json`
+
+```json
+{
+    "description": "Decode a 32-byte hash from its 0x-prefixed hex string wire form and re-emit the canonical 0x-prefixed 64-hex-digit encoding.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "encode_value",
+                "type": "hash",
+                "value": "0x011b4d03dd8c01f1049143cf9c4c817e4b167f1d1b83e5c6f0f10d89ba1e7bce"
+            },
+            "expected_output": "encoded=\"0x011b4d03dd8c01f1049143cf9c4c817e4b167f1d1b83e5c6f0f10d89ba1e7bce\"\n"
+        }
+    ]
+}
+```
+
+---
+
+*7.3 Byte payload — variable-length opaque bytes*
+
+An arbitrary byte payload decodes from a 0x-prefixed hex string and re-encodes as a 0x-prefixed hex string whose length follows the payload (no fixed width).
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_3_roundtrip_bytes.json`
+
+```json
+{
+    "description": "Decode an arbitrary byte payload from its 0x-prefixed hex string wire form and re-emit the canonical 0x-prefixed hex encoding.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "encode_value",
+                "type": "bytes",
+                "value": "0xdeadbeef"
+            },
+            "expected_output": "encoded=\"0xdeadbeef\"\n"
+        }
+    ]
+}
+```
+
+---
+
+*7.4 Block height — minimal-width quantity*
+
+A block height decodes from a 0x-prefixed hex string and re-encodes in minimal hex form: no leading-zero padding, so the encoding is the shortest hex that represents the value.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_4_roundtrip_block_number.json`
+
+```json
+{
+    "description": "Decode a block height from its 0x-prefixed minimal hex wire form and re-emit the canonical minimal hex encoding (no leading-zero padding).",
+    "cases": [
+        {
+            "input": {
+                "cmd": "encode_value",
+                "type": "block_number",
+                "value": "0x37c13aa"
+            },
+            "expected_output": "encoded=\"0x37c13aa\"\n"
+        }
+    ]
+}
+```
+
+---
+
+*7.5 Gas quantity — minimal-width quantity*
+
+A gas quantity decodes from a 0x-prefixed hex string and re-encodes in minimal hex form (no leading-zero padding).
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_5_roundtrip_gas.json`
+
+```json
+{
+    "description": "Decode a gas quantity from its 0x-prefixed hex wire form and re-emit the canonical minimal hex encoding.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "encode_value",
+                "type": "gas",
+                "value": "0x5208"
+            },
+            "expected_output": "encoded=\"0x5208\"\n"
+        }
+    ]
+}
+```
+
+---
+
+*7.6 Execution-outcome tag — tagged enumeration*
+
+An execution-outcome tag decodes from and re-encodes to a tagged form: a normal completion encodes as the bare string `"success"` and a reversion as `"reverted"`, while an incomplete execution encodes as an object carrying a free-text `reason`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_6_roundtrip_execution_result.json`
+
+```json
+{
+    "description": "Decode an execution-outcome tag from its wire form and re-emit the canonical encoding. A normal completion and a reversion are rendered as the bare strings 'success' and 'reverted'; an incomplete execution is rendered as a tagged object carrying a free-text reason.",
+    "cases": [
+        {
+            "input": {
+                "cmd": "encode_value",
+                "type": "execution_result",
+                "value": "success"
+            },
+            "expected_output": "encoded=\"success\"\n"
+        },
+        {
+            "input": {
+                "cmd": "encode_value",
+                "type": "execution_result",
+                "value": {
+                    "halted": {
+                        "reason": "OutOfGas"
+                    }
+                }
+            },
+            "expected_output": "encoded={\"halted\":{\"reason\":\"OutOfGas\"}}\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured, multi-file codebase implementing the value primitives, block-header derivation, the block-selector parser, scaled-decimal conversions, the block/receipt decoders, and the transaction executor with its pluggable storage and virtual-machine abstractions. The physical structure MUST align with the "Scale-Driven Code Organization" constraint.
+
+2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core system. It reads a single JSON command object from stdin, invokes the appropriate core logic, and prints the `key=value` result to stdout, strictly matching the per-leaf-feature contracts above — including translating any native error raised by the core into the neutral `error=<category>` contract. This adapter must be logically and physically separated from the core domain.
+
+3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it feeds the case `input` to the adapter on stdin and writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_block_header_derivation.json` run with `--cases-dir public_test_cases` becomes `rcb_tests/stdout/public_test_cases/feature1_block_header_derivation@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- parent field equals child field format
+- correct hex padding strategy for values

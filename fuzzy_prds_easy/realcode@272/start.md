@@ -1,0 +1,641 @@
+## Product Requirement Document
+
+# Rate-Limit Configuration & Counter-Key Library — Hierarchical Limit Resolution
+
+## Project Goal
+
+Build a reusable library that loads declarative rate-limit configuration, resolves an incoming request descriptor to the limit that governs it, and derives the deterministic storage key used to count hits within a time window, so service authors can express "how many of X per unit of time" as data and let the library answer "which limit applies to this request, and where do I count it" without hand-writing lookup and bucketing logic.
+
+---
+
+## Background & Problem
+
+A rate-limiting service is driven by configuration: a top-level *domain* owns a tree of *descriptors*, where each descriptor is identified by a key (optionally qualified by a specific value) and may carry a limit (a numeric allowance plus a time unit such as second, minute, hour, or day). Descriptors nest, so more specific rules can live beneath broader ones, and a value may be deliberately listed with no limit to whitelist it. Incoming traffic arrives as an ordered list of key/value entries that must be matched against this tree to find the single limit that applies.
+
+Without a shared library, every service re-implements the same fiddly logic: walking the descriptor tree, preferring an exact key+value match over a key-only default, honoring trailing-wildcard values, applying per-request overrides, merging configuration supplied across several files, validating the configuration up front, and finally computing the time-bucketed counter key. Small inconsistencies here cause wrong limits or mis-counted traffic. This library centralizes all of it behind one contract: parse and validate configuration, resolve a descriptor to its limit, and generate the counter key for a given moment in time. It also masks credentials embedded in backing-store connection strings so they are safe to log.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.
+   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.
+   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single "god file". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.
+   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.
+
+3. **Adherence to SOLID Design Principles:**
+   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):
+   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.
+   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.
+
+---
+
+## Core Features
+
+### Feature 1: Descriptor-to-Limit Resolution
+
+**As a developer**, I want to load a rate-limit configuration and resolve any incoming request descriptor to the single limit that governs it, so I can decide how a request should be counted without re-implementing tree-walking and matching rules.
+
+**Expected Behavior / Usage:**
+
+A `config_lookup` request supplies one or more configuration documents (each a name and its text), a `merge` flag, a `domain`, and a `descriptor` made of an ordered list of `entries` (each a `key` and a `value`) plus an optional `override`. The library loads the configuration, then resolves the descriptor within the named domain and reports the outcome as a set of `field=value` lines. A successful resolution prints `matched=true` followed by `full_key` (the fully-qualified accounting key for the matched descriptor path), `requests_per_unit` (the numeric allowance), `unit` (one of `SECOND`, `MINUTE`, `HOUR`, `DAY`, or `UNKNOWN`), `unlimited`, and `shadow_mode`. When no limit applies, the only output is `matched=false`. Every emitted line ends with a newline. The sub-features below describe each resolution behavior; each is fully specified by its own description and cases.
+
+*1.1 Hierarchical key/value resolution — most-specific match, defaults, nesting, and no-match*
+
+For an ordered descriptor, the resolver walks the configuration level by level. At each level it prefers an exact `key` + `value` match; if none exists it falls back to a key-only default that applies to any value. Nested descriptors let deeper entries refine broader ones. A limit is only returned when the matched node actually carries one and corresponds to the final entry of the request; an intermediate-only node, a path that runs off the configured tree, an unknown domain, or a value explicitly configured with no limit all resolve to no match.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_1_hierarchical_resolution.json`
+
+```json
+{
+    "description": "Resolve an ordered request descriptor against a hierarchical rate-limit configuration. The configuration maps descriptor keys (optionally qualified by a specific value) to limits and supports: key-only default limits, value-specific overrides at any level, nested multi-level descriptors, and value entries deliberately left without a limit. For a given domain and an ordered list of key/value entries, the resolver returns the most specific configured limit (its fully-qualified accounting key, numeric allowance, time unit, and flags) or reports that no limit applies (unknown domain, unmatched path, an intermediate-only node, or a value explicitly whitelisted with no limit).",
+    "cases": [
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n\n  # First level override with no limit. This effectively whitelists the value.\n  - key: key2\n    value: value3\n\n  - key: key3\n    rate_limit:\n      unit: hour\n      requests_per_unit: 1\n\n  - key: key4\n    rate_limit:\n      unit: day\n      requests_per_unit: 1\n\n  - key: key5\n    value: value5\n    rate_limit:\n      unit: day\n      requests_per_unit: 15\n    descriptors:\n      - key: subkey5\n        value: subvalue5\n        rate_limit:\n          unit: day\n          requests_per_unit: 25\n\n  - key: key6\n    rate_limit:\n      unlimited: true\n\n  # Top level key only with default rate limit.\n\n  - key: key7\n    detailed_metric: true\n    rate_limit:\n      unit: minute\n      requests_per_unit: 70\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key1",
+                            "value": "value1"
+                        },
+                        {
+                            "key": "subkey1",
+                            "value": "something"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key1_value1.subkey1\nrequests_per_unit=5\nunit=SECOND\nunlimited=false\nshadow_mode=false\n"
+        },
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n\n  # First level override with no limit. This effectively whitelists the value.\n  - key: key2\n    value: value3\n\n  - key: key3\n    rate_limit:\n      unit: hour\n      requests_per_unit: 1\n\n  - key: key4\n    rate_limit:\n      unit: day\n      requests_per_unit: 1\n\n  - key: key5\n    value: value5\n    rate_limit:\n      unit: day\n      requests_per_unit: 15\n    descriptors:\n      - key: subkey5\n        value: subvalue5\n        rate_limit:\n          unit: day\n          requests_per_unit: 25\n\n  - key: key6\n    rate_limit:\n      unlimited: true\n\n  # Top level key only with default rate limit.\n\n  - key: key7\n    detailed_metric: true\n    rate_limit:\n      unit: minute\n      requests_per_unit: 70\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key1",
+                            "value": "value1"
+                        },
+                        {
+                            "key": "subkey1",
+                            "value": "subvalue1"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key1_value1.subkey1_subvalue1\nrequests_per_unit=10\nunit=SECOND\nunlimited=false\nshadow_mode=false\n"
+        },
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n\n  # First level override with no limit. This effectively whitelists the value.\n  - key: key2\n    value: value3\n\n  - key: key3\n    rate_limit:\n      unit: hour\n      requests_per_unit: 1\n\n  - key: key4\n    rate_limit:\n      unit: day\n      requests_per_unit: 1\n\n  - key: key5\n    value: value5\n    rate_limit:\n      unit: day\n      requests_per_unit: 15\n    descriptors:\n      - key: subkey5\n        value: subvalue5\n        rate_limit:\n          unit: day\n          requests_per_unit: 25\n\n  - key: key6\n    rate_limit:\n      unlimited: true\n\n  # Top level key only with default rate limit.\n\n  - key: key7\n    detailed_metric: true\n    rate_limit:\n      unit: minute\n      requests_per_unit: 70\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key2",
+                            "value": "value3"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=false\n"
+        }
+    ]
+}
+```
+
+---
+
+*1.2 Unlimited descriptors*
+
+A descriptor may declare itself unlimited rather than carrying a numeric allowance. Resolving such a descriptor reports a match flagged `unlimited=true`, with `requests_per_unit=0` and `unit=UNKNOWN`, signalling that matching traffic is always permitted while still being accounted under its key.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_2_unlimited.json`
+
+```json
+{
+    "description": "A descriptor may be configured as unlimited, meaning matching requests are always allowed. Resolving such a descriptor reports a match flagged as unlimited, carrying a zero numeric allowance and an unspecified time unit.",
+    "cases": [
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n\n  # First level override with no limit. This effectively whitelists the value.\n  - key: key2\n    value: value3\n\n  - key: key3\n    rate_limit:\n      unit: hour\n      requests_per_unit: 1\n\n  - key: key4\n    rate_limit:\n      unit: day\n      requests_per_unit: 1\n\n  - key: key5\n    value: value5\n    rate_limit:\n      unit: day\n      requests_per_unit: 15\n    descriptors:\n      - key: subkey5\n        value: subvalue5\n        rate_limit:\n          unit: day\n          requests_per_unit: 25\n\n  - key: key6\n    rate_limit:\n      unlimited: true\n\n  # Top level key only with default rate limit.\n\n  - key: key7\n    detailed_metric: true\n    rate_limit:\n      unit: minute\n      requests_per_unit: 70\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key6",
+                            "value": "foo"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key6\nrequests_per_unit=0\nunit=UNKNOWN\nunlimited=true\nshadow_mode=false\n"
+        }
+    ]
+}
+```
+
+---
+
+*1.3 Per-value detailed accounting keys*
+
+A descriptor key may be configured to account each distinct request value separately. When it is, resolving a request for that key returns a limit whose `full_key` incorporates the concrete request value, so two different values produce two different accounting keys while sharing the same allowance and unit.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_3_detailed_metric.json`
+
+```json
+{
+    "description": "When a descriptor key is configured to track metrics per distinct request value, resolving a request for that key yields a limit whose fully-qualified accounting key incorporates the concrete request value. Different values therefore produce distinct accounting keys while sharing the same numeric allowance and time unit.",
+    "cases": [
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n\n  # First level override with no limit. This effectively whitelists the value.\n  - key: key2\n    value: value3\n\n  - key: key3\n    rate_limit:\n      unit: hour\n      requests_per_unit: 1\n\n  - key: key4\n    rate_limit:\n      unit: day\n      requests_per_unit: 1\n\n  - key: key5\n    value: value5\n    rate_limit:\n      unit: day\n      requests_per_unit: 15\n    descriptors:\n      - key: subkey5\n        value: subvalue5\n        rate_limit:\n          unit: day\n          requests_per_unit: 25\n\n  - key: key6\n    rate_limit:\n      unlimited: true\n\n  # Top level key only with default rate limit.\n\n  - key: key7\n    detailed_metric: true\n    rate_limit:\n      unit: minute\n      requests_per_unit: 70\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key7",
+                            "value": "unspecified_value"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key7_unspecified_value\nrequests_per_unit=70\nunit=MINUTE\nunlimited=false\nshadow_mode=false\n"
+        }
+    ]
+}
+```
+
+---
+
+*1.4 Trailing-wildcard value matching*
+
+A configured value may end in a trailing wildcard marker, which matches any request value sharing the prefix before the marker; all such values resolve to the same limit. The wildcard is honored only at the end of a value: a plain value never matches by prefix, a marker in the middle of a value is treated literally, and request values outside the prefix do not match.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_4_wildcard_value.json`
+
+```json
+{
+    "description": "A configured value ending in a trailing wildcard marker matches any request value that shares the prefix before the marker, and every matching value resolves to the same limit. Wildcard matching applies only to a trailing marker: a configured value without the marker is not matched by prefix, a marker placed in the middle of a value is not treated specially, and request values outside the prefix do not match.",
+    "cases": [
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  - key: wild\n    value: foo*\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n  - key: noWild\n    value: foo\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n  - key: noVal\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n  - key: midWild\n    value: bar*b\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "wild",
+                            "value": "foo1"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.wild_foo*\nrequests_per_unit=20\nunit=MINUTE\nunlimited=false\nshadow_mode=false\n"
+        },
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  - key: wild\n    value: foo*\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n  - key: noWild\n    value: foo\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n  - key: noVal\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n  - key: midWild\n    value: bar*b\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "wild",
+                            "value": "bar"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=false\n"
+        }
+    ]
+}
+```
+
+---
+
+*1.5 Per-request limit override*
+
+A request descriptor may carry its own `override` (a `requests_per_unit` and a `unit`). When the domain is known, the override's allowance and unit are returned in place of any configured limit, while `full_key` is derived from the descriptor's key/value path so the accounting identity is stable even as override numbers change. An override against an unknown domain still yields no match.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_5_limit_override.json`
+
+```json
+{
+    "description": "A request may carry its own limit override consisting of a numeric allowance and a time unit. When the domain is known, the override's allowance and unit are returned in place of any configured limit, and the resolved fully-qualified accounting key is derived from the descriptor's key/value path so accounting stays stable when only the override numbers change. An override targeting an unknown domain still yields no limit.",
+    "cases": [
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n\n  # First level override with no limit. This effectively whitelists the value.\n  - key: key2\n    value: value3\n\n  - key: key3\n    rate_limit:\n      unit: hour\n      requests_per_unit: 1\n\n  - key: key4\n    rate_limit:\n      unit: day\n      requests_per_unit: 1\n\n  - key: key5\n    value: value5\n    rate_limit:\n      unit: day\n      requests_per_unit: 15\n    descriptors:\n      - key: subkey5\n        value: subvalue5\n        rate_limit:\n          unit: day\n          requests_per_unit: 25\n\n  - key: key6\n    rate_limit:\n      unlimited: true\n\n  # Top level key only with default rate limit.\n\n  - key: key7\n    detailed_metric: true\n    rate_limit:\n      unit: minute\n      requests_per_unit: 70\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key1",
+                            "value": "value1"
+                        },
+                        {
+                            "key": "subkey1",
+                            "value": "something"
+                        }
+                    ],
+                    "override": {
+                        "requests_per_unit": 10,
+                        "unit": "DAY"
+                    }
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key1_value1.subkey1_something\nrequests_per_unit=10\nunit=DAY\nunlimited=false\nshadow_mode=false\n"
+        },
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "foo_domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n\n  # First level override with no limit. This effectively whitelists the value.\n  - key: key2\n    value: value3\n\n  - key: key3\n    rate_limit:\n      unit: hour\n      requests_per_unit: 1\n\n  - key: key4\n    rate_limit:\n      unit: day\n      requests_per_unit: 1\n\n  - key: key5\n    value: value5\n    rate_limit:\n      unit: day\n      requests_per_unit: 15\n    descriptors:\n      - key: subkey5\n        value: subvalue5\n        rate_limit:\n          unit: day\n          requests_per_unit: 25\n\n  - key: key6\n    rate_limit:\n      unlimited: true\n\n  # Top level key only with default rate limit.\n\n  - key: key7\n    detailed_metric: true\n    rate_limit:\n      unit: minute\n      requests_per_unit: 70\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [],
+                    "override": {
+                        "requests_per_unit": 10,
+                        "unit": "DAY"
+                    }
+                }
+            },
+            "expected_output": "matched=false\n"
+        }
+    ]
+}
+```
+
+---
+
+*1.6 Multi-file domain merge*
+
+Configuration for one domain may be split across several documents. With merging enabled, the documents are combined into one effective configuration for that domain, and limits contributed by any document become resolvable.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_6_domain_merge.json`
+
+```json
+{
+    "description": "Multiple configuration files for the same domain can be merged into a single effective configuration. After merging, limits defined in any contributing file are all resolvable under that domain.",
+    "cases": [
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": true,
+                "configs": [
+                    {
+                        "name": "a.yaml",
+                        "content": "# Basic configuration which will be merged with `merge_domain2.yaml`\ndomain: test-domain\ndescriptors:\n  # Top level key/value which is not specified in `merge_domain2.yaml`\n  - key: key1\n    value: value1\n    rate_limit:\n      unit: minute\n      requests_per_unit: 10\n"
+                    },
+                    {
+                        "name": "b.yaml",
+                        "content": "# Basic configuration which will be merged with `merge_domain.yaml`\ndomain: test-domain\ndescriptors:\n  # Top level key/value which is not specified in `merge_domain.yaml`\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key1",
+                            "value": "value1"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key1_value1\nrequests_per_unit=10\nunit=MINUTE\nunlimited=false\nshadow_mode=false\n"
+        },
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": true,
+                "configs": [
+                    {
+                        "name": "a.yaml",
+                        "content": "# Basic configuration which will be merged with `merge_domain2.yaml`\ndomain: test-domain\ndescriptors:\n  # Top level key/value which is not specified in `merge_domain2.yaml`\n  - key: key1\n    value: value1\n    rate_limit:\n      unit: minute\n      requests_per_unit: 10\n"
+                    },
+                    {
+                        "name": "b.yaml",
+                        "content": "# Basic configuration which will be merged with `merge_domain.yaml`\ndomain: test-domain\ndescriptors:\n  # Top level key/value which is not specified in `merge_domain.yaml`\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key2",
+                            "value": "value2"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key2_value2\nrequests_per_unit=20\nunit=MINUTE\nunlimited=false\nshadow_mode=false\n"
+        }
+    ]
+}
+```
+
+---
+
+*1.7 Per-descriptor shadow mode*
+
+A limit may be flagged as shadow mode, reported as `shadow_mode=true` alongside the resolved limit. The flag is per-descriptor: a limit defined with it reports it enabled, while a sibling default without it reports it disabled.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_7_shadow_mode.json`
+
+```json
+{
+    "description": "A descriptor may be flagged as shadow mode, which is reported alongside the resolved limit. The flag is per-descriptor: a limit defined with it reports shadow mode enabled, while sibling limits without it report it disabled.",
+    "cases": [
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n        shadow_mode: true\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n    shadow_mode: true\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key1",
+                            "value": "value1"
+                        },
+                        {
+                            "key": "subkey1",
+                            "value": "subvalue1"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key1_value1.subkey1_subvalue1\nrequests_per_unit=10\nunit=SECOND\nunlimited=false\nshadow_mode=true\n"
+        },
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "test-domain",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "config.yaml",
+                        "content": "# Basic configuration for testing.\ndomain: test-domain\ndescriptors:\n  # Top level key/value with no default rate limit.\n  - key: key1\n    value: value1\n    descriptors:\n      # 2nd level key only with default rate limit.\n      - key: subkey1\n        rate_limit:\n          unit: second\n          requests_per_unit: 5\n\n      # 2nd level key/value with limit. Specific override at 2nd level.\n      - key: subkey1\n        value: subvalue1\n        rate_limit:\n          unit: second\n          requests_per_unit: 10\n        shadow_mode: true\n\n  # Top level key only with default rate limit.\n  - key: key2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 20\n    shadow_mode: true\n  # Top level key/value with limit. Specific override at 1st level.\n  - key: key2\n    value: value2\n    rate_limit:\n      unit: minute\n      requests_per_unit: 30\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": [
+                        {
+                            "key": "key1",
+                            "value": "value1"
+                        },
+                        {
+                            "key": "subkey1",
+                            "value": "something"
+                        }
+                    ]
+                }
+            },
+            "expected_output": "matched=true\nfull_key=test-domain.key1_value1.subkey1\nrequests_per_unit=5\nunit=SECOND\nunlimited=false\nshadow_mode=false\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Configuration Validation
+
+**As a developer**, I want an invalid configuration to be rejected up front with a clear, categorized reason, so misconfiguration fails fast instead of silently producing wrong limits.
+
+**Expected Behavior / Usage:**
+
+When loading the supplied configuration fails, the request produces a single neutral error contract instead of a resolution: a line `error=<category>` identifying the problem, optionally followed by one detail line naming the offending element (`domain=...`, `key=...`, `unit=...`, or `value=...`). The categories cover an empty domain (`empty_domain`), a duplicate domain across documents when not merging (`duplicate_domain`), an empty descriptor key (`empty_key`), a duplicate composite key (`duplicate_key`), an unrecognized time unit (`invalid_unit`), specifying a unit together with unlimited (`unlimited_with_unit`), a replaces entry naming its own descriptor (`replaces_self`), an empty replaces entry (`replaces_empty`), an unknown configuration key (`unknown_key`), a non-string configuration key (`non_string_key`), a list item that is not a mapping (`invalid_list_item`), and configuration text that cannot be parsed at all (`parse_error`). Each line ends with a newline.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_config_validation.json`
+
+```json
+{
+    "description": "Loading an invalid configuration is rejected with a categorized error instead of producing a usable configuration. Each category names a distinct structural or semantic problem in the supplied configuration text; the offending element (a domain, composite key, unit, configuration key, or value) is reported in separate fields where one applies.",
+    "cases": [
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "x",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "bad_limit_unit.yaml",
+                        "content": "domain: test-domain\ndescriptors:\n  - key: key1\n    value: value1\n    rate_limit:\n      unit: foo\n      requests_per_unit: 5\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": []
+                }
+            },
+            "expected_output": "error=invalid_unit\nunit=foo\n"
+        },
+        {
+            "input": {
+                "action": "config_lookup",
+                "domain": "x",
+                "merge": false,
+                "configs": [
+                    {
+                        "name": "empty_domain.yaml",
+                        "content": "descriptors:\n"
+                    }
+                ],
+                "descriptor": {
+                    "entries": []
+                }
+            },
+            "expected_output": "error=empty_domain\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 3: Time-Bucketed Counter Key Generation
+
+**As a developer**, I want a deterministic storage key for counting a descriptor's hits within the current time window, so the counter rolls over automatically at the boundary of the limit's unit.
+
+**Expected Behavior / Usage:**
+
+A `cache_key` request supplies an optional `prefix`, a `domain`, the current time `now` (in seconds), the descriptor `entries`, and the governing `limit` (a `requests_per_unit` and `unit`). The library produces `key=<value>`: the prefix, the domain, each key and value, and the start of the current window — `now` floored to the size of the limit's unit — all joined with underscores in order. It also emits `per_second=<bool>`, true only when the unit is the finest, per-second granularity. Each line ends with a newline.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_cache_key.json`
+
+```json
+{
+    "description": "Generate the storage key used to bucket a counter for one descriptor within a domain at a given point in time. The key concatenates an optional prefix, the domain, each descriptor key and value, and the start of the current time window (the supplied timestamp floored to the limit's unit size). The result also reports whether the limit uses the finest, per-second granularity.",
+    "cases": [
+        {
+            "input": {
+                "action": "cache_key",
+                "prefix": "",
+                "domain": "domain",
+                "now": 1234,
+                "entries": [
+                    {
+                        "key": "key",
+                        "value": "value"
+                    }
+                ],
+                "limit": {
+                    "requests_per_unit": 10,
+                    "unit": "SECOND"
+                }
+            },
+            "expected_output": "key=domain_key_value_1234\nper_second=true\n"
+        },
+        {
+            "input": {
+                "action": "cache_key",
+                "prefix": "prefix:",
+                "domain": "domain",
+                "now": 1234,
+                "entries": [
+                    {
+                        "key": "key",
+                        "value": "value"
+                    }
+                ],
+                "limit": {
+                    "requests_per_unit": 10,
+                    "unit": "SECOND"
+                }
+            },
+            "expected_output": "key=prefix:domain_key_value_1234\nper_second=true\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: Connection-String Credential Masking
+
+**As a developer**, I want credentials embedded in a backing-store connection string replaced with a fixed mask, so connection strings are safe to log.
+
+**Expected Behavior / Usage:**
+
+A `mask_url` request supplies a `url` that may list several comma-separated endpoints. For each endpoint that carries userinfo before an `@` and uses the recognized scheme, the userinfo is replaced with a fixed mask while the endpoint address is preserved; endpoints with no credentials, or using a different scheme, are passed through unchanged even when they themselves contain an `@`. The result is emitted as `masked_url=<value>` ending with a newline.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_credential_masking.json`
+
+```json
+{
+    "description": "Mask embedded credentials inside a connection string. The string may list several comma-separated endpoints; for each endpoint that carries userinfo before an '@' and uses the recognized scheme, the credentials are replaced with a fixed mask while the endpoint address is kept. Endpoints with no credentials, or using a different scheme, are left unchanged even when they themselves contain an '@'.",
+    "cases": [
+        {
+            "input": {
+                "action": "mask_url",
+                "url": "redis://foo:bar@redis:6379"
+            },
+            "expected_output": "masked_url=redis://*****@redis:6379\n"
+        },
+        {
+            "input": {
+                "action": "mask_url",
+                "url": "redis://foo:bar@redis1:6379,redis://foo:bar@redis2:6379"
+            },
+            "expected_output": "masked_url=redis://*****@redis1:6379,redis://*****@redis2:6379\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing the features above — configuration parsing and validation, descriptor-to-limit resolution (including defaults, nesting, trailing wildcards, per-request overrides, multi-file merge, unlimited and shadow-mode flags, and per-value accounting keys), time-bucketed counter-key generation, and connection-string credential masking. Its physical structure MUST align with the "Scale-Driven Code Organization" constraint, and the core logic must be decoupled from standard I/O and JSON parsing.
+
+2. **The Execution/Test Adapter:** A runnable program that reads a single JSON request from stdin and prints the line-oriented result to stdout, matching the per-feature contracts above — logically (and ideally physically) separated from the core domain. The request's `action` selects behavior: `config_lookup` loads the supplied configuration documents (honoring `merge`) and resolves the `descriptor` (with optional `override`) within `domain`; `cache_key` generates the time-bucketed counter key; `mask_url` masks credentials. When configuration loading fails, the adapter renders the neutral `error=<category>` contract; it must never leak host-language runtime identities into stdout.
+
+3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- follow the same delimiter pattern as the path separator module

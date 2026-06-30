@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that release automation thing we've been talking about forever. Basically the idea is: dev runs one command, tool looks at git history, figures out what version bump is needed, updates the version everywhere it needs to go, spits out a changelog, does the commit and tag. Pretty much like what the payments team built for their pipeline last quarter — same kind of conventional commit parsing logic.
+
+A few things that came up in the last retro that we definitely need covered: people want to be able to override what version gets cut if they disagree with the auto recommendation. Also there's this whole pre-1.0 project situation where a breaking change accidentally pushed someone to 1.x when they weren't ready — need to guard against that. Pre-release builds (like alpha/beta/dev suffixes) should work too, and they should chain properly across multiple runs without resetting weirdly.
+
+Changelogs need to stack correctly when you run releases repeatedly, and old-format headers from legacy projects shouldn't blow everything up. There should also be some escape hatches — dry run, skip certain stages, lifecycle hooks if someone needs to inject custom logic. Oh and make sure bad config surfaces as something readable rather than a raw crash. File formatting should be preserved when we write version bumps back. That's the gist, let me know what's unclear.

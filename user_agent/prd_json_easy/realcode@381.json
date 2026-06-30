@@ -1,0 +1,659 @@
+{
+  "fuzzy_prd": "# Schema-Driven Binary Serialization Format — Encode / Decode Round-Trip Engine\n\n## Project Goal\n\nBuild a compact, schema-driven binary serialization engine that turns strongly-typed records into a deterministic little-endian byte sequence and back again, so developers can persist and transmit structured data across processes and languages with an exact, reproducible wire layout instead of hand-writing fragile binary readers and writers.\n\n---\n\n## Background & Problem\n\nApplications constantly need to move structured data — records with scalar fields, arrays, maps, enumerations, and tagged variants — between a producer and a consumer. Without a shared, precisely specified binary format, every team hand-rolls its own byte layout, which leads to subtle endianness bugs, version drift, and decoders that silently disagree with encoders.\n\nThis engine defines one well-specified wire format. A record is encoded to a byte sequence following fixed rules; the same byte sequence decodes back to an equivalent record (a round-trip). Because the byte layout is fully specified, two independent implementations of the format produce identical bytes for the same input, and either side can read what the other wrote. The format covers fixed-layout structures, tagged extensible messages, discriminated unions, enumerations of several integer widths, bit-flag enumerations, compile-time constants, and nested arrays and maps.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., a low-level byte reader/writer, per-type codecs, and the generated record types), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core serialization logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls to the core codecs and rendering results.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate the byte buffer reader/writer, the per-type encode/decode logic, and the output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** Adding a new record type must not require modifying the byte reader/writer primitives.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level record codecs should depend on an abstract byte reader/writer, not on concrete I/O.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully (empty arrays/maps, full 64-bit ranges, special floating-point values). Errors should be modeled properly rather than relying on generic faults.\n\n---\n\n## Wire Encoding Rules (shared contract)\n\nAll features below share one byte layout. Every multi-byte integer is **little-endian**. Unless stated otherwise, encoded bytes are reported as a [a standard hex representation] hexadecimal string with no separators. The primitive encodings are:\n\n- **boolean** → 1 byte, `00` for false, `01` for true.\n- **8-bit unsigned byte** → 1 byte.\n- **16-bit / 32-bit signed and unsigned integers** → 2 / 4 little-endian bytes (two's complement for signed).\n- **64-bit signed and unsigned integers** → 8 little-endian bytes (two's complement for signed).\n- **32-bit / 64-bit floating point** → 4 / 8 bytes, IEEE-754 little-endian.\n- **string** → a 4-byte little-endian unsigned byte-length prefix, followed by the UTF-8 bytes (an empty string is just `00000000`).\n- **date / absolute instant** → an 8-byte little-endian unsigned integer holding the number of 100-nanosecond ticks since 0001-01-01, computed as `milliseconds_since_unix_epoch * 10000 + 621355968000000000`, then bitwise-AND with `0x3fffffffffffffff` (the top two bits are cleared). Decoding reverses this: `milliseconds = (ticks_low62 - 621355968000000000) / 10000`.\n- **globally-unique identifier (guid)** → 16 bytes in the canonical mixed-endian layout: the first hyphen-group is written as a little-endian 32-bit integer, the second and third groups each as a little-endian 16-bit integer, and the final two groups as raw bytes in big-endian order. (For example the guid `01234567-0123-0123-0123-0123456789ab` encodes to the 16 bytes `674523012301230101230123456789ab`.)\n\nComposite encodings:\n\n- **Fixed structure** → its fields encoded back-to-back in declaration order, with no length prefix and no field tags.\n- **Array of T** → a 4-byte little-endian element count, then each element encoded in order. An array of raw bytes is encoded as the count followed by the contiguous bytes.\n- **Map of K→V** → a 4-byte little-endian entry count, then, for each entry in order, the key encoded followed by the value encoded.\n- **Tagged message** → a 4-byte little-endian prefix giving the byte length of the message body, then, for each present field, a single 1-byte field number followed by that field's encoded value, then a terminating `00` byte. Absent fields are simply omitted. Decoding stops at the `00` terminator or at the end of the declared body length and leaves omitted fields unset.\n- **Discriminated union** → a 4-byte little-endian prefix giving the byte length of the union body, then a single 1-byte discriminator identifying the active branch, then that branch's payload encoded according to its own kind (structure or message).\n\nThe execution adapter reads ONE JSON command object from stdin. Every command has an `op` field selecting the behavior. Each feature below documents its command shape and its stdout contract. Round-trip features print the encoded bytes as hex and a deterministic textual rendering of the decoded record. In that rendering: booleans print as `true`/`false`; integers print in decimal (full 64-bit values included); the special floating-point values print as `Infinity`, `-Infinity`, and `NaN`; strings print JSON-quoted; byte sequences and arrays print as `[`comma-separated elements`]`; a date prints as `Date(<milliseconds_since_unix_epoch>)`; a map prints as `{`comma-separated `key:value` entries in wire order`}`; and a structure/object prints as `{`comma-separated `field:value` entries with field names in ascending alphabetical order`}`.\n\n---\n\n## Core Features\n\n### Feature 1: Scalar Value Round-Trip\n\n**As a developer**, I want a record made of one field of every primitive scalar type to encode to bytes and decode back unchanged, so I can trust that the core scalar codecs are correct.\n\n**Expected Behavior / Usage:**\n\nThe command `op` is `scalars_roundtrip` and `value` is an object with one field per scalar type: `a_bool` (boolean), `a_byte` (unsigned byte), `a_int16`/`a_uint16`/`a_int32`/`a_uint32` (fixed-width integers), `a_int64`/`a_uint64` (64-bit integers, supplied as decimal strings to preserve full precision), `a_float32`/`a_float64` (floating point), `a_string` (UTF-8 string), `a_guid` (canonical hyphenated identifier), and `a_date` (absolute instant given as integer milliseconds since the Unix epoch). The adapter builds the fixed structure (fields encoded back-to-back in the order listed), encodes it to bytes, then decodes those bytes back into a record. Output is two lines: `encoded=<hex>` and `decoded=<rendering>`, where the rendering lists the decoded fields in ascending alphabetical order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_scalars_roundtrip.json`\n\n```json\n{\n    \"description\": \"Round-trip a record made of one field of every scalar wire type (boolean, the four signed and unsigned fixed-width integers, both 64-bit integers, both floating-point widths, a length-prefixed UTF-8 string, a 16-byte globally-unique identifier rendered in canonical hyphenated form, and a date stored as an absolute instant). The adapter encodes the record to the wire byte sequence, then decodes that byte sequence back into a record. The output reports the encoded bytes as a [a standard hex representation] hex string and the decoded field values, demonstrating that every scalar type survives an encode/decode cycle unchanged.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"scalars_roundtrip\",\n                \"value\": {\n                    \"a_bool\": true, \"a_byte\": 1, \"a_int16\": 2, \"a_uint16\": 3,\n                    \"a_int32\": 4, \"a_uint32\": 5, \"a_int64\": \"6\", \"a_uint64\": \"7\",\n                    \"a_float32\": 8, \"a_float64\": 9, \"a_string\": \"hello world\",\n                    \"a_guid\": \"01234567-0123-0123-0123-0123456789ab\", \"a_date\": 823651200000\n                }\n            },\n            \"expected_output\": \"encoded=0101020003000400000005000000060000000000000007000000000000000000004100000000000022400b00000068656c6c6f20776f726c64674523012301230101230123456789ab0040a85b06c3bc08\\ndecoded={a_bool:true,a_byte:1,a_date:Date(823651200000),a_float32:8,a_float64:9,a_guid:\\\"01234567-0123-0123-0123-0123456789ab\\\",a_int16:2,a_int32:4,a_int64:6,a_string:\\\"hello world\\\",a_uint16:3,a_uint32:5,a_uint64:7}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Array Round-Trip\n\n**As a developer**, I want arrays of every element type — including a very large array — to round-trip, so I can serialize collections of any size reliably.\n\n**Expected Behavior / Usage:**\n\n*2.1 Homogeneous Typed Arrays — one array field per element type*\n\nThe command `op` is `arrays_roundtrip` and `value` is an object whose fields are arrays, one per element type: `a_bool`, `a_byte` (a sequence of unsigned bytes), `a_int16`/`a_uint16`/`a_int32`/`a_uint32`, `a_int64`/`a_uint64` (each element a decimal string), `a_float32`/`a_float64`, `a_string`, and `a_guid`. Each array is encoded as a 4-byte little-endian element count followed by its encoded elements (the byte array as a count plus contiguous bytes). The adapter encodes the fixed structure, then decodes it back. Output is `encoded=<hex>` and `decoded=<rendering>` with decoded fields in ascending alphabetical order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_arrays_roundtrip.json`\n\n```json\n{\n    \"description\": \"Round-trip a record whose fields are homogeneous arrays, one array per scalar element type. The byte array is encoded as a compact contiguous block; every other array is a length-prefixed sequence of its elements. The adapter encodes the record to wire bytes then decodes it back. The output reports the encoded bytes as hex and the decoded arrays, demonstrating element order and values are preserved for each element type.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"arrays_roundtrip\",\n                \"value\": {\n                    \"a_bool\": [true, false], \"a_byte\": [1, 11, 111],\n                    \"a_int16\": [2, 22, 222], \"a_uint16\": [3, 33, 333],\n                    \"a_int32\": [4, 44, 444], \"a_uint32\": [5, 55, 555],\n                    \"a_int64\": [\"6\", \"66\", \"666\"], \"a_uint64\": [\"7\", \"77\", \"777\"],\n                    \"a_float32\": [8, 88, 888], \"a_float64\": [9, 99, 999],\n                    \"a_string\": [\"hello world\", \"goodbye world\"],\n                    \"a_guid\": [\"01234567-0123-0123-0123-0123456789ab\", \"ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb\"]\n                }\n            },\n            \"expected_output\": \"encoded=02000000010003000000010b6f0300000002001600de0003000000030021004d0103000000040000002c000000bc0100000300000005000000370000002b02000003000000060000000000000042000000000000009a020000000000000300000007000000000000004d00000000000000090300000000000003000000000000410000b04200005e440300000000000000000022400000000000c058400000000000388f40020000000b00000068656c6c6f20776f726c640d000000676f6f6462796520776f726c6402000000674523012301230101230123456789abffffffffeeeeddddccccbbbbbbbbbbbb\\ndecoded={a_bool:[true,false],a_byte:[1,11,111],a_float32:[8,88,888],a_float64:[9,99,999],a_guid:[\\\"01234567-0123-0123-0123-0123456789ab\\\",\\\"ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb\\\"],a_int16:[2,22,222],a_int32:[4,44,444],a_int64:[6,66,666],a_string:[\\\"hello world\\\",\\\"goodbye world\\\"],a_uint16:[3,33,333],a_uint32:[5,55,555],a_uint64:[7,77,777]}\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Very Large Array — a long array of 32-bit integers*\n\nThe command `op` is `large_array_roundtrip` with a `count` (number of elements) and a `value` (the integer to repeat). The adapter builds a single-field structure holding an array of `count` copies of `value`, encodes it, then decodes it. Because dumping the full blob is impractical, output reports five summary lines proving the whole array survived: `encoded_length=<total encoded byte count>` (which equals 4 for the element-count prefix plus 4 per element), `decoded_count=<element count>`, `decoded_first=<first decoded element>`, `decoded_last=<last decoded element>`, and `decoded_sum=<arithmetic sum of all decoded elements>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_large_array_roundtrip.json`\n\n```json\n{\n    \"description\": \"Round-trip a record holding a single very large array of 32-bit integers built by repeating one value many times. Because emitting the full encoded blob and every decoded element would be unwieldy, the output instead reports the total encoded byte length, the decoded element count, the first and last decoded elements, and the arithmetic sum of all decoded elements. Together these prove the entire array is encoded and decoded without truncation or corruption.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"large_array_roundtrip\", \"count\": 100000, \"value\": 12345},\n            \"expected_output\": \"encoded_length=400004\\ndecoded_count=100000\\ndecoded_first=12345\\ndecoded_last=12345\\ndecoded_sum=1234500000\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Keyed Map Round-Trip\n\n**As a developer**, I want deeply nested associative maps — maps keyed by booleans, identifiers, and strings, with values that are themselves maps, arrays, structures, or messages — to round-trip, so I can serialize rich keyed data.\n\n**Expected Behavior / Usage:**\n\nThe command `op` is `maps_roundtrip` and `value` carries five fields, each a different nested-map shape. To preserve key order and allow non-string keys, every map is supplied as an ordered list of `[key, value]` pairs: `m1` is a map keyed by booleans to booleans; `m2` is a map of strings to (maps of strings to strings); `m3` is an array of maps from integers to arrays of (maps from booleans to a small `{x, y}` structure); `m4` is an array of maps from strings to arrays of floats; `m5` is a map from identifiers to a small message `{a, b}`. Each map is encoded as a 4-byte entry count followed by each key then value, in the order given. The adapter encodes the structure, decodes it back, and prints `encoded=<hex>` and `decoded=<rendering>`; in the rendering, maps print their entries in wire order while plain structures print their fields alphabetically.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_maps_roundtrip.json`\n\n```json\n{\n    \"description\": \"Round-trip a record exercising deeply nested associative-map structures: a map keyed by booleans, a map of maps, maps whose values are arrays of maps of small fixed structures, arrays of maps to arrays of floats, and a map keyed by a globally-unique identifier whose values are small messages. The adapter encodes the record then decodes it. The output reports the encoded bytes as hex and a deterministic textual rendering of every decoded map (entries shown in wire order), demonstrating that nested keyed containers round-trip intact.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"maps_roundtrip\",\n                \"value\": {\n                    \"m1\": [[false, true], [true, false]],\n                    \"m2\": [[\"a\", [[\"a0k\", \"a0v\"]]], [\"b\", [[\"b0k\", \"b0v\"]]]],\n                    \"m3\": [[[0, []], [1, [[[false, {\"x\": 1, \"y\": 2}]]]]]],\n                    \"m4\": [[[\"a\", [1, 2, 3]], [\"b\", [4, 5, 6]]], [[\"A\", [11, 22, 33]], [\"B\", [44, 55, 66]]]],\n                    \"m5\": [[\"01234567-0123-0123-0123-0123456789ab\", {\"a\": 1.5, \"b\": 2.5}]]\n                }\n            },\n            \"expected_output\": \"encoded=0200000000010100020000000100000061010000000300000061306b030000006130760100000062010000000300000062306b030000006230760100000002000000000000000000000001000000010000000100000000010000000200000002000000020000000100000061030000000000803f0000004000004040010000006203000000000080400000a0400000c04002000000010000004103000000000030410000b041000004420100000042030000000000304200005c420000844201000000674523012301230101230123456789ab0f000000010000c03f02000000000000044000\\ndecoded={m1:{false:true,true:false},m2:{\\\"a\\\":{\\\"a0k\\\":\\\"a0v\\\"},\\\"b\\\":{\\\"b0k\\\":\\\"b0v\\\"}},m3:[{0:[],1:[{false:{x:1,y:2}}]}],m4:[{\\\"a\\\":[1,2,3],\\\"b\\\":[4,5,6]},{\\\"A\\\":[11,22,33],\\\"B\\\":[44,55,66]}],m5:{\\\"01234567-0123-0123-0123-0123456789ab\\\":{a:1.5,b:2.5}}}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Schema Constants\n\n**As a developer**, I want compile-time constants declared in the schema to resolve to their declared values, so generated code exposes named literals with the right type and value.\n\n**Expected Behavior / Usage:**\n\nThe command `op` is `constant` with a `name` naming one constant by a neutral handle. The handles and the values they resolve to are: `signed_int` → a small negative 32-bit integer; `unsigned_long_hex` → a large unsigned 64-bit integer written in the schema as a hexadecimal literal; `float_scientific` → a 64-bit float written in scientific notation; `positive_infinity`, `negative_infinity`, `not_a_number` → the three special floating-point values; `boolean_false`, `boolean_true` → the two boolean literals; `quoted_string` → a string literal containing embedded double-quotes and a newline; `guid_literal` → a globally-unique-identifier literal. Output is a single line `value=<rendering>` using the shared rendering rules (so the special floats print as `Infinity`/`-Infinity`/`NaN` and the string prints JSON-quoted with escapes). If the handle is unknown, output `error=unknown_constant` then `name=<rendering>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_constants.json`\n\n```json\n{\n    \"description\": \"Resolve a compile-time constant declared in the schema and report its value. Constants cover signed and unsigned integers (including a large hexadecimal literal), a floating-point value written in scientific notation, the three special floating-point values (positive infinity, negative infinity, and not-a-number), both boolean literals, a string literal containing embedded quotes and a newline, and a globally-unique-identifier literal. Each request names one constant by a neutral handle; the output reports that constant's resolved value.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"constant\", \"name\": \"signed_int\"}, \"expected_output\": \"value=-123\\n\"},\n        {\"input\": {\"op\": \"constant\", \"name\": \"float_scientific\"}, \"expected_output\": \"value=123456780000\\n\"},\n        {\"input\": {\"op\": \"constant\", \"name\": \"quoted_string\"}, \"expected_output\": \"value=\\\"hello \\\\\\\"world\\\\\\\"\\\\nwith newlines\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Enumeration Backing-Width Round-Trip\n\n**As a developer**, I want enumeration fields with different backing-integer widths to encode using exactly their backing width and decode preserving full range, so a 64-bit-backed enum is never silently truncated.\n\n**Expected Behavior / Usage:**\n\nThe command `op` is `enum_sizes_roundtrip` with `value` holding `small` (an enum backed by a single unsigned byte) and `huge` (an enum backed by a signed 64-bit integer, supplied as a decimal string). The adapter builds a structure with these two fields, encodes it (1 byte for `small`, 8 bytes for `huge`, in that order), then decodes it. Output reports: `encoded=<hex>`; `encoded_length=<byte count>` (which equals 9); `decoded.small=<value>` and `decoded.small_kind=<runtime numeric category>` (a plain machine integer / `number`); `decoded.huge=<value>` and `decoded.huge_kind=<runtime numeric category>` (an arbitrary-precision integer / `bigint`), demonstrating the 64-bit field keeps its full range.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_enum_sizes_roundtrip.json`\n\n```json\n{\n    \"description\": \"Round-trip a record containing two enumeration-typed fields with different backing-integer widths: one backed by a single unsigned byte and one backed by a signed 64-bit integer. The adapter encodes the record then decodes it. The output reports the encoded hex, the total encoded byte length (which reflects the sum of the two backing widths), each decoded field value, and the runtime numeric category of each decoded field (a plain number for the byte-backed enum and an arbitrary-precision integer for the 64-bit-backed enum), demonstrating that the larger field preserves full 64-bit range.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"enum_sizes_roundtrip\", \"value\": {\"small\": 123, \"huge\": \"9223372036854775807\"}},\n            \"expected_output\": \"encoded=7bffffffffffffff7f\\nencoded_length=9\\ndecoded.small=123\\ndecoded.small_kind=number\\ndecoded.huge=9223372036854775807\\ndecoded.huge_kind=bigint\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Bit-Flag Enumeration Values\n\n**As a developer**, I want the integer values of a bit-flag enumeration — whose members are defined with bit shifts and bitwise combinations of earlier members — to resolve correctly, so combined flags equal the bitwise OR of their parts.\n\n**Expected Behavior / Usage:**\n\nThe command `op` is `flags` with `keys`, a list of member handles to resolve. The members and the integer values they must resolve to are: `none` → 0; `read` → 1; `write` → 2; `read_write` → the bitwise OR of read and write; `something_else` → a distinct higher single bit; `complex` → a value built from a bitwise combination of earlier members with masking; `eight` → 8; `minus_eight` → -8. Output is one line per requested handle, `<handle>=<integer value>`, in the order requested. The relationship `read_write == read | write` must be observable from the reported integers.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_flags.json`\n\n```json\n{\n    \"description\": \"Resolve the integer values of the members of a bit-flag enumeration whose members are defined using bit shifts and bitwise combinations of earlier members, including combined and negative members. Each request lists the member handles to resolve; the output reports each member handle paired with its resolved integer value, demonstrating that combined members equal the bitwise OR of their components.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"flags\", \"keys\": [\"none\", \"read\", \"write\", \"read_write\", \"something_else\", \"complex\", \"eight\", \"minus_eight\"]},\n            \"expected_output\": \"none=0\\nread=1\\nwrite=2\\nread_write=3\\nsomething_else=4\\ncomplex=19\\neight=8\\nminus_eight=-8\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Discriminated Union Round-Trip\n\n**As a developer**, I want a tagged union to encode the active branch behind a one-byte discriminator and decode back to the same branch, including when the declared branches use non-sequential discriminator numbers.\n\n**Expected Behavior / Usage:**\n\n*7.1 Sequential Discriminators — branches numbered 1, 2, 3, 4*\n\nThe command `op` is `union_roundtrip` with a `discriminator` (1-based) selecting the branch and a `value` carrying that branch's payload. Branch 1 is a tagged message `{b}` (a 32-bit unsigned integer field numbered 1); branch 2 is a structure `{c}` (a boolean); branch 3 is an empty structure; branch 4 is a structure wrapping a small message. The adapter constructs the union, encodes it (a 4-byte body-length prefix, the discriminator byte, then the branch payload), and decodes it back. Output is `encoded=<hex>`, then `discriminator=<n>`, then `value=<rendering>` of the decoded branch.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_union_roundtrip.json`\n\n```json\n{\n    \"description\": \"Round-trip a discriminated union whose branches are selected by a one-based wire discriminator. The request supplies the discriminator and the payload for the corresponding branch; the adapter constructs the union, encodes it (a length prefix, then the discriminator byte, then the encoded branch payload), and decodes it back. The output reports the encoded hex, the decoded discriminator, and the decoded branch value, demonstrating the correct branch is recovered.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"union_roundtrip\", \"discriminator\": 1, \"value\": {\"b\": 12345}},\n            \"expected_output\": \"encoded=0a0000000106000000013930000000\\ndiscriminator=1\\nvalue={b:12345,discriminator:1}\\n\"\n        }\n    ]\n}\n```\n\n*7.2 Non-Sequential Discriminators — branches declared out of order*\n\nThe command `op` is `union_reordered_roundtrip`. This union declares its branches with non-sequential, out-of-order discriminator numbers: discriminator 2 is a structure `{b}` (a single byte), discriminator 4 is an empty structure, and discriminator 1 (an empty structure) is declared last. The request supplies the `discriminator` and the matching `value`. The encoded discriminator byte equals the requested number regardless of declaration order. Output is `encoded=<hex>`, then `discriminator=<n>`, then `value=<rendering>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_union_reordered_roundtrip.json`\n\n```json\n{\n    \"description\": \"Round-trip a discriminated union whose declared branches use non-sequential, out-of-order wire discriminators (one branch reuses a higher number, one is skipped, and the lowest number is declared last). The request supplies the discriminator and the matching branch payload; the adapter constructs, encodes, and decodes the union. The output reports the encoded hex (whose discriminator byte equals the requested value regardless of declaration order) and the decoded discriminator and value, demonstrating that discriminator identity, not declaration order, governs the wire format.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"union_reordered_roundtrip\", \"discriminator\": 2, \"value\": {\"b\": 99}},\n            \"expected_output\": \"encoded=010000000263\\ndiscriminator=2\\nvalue={b:99,discriminator:2}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Decode a Pre-Built Binary Blob\n\n**As a developer**, I want to decode an externally produced binary blob into a structured record, so a consumer can read exactly what some other encoder wrote.\n\n**Expected Behavior / Usage:**\n\nThe command `op` is `decode_blob` with `hex`, a [a standard hex representation] hex string of the raw bytes. Those bytes encode a container holding a map from globally-unique identifiers to messages; each message has an optional title (string, field 1), an optional 16-bit year (field 2), and an array of small fixed structures (field 3) each pairing a performer name with an enumeration value (an instrument, where the enumeration values are small non-negative integers). The adapter decodes the blob and prints: `songs_count=<map entry count>`; then for each entry, `song.key=<identifier>`, `song.title=<rendering>`, `song.year=<rendering>`, `song.performers_count=<n>`, and `song.performer[i]=<name rendering>:<instrument value>` for each performer in order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_decode_blob.json`\n\n```json\n{\n    \"description\": \"Decode a pre-existing binary blob (supplied as a hex string) into a structured record: a container holding a map from globally-unique identifiers to messages, where each message has an optional title, an optional 16-bit year, and an array of small fixed structures each pairing a name with an enumeration value. The output reports the number of map entries and, for each entry, its key and the message's title, year, performer count, and each performer's name paired with its enumeration value.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"decode_blob\", \"hex\": \"010000007b98c681b7485f49ad01ec20cc5f5be1400000000109000000446f6e6e61204c656502b60703020000000e000000436861726c6965205061726b6572000000000b0000004d696c65732044617669730100000000\"},\n            \"expected_output\": \"songs_count=1\\nsong.key=81c6987b-48b7-495f-ad01-ec20cc5f5be1\\nsong.title=\\\"Donna Lee\\\"\\nsong.year=1974\\nsong.performers_count=2\\nsong.performer[0]=\\\"Charlie Parker\\\":0\\nsong.performer[1]=\\\"Miles Davis\\\":1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the binary format described above — a low-level little-endian byte reader/writer, per-type encode/decode codecs for scalars, structures, tagged messages, discriminated unions, enumerations (of several backing widths and bit-flag style), arrays, and maps, plus the declared compile-time constants. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint. The core serialization logic must be decoupled from standard I/O and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON command from stdin, dispatches on the `op` field, invokes the appropriate core codec, and prints the result to stdout, matching the per-feature contracts above. Encoded bytes are reported as a [a standard hex representation] hex string; decoded records are reported using the shared rendering rules (booleans as `true`/`false`, integers in decimal, special floats as `Infinity`/`-Infinity`/`NaN`, strings JSON-quoted, arrays and byte sequences as bracketed comma-separated lists, dates as `Date(<ms>)`, maps as brace-wrapped `key:value` entries in wire order, and structures as brace-wrapped `field:value` entries with field names sorted alphabetically).\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- sort columns alphabetically like the report module\n- apply the same sorting logic used for API parameters\n",
+  "oracle_data": {
+    "task_id": "6over3__bebop-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "what is the timestamp format",
+          "how are dates encoded",
+          "return date type specification",
+          "ease to parse date output",
+          "modern date format vs epoch"
+        ],
+        "oracle_response": "absolute nanosecond ticks since 0001-01-01"
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "is the hex case sensitive",
+          "should I get lowercase hex",
+          "hex casing requirement"
+        ],
+        "oracle_response": "lowercase"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "sort columns alphabetically like the report module",
+        "actual_meaning": "ascending alphabetical order of field keys"
+      },
+      {
+        "vague_reference": "apply the same sorting logic used for API parameters",
+        "actual_meaning": "ascending alphabetical order of field keys"
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_decode_blob.json": {
+      "description": "Decode a pre-existing binary blob (supplied as a hex string) into a structured record: a container holding a map from globally-unique identifiers to messages, where each message has an optional title, an optional 16-bit year, and an array of small fixed structures each pairing a name with an enumeration value. The output reports the number of map entries and, for each entry, its key and the message's title, year, performer count, and each performer's name paired with its enumeration value.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_blob",
+            "hex": "010000007b98c681b7485f49ad01ec20cc5f5be1400000000109000000446f6e6e61204c656502b60703020000000e000000436861726c6965205061726b6572000000000b0000004d696c65732044617669730100000000"
+          },
+          "expected_output": "songs_count=1\nsong.key=81c6987b-48b7-495f-ad01-ec20cc5f5be1\nsong.title=\"Donna Lee\"\nsong.year=1974\nsong.performers_count=2\nsong.performer[0]=\"Charlie Parker\":0\nsong.performer[1]=\"Miles Davis\":1\n"
+        }
+      ]
+    },
+    "feature1_scalars_roundtrip.json": {
+      "description": "Round-trip a record made of one field of every scalar wire type (boolean, the four signed and unsigned fixed-width integers, both 64-bit integers, both floating-point widths, a length-prefixed UTF-8 string, a 16-byte globally-unique identifier rendered in canonical hyphenated form, and a date stored as an absolute instant). The adapter encodes the record to the wire byte sequence, then decodes that byte sequence back into a record. The output reports the encoded bytes as a lowercase hex string and the decoded field values, demonstrating that every scalar type survives an encode/decode cycle unchanged.",
+      "cases": [
+        {
+          "input": {
+            "op": "scalars_roundtrip",
+            "value": {
+              "a_bool": true,
+              "a_byte": 1,
+              "a_int16": 2,
+              "a_uint16": 3,
+              "a_int32": 4,
+              "a_uint32": 5,
+              "a_int64": "6",
+              "a_uint64": "7",
+              "a_float32": 8,
+              "a_float64": 9,
+              "a_string": "hello world",
+              "a_guid": "01234567-0123-0123-0123-0123456789ab",
+              "a_date": 823651200000
+            }
+          },
+          "expected_output": "encoded=0101020003000400000005000000060000000000000007000000000000000000004100000000000022400b00000068656c6c6f20776f726c64674523012301230101230123456789ab0040a85b06c3bc08\ndecoded={a_bool:true,a_byte:1,a_date:Date(823651200000),a_float32:8,a_float64:9,a_guid:\"01234567-0123-0123-0123-0123456789ab\",a_int16:2,a_int32:4,a_int64:6,a_string:\"hello world\",a_uint16:3,a_uint32:5,a_uint64:7}\n"
+        }
+      ]
+    },
+    "feature2_arrays_roundtrip.json": {
+      "description": "Round-trip a record whose fields are homogeneous arrays, one array per scalar element type. The byte array is encoded as a compact contiguous block; every other array is a length-prefixed sequence of its elements. The adapter encodes the record to wire bytes then decodes it back. The output reports the encoded bytes as hex and the decoded arrays, demonstrating element order and values are preserved for each element type.",
+      "cases": [
+        {
+          "input": {
+            "op": "arrays_roundtrip",
+            "value": {
+              "a_bool": [
+                true,
+                false
+              ],
+              "a_byte": [
+                1,
+                11,
+                111
+              ],
+              "a_int16": [
+                2,
+                22,
+                222
+              ],
+              "a_uint16": [
+                3,
+                33,
+                333
+              ],
+              "a_int32": [
+                4,
+                44,
+                444
+              ],
+              "a_uint32": [
+                5,
+                55,
+                555
+              ],
+              "a_int64": [
+                "6",
+                "66",
+                "666"
+              ],
+              "a_uint64": [
+                "7",
+                "77",
+                "777"
+              ],
+              "a_float32": [
+                8,
+                88,
+                888
+              ],
+              "a_float64": [
+                9,
+                99,
+                999
+              ],
+              "a_string": [
+                "hello world",
+                "goodbye world"
+              ],
+              "a_guid": [
+                "01234567-0123-0123-0123-0123456789ab",
+                "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
+              ]
+            }
+          },
+          "expected_output": "encoded=02000000010003000000010b6f0300000002001600de0003000000030021004d0103000000040000002c000000bc0100000300000005000000370000002b02000003000000060000000000000042000000000000009a020000000000000300000007000000000000004d00000000000000090300000000000003000000000000410000b04200005e440300000000000000000022400000000000c058400000000000388f40020000000b00000068656c6c6f20776f726c640d000000676f6f6462796520776f726c6402000000674523012301230101230123456789abffffffffeeeeddddccccbbbbbbbbbbbb\ndecoded={a_bool:[true,false],a_byte:[1,11,111],a_float32:[8,88,888],a_float64:[9,99,999],a_guid:[\"01234567-0123-0123-0123-0123456789ab\",\"ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb\"],a_int16:[2,22,222],a_int32:[4,44,444],a_int64:[6,66,666],a_string:[\"hello world\",\"goodbye world\"],a_uint16:[3,33,333],a_uint32:[5,55,555],a_uint64:[7,77,777]}\n"
+        }
+      ]
+    },
+    "feature3_large_array_roundtrip.json": {
+      "description": "Round-trip a record holding a single very large array of 32-bit integers built by repeating one value many times. Because emitting the full encoded blob and every decoded element would be unwieldy, the output instead reports the total encoded byte length, the decoded element count, the first and last decoded elements, and the arithmetic sum of all decoded elements. Together these prove the entire array is encoded and decoded without truncation or corruption.",
+      "cases": [
+        {
+          "input": {
+            "op": "large_array_roundtrip",
+            "count": 100000,
+            "value": 12345
+          },
+          "expected_output": "encoded_length=400004\ndecoded_count=100000\ndecoded_first=12345\ndecoded_last=12345\ndecoded_sum=1234500000\n"
+        }
+      ]
+    },
+    "feature4_maps_roundtrip.json": {
+      "description": "Round-trip a record exercising deeply nested associative-map structures: a map keyed by booleans, a map of maps, maps whose values are arrays of maps of small fixed structures, arrays of maps to arrays of floats, and a map keyed by a globally-unique identifier whose values are small messages. The adapter encodes the record then decodes it. The output reports the encoded bytes as hex and a deterministic textual rendering of every decoded map (entries shown in wire order), demonstrating that nested keyed containers round-trip intact.",
+      "cases": [
+        {
+          "input": {
+            "op": "maps_roundtrip",
+            "value": {
+              "m1": [
+                [
+                  false,
+                  true
+                ],
+                [
+                  true,
+                  false
+                ]
+              ],
+              "m2": [
+                [
+                  "a",
+                  [
+                    [
+                      "a0k",
+                      "a0v"
+                    ]
+                  ]
+                ],
+                [
+                  "b",
+                  [
+                    [
+                      "b0k",
+                      "b0v"
+                    ]
+                  ]
+                ]
+              ],
+              "m3": [
+                [
+                  [
+                    0,
+                    []
+                  ],
+                  [
+                    1,
+                    [
+                      [
+                        [
+                          false,
+                          {
+                            "x": 1,
+                            "y": 2
+                          }
+                        ]
+                      ]
+                    ]
+                  ]
+                ]
+              ],
+              "m4": [
+                [
+                  [
+                    "a",
+                    [
+                      1,
+                      2,
+                      3
+                    ]
+                  ],
+                  [
+                    "b",
+                    [
+                      4,
+                      5,
+                      6
+                    ]
+                  ]
+                ],
+                [
+                  [
+                    "A",
+                    [
+                      11,
+                      22,
+                      33
+                    ]
+                  ],
+                  [
+                    "B",
+                    [
+                      44,
+                      55,
+                      66
+                    ]
+                  ]
+                ]
+              ],
+              "m5": [
+                [
+                  "01234567-0123-0123-0123-0123456789ab",
+                  {
+                    "a": 1.5,
+                    "b": 2.5
+                  }
+                ]
+              ]
+            }
+          },
+          "expected_output": "encoded=0200000000010100020000000100000061010000000300000061306b030000006130760100000062010000000300000062306b030000006230760100000002000000000000000000000001000000010000000100000000010000000200000002000000020000000100000061030000000000803f0000004000004040010000006203000000000080400000a0400000c04002000000010000004103000000000030410000b041000004420100000042030000000000304200005c420000844201000000674523012301230101230123456789ab0f000000010000c03f02000000000000044000\ndecoded={m1:{false:true,true:false},m2:{\"a\":{\"a0k\":\"a0v\"},\"b\":{\"b0k\":\"b0v\"}},m3:[{0:[],1:[{false:{x:1,y:2}}]}],m4:[{\"a\":[1,2,3],\"b\":[4,5,6]},{\"A\":[11,22,33],\"B\":[44,55,66]}],m5:{\"01234567-0123-0123-0123-0123456789ab\":{a:1.5,b:2.5}}}\n"
+        }
+      ]
+    },
+    "feature5_constants.json": {
+      "description": "Resolve a compile-time constant declared in the schema and report its value. Constants cover signed and unsigned integers (including a large hexadecimal literal), a floating-point value written in scientific notation, the three special floating-point values (positive infinity, negative infinity, and not-a-number), both boolean literals, a string literal containing embedded quotes and a newline, and a globally-unique-identifier literal. Each request names one constant by a neutral handle; the output reports that constant's resolved value.",
+      "cases": [
+        {
+          "input": {
+            "op": "constant",
+            "name": "signed_int"
+          },
+          "expected_output": "value=-123\n"
+        },
+        {
+          "input": {
+            "op": "constant",
+            "name": "float_scientific"
+          },
+          "expected_output": "value=123456780000\n"
+        },
+        {
+          "input": {
+            "op": "constant",
+            "name": "quoted_string"
+          },
+          "expected_output": "value=\"hello \\\"world\\\"\\nwith newlines\"\n"
+        }
+      ]
+    },
+    "feature6_flags.json": {
+      "description": "Resolve the integer values of the members of a bit-flag enumeration whose members are defined using bit shifts and bitwise combinations of earlier members, including combined and negative members. Each request lists the member handles to resolve; the output reports each member handle paired with its resolved integer value, demonstrating that combined members equal the bitwise OR of their components.",
+      "cases": [
+        {
+          "input": {
+            "op": "flags",
+            "keys": [
+              "none",
+              "read",
+              "write",
+              "read_write",
+              "something_else",
+              "complex",
+              "eight",
+              "minus_eight"
+            ]
+          },
+          "expected_output": "none=0\nread=1\nwrite=2\nread_write=3\nsomething_else=4\ncomplex=19\neight=8\nminus_eight=-8\n"
+        }
+      ]
+    },
+    "feature7_enum_sizes_roundtrip.json": {
+      "description": "Round-trip a record containing two enumeration-typed fields with different backing-integer widths: one backed by a single unsigned byte and one backed by a signed 64-bit integer. The adapter encodes the record then decodes it. The output reports the encoded hex, the total encoded byte length (which reflects the sum of the two backing widths), each decoded field value, and the runtime numeric category of each decoded field (a plain number for the byte-backed enum and an arbitrary-precision integer for the 64-bit-backed enum), demonstrating that the larger field preserves full 64-bit range.",
+      "cases": [
+        {
+          "input": {
+            "op": "enum_sizes_roundtrip",
+            "value": {
+              "small": 123,
+              "huge": "9223372036854775807"
+            }
+          },
+          "expected_output": "encoded=7bffffffffffffff7f\nencoded_length=9\ndecoded.small=123\ndecoded.small_kind=number\ndecoded.huge=9223372036854775807\ndecoded.huge_kind=bigint\n"
+        }
+      ]
+    },
+    "feature8_union_roundtrip.json": {
+      "description": "Round-trip a discriminated union whose branches are selected by a one-based wire discriminator. The request supplies the discriminator and the payload for the corresponding branch; the adapter constructs the union, encodes it (a length prefix, then the discriminator byte, then the encoded branch payload), and decodes it back. The output reports the encoded hex, the decoded discriminator, and the decoded branch value, demonstrating the correct branch is recovered.",
+      "cases": [
+        {
+          "input": {
+            "op": "union_roundtrip",
+            "discriminator": 1,
+            "value": {
+              "b": 12345
+            }
+          },
+          "expected_output": "encoded=0a0000000106000000013930000000\ndiscriminator=1\nvalue={b:12345,discriminator:1}\n"
+        }
+      ]
+    },
+    "feature9_union_reordered_roundtrip.json": {
+      "description": "Round-trip a discriminated union whose declared branches use non-sequential, out-of-order wire discriminators (one branch reuses a higher number, one is skipped, and the lowest number is declared last). The request supplies the discriminator and the matching branch payload; the adapter constructs, encodes, and decodes the union. The output reports the encoded hex (whose discriminator byte equals the requested value regardless of declaration order) and the decoded discriminator and value, demonstrating that discriminator identity, not declaration order, governs the wire format.",
+      "cases": [
+        {
+          "input": {
+            "op": "union_reordered_roundtrip",
+            "discriminator": 2,
+            "value": {
+              "b": 99
+            }
+          },
+          "expected_output": "encoded=010000000263\ndiscriminator=2\nvalue={b:99,discriminator:2}\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "dispatch_values",
+      "input_condition": "input.op equals a recognized operation identifier",
+      "output_rule": "The adapter dispatches to the specific codec for that operation",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "scalars_roundtrip_dispatch",
+      "input_condition": "input.op === 'scalars_roundtrip'",
+      "output_rule": "Encodes a fixed structure, then decodes the resulting bytes back into a record, then renders the decoded record",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "scalars_roundtrip_fields_order",
+      "input_condition": "input.op === 'scalars_roundtrip'",
+      "output_rule": "The encoded bytes layout follows field declaration order as defined in the composite rules",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "scalars_roundtrip_render_order",
+      "input_condition": "input.op === 'scalars_roundtrip'",
+      "output_rule": "The 'decoded' line in the output renders fields in ascending alphabetical order",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "scalars_roundtrip_yaml",
+      "input_condition": "input.op === 'scalars_roundtrip'",
+      "output_rule": "Output line format is 'encoded=<hex_string>' on the first line",
+      "exact_values": [
+        "encoded="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "scalars_roundtrip_hex_format",
+      "input_condition": "input.op === 'scalars_roundtrip'",
+      "output_rule": "Encoded bytes must be reported as a lowercase hexadecimal string with no separators",
+      "exact_values": [
+        "lowercase"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "scalars_roundtrip_yaml2",
+      "input_condition": "input.op === 'scalars_roundtrip'",
+      "output_rule": "Output line format for decoded values is 'decoded=<rendered_string>' on the second line",
+      "exact_values": [
+        "decoded="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "scalars_roundtrip_data_type_mapping",
+      "input_condition": "Input uses 'scalars_roundtrip'",
+      "output_rule": "a_bool maps to boolean; a_byte maps to unsigned 8-bit int; a_int16/uint16/map to respective sized ints; a_int64/uint64 maps to big ints; a_float32/64 maps to float; a_string maps to UTF-8 prefixed by length; a_guid maps to mixed-endian 16 bytes; a_date maps to absolute nanosecond ticks since 0001-01-01",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "encoded_yaml_hex",
+      "input_condition": "multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "encoded_yaml_value",
+      "input_condition": "multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "encoded_yaml_hex2",
+      "input_condition": "multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "encoded_yaml_encoding",
+      "input_condition": "multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "encoded_yaml_output_value",
+      "input_condition": "multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "encoded_yaml_changes",
+      "input_condition": "multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "encoded_yaml_logic",
+      "input_condition": "multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "encoded_yaml_structure",
+      "input_condition": "multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "scalars_roundtrip_render_decoded_order",
+      "input_condition": "input.op === 'scalars_roundtrip'",
+      "output_rule": "The 'decoded' line in the output renders fields in ascending alphabetical order",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "encoded_yaml_type_inferred",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "encoded_yaml_two_lane",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "encoded_yaml_second",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "encoded_yaml_last",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "encoded_yaml_first",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "encoded_yaml_second",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "encoded_yaml_canonical",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "encoded_yaml_row",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "encoded_yaml_bool",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "encoded_yaml_offset",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "encoded_yaml_name",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "encoded_yaml_value",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "encoded_yaml_entry",
+      "input_condition": "any multi-line output required",
+      "output_rule": "The encoded value must appear on the first line of the output",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C008",
+        "replacement": "various timestamp format standards",
+        "exact_values_to_replace": [
+          "a_date maps to absolute nanosecond ticks since 0001-01-01"
+        ],
+        "trigger_keywords": [
+          "what is the timestamp format",
+          "how are dates encoded",
+          "return date type specification",
+          "ease to parse date output",
+          "modern date format vs epoch"
+        ],
+        "oracle_response": "absolute nanosecond ticks since 0001-01-01"
+      },
+      {
+        "constraint_id": "C006",
+        "replacement": "a standard hex representation",
+        "exact_values_to_replace": [
+          "lowercase"
+        ],
+        "trigger_keywords": [
+          "is the hex case sensitive",
+          "should I get lowercase hex",
+          "hex casing requirement"
+        ],
+        "oracle_response": "lowercase"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C004",
+        "vague_phrase": "sort columns alphabetically like the report module",
+        "actual_meaning": "ascending alphabetical order of field keys"
+      },
+      {
+        "constraint_id": "C017",
+        "vague_phrase": "apply the same sorting logic used for API parameters",
+        "actual_meaning": "ascending alphabetical order of field keys"
+      }
+    ]
+  }
+}

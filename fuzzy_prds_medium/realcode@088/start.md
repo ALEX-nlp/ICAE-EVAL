@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the coupon redemption library before next sprint. The core idea is pretty straightforward — developers should be able to plug this into their apps and get coupon creation, checking, and redemption without writing all the boilerplate themselves. Think of it like the voucher module we shipped for the loyalty project last year, same kind of vibe but more flexible.
+
+Main things we care about: coupons should track whether they've been used up or expired, and there should be some way to lock a coupon to a specific buyer or buyer category so it can't just be used by anyone. We also need to handle the case where a coupon is being applied to something on behalf of someone else — like a gift or enrollment scenario.
+
+On the limits side, we need both a per-person cap and a global stock cap, and when either one runs out the system should say so clearly rather than just blowing up. There's also a bulk generation flow for seeding campaigns — marketing keeps asking about this.
+
+Optional/nullable coupon fields should degrade gracefully — no crashes if someone passes nothing. And coupons should be able to carry extra payload data for downstream job triggers or whatever the app needs.
+
+Finally, the storage layer needs to support alternate table configurations, similar to how we handled the multi-tenant setup before. Let me know if anything's unclear.
+
+One extra pass on the behavior details since a few people asked. For a normal successful redemption, we want exactly two domain events and in this order: 'coupon_verified' first, then 'coupon_redeemed'. In the events output that should show up as ["coupon_verified","coupon_redeemed"]. If validation fails before redemption, then nothing should fire and that should just be an empty array. The one wrinkle is the limit/stock edge: over-limit or over-quantity failures still append a third event after the first two, because one redemption succeeded before the limit was hit, so you’ll see either ["coupon_verified","coupon_redeemed","coupon_over_limit"] or ["coupon_verified","coupon_redeemed","coupon_over_quantity"].
+
+On the caps, the per-customer limit is the 'limit' field on the coupon and it controls how many times a single redeemer can use that coupon. If they go past it, the error output needs to be 'error=coupon_over_limit', the events array must include all three events ["coupon_verified","coupon_redeemed","coupon_over_limit"], and redemption_count should only reflect the successful redemptions up to the limit. We should still print remaining_quantity there too, and if no quantity was ever set it should be null. Separately, the global quantity field is total stock across everybody. Each successful redemption decrements it by one. Once it reaches zero, the next attempt should return 'error=coupon_over_quantity', events should be ["coupon_verified","coupon_redeemed","coupon_over_quantity"], redemption_count still reflects only successful redemptions, and remaining_quantity must be printed as 0.
+
+For restrictions, there are four modes we need to support: 'this_customer', 'other_customer', 'this_customer_type', and 'other_customer_type'. The intent is 'this_customer' means it’s locked to the redeemer making the request, 'other_customer' means it’s locked to some other specific customer, 'this_customer_type' means it’s locked to the redeemer's type/model class), and 'other_customer_type' means it’s locked to a different model type. If the restriction matches, redemption goes through like normal. If it doesn’t match, the output should be 'error=coupon_not_allowed', we emit a 'coupon_not_allowed' event, and redemption_count=0.
+
+Also, for the optional paths, both 'redeem_coupon_or_fallback' and 'verify_coupon_or_fallback' should quietly return a null result with no exception if the code is null or just not found. The output format there is exactly 'result=null
+redemption_count=0
+'. If the code is valid, they should behave the same as the non-optional versions, except verification still does not create a redemption record.
+
+One more implementation-ish detail that came up: the library is using the polymorphic coupon-redeemable relationship pattern, specifically the HasCoupons and CouponRedemption model contracts defined in the core domain, basically mirroring the standard Laravel polymorphic belongsTo/morphTo shape we’ve used before. And for storage, we do still need the configurable table setup from Feature 10, where the coupon model table name can be overridden to 'alternate_coupons', same general idea as per-tenant table prefixing.

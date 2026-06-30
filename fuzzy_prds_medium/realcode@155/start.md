@@ -1,0 +1,9 @@
+## Product Requirement Document
+
+We need the full unidirectional state-container and stream demo surface covered by the tests: reducer-driven Kaskade state updates, flow/live/replay stream behavior, single-event buffering, clear/reset operations, normalized errors, and the sample media-player state machine. The player scenario has a fixed playlist and deterministic play/pause/next/previous/stop transitions; its output is part of the same black-box contract as the lower-level stream scenarios.
+
+One small follow-up from the team questions: when onStateChanged is set, the container immediately drains a stateQueue that has been accumulating states. The initial state is always the first element of that queue, so attaching a listener always delivers the initial state first, even if no actions have been processed.
+
+Also, for the action error behavior, processing an action with no registered reducer emits two lines in order: first 'error=unhandled_action', then 'action=<label>' where <label> is the exact string of the unrecognized action. Processing after teardown emits only 'error=unsubscribed'.
+
+And just to be extra clear on the SingleEvent behavior, a state implementing SingleEvent is delivered to listeners but is never saved back as currentState. The container tracks the previous non-SingleEvent state and continues to use it for the next reduction. Same idea on the replay side: in the DamEmitter, SingleEvent values are also excluded from savedValues and never replayed to new subscribers. DamEmitter's saveValue() method checks 'if (value !is SingleEvent)' before storing, which matches how the state container itself never sets currentState to a SingleEvent. Both the Kaskade container and the DamEmitter share this exclusion rule.

@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out the annotation processing pipeline for the DI wiring system. Basically the idea is that feature modules should be able to "register" themselves without the root module needing to manually list everyone — same pattern we did for that login module auto-discovery thing a while back, you know the one. The processor needs to read annotated Kotlin source files, figure out what's being contributed/merged/wired, and spit out a deterministic text report so we can test it without depending on any specific test framework.
+
+The input comes in as JSON on stdin (list of source strings plus some query fields), and the output is plain text lines — success case lists out what got generated, failure case gives a clean domain-level reason with no stack traces or file paths leaking out.
+
+A few things I'm fuzzy on that someone will need to nail down: what exactly the output lines look like for each feature type, how nested types show up in the report, what happens with visibility modifiers on the various contribution types, and whether there's any special handling needed when you're in that cross-platform common-code mode. Also need to make sure the test harness writes outputs to the right place and does pass/fail comparison properly. The batch loop should stay in-process for speed but exit cleanly even if compiler threads linger.

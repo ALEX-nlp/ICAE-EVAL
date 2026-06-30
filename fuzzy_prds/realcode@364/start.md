@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out the error monitoring adapter library for our Ruby web apps. Basically the idea is that right now every team is manually wiring exception handling into their endpoints and it's a mess — different teams produce different payloads, some are leaking user IPs and cookies when they shouldn't be, and we're missing traces on a bunch of routes. We want a single library that wraps both our generic rack-style apps and our routed Rails-style apps and handles all this automatically.
+
+The library needs to parse our monitoring DSN format (similar to what we discussed in the infra meeting last quarter), figure out the real client IP from proxy headers the same way the login module does it, pull request correlation IDs from the environment, sanitize request snapshots based on whether we're allowed to send personal data, and attach all that context to outgoing events. It also needs to wrap rack apps to catch exceptions and do transaction tracing, and integrate with the Rails request cycle for route-aware error reporting including manual captures inside controllers.
+
+One thing that's been biting us is the privacy rules around cookies, IP headers, and request bodies — we need those to follow the pii flag strictly. Also the transaction naming for Rails errors needs to use the controller#action format. Can someone spec out the implementation? We should follow the same pattern we used for the last integration adapter project.

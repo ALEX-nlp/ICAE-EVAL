@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+hey team, we need to get the bitcore node container thing wrapped up — the one where you can plug in service modules without having to hand-wire everything. basically the idea is that devs shouldn't need to manually figure out boot order or worry about method name clashes when two services try to register the same thing. there's also the event routing piece where services publish named events and subscribers should get routed automatically without each service reimplementing that logic themselves.
+
+we also need those small utility checks we discussed — the ones for making sure identifiers are well-formed (similar to how we validated hashes in the wallet module last time) and the counter initialization helper that preserves existing values even when they're falsy. the tricky part there is it should care about whether a key *exists*, not whether the value is truthy — we got burned by that before.
+
+the network selection on startup also needs to handle the three environments correctly, including the local regression one that has to be explicitly registered. and the lifecycle — start in dependency order, stop only what actually started, surface errors properly if something fails to boot or if there's a naming collision.
+
+please keep the code split up sensibly, not one giant file. the JSON test harness is just for black-box testing, the real logic should be decoupled from that.
+
+one quick follow-up from the questions that came in: for the identifier check, a valid hash string is exactly 64 characters long and only uses hexadecimal digits (0-9, a-f, A-F). if the length is wrong, it has any non-hex characters, or the input isn't a string at all, it should fail. that includes raw byte buffers or numbers, and in feature1_1 that also specifically means rejecting raw byte buffers expressed as {"__type":"bytes","hex":"..."}. the result there should come back as 'hash_valid=true' or 'hash_valid=false'.
+
+for the safe natural number helper, we only accept an actual numeric type — string versions don't count. it also has to be finite, so not NaN or Infinity, it has to be a whole integer with no fractional part, it has to be non-negative (>= 0), and it can't be bigger than 2^53 - 1 (9007199254740991). anything at or above 2^53 is rejected. output on that one should be 'safe_natural=true' or 'safe_natural=false'.
+
+also, on the default-zero behavior, this is definitely about own-property existence and NOT truthiness. if the key is already there as an own property, we keep whatever is already there even if it's false, null, or undefined, and report 'present_before=true'. only if the key is totally absent as an own property do we set it to 0. the output lines are 'present_before=<true|false>' and 'value_after=<value>', and if something is missing/undefined that should render as the token 'undefined'.
+
+for event routing, when someone subscribes by event name, the bus should look across all published events on all services, find the ones with that exact name, and call each matching event's subscribe handler exactly once. nothing non-matching should fire. the handler always gets the bus instance first, then the caller's extra args in order. and for rendering, every emitted event line should use the literal token 'bus' for the bus instance, not quoted and not JSON-serialized, while everything else uses normal JSON formatting. so the argument vector should look like '[bus,"a","b","c"]' with no spaces after commas, and the per-line format is '<event-name> subscribe args=[bus,"arg1","arg2",...]'.
+
+on the startup side, the network detail people asked about is that in feature3_1_node_construction, 'regtest' is the special case: unlike livenet and testnet, it has to be explicitly registered before selection, and it resolves to the name 'regtest'.
+
+and just to restate the code organization expectation since that came up a few times: this must NOT be one giant god file. please keep responsibilities split into distinct files/modules for validation helpers (hash, safe natural, default zero), event bus, service registry with dependency ordering, and lifecycle controller. the JSON stdin/stdout adapter should stay decoupled from the core domain logic.

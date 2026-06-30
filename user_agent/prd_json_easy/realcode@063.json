@@ -1,0 +1,1603 @@
+{
+  "fuzzy_prd": "# Release Automation Toolkit — Semantic Version Bumping & Changelog Generation\n\n## Project Goal\n\nBuild a release-automation tool that, from a project's conventional commit history, computes the next semantic version, updates the version recorded in the project's metadata files, generates a human-readable changelog, and records the release in version control (a release commit and an annotated tag). The tool lets maintainers cut consistent, well-documented releases without hand-editing version numbers or assembling changelogs by hand.\n\n---\n\n## Background & Problem\n\nWithout such a tool, maintainers must manually decide whether a set of changes warrants a [contradictory release type and version arguments], minor, or patch release, edit the version string in one or more metadata files, hand-write changelog entries grouped by change type, and remember to commit and tag the result. This is repetitive, easy to get wrong, and drifts out of sync across the several files that record a version.\n\nWith this tool, the maintainer runs a single command. The tool reads the commits made since the last release, applies well-defined rules to recommend the next version, rewrites the version in every recognised metadata file (preserving each file's formatting), produces or extends a changelog, and creates the release commit and tag — all deterministically driven by the commit history and a small set of options.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility system (version recommendation, metadata-file rewriting, changelog rendering, version-control interaction, lifecycle-hook execution, option/configuration parsing). It MUST be organised as a clear multi-file tree separating these concerns; it MUST NOT be a single monolithic file.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases below are a black-box contract for an execution adapter, NOT the internal data model. The core logic (version math, changelog formatting, release orchestration) must be decoupled from stdin/stdout and JSON. The adapter alone sets up the temporary version-controlled workspace, invokes the core, and renders results to stdout.\n\n3. **Adherence to SOLID Design Principles:** Separate parsing, recommendation, file rewriting, changelog rendering, and version-control side effects into distinct units; keep the core engine open for extension (new metadata file types, new lifecycle points) but closed for modification; depend on abstractions for the version-control and filesystem boundaries.\n\n4. **Robustness & Interface Design:** The public interface must be idiomatic to the target language and hide internal complexity. Invalid configuration and impossible requests must be modeled as well-defined error conditions, surfaced to the contract as neutral error categories (see Feature 11), never as raw runtime fault text.\n\n---\n\n## Domain Conventions (shared by all features)\n\n- **Versions** are semantic-version strings `MAJOR.MINOR.PATCH`, optionally with a pre-release suffix (`-<id>.<n>` or `-<n>`).\n- **Conventional commits**: a commit subject begins with a type. A `fix:` commit denotes a patch-level change, a `feat:` commit a feature (minor) change, and an exclamation mark after the type (e.g. `feat!:`) denotes a breaking ([contradictory release type and version arguments]) change. Other subjects carry no release weight.\n- **Tags** are version strings carrying a configurable prefix (default `v`), e.g. `v1.2.3`.\n- In changelog outputs, calendar dates are rendered as the literal token `DATE` and commit short-hashes as the literal token `HASH`, so that outputs are stable and comparable. (These tokens are an artifact of the test contract's normalisation, not literal program text.)\n- The default branch of the workspace is `master`.\n\n---\n\n## Core Features\n\n### Feature 1: Message Template Substitution\n\n**As a developer**, I want a release message template with a version placeholder, so I can produce commit and tag messages that always carry the correct version.\n\n**Expected Behavior / Usage:**\n\nThe input is a message template plus a version string. Every occurrence of the placeholder token `{{currentTag}}` in the template is replaced by the version string; all other characters are left untouched (zero occurrences yields the template unchanged; multiple occurrences are all replaced). Output is the substituted message followed by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_format_message.json`\n\n```json\n{\n    \"description\": \"Substitute a release version into a commit/tag message template. The template contains zero or more occurrences of the version placeholder token {{currentTag}}; every occurrence is replaced by the supplied version string and all other text is left untouched.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"format_message\", \"template\": \"chore(release): 1.0.0\", \"version\": \"1.0.0\"}, \"expected_output\": \"chore(release): 1.0.0\\n\"},\n        {\"input\": {\"kind\": \"format_message\", \"template\": \"chore(release): {{currentTag}}\", \"version\": \"1.0.0\"}, \"expected_output\": \"chore(release): 1.0.0\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Automatic Version Recommendation\n\n**As a developer**, I want the next version inferred from commit history, so I do not have to decide the increment by hand.\n\n**Expected Behavior / Usage:**\n\nGiven a current version (read from the project manifest) and the commits added since that version, the tool selects the smallest semantic increment that covers them: a breaking-change commit bumps the [contradictory release type and version arguments] component (minor and patch reset to zero), a feature commit bumps the minor component (patch reset), and a fix commit bumps the patch component. The recommended next version is reported as `version=<x.y.z>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_auto_bump.json`\n\n```json\n{\n    \"description\": \"Automatic version recommendation from conventional commit history. A breaking-change commit bumps the [contradictory release type and version arguments] component, a feature commit bumps the minor, and a fix commit bumps the patch.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat!: breaking change\"}], \"args\": [], \"report\": [\"version\"]}, \"expected_output\": \"version=2.0.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: a feature\"}], \"args\": [], \"report\": [\"version\"]}, \"expected_output\": \"version=1.1.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"fix: a fix\"}], \"args\": [], \"report\": [\"version\"]}, \"expected_output\": \"version=1.0.1\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Pre[pre-release suffix progression pattern].0.0 Major Protection\n\n**As a developer**, I want breaking changes on a pre[pre-release suffix progression pattern].0.0 project to stay below 1.0.0 unless I explicitly opt in, so an unstable project is not forced to a stable [contradictory release type and version arguments] release by accident.\n\n**Expected Behavior / Usage:**\n\n*3.1 Automatic path is protected — a breaking change does not auto-promote to 1.x*\n\nWhen the current version is below `1.0.0` and the increment is being recommended automatically, a breaking-change commit is downgraded one level: it bumps the minor component (patch reset) instead of the [contradictory release type and version arguments]. Output is reported as `version=<x.y.z>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_pre[contradictory release type and version arguments]_auto.json`\n\n```json\n{\n    \"description\": \"Pre[pre-release suffix progression pattern].0.0 [contradictory release type and version arguments]-protection. While below 1.0.0, an automatically recommended breaking change bumps the minor component instead of escalating to the 1.x line.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"[specific pre[pre-release suffix progression pattern].x historical versions where downgrade rules apply]\", \"packageOptions\": {\"repository\": {\"url\": \"x\"}}, \"ops\": [{\"commit\": \"feat!: this is a breaking change\"}], \"args\": [], \"report\": [\"version\"]}, \"expected_output\": \"version=[specific pre[pre-release suffix progression pattern].x historical versions where downgrade rules apply]\\n\"}\n    ]\n}\n```\n\n*3.2 Explicit [contradictory release type and version arguments] request overrides protection — promotes to 1.0.0*\n\nWhen the caller explicitly forces a [contradictory release type and version arguments] release, a pre[pre-release suffix progression pattern].0.0 project is promoted to `1.0.0`, even though the automatic path would have refused.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_pre[contradictory release type and version arguments]_forced.json`\n\n```json\n{\n    \"description\": \"Pre[pre-release suffix progression pattern].0.0 [contradictory release type and version arguments]-protection is overridden by an explicit [contradictory release type and version arguments] release request, promoting the project to 1.0.0.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"[specific pre[pre-release suffix progression pattern].x historical versions where downgrade rules apply]\", \"packageOptions\": {\"repository\": {\"url\": \"x\"}}, \"ops\": [{\"commit\": \"feat!: this is a breaking change\"}], \"args\": [\"-r\", \"[contradictory release type and version arguments]\"], \"report\": [\"version\"]}, \"expected_output\": \"version=1.0.0\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Manual Release Selection\n\n**As a developer**, I want to override the increment explicitly, so I can release exactly what I intend regardless of commit history.\n\n**Expected Behavior / Usage:**\n\n*4.1 Named increment*\n\nWhen the caller names the increment as `[contradictory release type and version arguments]`, `minor`, or `patch`, that component is incremented (lower components reset to zero); commit history is ignored for the choice.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_release_as_type.json`\n\n```json\n{\n    \"description\": \"Manual release-type override. The caller names the increment as [contradictory release type and version arguments], minor, or patch and that component is incremented.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"fix: first commit\"}], \"args\": [\"--release-as\", \"[contradictory release type and version arguments]\"], \"report\": [\"version\"]}, \"expected_output\": \"version=2.0.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"fix: first commit\"}], \"args\": [\"--release-as\", \"minor\"], \"report\": [\"version\"]}, \"expected_output\": \"version=1.1.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"fix: first commit\"}], \"args\": [\"--release-as\", \"patch\"], \"report\": [\"version\"]}, \"expected_output\": \"version=1.0.1\\n\"}\n    ]\n}\n```\n\n*4.2 Exact version*\n\nWhen the explicit value is a full version string (optionally with a pre-release suffix) rather than a named keyword, that exact string becomes the new version verbatim. A leading `v` on the requested value is stripped.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_release_as_exact.json`\n\n```json\n{\n    \"description\": \"Manual release as an exact version string; the supplied value becomes the new version verbatim, with a leading 'v' stripped.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"fix: first commit\"}], \"args\": [\"--release-as\", \"[contradictory release type and version arguments]\"], \"report\": [\"version\"]}, \"expected_output\": \"version=100.0.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"fix: first commit\"}], \"args\": [\"--release-as\", \"200.0.0-amazing\"], \"report\": [\"version\"]}, \"expected_output\": \"version=200.0.0-amazing\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Pre-releases\n\n**As a developer**, I want to cut pre-release versions and advance them across runs, so I can ship previews before a stable release.\n\n**Expected Behavior / Usage:**\n\n*5.1 Typed pre-release with a named increment*\n\nWhen a pre-release identifier is requested together with a named increment, the increment is applied to the base version and a suffix `-<id>.0` is appended.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_prerelease_typed.json`\n\n```json\n{\n    \"description\": \"Pre-release tagging combined with a named increment appends a suffix '-<id>.0' to the bumped base version.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"fix: first commit\"}], \"args\": [\"--release-as\", \"[contradictory release type and version arguments]\", \"--prerelease\", \"[contradictory release type and version arguments]\"], \"report\": [\"version\"]}, \"expected_output\": \"version=2.0.0-[contradictory release type and version arguments].0\\n\"}\n    ]\n}\n```\n\n*5.2 Default pre-release using the automatic recommendation*\n\nWhen a pre-release is requested without naming an identifier, the increment is inferred from commit history and a numeric suffix `[pre-release suffix progression pattern]` is appended to the bumped base.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_prerelease_default.json`\n\n```json\n{\n    \"description\": \"Pre-release with no explicit identifier uses the automatic recommendation and appends a numeric '[pre-release suffix progression pattern]' suffix.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"changelogSeed\": \"legacy header format<a name=1.0.0>\\n\", \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [\"--prerelease\"], \"report\": [\"version\"]}, \"expected_output\": \"version=1.1.0[pre-release suffix progression pattern]\\n\"}\n    ]\n}\n```\n\n*5.3 Sequential pre-release progression*\n\nAcross repeated runs under one pre-release identifier, the trailing pre-release counter increments (`.0`, `.1`, `.2` …) while the underlying increment does not exceed the level the active pre-release already represents; when a higher-level increment is requested, the base version rises and the counter restarts at zero. Each run reports the version it produced, in order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_3_prerelease_progression.json`\n\n```json\n{\n    \"description\": \"Sequential pre-release progression across several runs: the trailing counter advances until a higher-level increment raises the base and restarts it at zero. Each run reports one version, in order.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"rounds\": [\n            {\"ops\": [{\"commit\": \"fix: first patch\"}], \"args\": [\"--release-as\", \"patch\", \"--prerelease\", \"dev\"]},\n            {\"ops\": [{\"commit\": \"fix: second patch\"}], \"args\": [\"--prerelease\", \"dev\"]},\n            {\"ops\": [{\"commit\": \"feat: first new feat\"}], \"args\": [\"--release-as\", \"minor\", \"--prerelease\", \"dev\"]},\n            {\"ops\": [{\"commit\": \"fix: third patch\"}], \"args\": [\"--release-as\", \"minor\", \"--prerelease\", \"dev\"]},\n            {\"ops\": [{\"commit\": \"fix: forth patch\"}], \"args\": [\"--prerelease\", \"dev\"]}\n        ]}, \"expected_output\": \"version=1.0.1-dev.0\\nversion=1.0.1-dev.1\\nversion=1.1.0-dev.0\\nversion=1.1.0-dev.1\\nversion=1.1.0-dev.2\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Changelog Generation\n\n**As a developer**, I want a grouped, linked changelog generated from commits, so release notes stay accurate and consistent.\n\n**Expected Behavior / Usage:**\n\n*6.1 Single-release section rendering*\n\nA generated changelog opens with the configured header line, then a release-section heading carrying the new version as a comparison link (URL built from a configurable compare format and the previous/current tags) and a date, then grouped subsections: fix commits under `Bug Fixes`, feature commits under `Features`, each entry being the commit description followed by its short hash. The `changelogSeed` input provides the pre-existing changelog text (empty here); the compare format and header are passed as arguments.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_changelog_section.json`\n\n```json\n{\n    \"description\": \"Changelog section rendering for a single release: configured header, a release-section heading with a comparison link and date, then grouped Bug Fixes / Features subsections.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"changelog\", \"packageVersion\": null, \"changelogSeed\": \"\", \"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"commit\": \"fix: patch release\"}], \"args\": [\"--changelogHeader=# Release Notes\", \"--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}\"]}, \"expected_output\": \"# Release Notes\\n### [1.0.1](/compare/v1.0.0...v1.0.1) (DATE)\\n\\n\\n### Bug Fixes\\n\\n* patch release HASH\\n\"},\n        {\"input\": {\"kind\": \"changelog\", \"packageVersion\": null, \"changelogSeed\": \"\", \"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"commit\": \"feat: a new feature\"}], \"args\": [\"--changelogHeader=# Release Notes\", \"--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}\"]}, \"expected_output\": \"# Release Notes\\n## [1.1.0](/compare/v1.0.0...v1.1.0) (DATE)\\n\\n\\n### Features\\n\\n* a new feature HASH\\n\"}\n    ]\n}\n```\n\n*6.2 Stacked releases (newest first)*\n\nWhen a changelog already contains a prior release section, the next release's section is prepended above it, the header appears once at the top, and releases are listed newest-first.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_changelog_stacked.json`\n\n```json\n{\n    \"description\": \"Stacked changelog across two releases: the newer section is prepended above the older one with the header kept once at the top.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"changelog\", \"packageVersion\": null, \"changelogSeed\": \"\", \"rounds\": [\n            {\"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"commit\": \"fix: patch release\"}], \"args\": [\"--changelogHeader=# Release Notes\", \"--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}\"]},\n            {\"ops\": [{\"commit\": \"fix: another patch release\"}], \"args\": [\"--changelogHeader=# Release Notes\", \"--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}\"]}\n        ]}, \"expected_output\": \"# Release Notes\\n### [1.0.2](/compare/v1.0.1...v1.0.2) (DATE)\\n\\n\\n### Bug Fixes\\n\\n* another patch release HASH\\n\\n\\n\\n### [1.0.1](/compare/v1.0.0...v1.0.1) (DATE)\\n\\n\\n### Bug Fixes\\n\\n* patch release HASH\\n\"}\n    ]\n}\n```\n\n*6.3 Replacing a legacy release marker*\n\nWhen the existing changelog begins with free-form legacy header text ending in an old-style release anchor marker, the legacy header text is stripped but everything from the old anchor onward is retained, with the freshly generated section prepended above it.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_changelog_legacy.json`\n\n```json\n{\n    \"description\": \"Replacing a legacy release marker: the legacy header text is dropped but the old release anchor block is preserved below the freshly generated section.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"changelog\", \"packageVersion\": null, \"changelogSeed\": \"legacy header format<a name=1.0.0>\\n\", \"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"commit\": \"fix: patch release\"}], \"args\": [\"--changelogHeader=# Release Notes\", \"--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}\"]}, \"expected_output\": \"# Release Notes\\n### [1.0.1](/compare/v1.0.0...v1.0.1) (DATE)\\n\\n\\n### Bug Fixes\\n\\n* patch release HASH\\n\\n\\n\\n<a name=1.0.0>\\n\"}\n    ]\n}\n```\n\n*6.4 Configurable issue-reference linking*\n\nA configuration file may supply an issue URL format with an `{{id}}` placeholder; an issue reference by number in a changelog entry is rewritten as a markdown link to the configured URL with the number filled in.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_4_changelog_issue_url.json`\n\n```json\n{\n    \"description\": \"Configurable issue-reference linking: a numeric issue reference becomes a markdown link built from the configured issue URL format.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"changelog\", \"packageVersion\": null, \"changelogSeed\": \"\", \"versionrc\": {\"issueUrlFormat\": \"http://www.foo.com/{{id}}\", \"changelogHeader\": \"# Release Notes\", \"compareUrlFormat\": \"/compare/{{previousTag}}...{{currentTag}}\"}, \"ops\": [{\"commit\": \"feat: another commit addresses issue #1\"}], \"args\": []}, \"expected_output\": \"# Release Notes\\n## 1.1.0 (DATE)\\n\\n\\n### Features\\n\\n* another commit addresses issue [#1](http://www.foo.com/1) HASH\\n\"}\n    ]\n}\n```\n\n*6.5 Custom header text*\n\nA caller-supplied header string becomes the first line of the changelog, replacing the default header; the sections below are unaffected.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_5_changelog_custom_header.json`\n\n```json\n{\n    \"description\": \"Custom changelog header text replaces the default header as the first line of the document.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"changelog\", \"packageVersion\": null, \"changelogSeed\": \"\", \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [\"--changelogHeader=# Pork Chop Log\", \"--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}\"]}, \"expected_output\": \"# Pork Chop Log\\n## 1.1.0 (DATE)\\n\\n\\n### Features\\n\\n* first commit HASH\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Release Commit & Tag Messages\n\n**As a developer**, I want consistent, configurable release commit/tag messages, so my history reads clearly.\n\n**Expected Behavior / Usage:**\n\n*7.1 Default message*\n\nAfter a release the recording commit and the annotated tag both carry a default message of the form `chore(release): <version>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_1_release_message_default.json`\n\n```json\n{\n    \"description\": \"Release commit and annotated-tag message defaults: both carry 'chore(release): <version>'.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"commit\": \"feat: new feature!\"}], \"args\": [], \"report\": [\"commit_message\", \"tag_message\"]}, \"expected_output\": \"commit_message=chore(release): 1.1.0\\ntag_message=chore(release): 1.1.0\\n\"}\n    ]\n}\n```\n\n*7.2 Custom commit message*\n\nThe release commit message template can be overridden by configuration or by argument; its `{{currentTag}}` placeholder is filled with the new version.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_2_release_message_custom.json`\n\n```json\n{\n    \"description\": \"Customising the release commit message via configuration or a command-line argument, with the version placeholder filled in.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"versionrc\": {\"releaseCommitMessageFormat\": \"This commit represents release: {{currentTag}}\"}, \"ops\": [{\"commit\": \"feat: another commit addresses issue #1\"}], \"args\": [], \"report\": [\"commit_message\"]}, \"expected_output\": \"commit_message=This commit represents release: 1.1.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: another commit\"}], \"args\": [\"--releaseCommitMessageFormat={{currentTag}} is the version.\"], \"report\": [\"commit_message\"]}, \"expected_output\": \"commit_message=1.1.0 is the version.\\n\"}\n    ]\n}\n```\n\n*7.3 Legacy percent-substitution*\n\nA deprecated message option uses `%s` as the version placeholder; every `%s` is replaced by the new version.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_3_legacy_message.json`\n\n```json\n{\n    \"description\": \"Legacy percent-substitution in the release commit message: every %s is replaced by the new version.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: another commit\"}], \"args\": [\"--message=V:%s\"], \"report\": [\"commit_message\"]}, \"expected_output\": \"commit_message=V:1.1.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: another commit\"}], \"args\": [\"--message=V:%s is the %s.\"], \"report\": [\"commit_message\"]}, \"expected_output\": \"commit_message=V:1.1.0 is the 1.1.0.\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 8: Metadata File Updates\n\n**As a developer**, I want every recognised metadata file kept in sync and nicely formatted, so versions never drift and diffs stay clean.\n\n**Expected Behavior / Usage:**\n\n*8.1 Synchronising auxiliary files*\n\nBesides the primary manifest, several recognised metadata files (a front-end package descriptor, an extension manifest, a dependency lock descriptor, a dependency shrinkwrap descriptor) have their version field updated to the new release version when present. The `manifests` input supplies such files; output reports the new version and the version recorded in the auxiliary file.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_1_manifest_sync.json`\n\n```json\n{\n    \"description\": \"Synchronising the version across auxiliary metadata files: a recognised auxiliary file's version field is updated to the new release version.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"manifests\": {\"bower.json\": {\"version\": \"1.0.0\"}}, \"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"commit\": \"feat: new feature!\"}], \"args\": [], \"report\": [\"version\", \"files\"]}, \"expected_output\": \"version=1.1.0\\nfile bower.json=1.1.0\\n\"}\n    ]\n}\n```\n\n*8.2 Ignored files are skipped*\n\nAn auxiliary file whose path is listed in the project's ignore file is left untouched, while the primary manifest is still bumped.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_2_manifest_gitignore.json`\n\n```json\n{\n    \"description\": \"An auxiliary metadata file named in the ignore file is not version-bumped, while the primary manifest still is.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"manifests\": {\"bower.json\": {\"version\": \"1.0.0\"}}, \"gitignore\": \"bower.json\", \"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"commit\": \"feat: new feature!\"}], \"args\": [], \"report\": [\"version\", \"files\"]}, \"expected_output\": \"version=1.1.0\\nfile bower.json=1.0.0\\n\"}\n    ]\n}\n```\n\n*8.3 Formatting preservation*\n\nWhen the primary manifest's version is rewritten, the original indentation unit (tab or a run of spaces) and line-ending style (LF, or CRLF) are preserved and a single trailing newline is ensured. The input supplies the exact raw manifest text; the output reports the exact raw text afterward, as a JSON-quoted string.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_3_manifest_formatting.json`\n\n```json\n{\n    \"description\": \"Formatting preservation when rewriting the primary manifest: the existing indentation unit and line-ending style are kept, with a single trailing newline.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"manifestText\": \"{\\n  \\\"version\\\": \\\"1.0.0\\\"\\n}\\n\", \"ops\": [{\"commit\": \"feat: c\"}], \"args\": [], \"report\": [\"manifest_raw\"]}, \"expected_output\": \"manifest_raw=\\\"{\\\\n  \\\\\\\"version\\\\\\\": \\\\\\\"1.1.0\\\\\\\"\\\\n}\\\\n\\\"\\n\"},\n        {\"input\": {\"kind\": \"release\", \"manifestText\": \"{\\n\\t\\\"version\\\": \\\"1.0.0\\\"\\n}\\n\", \"ops\": [{\"commit\": \"feat: c\"}], \"args\": [], \"report\": [\"manifest_raw\"]}, \"expected_output\": \"manifest_raw=\\\"{\\\\n\\\\t\\\\\\\"version\\\\\\\": \\\\\\\"1.1.0\\\\\\\"\\\\n}\\\\n\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 9: Version Source & Tagging\n\n**As a developer**, I want a sensible base version even without a manifest, and a way to release the current version as-is, so first releases and manifest-less projects work too.\n\n**Expected Behavior / Usage:**\n\n*9.1 Tag fallback when no manifest exists*\n\nWith no primary manifest, the base version is taken from the highest existing semantic-version tag (or defaults to `1.0.0` if there are none), the recommended increment is applied, and a new tag is created at the result. Output reports the set of tags newly created by the run.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_1_tag_fallback.json`\n\n```json\n{\n    \"description\": \"Deriving the base version from version-control tags when no manifest exists: the highest semantic-version tag is the base (or 1.0.0 if none), then the recommended increment is applied and a new tag created.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": null, \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [], \"report\": [\"tag\"]}, \"expected_output\": \"tag=v1.1.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": null, \"ops\": [{\"tag\": \"v5.0.0\"}, {\"tag\": \"v3.0.0\"}, {\"commit\": \"feat: another commit\"}], \"args\": [], \"report\": [\"tag\"]}, \"expected_output\": \"tag=v5.1.0\\n\"}\n    ]\n}\n```\n\n*9.2 First-release mode keeps the current version*\n\nWhen the run is marked a first release, the bump step is skipped: the current manifest version is released and tagged unchanged.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_2_first_release.json`\n\n```json\n{\n    \"description\": \"First-release mode skips the version bump: the current version is released and tagged as-is.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.1\", \"ops\": [{\"commit\": \"feat: first commit\"}, {\"commit\": \"fix: patch release\"}], \"args\": [\"--first-release\"], \"report\": [\"version\", \"tag\"]}, \"expected_output\": \"version=1.0.1\\ntag=v1.0.1\\n\"}\n    ]\n}\n```\n\n*9.3 Merge commits count toward recommendation*\n\nA feature merged from a side branch via a no-fast-forward merge whose subject follows the conventional format is counted in the recommendation, so it yields a minor bump.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_3_merge_commits.json`\n\n```json\n{\n    \"description\": \"Merge commits participate in version recommendation: a merged feature whose merge subject is conventionally typed yields a minor bump.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"branch\": \"new-feature\"}, {\"checkout\": \"new-feature\"}, {\"commit\": \"Implementing new feature\"}, {\"checkout\": \"master\"}, {\"merge\": {\"msg\": \"feat: new feature from branch\", \"branch\": \"new-feature\"}}], \"args\": [], \"report\": [\"version\"]}, \"expected_output\": \"version=1.1.0\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 10: Pipeline Control\n\n**As a developer**, I want to skip stages, preview without side effects, get publishing guidance, include staged files, and hook custom scripts, so I can adapt the release to my workflow.\n\n**Expected Behavior / Usage:**\n\n*10.1 Skipping stages*\n\nIndividual stages can be skipped: skipping the bump leaves the version unchanged; skipping the changelog means no changelog file is created.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_1_skip_stages.json`\n\n```json\n{\n    \"description\": \"Skipping individual release stages: skipping the bump leaves the version unchanged; skipping the changelog creates no changelog file.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"changelogSeed\": \"legacy header format<a name=1.0.0>\\n\", \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [\"--skip.bump\", \"true\", \"--skip.changelog\", \"true\"], \"report\": [\"version\"]}, \"expected_output\": \"version=1.0.0\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [\"--skip.changelog\", \"true\"], \"report\": [\"version\", \"changelog\"]}, \"expected_output\": \"version=1.1.0\\nchangelog=absent\\n\"}\n    ]\n}\n```\n\n*10.2 Dry run*\n\nA dry run performs no non-idempotent action: no version change, no new tag, no changelog file.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_2_dry_run.json`\n\n```json\n{\n    \"description\": \"Dry-run mode performs no side effects: the version is unchanged, no tag is created, and no changelog file is written.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: first commit\"}, {\"tag\": \"v1.0.0\"}, {\"commit\": \"feat: new feature!\"}], \"args\": [\"--dry-run\"], \"report\": [\"version\", \"tag\", \"changelog\"]}, \"expected_output\": \"version=1.0.0\\ntag=none\\nchangelog=absent\\n\"}\n    ]\n}\n```\n\n*10.3 Publishing advice*\n\nAfter a release the tool emits a suggested push/publish command: always a follow-tags push to the current branch, plus a publish step only when a publishable, non-private primary manifest was bumped; for a pre-release the publish step carries a dist-tag derived from the pre-release identifier (or a default tag when empty).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_3_publish_advice.json`\n\n```json\n{\n    \"description\": \"Post-release publishing advice: always a follow-tags push, plus a publish step (with a pre-release dist-tag where relevant) when a publishable, non-private manifest was bumped.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [], \"report\": [\"publish\"]}, \"expected_output\": \"publish=git push --follow-tags origin master && npm publish\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [\"--prerelease\"], \"report\": [\"publish\"]}, \"expected_output\": \"publish=git push --follow-tags origin master && npm publish --tag prerelease\\n\"}\n    ]\n}\n```\n\n*10.4 Committing all staged files*\n\nWith the commit-all option the release commit also includes any already-staged changes, leaving the working tree clean and adding a staged-files notice to the progress output; without it the notice is absent.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_4_commit_all.json`\n\n```json\n{\n    \"description\": \"Committing all staged changes: with the option the staged-files notice appears (and the tree ends clean); without it the notice is absent.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: c\"}], \"args\": [\"--commit-all\"], \"report\": [\"staged_notice\"]}, \"expected_output\": \"staged_notice=yes\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"ops\": [{\"commit\": \"feat: c\"}], \"args\": [], \"report\": [\"staged_notice\"]}, \"expected_output\": \"staged_notice=no\\n\"}\n    ]\n}\n```\n\n*10.5 Lifecycle hooks*\n\nUser scripts run at defined points. A pre-bump hook that prints a version string makes that the release version; a pre-commit hook that prints text supplies an alternate release commit message. The hook body is provided as script source in the input.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_5_lifecycle_hooks.json`\n\n```json\n{\n    \"description\": \"Lifecycle hooks influence the release: a pre-bump hook printing a version sets the release version; a pre-commit hook printing text supplies an alternate commit message.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"changelogSeed\": \"legacy header format<a name=1.0.0>\\n\", \"hooks\": {\"prebump\": \"console.log(\\\"9.9.9\\\")\"}, \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [\"--patch\"], \"report\": [\"version\"]}, \"expected_output\": \"version=9.9.9\\n\"},\n        {\"input\": {\"kind\": \"release\", \"packageVersion\": \"1.0.0\", \"changelogSeed\": \"legacy header format<a name=1.0.0>\\n\", \"hooks\": {\"precommit\": \"console.log(\\\"releasing %s delivers #222\\\")\"}, \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [\"--patch\"], \"report\": [\"commit_message\"]}, \"expected_output\": \"commit_message=releasing %s delivers #222\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 11: Validation & Error Reporting\n\n**As a developer**, I want invalid configurations and impossible requests rejected with a clear category, so failures are predictable and actionable.\n\n**Expected Behavior / Usage:**\n\nThe tool validates configuration and the request and, on failure, reports a single neutral error-category line `error=<category>` instead of completing. Covered conditions: the embedded scripts configuration must be an object (`invalid_scripts`); the embedded skip configuration must be an object (`invalid_skip`); a custom changelog header must not itself look like a release-section heading (`invalid_changelog_header`); a run with no manifest and tag-fallback disabled has no version source (`no_package_file`); a manual release request given with no release-type value is incomplete (`missing_release_type`). A run that completes successfully reports `error=none`. Error categories are language-neutral and must not leak host runtime details. (Project-embedded settings are supplied to the adapter via a neutral `toolConfig` field; the adapter places them under the implementation's reserved manifest key.)\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_validation_errors.json`\n\n```json\n{\n    \"description\": \"Input validation and error reporting as neutral categories for invalid scripts/skip configuration, an invalid changelog header, a missing version source, a missing release type, and the success case.\",\n    \"cases\": [\n        {\"input\": {\"kind\": \"error\", \"packageVersion\": \"1.0.0\", \"toolConfig\": {\"scripts\": \"echo hello\"}, \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": []}, \"expected_output\": \"error=invalid_scripts\\n\"},\n        {\"input\": {\"kind\": \"error\", \"packageVersion\": \"1.0.0\", \"toolConfig\": {\"skip\": true}, \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": []}, \"expected_output\": \"error=invalid_skip\\n\"},\n        {\"input\": {\"kind\": \"error\", \"packageVersion\": \"1.0.0\", \"changelogSeed\": \"\", \"ops\": [{\"commit\": \"feat: first commit\"}], \"args\": [\"--changelogHeader=## 3.0.2\"]}, \"expected_output\": \"error=invalid_changelog_header\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the features above, separating version recommendation, metadata-file rewriting, changelog rendering, version-control interaction, lifecycle-hook execution, and option/configuration parsing.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON command from stdin, sets up a deterministic temporary version-controlled workspace as described by the command, invokes the core logic, and prints results to stdout strictly matching the per-leaf-feature contracts above (including normalising any error into a neutral `error=<category>` line). This adapter must be separated from the core domain.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{stem}@{index:03}.txt` containing only the raw program stdout, so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- validate changelog header format as per project convention\n- ensure proper section ordering in changelog output\n",
+  "oracle_data": {
+    "task_id": "conventional-changelog__standard-version-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "downgrade breaking",
+          "pre 1.x protection",
+          "0.5 downgrade",
+          "older version bump",
+          "pre 1.0 breaking change"
+        ],
+        "oracle_response": "The constraint applies when the current version is strictly less than '1.0.0' (e.g. 0.9.9) AND the project history contains at least one commit starting with 'feat!:' (breaking change). In this scenario, the bump must be applied as a minor increment, skipping a major bump entirely."
+      },
+      {
+        "constraint_id": "C011",
+        "trigger_keywords": [
+          "pre-release progression",
+          "dev suffix increment",
+          "counter reset",
+          "pentesting release",
+          "baseline minor bump"
+        ],
+        "oracle_response": "When running under a persistent pre-release identifier (like 'dev'), and performing a minor or patch increment within the baseline version, the pre-release suffix counter increments by one (e.g., from .0 to .1, then .2). This counter resets to .0 only when a higher-level release (major or minor bump) is requested."
+      },
+      {
+        "constraint_id": "C034",
+        "trigger_keywords": [
+          "conflicting release-as",
+          "valid -r but invalid version",
+          "malformed release request",
+          "type vs exact mismatch",
+          "argument ordering error"
+        ],
+        "oracle_response": "This constraint triggers when the user provides a generic release type (e.g., '--release-as major') combined with or in an ambiguous context where an exact version string (e.g., '--release-as v100.0.0') is also present or implied, causing a logic conflict regarding whether to treat the input as a type hint or an explicit version string."
+      },
+      {
+        "constraint_id": "TC_feature5_3_prerelease_progression",
+        "trigger_keywords": [
+          "test cases for feature5 3 prerelease progression",
+          "show me feature5 3 prerelease progression test cases",
+          "what are the feature5 3 prerelease progression inputs and outputs",
+          "give me the feature5_3_prerelease_progression test file",
+          "feature5 3 prerelease progression expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_prerelease_progression:\n{\n  \"description\": \"Sequential pre-release progression across several runs. Within one ongoing pre-release identifier, repeated runs increment the trailing pre-release counter (.0, .1, .2 ...) as long as the recommended underlying increment does not exceed the level the active pre-release already represents. When a higher-level increment is requested or recommended (e.g. moving from a patch pre-release to a minor pre-release), the base version is raised and the pre-release counter restarts at zero. Each run reports the version it produced. Input is an ordered list of runs, each with its commits and arguments; output reports one resulting version per run, in order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"release\",\n        \"packageVersion\": \"1.0.0\",\n        \"rounds\": [\n          {\n            \"ops\": [\n              {\n                \"commit\": \"fix: first patch\"\n              }\n            ],\n            \"args\": [\n              \"--release-as\",\n              \"patch\",\n              \"--prerelease\",\n              \"dev\"\n            ]\n          },\n          {\n            \"ops\": [\n              {\n                \"commit\": \"fix: second patch\"\n              }\n            ],\n            \"args\": [\n              \"--prerelease\",\n              \"dev\"\n            ]\n          },\n          {\n            \"ops\": [\n              {\n                \"commit\": \"feat: first new feat\"\n              }\n            ],\n            \"args\": [\n              \"--release-as\",\n              \"minor\",\n              \"--prerelease\",\n              \"dev\"\n            ]\n          },\n          {\n            \"ops\": [\n              {\n                \"commit\": \"fix: third patch\"\n              }\n            ],\n            \"args\": [\n              \"--release-as\",\n              \"minor\",\n              \"--prerelease\",\n              \"dev\"\n            ]\n          },\n          {\n            \"ops\": [\n              {\n                \"commit\": \"fix: forth patch\"\n              }\n            ],\n            \"args\": [\n              \"--prerelease\",\n              \"dev\"\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"version=1.0.1-dev.0\\nversion=1.0.1-dev.1\\nversion=1.1.0-dev.0\\nversion=1.1.0-dev.1\\nversion=1.1.0-dev.2\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "validate changelog header format as per project convention",
+        "actual_meaning": "The changelogHeader string must not contain a '#' followed by a semantic version pattern (e.g., '# 3.0.2') at the start, as this configures it to be a root version header rather than a section header."
+      },
+      {
+        "vague_reference": "ensure proper section ordering in changelog output",
+        "actual_meaning": "If multiple release rounds are detected, the output sections must be appended sequentially based on the round order; inside a single section, the 'Bug Fixes' subsection must be listed before the 'Features' subsection."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_1_skip_stages.json": {
+      "description": "Skipping individual release stages. The release pipeline's stages can be selectively skipped. Skipping the bump stage leaves the manifest version unchanged; skipping the changelog stage means no changelog file is created. Input describes release runs with combinations of skipped stages; output reports the resulting version and, where relevant, whether a changelog file exists afterward.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "changelogSeed": "legacy header format<a name=1.0.0>\n",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [
+              "--skip.bump",
+              "true",
+              "--skip.changelog",
+              "true"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=1.0.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [
+              "--skip.changelog",
+              "true"
+            ],
+            "report": [
+              "version",
+              "changelog"
+            ]
+          },
+          "expected_output": "version=1.1.0\nchangelog=absent\n"
+        }
+      ]
+    },
+    "feature10_2_dry_run.json": {
+      "description": "Dry-run mode performs no side effects. When the run is a dry run, all non-idempotent actions are skipped: the manifest version is not changed, no new tag is created, and no changelog file is written. Input describes a dry run over a history that would otherwise produce a minor bump; output reports the (unchanged) version, the absence of any newly created tag, and the absence of a changelog file.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "tag": "v1.0.0"
+              },
+              {
+                "commit": "feat: new feature!"
+              }
+            ],
+            "args": [
+              "--dry-run"
+            ],
+            "report": [
+              "version",
+              "tag",
+              "changelog"
+            ]
+          },
+          "expected_output": "version=1.0.0\ntag=none\nchangelog=absent\n"
+        }
+      ]
+    },
+    "feature10_3_publish_advice.json": {
+      "description": "Post-release publishing advice. After a release the tool emits a suggested command for pushing the release and publishing the package. The advice always includes pushing with follow-tags to the current branch. It appends a publish step only when a publishable primary manifest was bumped and the package is not marked private; for a pre-release the publish step carries a dist-tag derived from the pre-release identifier (or a default tag when the identifier is empty). Input describes a release run and requests the advice; output reports the suggested command line.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [],
+            "report": [
+              "publish"
+            ]
+          },
+          "expected_output": "publish=git push --follow-tags origin master && npm publish\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [
+              "--prerelease"
+            ],
+            "report": [
+              "publish"
+            ]
+          },
+          "expected_output": "publish=git push --follow-tags origin master && npm publish --tag prerelease\n"
+        }
+      ]
+    },
+    "feature10_4_commit_all.json": {
+      "description": "Committing all staged changes. With the commit-all option the release commit additionally includes any other already-staged changes in the working tree, leaving the working tree clean afterward, and the run's progress output mentions that all staged files are included. Without the option that notice is absent. Input describes a release run with and without the commit-all option; output reports whether the staged-files notice appeared and, where requested, whether the working tree ended clean.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: c"
+              }
+            ],
+            "args": [
+              "--commit-all"
+            ],
+            "report": [
+              "staged_notice"
+            ]
+          },
+          "expected_output": "staged_notice=yes\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: c"
+              }
+            ],
+            "args": [],
+            "report": [
+              "staged_notice"
+            ]
+          },
+          "expected_output": "staged_notice=no\n"
+        }
+      ]
+    },
+    "feature10_5_lifecycle_hooks.json": {
+      "description": "Lifecycle hooks influence the release. The release pipeline runs user-provided hook scripts at defined points. A pre-bump hook that prints a version string causes that string to be used as the release version, overriding the normal recommendation. A pre-commit hook that prints text supplies an alternate release commit message. Input describes a release run that registers such a hook (the hook body is provided as the script source); output reports the affected result — the resulting version for a pre-bump hook, or the recorded commit message for a pre-commit hook.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "changelogSeed": "legacy header format<a name=1.0.0>\n",
+            "hooks": {
+              "prebump": "console.log(\"9.9.9\")"
+            },
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [
+              "--patch"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=9.9.9\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "changelogSeed": "legacy header format<a name=1.0.0>\n",
+            "hooks": {
+              "precommit": "console.log(\"releasing %s delivers #222\")"
+            },
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [
+              "--patch"
+            ],
+            "report": [
+              "commit_message"
+            ]
+          },
+          "expected_output": "commit_message=releasing %s delivers #222\n"
+        }
+      ]
+    },
+    "feature11_validation_errors.json": {
+      "description": "Input validation and error reporting as neutral categories. The tool rejects invalid configurations and impossible requests, reporting a normalised error category rather than completing. Categories covered: the scripts configuration must be an object (not a string/array), the skip configuration must be an object, a custom changelog header must not itself look like a release-section heading, a release with no manifest and tag-fallback disabled has no version source, and a manual release request given without a release-type value is incomplete. A run that completes successfully reports no error. Input describes a run designed to trigger (or not) a specific condition; output reports a single neutral error-category line.",
+      "cases": [
+        {
+          "input": {
+            "kind": "error",
+            "packageVersion": "1.0.0",
+            "toolConfig": {
+              "scripts": "echo hello"
+            },
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": []
+          },
+          "expected_output": "error=invalid_scripts\n"
+        },
+        {
+          "input": {
+            "kind": "error",
+            "packageVersion": "1.0.0",
+            "toolConfig": {
+              "skip": true
+            },
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": []
+          },
+          "expected_output": "error=invalid_skip\n"
+        },
+        {
+          "input": {
+            "kind": "error",
+            "packageVersion": "1.0.0",
+            "changelogSeed": "",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [
+              "--changelogHeader=## 3.0.2"
+            ]
+          },
+          "expected_output": "error=invalid_changelog_header\n"
+        }
+      ]
+    },
+    "feature1_format_message.json": {
+      "description": "Substitute a release version into a commit/tag message template. The template contains zero or more occurrences of the version placeholder token {{currentTag}}; every occurrence is replaced by the supplied version string and all other text is left untouched. Input is an object with a message template and a version string; output is the substituted message followed by a newline.",
+      "cases": [
+        {
+          "input": {
+            "kind": "format_message",
+            "template": "chore(release): 1.0.0",
+            "version": "1.0.0"
+          },
+          "expected_output": "chore(release): 1.0.0\n"
+        },
+        {
+          "input": {
+            "kind": "format_message",
+            "template": "chore(release): {{currentTag}}",
+            "version": "1.0.0"
+          },
+          "expected_output": "chore(release): 1.0.0\n"
+        }
+      ]
+    },
+    "feature2_auto_bump.json": {
+      "description": "Automatic version recommendation from conventional commit history. Starting from a current version recorded in the project manifest, the tool inspects the commit messages added since that version and selects the smallest semantic-version increment that covers them: a commit whose type marks a breaking change bumps the major component (resetting minor and patch to zero), a feature commit bumps the minor component (resetting patch), and a fix commit bumps the patch component. The reported value is the recommended next version. Input gives the starting version and the sequence of commit subject lines; output reports the computed next version.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat!: breaking change"
+              }
+            ],
+            "args": [],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=2.0.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: a feature"
+              }
+            ],
+            "args": [],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=1.1.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "fix: a fix"
+              }
+            ],
+            "args": [],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=1.0.1\n"
+        }
+      ]
+    },
+    "feature3_1_premajor_auto.json": {
+      "description": "Pre-1.0.0 major-protection. While a project is still below version 1.0.0 the public surface is considered unstable, so a breaking-change commit must NOT escalate to the 1.x line automatically; instead it is downgraded one level and bumps the minor component (resetting patch). This protection only applies to the automatic recommendation path. Input gives a starting version below 1.0.0 and a breaking-change commit; output reports the recommended next version.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "0.5.0",
+            "packageOptions": {
+              "repository": {
+                "url": "x"
+              }
+            },
+            "ops": [
+              {
+                "commit": "feat!: this is a breaking change"
+              }
+            ],
+            "args": [],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=0.6.0\n"
+        }
+      ]
+    },
+    "feature3_2_premajor_forced.json": {
+      "description": "Pre-1.0.0 major-protection is overridden by an explicit major release request. When the caller explicitly forces a major release, a project below 1.0.0 is promoted to 1.0.0 even though the automatic path would have refused. Input gives a starting version below 1.0.0, a breaking-change commit, and an explicit major release request; output reports the resulting version.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "0.5.0",
+            "packageOptions": {
+              "repository": {
+                "url": "x"
+              }
+            },
+            "ops": [
+              {
+                "commit": "feat!: this is a breaking change"
+              }
+            ],
+            "args": [
+              "-r",
+              "major"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=1.0.0\n"
+        }
+      ]
+    },
+    "feature4_1_release_as_type.json": {
+      "description": "Manual release-type override. Instead of inferring the increment from commit history, the caller names the increment explicitly as one of major, minor, or patch, and that component is incremented (with lower components reset to zero). The commit history is irrelevant to the chosen increment in this mode. Input gives the starting version and the named increment; output reports the resulting version.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "fix: first commit"
+              }
+            ],
+            "args": [
+              "--release-as",
+              "major"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=2.0.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "fix: first commit"
+              }
+            ],
+            "args": [
+              "--release-as",
+              "minor"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=1.1.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "fix: first commit"
+              }
+            ],
+            "args": [
+              "--release-as",
+              "patch"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=1.0.1\n"
+        }
+      ]
+    },
+    "feature4_2_release_as_exact.json": {
+      "description": "Manual release as an exact version. When the explicit release value is a full semantic-version string (optionally with a pre-release suffix) rather than one of the named increment keywords, that exact string becomes the new version verbatim, regardless of the current version or commit history. A leading 'v' on the requested value is stripped. Input gives the starting version and the exact requested version; output reports the resulting version.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "fix: first commit"
+              }
+            ],
+            "args": [
+              "--release-as",
+              "v100.0.0"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=100.0.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "fix: first commit"
+              }
+            ],
+            "args": [
+              "--release-as",
+              "200.0.0-amazing"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=200.0.0-amazing\n"
+        }
+      ]
+    },
+    "feature5_1_prerelease_typed.json": {
+      "description": "Pre-release tagging combined with a named increment. When a pre-release identifier is requested together with a named increment, the increment is applied to the base version and a pre-release suffix '-<id>.0' is appended, beginning the pre-release counter at zero. Input gives the starting version, the named increment, and the pre-release identifier; output reports the resulting pre-release version.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "fix: first commit"
+              }
+            ],
+            "args": [
+              "--release-as",
+              "major",
+              "--prerelease",
+              "major"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=2.0.0-major.0\n"
+        }
+      ]
+    },
+    "feature5_2_prerelease_default.json": {
+      "description": "Pre-release with no explicit identifier, using the automatic recommendation. When a pre-release is requested without naming an identifier, the increment is still inferred from commit history and a numeric pre-release suffix '-0' is appended to the bumped base version. Input gives the starting version, a feature commit, and a pre-release request with no identifier; output reports the resulting pre-release version.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "changelogSeed": "legacy header format<a name=1.0.0>\n",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [
+              "--prerelease"
+            ],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=1.1.0-0\n"
+        }
+      ]
+    },
+    "feature5_3_prerelease_progression.json": {
+      "description": "Sequential pre-release progression across several runs. Within one ongoing pre-release identifier, repeated runs increment the trailing pre-release counter (.0, .1, .2 ...) as long as the recommended underlying increment does not exceed the level the active pre-release already represents. When a higher-level increment is requested or recommended (e.g. moving from a patch pre-release to a minor pre-release), the base version is raised and the pre-release counter restarts at zero. Each run reports the version it produced. Input is an ordered list of runs, each with its commits and arguments; output reports one resulting version per run, in order.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "rounds": [
+              {
+                "ops": [
+                  {
+                    "commit": "fix: first patch"
+                  }
+                ],
+                "args": [
+                  "--release-as",
+                  "patch",
+                  "--prerelease",
+                  "dev"
+                ]
+              },
+              {
+                "ops": [
+                  {
+                    "commit": "fix: second patch"
+                  }
+                ],
+                "args": [
+                  "--prerelease",
+                  "dev"
+                ]
+              },
+              {
+                "ops": [
+                  {
+                    "commit": "feat: first new feat"
+                  }
+                ],
+                "args": [
+                  "--release-as",
+                  "minor",
+                  "--prerelease",
+                  "dev"
+                ]
+              },
+              {
+                "ops": [
+                  {
+                    "commit": "fix: third patch"
+                  }
+                ],
+                "args": [
+                  "--release-as",
+                  "minor",
+                  "--prerelease",
+                  "dev"
+                ]
+              },
+              {
+                "ops": [
+                  {
+                    "commit": "fix: forth patch"
+                  }
+                ],
+                "args": [
+                  "--prerelease",
+                  "dev"
+                ]
+              }
+            ]
+          },
+          "expected_output": "version=1.0.1-dev.0\nversion=1.0.1-dev.1\nversion=1.1.0-dev.0\nversion=1.1.0-dev.1\nversion=1.1.0-dev.2\n"
+        }
+      ]
+    },
+    "feature6_1_changelog_section.json": {
+      "description": "Changelog section rendering for a single release. After a previous release tag exists, a new release's changelog document is generated. The document opens with the configured header line, then a release-section heading carrying the new version as a comparison link (whose URL is built from a configurable compare format and the previous/current tags) and a date, then grouped subsections of changes. Fix commits appear under a 'Bug Fixes' subsection and feature commits under a 'Features' subsection, each entry being the commit description followed by its short hash. Dates are rendered as the literal DATE and commit short hashes as the literal HASH to keep output stable. Input describes the manifest state, a seed changelog, the commit/tag history, and changelog formatting arguments; output is the rendered changelog document.",
+      "cases": [
+        {
+          "input": {
+            "kind": "changelog",
+            "packageVersion": null,
+            "changelogSeed": "",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "tag": "v1.0.0"
+              },
+              {
+                "commit": "fix: patch release"
+              }
+            ],
+            "args": [
+              "--changelogHeader=# Release Notes",
+              "--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}"
+            ]
+          },
+          "expected_output": "# Release Notes\n### [1.0.1](/compare/v1.0.0...v1.0.1) (DATE)\n\n\n### Bug Fixes\n\n* patch release HASH\n"
+        },
+        {
+          "input": {
+            "kind": "changelog",
+            "packageVersion": null,
+            "changelogSeed": "",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "tag": "v1.0.0"
+              },
+              {
+                "commit": "feat: a new feature"
+              }
+            ],
+            "args": [
+              "--changelogHeader=# Release Notes",
+              "--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}"
+            ]
+          },
+          "expected_output": "# Release Notes\n## [1.1.0](/compare/v1.0.0...v1.1.0) (DATE)\n\n\n### Features\n\n* a new feature HASH\n"
+        }
+      ]
+    },
+    "feature6_2_changelog_stacked.json": {
+      "description": "Stacked changelog across two successive releases. When a changelog already contains a prior release section, generating the next release prepends the new section above the existing content while keeping the configured header at the top only once. The result lists releases newest-first. Input describes a sequence of two release runs over an initially empty changelog; output is the final changelog document containing both release sections in newest-first order.",
+      "cases": [
+        {
+          "input": {
+            "kind": "changelog",
+            "packageVersion": null,
+            "changelogSeed": "",
+            "rounds": [
+              {
+                "ops": [
+                  {
+                    "commit": "feat: first commit"
+                  },
+                  {
+                    "tag": "v1.0.0"
+                  },
+                  {
+                    "commit": "fix: patch release"
+                  }
+                ],
+                "args": [
+                  "--changelogHeader=# Release Notes",
+                  "--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}"
+                ]
+              },
+              {
+                "ops": [
+                  {
+                    "commit": "fix: another patch release"
+                  }
+                ],
+                "args": [
+                  "--changelogHeader=# Release Notes",
+                  "--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}"
+                ]
+              }
+            ]
+          },
+          "expected_output": "# Release Notes\n### [1.0.2](/compare/v1.0.1...v1.0.2) (DATE)\n\n\n### Bug Fixes\n\n* another patch release HASH\n\n\n\n### [1.0.1](/compare/v1.0.0...v1.0.1) (DATE)\n\n\n### Bug Fixes\n\n* patch release HASH\n"
+        }
+      ]
+    },
+    "feature6_3_changelog_legacy.json": {
+      "description": "Replacing a legacy release marker. When the existing changelog begins with a free-form legacy header that ends in an old-style release anchor marker, generating a new release strips the legacy header text but retains everything from the old release anchor onward, prepending the freshly generated section above it. Input describes a release run over a changelog seeded with legacy header text plus an old release anchor; output is the new section followed by the preserved legacy anchor block.",
+      "cases": [
+        {
+          "input": {
+            "kind": "changelog",
+            "packageVersion": null,
+            "changelogSeed": "legacy header format<a name=1.0.0>\n",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "tag": "v1.0.0"
+              },
+              {
+                "commit": "fix: patch release"
+              }
+            ],
+            "args": [
+              "--changelogHeader=# Release Notes",
+              "--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}"
+            ]
+          },
+          "expected_output": "# Release Notes\n### [1.0.1](/compare/v1.0.0...v1.0.1) (DATE)\n\n\n### Bug Fixes\n\n* patch release HASH\n\n\n\n<a name=1.0.0>\n"
+        }
+      ]
+    },
+    "feature6_4_changelog_issue_url.json": {
+      "description": "Configurable issue-reference linking inside changelog entries. A project configuration file may supply a custom issue URL format containing an id placeholder; when a changelog entry references an issue by number, that reference is rewritten as a markdown link whose target is the configured format with the placeholder filled by the issue number. Input describes a release run with a configuration that sets the issue URL format and the changelog header/compare formats, plus a commit that references an issue; output is the rendered changelog with the linked issue reference.",
+      "cases": [
+        {
+          "input": {
+            "kind": "changelog",
+            "packageVersion": null,
+            "changelogSeed": "",
+            "versionrc": {
+              "issueUrlFormat": "http://www.foo.com/{{id}}",
+              "changelogHeader": "# Release Notes",
+              "compareUrlFormat": "/compare/{{previousTag}}...{{currentTag}}"
+            },
+            "ops": [
+              {
+                "commit": "feat: another commit addresses issue #1"
+              }
+            ],
+            "args": []
+          },
+          "expected_output": "# Release Notes\n## 1.1.0 (DATE)\n\n\n### Features\n\n* another commit addresses issue [#1](http://www.foo.com/1) HASH\n"
+        }
+      ]
+    },
+    "feature6_5_changelog_custom_header.json": {
+      "description": "Custom changelog header text. The first line of the generated changelog document is a caller-supplied header string. Providing a custom header replaces the default header with the given text while the release sections below are unaffected. Input describes a release run with a custom header and compare format over an empty changelog and a single feature commit; output is the changelog beginning with the custom header.",
+      "cases": [
+        {
+          "input": {
+            "kind": "changelog",
+            "packageVersion": null,
+            "changelogSeed": "",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [
+              "--changelogHeader=# Pork Chop Log",
+              "--compareUrlFormat=/compare/{{previousTag}}...{{currentTag}}"
+            ]
+          },
+          "expected_output": "# Pork Chop Log\n## 1.1.0 (DATE)\n\n\n### Features\n\n* first commit HASH\n"
+        }
+      ]
+    },
+    "feature7_1_release_message_default.json": {
+      "description": "Release commit and annotated-tag message defaults. After a successful release the version-control commit recording the release and the annotated tag both carry a default message of the form 'chore(release): <version>'. Input describes a release run and requests the recorded commit message and the message of the newly created tag; output reports both.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "tag": "v1.0.0"
+              },
+              {
+                "commit": "feat: new feature!"
+              }
+            ],
+            "args": [],
+            "report": [
+              "commit_message",
+              "tag_message"
+            ]
+          },
+          "expected_output": "commit_message=chore(release): 1.1.0\ntag_message=chore(release): 1.1.0\n"
+        }
+      ]
+    },
+    "feature7_2_release_message_custom.json": {
+      "description": "Customising the release commit message. The release commit message template can be overridden via configuration or a command-line argument; the template's version placeholder is filled with the new version. Input describes a release run whose message template is overridden (in one case via a project configuration file, in another via a command-line argument); output reports the resulting recorded commit message.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "versionrc": {
+              "releaseCommitMessageFormat": "This commit represents release: {{currentTag}}"
+            },
+            "ops": [
+              {
+                "commit": "feat: another commit addresses issue #1"
+              }
+            ],
+            "args": [],
+            "report": [
+              "commit_message"
+            ]
+          },
+          "expected_output": "commit_message=This commit represents release: 1.1.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: another commit"
+              }
+            ],
+            "args": [
+              "--releaseCommitMessageFormat={{currentTag}} is the version."
+            ],
+            "report": [
+              "commit_message"
+            ]
+          },
+          "expected_output": "commit_message=1.1.0 is the version.\n"
+        }
+      ]
+    },
+    "feature7_3_legacy_message.json": {
+      "description": "Legacy percent-substitution in the release commit message. A deprecated message option uses the token %s as the version placeholder; every occurrence of %s in the supplied message is replaced by the new version. Input describes a release run whose legacy message option contains one or more %s tokens; output reports the resulting recorded commit message with all occurrences substituted.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: another commit"
+              }
+            ],
+            "args": [
+              "--message=V:%s"
+            ],
+            "report": [
+              "commit_message"
+            ]
+          },
+          "expected_output": "commit_message=V:1.1.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: another commit"
+              }
+            ],
+            "args": [
+              "--message=V:%s is the %s."
+            ],
+            "report": [
+              "commit_message"
+            ]
+          },
+          "expected_output": "commit_message=V:1.1.0 is the 1.1.0.\n"
+        }
+      ]
+    },
+    "feature8_1_manifest_sync.json": {
+      "description": "Synchronising the version across auxiliary manifest files. Besides the primary package manifest, several other recognised metadata files (such as a front-end package descriptor, an extension manifest, a dependency lock descriptor, and a dependency shrinkwrap descriptor) have their recorded version field updated to the new release version when present. Input describes a release run with one such auxiliary file present alongside the primary manifest; output reports the new version and the version recorded in the auxiliary file.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "manifests": {
+              "bower.json": {
+                "version": "1.0.0"
+              }
+            },
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "tag": "v1.0.0"
+              },
+              {
+                "commit": "feat: new feature!"
+              }
+            ],
+            "args": [],
+            "report": [
+              "version",
+              "files"
+            ]
+          },
+          "expected_output": "version=1.1.0\nfile bower.json=1.1.0\n"
+        }
+      ]
+    },
+    "feature8_2_manifest_gitignore.json": {
+      "description": "Ignored files are not version-bumped. An auxiliary manifest whose path is listed in the project's ignore file is left untouched even though it would otherwise be a recognised version-bearing file; the primary manifest is still bumped. Input describes a release run where an auxiliary manifest is named in the ignore file; output reports the new primary version and the unchanged version still recorded in the ignored auxiliary file.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "manifests": {
+              "bower.json": {
+                "version": "1.0.0"
+              }
+            },
+            "gitignore": "bower.json",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "tag": "v1.0.0"
+              },
+              {
+                "commit": "feat: new feature!"
+              }
+            ],
+            "args": [],
+            "report": [
+              "version",
+              "files"
+            ]
+          },
+          "expected_output": "version=1.1.0\nfile bower.json=1.0.0\n"
+        }
+      ]
+    },
+    "feature8_3_manifest_formatting.json": {
+      "description": "Formatting preservation when rewriting the primary manifest. When the recorded version inside the primary manifest is updated, the file's original whitespace style is preserved: the existing indentation unit (tab or a run of spaces) and the existing line-ending style (line feed, or carriage-return plus line feed) are kept unchanged, and a single trailing newline is ensured. Input supplies the exact raw text of the primary manifest before the release; output reports the exact raw text of the manifest after the version bump, as a JSON-quoted string.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "manifestText": "{\n  \"version\": \"1.0.0\"\n}\n",
+            "ops": [
+              {
+                "commit": "feat: c"
+              }
+            ],
+            "args": [],
+            "report": [
+              "manifest_raw"
+            ]
+          },
+          "expected_output": "manifest_raw=\"{\\n  \\\"version\\\": \\\"1.1.0\\\"\\n}\\n\"\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "manifestText": "{\n\t\"version\": \"1.0.0\"\n}\n",
+            "ops": [
+              {
+                "commit": "feat: c"
+              }
+            ],
+            "args": [],
+            "report": [
+              "manifest_raw"
+            ]
+          },
+          "expected_output": "manifest_raw=\"{\\n\\t\\\"version\\\": \\\"1.1.0\\\"\\n}\\n\"\n"
+        }
+      ]
+    },
+    "feature9_1_tag_fallback.json": {
+      "description": "Deriving the base version from version-control tags when no manifest exists. When there is no primary manifest file, the tool falls back to the project's existing semantic-version tags: it takes the highest such tag as the base and applies the recommended increment, creating a new tag at the result. If there are no semantic-version tags at all, the base defaults to 1.0.0. Input describes a release run with no manifest and a given tag/commit history; output reports the set of tags newly created by the run.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": null,
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              }
+            ],
+            "args": [],
+            "report": [
+              "tag"
+            ]
+          },
+          "expected_output": "tag=v1.1.0\n"
+        },
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": null,
+            "ops": [
+              {
+                "tag": "v5.0.0"
+              },
+              {
+                "tag": "v3.0.0"
+              },
+              {
+                "commit": "feat: another commit"
+              }
+            ],
+            "args": [],
+            "report": [
+              "tag"
+            ]
+          },
+          "expected_output": "tag=v5.1.0\n"
+        }
+      ]
+    },
+    "feature9_2_first_release.json": {
+      "description": "First-release mode keeps the current version. When the run is marked as a first release, the version-bump step is skipped: the current manifest version is released and tagged as-is, with no increment applied regardless of commit history. Input describes a first-release run with a given starting version; output reports the released version and the newly created tag.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.1",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "commit": "fix: patch release"
+              }
+            ],
+            "args": [
+              "--first-release"
+            ],
+            "report": [
+              "version",
+              "tag"
+            ]
+          },
+          "expected_output": "version=1.0.1\ntag=v1.0.1\n"
+        }
+      ]
+    },
+    "feature9_3_merge_commits.json": {
+      "description": "Merge commits participate in version recommendation. A feature merged from a side branch via a merge commit whose subject follows the conventional format is taken into account when recommending the increment, so a merged feature yields a minor bump. Input describes a release run whose history includes branching, a commit on the branch, and a no-fast-forward merge back with a feature-typed merge subject; output reports the recommended new version.",
+      "cases": [
+        {
+          "input": {
+            "kind": "release",
+            "packageVersion": "1.0.0",
+            "ops": [
+              {
+                "commit": "feat: first commit"
+              },
+              {
+                "tag": "v1.0.0"
+              },
+              {
+                "branch": "new-feature"
+              },
+              {
+                "checkout": "new-feature"
+              },
+              {
+                "commit": "Implementing new feature"
+              },
+              {
+                "checkout": "master"
+              },
+              {
+                "merge": {
+                  "msg": "feat: new feature from branch",
+                  "branch": "new-feature"
+                }
+              }
+            ],
+            "args": [],
+            "report": [
+              "version"
+            ]
+          },
+          "expected_output": "version=1.1.0\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "version_recommendation",
+      "input_condition": "commit message subject starts with 'fix:'",
+      "output_rule": "increment patch version (z+1, reset to 0 if z≥99), reset minor and major to 0",
+      "exact_values": [
+        "fix:"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "version_recommendation",
+      "input_condition": "commit message subject starts with 'feat:' without '!' (breaking)",
+      "output_rule": "increment minor version (z+1, reset to 0 if z≥99), reset patch to 0",
+      "exact_values": [
+        "feat:"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "version_recommendation",
+      "input_condition": "commit message subject starts with 'feat:' followed by single '!' (breaking)",
+      "output_rule": "increment major version (z+1, reset to 0 if z≥99), reset minor and patch to 0",
+      "exact_values": [
+        "feat!:"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "pre_1_x_protection",
+      "input_condition": "current version < '1.0.0' AND breaking change ('feat!: ...') present in history",
+      "output_rule": "downgrade breaking change to minor increment (no major bump)",
+      "exact_values": [
+        "0.5.0",
+        "0.6.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "manual_override_major",
+      "input_condition": "args contains '-r' or '--release-as' substring with 'major'",
+      "output_rule": "force major increment regardless of current version < 1.0.0 or commit types",
+      "exact_values": [
+        "major",
+        "-r",
+        "major"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "manual_override_minor",
+      "input_condition": "args contains '-r' or '--release-as' substring with 'minor'",
+      "output_rule": "force minor increment, reset patch to 0",
+      "exact_values": [
+        "minor",
+        "-r",
+        "minor"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "manual_override_patch",
+      "input_condition": "args contains '-r' or '--release-as' substring with 'patch'",
+      "output_rule": "force patch increment, reset minor and major to 0",
+      "exact_values": [
+        "patch",
+        "-r",
+        "patch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "manual_override_exact",
+      "input_condition": "args contains '-r' or '--release-as' followed by a semantic version string (may contain '-' or 'v')",
+      "output_rule": "set new version exactly to the supplied string, strip leading 'v' if present",
+      "exact_values": [
+        "100.0.0",
+        "200.0.0-amazing",
+        "v100.0.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "prerelease_typed",
+      "input_condition": "args contains '--prerelease' followed by a non-empty string AND --release-as is a named type",
+      "output_rule": "append '-<id>.0' to the bumped base version",
+      "exact_values": [
+        "-dev.0",
+        "major",
+        "minor",
+        "patch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "prerelease_default_numeric",
+      "input_condition": "args contains '--prerelease' (no following non-empty string OR string is empty) AND --release-as is not an exact version string",
+      "output_rule": "append '-0' to the bumped base version",
+      "exact_values": [
+        "-0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "prerelease_progression",
+      "input_condition": "running under a persistent pre-release identifier (e.g. 'dev') and performing a minor/patch increment within the baseline version",
+      "output_rule": "increment the pre-release suffix counter (.0 -> .1 -> .2) until a higher-level release (major/minor) is requested/recommended, which resets the counter to .0",
+      "exact_values": [
+        "-0",
+        "-1",
+        "-2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "changelog_header",
+      "input_condition": "args contains '--changelogHeader'",
+      "output_rule": "use the string value as the changelog root header",
+      "exact_values": [
+        "# Release Notes"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "changelog_url_format",
+      "input_condition": "args contains '--compareUrlFormat'",
+      "output_rule": "apply the string pattern, replacing {{previousTag}} and {{currentTag}} with tag strings, producing the link URL",
+      "exact_values": [
+        "/compare/{{previousTag}}...{{currentTag}}"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "changelog_date_rendering",
+      "input_condition": "general changelog generation",
+      "output_rule": "render current date as the literal token 'DATE'",
+      "exact_values": [
+        "DATE"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "changelog_date_rendering",
+      "input_condition": "general changelog generation",
+      "output_rule": "render commit short-hash as the literal token 'HASH'",
+      "exact_values": [
+        "HASH"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "changelog_output_format",
+      "input_condition": "generating changelog output",
+      "output_rule": "each line of output text must end with '\\n'",
+      "exact_values": [
+        "\\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "changelog_section_order",
+      "input_condition": "multiple release rounds in input",
+      "output_rule": "sections are appended in order of rounds; within a section, 'Bug Fixes' comes before 'Features'",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "changelog_legacy_marker",
+      "input_condition": "changelogSeed contains '<a name=EXPORT>'",
+      "output_rule": "retain text from the seed starting at the marker as blank content below the new section",
+      "exact_values": [
+        "<a name=",
+        "1.0.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "format_message_output",
+      "input_condition": "feature1_format_message input",
+      "output_rule": "output must be exactly the substituted template followed by a single '\\n'",
+      "exact_values": [
+        "\\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "report_single_value",
+      "input_condition": "args.contains_field 'report' with a single string element that matches an output key",
+      "output_rule": "output exactly one line: key=result_value\\n",
+      "exact_values": [
+        "version=",
+        "changelog=",
+        "tag=",
+        "publish=",
+        "staged_notice=",
+        "commit_message="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "report_multiple_values",
+      "input_condition": "args.contains_field 'report' with multiple string elements",
+      "output_rule": "output each key=value pair on a separate line",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "report_absent",
+      "input_condition": "reporting 'changelog' when stages is skipped or dry-run",
+      "output_rule": "output 'changelog=absent'",
+      "exact_values": [
+        "absent"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "report_none_tag",
+      "input_condition": "reporting 'tag' in dry-run mode",
+      "output_rule": "output 'tag=none'",
+      "exact_values": [
+        "none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "skip_stages_manifest",
+      "input_condition": "args contains '--skip.bump' true",
+      "output_rule": "patch version remains exactly the original packageVersion",
+      "exact_values": [
+        "1.0.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "dry_run_no_side_effects",
+      "input_condition": "args contains '--dry-run'",
+      "output_rule": "manifest version and tags returned reflect state before any commits/tags were applied; changelog=absent",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "hook_prebump_override_version",
+      "input_condition": "hooks object contains 'prebump' with a script that echoes a version string",
+      "output_rule": "use the script's output as the final version (overrides automatic calculation)",
+      "exact_values": [
+        "9.9.9"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "hook_precommit_override_message",
+      "input_condition": "hooks object contains 'precommit' with a script",
+      "output_rule": "use the script's output formatted with replacement tokens as the final commit message",
+      "exact_values": [
+        "releasing %s delivers #222"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "changelog_header_validation",
+      "input_condition": "changelogHeader contains '#' and subsequent text matches a pattern like 'X.Y.Z' at line start",
+      "output_rule": "reject input as 'error=invalid_changelog_header'",
+      "exact_values": [
+        "## 3.0.2",
+        "# Release Notes"
+      ],
+      "ambiguous": true
+    },
+    {
+      "id": "C029",
+      "feature": "scripts_validation",
+      "input_condition": "toolConfig.scripts is a string, array, or null",
+      "output_rule": "reject input as 'error=invalid_scripts'",
+      "exact_values": [
+        "echo hello",
+        [
+          "echo"
+        ],
+        null
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "skip_validation",
+      "input_condition": "toolConfig.skip is not an object (e.g., true, false)",
+      "output_rule": "reject input as 'error=invalid_skip'",
+      "exact_values": [
+        true,
+        false
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "publish_advice_stable",
+      "input_condition": "generation publish advice AND version is NOT pre-release",
+      "output_rule": "output 'npm publish'",
+      "exact_values": [
+        "npm publish"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "publish_advice_pre",
+      "input_condition": "generation publish advice AND version IS pre-release (args contains '--prerelease')",
+      "output_rule": "output 'npm publish --tag <identifier>'",
+      "exact_values": [
+        "prerelease",
+        "--tag prerelease"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "commit_all_notices",
+      "input_condition": "args contains '--commit-all'",
+      "output_rule": "output 'staged_notice=yes'"
+    },
+    {
+      "id": "C034",
+      "feature": "invalid_release_as_type",
+      "input_condition": "args contains --release-as with value 'major'/'minor'/'patch' BUT also provides an exact version string",
+      "output_rule": "reject as malformed request (ambiguous logic not explicitly tested but implied by type vs exact)",
+      "exact_values": [
+        "major",
+        "v100.0.0"
+      ],
+      "ambiguous": true
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C004",
+        "replacement": "specific pre-1.x historical versions where downgrade rules apply",
+        "exact_values_to_replace": [
+          "0.5.0",
+          "0.6.0"
+        ],
+        "trigger_keywords": [
+          "downgrade breaking",
+          "pre 1.x protection",
+          "0.5 downgrade",
+          "older version bump",
+          "pre 1.0 breaking change"
+        ],
+        "oracle_response": "The constraint applies when the current version is strictly less than '1.0.0' (e.g. 0.9.9) AND the project history contains at least one commit starting with 'feat!:' (breaking change). In this scenario, the bump must be applied as a minor increment, skipping a major bump entirely."
+      },
+      {
+        "constraint_id": "C011",
+        "replacement": "pre-release suffix progression pattern",
+        "exact_values_to_replace": [
+          "-0",
+          "-1",
+          "-2"
+        ],
+        "trigger_keywords": [
+          "pre-release progression",
+          "dev suffix increment",
+          "counter reset",
+          "pentesting release",
+          "baseline minor bump"
+        ],
+        "oracle_response": "When running under a persistent pre-release identifier (like 'dev'), and performing a minor or patch increment within the baseline version, the pre-release suffix counter increments by one (e.g., from .0 to .1, then .2). This counter resets to .0 only when a higher-level release (major or minor bump) is requested."
+      },
+      {
+        "constraint_id": "C034",
+        "replacement": "contradictory release type and version arguments",
+        "exact_values_to_replace": [
+          "major",
+          "v100.0.0"
+        ],
+        "trigger_keywords": [
+          "conflicting release-as",
+          "valid -r but invalid version",
+          "malformed release request",
+          "type vs exact mismatch",
+          "argument ordering error"
+        ],
+        "oracle_response": "This constraint triggers when the user provides a generic release type (e.g., '--release-as major') combined with or in an ambiguous context where an exact version string (e.g., '--release-as v100.0.0') is also present or implied, causing a logic conflict regarding whether to treat the input as a type hint or an explicit version string."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C028",
+        "vague_phrase": "validate changelog header format as per project convention",
+        "actual_meaning": "The changelogHeader string must not contain a '#' followed by a semantic version pattern (e.g., '# 3.0.2') at the start, as this configures it to be a root version header rather than a section header."
+      },
+      {
+        "constraint_id": "C017",
+        "vague_phrase": "ensure proper section ordering in changelog output",
+        "actual_meaning": "If multiple release rounds are detected, the output sections must be appended sequentially based on the round order; inside a single section, the 'Bug Fixes' subsection must be listed before the 'Features' subsection."
+      }
+    ]
+  }
+}

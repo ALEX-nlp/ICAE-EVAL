@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a telemetry runtime support library for our mobile SDK. Basically the problem is that right now every team that wants to add telemetry has to reinvent the wheel — they manually track when the app goes to background/foreground, they lose signals that were emitted before the exporter is even ready, and retry logic is all over the place. It's a mess and we keep getting bug reports about missing session data and crashes on cold start.
+
+The library needs to handle session lifecycle (you know, like that rotation logic we discussed, similar to what we did for the login token refresh), buffering signals before the real exporter connects, writing batches to disk so we can retry them, managing storage paths cleanly, and some kind of periodic background worker. Oh also we need log enrichment — attaching context like which screen the user is on or what session they're in. And there's something about a frame-rate monitoring config that the mobile performance team asked for, they mentioned a polling interval but I don't have the exact spec for what counts as invalid.
+
+Please make sure the code is well structured, not one giant file. We'll want tests too. Reach out if anything is unclear but ideally just look at how we handled similar buffering/retry patterns in the existing codebase.

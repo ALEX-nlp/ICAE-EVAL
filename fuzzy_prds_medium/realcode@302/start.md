@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+hey team, we need a small runtime value inspection utility in Node.js. basically the idea is: given any JS value, we want a single consistent way to ask 'what is this thing?' and 'what does it look like when you squish it into a bool/number/string?' and also 'can you make this an object for me?'. right now every team that touches a dynamic payload is rolling their own typeof ladder and they keep getting different answers for edge cases — like one service thinks an empty array is truthy-ish numeric zero and another forgets that typed arrays are also objects, it's a mess.
+
+the entry point should read a JSON command off stdin and print results line by line. the value description format is kind of like what we did for the sandbox descriptor protocol in that auth boundary work — same neutral tagging idea, just applied here.
+
+for the object categories, remember the 'object' bucket should be broad — things like arrays, buffers, functions, promises all count. null does NOT. and functions are special in two ways simultaneously.
+
+for boxing, primitives get wrapped fresh (no same reference), everything else comes back as-is. we also need a test runner script under rcb_tests/ that saves raw stdout per case into namespaced files.
+
+please keep the classifier, coercion logic, and I/O adapter in separate logical units — no god files. errors should never bubble raw exceptions to stdout.
+
+one small follow-up after the team questions: for classify, please make the output order fixed and complete every time. it should always print exactly these 13 lines in this exact order, one `<category>=<true|false>` each: undefined, null, boolean, number, string, symbol, array, arraybuffer, typedarray, object, function, promise, dataview. even if the answer is false for almost everything, we still want all 13 lines so downstream consumers never have to guess what was omitted.
+
+also just to make the broad object bucket extra explicit since this came up a few times: array, arraybuffer, typedarray, plain object, function, promise, and dataview all report `object=true`. `null` is still `object=false`, even though JS has that old weirdness, and primitives stay `object=false` too: undefined, boolean, number, string, symbol. functions keep the special dual behavior, so a function reports both `function=true` and `object=true` at the same time. same idea for the other specific object-ish categories: they report their own category as true and also `object=true`, with the unrelated categories staying false.
+
+for typedarray vs dataview, please keep them separate and do not let the shared backing buffer blur the result. a typedarray reports `typedarray=true` and `object=true` but `dataview=false` and `arraybuffer=false`. a dataview reports `dataview=true` and `object=true` but `typedarray=false` and `arraybuffer=false`. neither one reports `arraybuffer=true`. an arraybuffer only reports `arraybuffer=true` plus `object=true`.
+
+on the input shape, the JSON `value` descriptor format is the one with a `kind` field plus optional `data`/`byteLength` fields, as fully specified in the PRD's 'value describes the runtime value to construct' section under Core Features. supported `value` kinds here are `undefined`, `null`, `boolean` with data: true|false, `number` with data: number, `string` with data: string, `symbol` with data: string label, `array` as empty, `arraybuffer` with byteLength: n, `typedarray` with byteLength: n — Int32Array over zero-filled buffer, `object` as empty plain object, `function` with source: `function () {}`, `promise` as pending, and `dataview` with byteLength: n — DataView over n-byte buffer.
+
+and one more implementation reminder since this is part of the shape of the work, not just style: keep the code split into distinct logical units. we want (1) core type classifier — no I/O dependency, (2) core coercion logic — no I/O dependency, (3) execution/IO adapter — reads stdin JSON, calls core, writes stdout. the adapter depends on the core; the core must not depend on the adapter.
+
+last bit is error behavior. any malformed or unsupported command needs to come out as a neutral `error=<category>` line on stdout. no raw exception text, no stack trace, no runtime-specific suffixes, and nothing that makes it look like the process blew up. catch everything and convert it to that error line format so failures stay boring and consistent.

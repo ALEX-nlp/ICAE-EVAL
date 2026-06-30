@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+hey team, we need to get the fluent test toolkit shipped. basically the idea is devs are sick of writing the same low-level assert boilerplate over and over — we want something readable and expressive. i know we talked about this in the Q2 planning and there were some notes somewhere about how we handled the 'compatible check' patterns in the login module, same idea applies here for some of the type and callable stuff.
+
+the tool should read a JSON blob from stdin, figure out what kind of check is being requested, run it, and print the result to stdout in a specific key=value line format. there are like 15 different check types — equality, ranges, truthiness, types, sizes, ordering, record lookups, text fuzzy matching, regex, containment, exception handling, value rendering, deep structural diffs, and two scenario/context lifecycle ones.
+
+the tricky parts are: the range check has a specific boundary behavior we need to get right (users were complaining the off-by-one was causing flaky tests), the text comparison should be forgiving about whitespace and casing, and the deep comparison needs a human-readable summary when things don't match. also the context lifecycle stuff needs setup and teardown to actually wire up properly — there were some issues reported where teardown wasn't running and state was leaking between tests.
+
+please make sure the output format is exactly right, some CI pipelines are parsing it directly. multi-file layout preferred, keep things clean.
+
+one other thing the team asked about: the input JSON does not explicitly say which feature to run. the adapter/router figures that out from the combination of fields on the input object, so presence of `lower`+`upper` implies feature2, presence of `pattern` implies feature9, presence of `scenario` implies feature14 or feature15, and so on. each handler is responsible for declaring the fields it expects so routing stays predictable.
+
+for stdout, every response is a series of newline-terminated key=value lines printed to stdout. the first line is always `feature=<feature_name>`, followed by `result=matched` on success or `error=<code>` on failure, then the feature-specific fields. JSON-serializable values like arrays and objects are rendered as compact JSON (no spaces). string values for text features are rendered as JSON strings with quotes. there is a trailing newline after the last field.
+
+on the range behavior, feature2_range_membership is definitely half-open: the lower bound is INCLUSIVE and the upper bound is EXCLUSIVE. so for lower=0, upper=2, the value 2 does NOT match. that is why the output field needs to be named `upper_exclusive` and not `upper`. same point as before, but spelling it out because this is where the off-by-one confusion came from.
+
+for feature4_type_callable, we still cannot pass an actual function through JSON. instead, the sentinel string `callable_sample` in the `value` field tells the adapter to swap in a real callable object before running the category check. the output should still echo `value=callable_sample` literally, not the function object itself. this is the callable/type category check logic in feature4_type_callable, specifically the sentinel value `callable_sample` used to represent a callable in JSON since functions cannot be serialized — analogous to a previous pattern of using token strings to represent non-serializable types.
+
+for feature 8, the text similarity check strips ALL whitespace characters from both strings, including spaces, tabs, and newlines, and lowercases them before comparing. so '   \n  aa \n  ' normalizes to 'aa' and 'AA' normalizes to 'aa', which means they match. the important part is that the output still echoes the original un-normalized strings as JSON-quoted strings.
+
+also, for feature13_deep_comparison, mismatches do not come back as `result=matched`. when it finds a mismatch it should output `error=deep_mismatch` and then a `summary=` line in this exact shape: `X[<key_or_index>] is '<actual_val>' whereas Y[<key_or_index>] is '<expected_val>'`. Both `actual` and `expected` are still echoed as compact JSON on the lines after summary.

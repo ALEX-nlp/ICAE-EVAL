@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out this filesystem abstraction library we've been talking about. The basic idea is that a caller passes in a URL and the library figures out where to get the data — could be local disk, could be over the wire, could be in a bucket, could be a repo, could be in memory. All of these should feel identical from the outside. We've done something similar before with that URL parsing approach we used in the datasource routing work, so just follow that same pattern.
+
+The tricky parts are around the repo URLs — there's a special double-slash convention for splitting the repo location from the file path inside it, and we need to handle the version pinning via the URL hash. Auth for repos is also a bit fiddly: environment variables can inject credentials, and there's that base64 key thing for SSH. For cloud buckets we need to strip out query params that the storage drivers don't understand and keep only the ones they care about. For config values there's a file indirection pattern (the _FILE suffix thing) that mirrors what we did in the secrets loader.
+
+The whole thing needs to be split into separate files per backend — no monoliths please. The stdin/stdout JSON dispatch is just a thin wrapper, the core library shouldn't know about it. Let's make sure unknown schemes and bad URLs give back clean typed errors rather than panics.

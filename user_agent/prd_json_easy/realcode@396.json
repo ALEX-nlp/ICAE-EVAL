@@ -1,0 +1,741 @@
+{
+  "fuzzy_prd": "# Project Manifest & CLI Argument Toolkit - Build-Tooling Primitives Library\n\n## Project Goal\n\nBuild a small, dependency-light utility library that supplies the reusable \"plumbing\" primitives a command-line build/deploy tool needs: environment-variable templating, key/value and command-line argument parsing, relative-path math, project-manifest inspection, SDK-version selection, and POSIX user resolution. The goal is to let a higher-level CLI focus on its workflow while delegating these fiddly, well-defined string/parsing tasks to a single, well-tested component.\n\n---\n\n## Background & Problem\n\nWithout this library, every command in a build/deploy CLI re-implements the same low-level chores: expanding `$(NAME)` placeholders against the environment, splitting `key=value;key2=value2` option strings (with quoting), turning raw `argv` tokens into typed options, computing relative paths between project and solution directories, reading a project manifest to learn its target framework / output type / AOT setting, picking the newest installed SDK from a version listing, and discovering the effective user/group id on Linux/macOS. Each re-implementation drifts subtly, producing inconsistent edge-case behavior and brittle, hard-to-test code.\n\nWith this library, those primitives live in one place behind small, idiomatic functions with precise, documented behavior on every edge case (missing variables, quoted values, empty values, malformed input, case-insensitive path comparison, override precedence, command-probe failures). The CLI calls them and gets predictable results, and the behavior is locked down by a black-box test contract.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain is a collection of mostly-independent primitives, so group related primitives into cohesive units (e.g. a string/option-parsing unit, a path/manifest unit, a process/user unit, an argument-parsing unit) rather than one monolithic file or one file per trivial function. Do not over-engineer, but do not produce a single \"god file\".\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below are a **black-box contract for the execution adapter**, NOT the internal data model. The core primitives must take and return ordinary native values (strings, maps, booleans, numeric versions, small structs) and must know nothing about stdin/stdout or JSON. A thin execution adapter is solely responsible for decoding a JSON payload, calling the right primitive, and formatting the result lines.\n\n3. **Adherence to SOLID Design Principles (scaled to project size):**\n   - **SRP:** Keep parsing, path math, manifest reading, process probing, and output formatting in distinct units.\n   - **OCP:** Adding a new option value type or a new manifest property should not require rewriting existing primitives.\n   - **LSP:** Any process-probe and logger abstractions must be substitutable by test doubles without changing behavior.\n   - **ISP:** Keep the process-probe and logger interfaces tiny and focused.\n   - **DIP:** The user-resolution primitive must depend on an injectable process-probe abstraction and an injectable logger abstraction, not on a concrete OS-process implementation, so it is testable with scripted results.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** Each primitive should read naturally in the target language and hide its internal parsing state.\n   - **Resilience:** Malformed input must be modeled with explicit error categories, not generic crashes. In particular, a key/value pair with an empty key is a domain error and must surface as a normalized error category (never as a host-language exception identity).\n\n---\n\n## Core Features\n\n### Feature 1: Environment Variable Substitution\n\n**As a developer**, I want to expand `$(NAME)` placeholders in a string using the current environment, so I can templatize configuration values without writing my own scanner.\n\n**Expected Behavior / Usage:**\n\nThe input is a string plus the set of environment entries that should be visible. Every `$(NAME)` token is replaced by the value of the environment entry named `NAME` (exact, case-sensitive name match). A token whose name has no matching environment entry is left exactly as written, including its surrounding `$(` and `)`. A string containing no tokens is returned unchanged. The same token may appear several times and every occurrence is replaced. The output is a single line `result=<expanded string>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_env_substitution.json`\n\n```json\n{\n    \"description\": \"Substitute $(NAME) tokens inside a string with values from the process environment. Tokens whose name has no matching environment entry are left untouched, and a string with no tokens passes through unchanged. The same token may appear multiple times and every occurrence is replaced.\",\n    \"cases\": [\n        {\n            \"input\": {\"env\": {}, \"text\": \"some string\"},\n            \"expected_output\": \"result=some string\\n\"\n        },\n        {\n            \"input\": {\"env\": {}, \"text\": \"some string=$(variable)\"},\n            \"expected_output\": \"result=some string=$(variable)\\n\"\n        },\n        {\n            \"input\": {\"env\": {\"Key1\": \"replacement1\"}, \"text\": \"some string=$(Key1) other $(Key1)\"},\n            \"expected_output\": \"result=some string=replacement1 other replacement1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Key/Value Option Parsing\n\n**As a developer**, I want to parse a `key1=value1;key2=value2` option string into a map, so users can pass structured parameters as a single argument.\n\n**Expected Behavior / Usage:**\n\nThe input is one option string. It is split into pairs on `;` and each pair into key and value on `=`. Output is `count=<n>` followed by one `key=value` line per pair in the order parsed. Rules and edge cases:\n- A null or empty option yields `count=0` with no further lines.\n- A trailing `;` is tolerated (it does not produce an extra empty pair).\n- Either side may be wrapped in double quotes; quoting lets a value contain literal `=` and `;` characters, and the surrounding quotes are stripped from the result.\n- An empty value is allowed and renders as a `key=` line with nothing after the `=`.\n- A pair whose key is empty (e.g. `=aaa`) is invalid and must be reported as the normalized error line `error=command_line_parse_error` (and nothing else).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_key_value_parsing.json`\n\n```json\n{\n    \"description\": \"Parse a semicolon-delimited list of key=value pairs into a map, reporting how many pairs were found followed by each key=value. Values may be quoted so they can themselves contain '=' and ';' characters; a trailing ';' is tolerated; an empty value is allowed. A pair with an empty key is rejected as a command-line parse error.\",\n    \"cases\": [\n        {\n            \"input\": {\"option\": \"\"},\n            \"expected_output\": \"count=0\\n\"\n        },\n        {\n            \"input\": {\"option\": \"Table=Blog\"},\n            \"expected_output\": \"count=1\\nTable=Blog\\n\"\n        },\n        {\n            \"input\": {\"option\": \"Table=Blog;Bucket=MyBucket\"},\n            \"expected_output\": \"count=2\\nTable=Blog\\nBucket=MyBucket\\n\"\n        },\n        {\n            \"input\": {\"option\": \"\\\"ConnectionString\\\"=\\\"User=foo;Password=test\\\"\"},\n            \"expected_output\": \"count=1\\nConnectionString=User=foo;Password=test\\n\"\n        },\n        {\n            \"input\": {\"option\": \"ShouldCreateTable=true;BlogTableName=\"},\n            \"expected_output\": \"count=2\\nShouldCreateTable=true\\nBlogTableName=\\n\"\n        },\n        {\n            \"input\": {\"option\": \"=aaa\"},\n            \"expected_output\": \"error=command_line_parse_error\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Relative Path Computation\n\n**As a developer**, I want to compute the relative path from one location to another, so I can emit portable project references instead of absolute paths.\n\n**Expected Behavior / Usage:**\n\nThe input is a `start` path and a `relative_to` (target) path. Both are normalized first: backslashes are treated as path separators and equal forward slashes, and segment comparison is case-insensitive. Walking from the deepest shared ancestor, each remaining segment on the `start` side contributes one `../`, then the remaining segments on the target side are appended joined by `/`. If `start` is itself an ancestor of the target, the result is just the descending segments (no `../`). A trailing separator on the target path is preserved in the output. The result is emitted as `relative_path=<path>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_relative_path.json`\n\n```json\n{\n    \"description\": \"Compute the relative path from a start location to a target location. Both inputs are normalized (backslashes treated as separators, comparison is case-insensitive); each directory left behind on the start side becomes a '../' segment and the remaining target segments are appended with '/'. When the start path is an ancestor of the target the result is just the descending segments; a trailing separator on the target is preserved.\",\n    \"cases\": [\n        {\n            \"input\": {\"start\": \"/home/user/Solution/Project\", \"relative_to\": \"/home/user/Solution\"},\n            \"expected_output\": \"relative_path=../\\n\"\n        },\n        {\n            \"input\": {\"start\": \"/home/user/Solution\", \"relative_to\": \"/home/user/Solution/Project\"},\n            \"expected_output\": \"relative_path=Project\\n\"\n        },\n        {\n            \"input\": {\"start\": \"C:\\\\Code\\\\Solution\\\\ProjectA\", \"relative_to\": \"C:\\\\Code\\\\Solution\\\\ProjectB\\\\file.csproj\"},\n            \"expected_output\": \"relative_path=../ProjectB/file.csproj\\n\"\n        },\n        {\n            \"input\": {\"start\": \"user/Solution/\", \"relative_to\": \"user/Solution/Project/\"},\n            \"expected_output\": \"relative_path=Project/\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Typed Command-Line Argument Parsing\n\n**As a developer**, I want to map raw `argv` tokens onto declared options with typed values, so commands receive validated, typed inputs instead of raw strings.\n\n**Expected Behavior / Usage:**\n\nThe input declares a list of options and a list of argument tokens. Each option has a `name`, a `short` switch (single dash), a `switch` (long, double dash), and a `type` of `string`, `int`, or `bool`. The parser scans tokens; when a token equals an option's short or long switch (case-insensitive, the two forms interchangeable), the immediately following token is consumed and coerced to the declared type. The output reports `count=<number of matched options>` followed, for each matched option, by `name=<name>`, `type=<string|int|bool>`, and `value=<parsed value>` (booleans render lowercase `true`/`false`; integers render in decimal). Both `-c Release` and `--configuration Release` must produce identical output.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_argument_parsing.json`\n\n```json\n{\n    \"description\": \"Parse a list of command-line tokens against a set of declared options. Each option declares a name, a short switch (single dash) and a long switch (double dash), and a value type (string, int, or bool). When a switch is matched, the following token is consumed and coerced to the declared type. The result reports how many options were matched and, for each matched option, its name, value type, and parsed value. Both the short and long switch forms are accepted interchangeably.\",\n    \"cases\": [\n        {\n            \"input\": {\"options\": [{\"name\": \"Configuration\", \"short\": \"-c\", \"switch\": \"--configuration\", \"type\": \"string\"}], \"args\": [\"-c\", \"Release\"]},\n            \"expected_output\": \"count=1\\nname=Configuration\\ntype=string\\nvalue=Release\\n\"\n        },\n        {\n            \"input\": {\"options\": [{\"name\": \"MyInt\", \"short\": \"-i\", \"switch\": \"--integer\", \"type\": \"int\"}], \"args\": [\"--integer\", \"100\"]},\n            \"expected_output\": \"count=1\\nname=MyInt\\ntype=int\\nvalue=100\\n\"\n        },\n        {\n            \"input\": {\"options\": [{\"name\": \"MyBool\", \"short\": \"-b\", \"switch\": \"--bool\", \"type\": \"bool\"}], \"args\": [\"-b\", \"true\"]},\n            \"expected_output\": \"count=1\\nname=MyBool\\ntype=bool\\nvalue=true\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Project Manifest Inspection\n\n**As a developer**, I want to read selected properties out of an XML project manifest, so the tool can adapt its behavior to how a project is configured without me parsing XML by hand.\n\n**Expected Behavior / Usage:**\n\nEach leaf below takes the text of an XML project manifest (a `<Project>` root containing one or more `<PropertyGroup>` blocks) and extracts one property. The manifest's SDK attribute and surrounding properties may vary; extraction must locate the requested property regardless of the rest of the document.\n\n*5.1 Target Framework — read the target framework property*\n\nThe input is the manifest text. Return the text of the project's target framework property as `target_framework=<value>`. Extraction is independent of the project's SDK style or which other properties are present.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_target_framework.json`\n\n```json\n{\n    \"description\": \"Given the text of an XML project manifest, return the value of the project's target framework property. The manifest's SDK style and other properties vary, but the target framework is read regardless of the surrounding structure.\",\n    \"cases\": [\n        {\n            \"input\": {\"project_file\": \"<Project Sdk=\\\"Microsoft.NET.Sdk\\\">\\n  <PropertyGroup>\\n    <TargetFramework>netcoreapp3.1</TargetFramework>\\n    <OutputType>Library</OutputType>\\n  </PropertyGroup>\\n</Project>\\n\"},\n            \"expected_output\": \"target_framework=netcoreapp3.1\\n\"\n        },\n        {\n            \"input\": {\"project_file\": \"<Project Sdk=\\\"Microsoft.NET.Sdk.Web\\\">\\n  <PropertyGroup>\\n    <TargetFramework>netcoreapp3.1</TargetFramework>\\n  </PropertyGroup>\\n</Project>\\n\"},\n            \"expected_output\": \"target_framework=netcoreapp3.1\\n\"\n        }\n    ]\n}\n```\n\n*5.2 Output Type — read the output type property*\n\nThe input is the manifest text. Return the text of the project's output type property as `output_type=<value>` (e.g. a library versus an executable).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_output_type.json`\n\n```json\n{\n    \"description\": \"Given the text of an XML project manifest, return the value of the project's output type property (for example a library versus an executable).\",\n    \"cases\": [\n        {\n            \"input\": {\"project_file\": \"<Project Sdk=\\\"Microsoft.NET.Sdk\\\">\\n  <PropertyGroup>\\n    <TargetFramework>netcoreapp3.1</TargetFramework>\\n    <OutputType>Library</OutputType>\\n  </PropertyGroup>\\n</Project>\\n\"},\n            \"expected_output\": \"output_type=Library\\n\"\n        },\n        {\n            \"input\": {\"project_file\": \"<Project Sdk=\\\"Microsoft.NET.Sdk\\\">\\n  <PropertyGroup>\\n    <OutputType>Exe</OutputType>\\n    <TargetFramework>net7.0</TargetFramework>\\n    <PublishAot>true</PublishAot>\\n  </PropertyGroup>\\n</Project>\\n\"},\n            \"expected_output\": \"output_type=Exe\\n\"\n        }\n    ]\n}\n```\n\n*5.3 Ahead-of-Time Publish Flag — resolve the AOT publish setting with override precedence*\n\nThe input is the manifest text plus an optional build-parameter string. Resolution order: if the build-parameter string contains the publish-AOT flag (matched case-insensitively, with whitespace ignored) set to `true` or `false`, that value wins and the manifest is not consulted. Otherwise the manifest's publish-AOT property is read; if it is present and a valid boolean its value is used, and if it is absent or not a valid boolean the result defaults to `false`. Output is `publish_aot=<true|false>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_3_publish_aot.json`\n\n```json\n{\n    \"description\": \"Decide whether ahead-of-time (AOT) publishing is requested. An optional build-parameter string is consulted first: if it contains the publish-AOT flag set to true or false (case-insensitive, whitespace ignored) that value wins. Otherwise the project manifest's publish-AOT property is read; if it is absent or not a boolean the result defaults to false.\",\n    \"cases\": [\n        {\n            \"input\": {\"project_file\": \"<Project Sdk=\\\"Microsoft.NET.Sdk\\\">\\n  <PropertyGroup>\\n    <TargetFramework>netcoreapp3.1</TargetFramework>\\n    <OutputType>Library</OutputType>\\n  </PropertyGroup>\\n</Project>\\n\", \"msbuild_parameters\": null},\n            \"expected_output\": \"publish_aot=false\\n\"\n        },\n        {\n            \"input\": {\"project_file\": \"<Project Sdk=\\\"Microsoft.NET.Sdk\\\">\\n  <PropertyGroup>\\n    <TargetFramework>netcoreapp3.1</TargetFramework>\\n    <OutputType>Library</OutputType>\\n  </PropertyGroup>\\n</Project>\\n\", \"msbuild_parameters\": \"publishaot=true\"},\n            \"expected_output\": \"publish_aot=true\\n\"\n        },\n        {\n            \"input\": {\"project_file\": \"<Project Sdk=\\\"Microsoft.NET.Sdk\\\">\\n  <PropertyGroup>\\n    <OutputType>Exe</OutputType>\\n    <TargetFramework>net7.0</TargetFramework>\\n    <PublishAot>true</PublishAot>\\n  </PropertyGroup>\\n</Project>\\n\", \"msbuild_parameters\": null},\n            \"expected_output\": \"publish_aot=true\\n\"\n        },\n        {\n            \"input\": {\"project_file\": \"<Project Sdk=\\\"Microsoft.NET.Sdk\\\">\\n  <PropertyGroup>\\n    <OutputType>Exe</OutputType>\\n    <TargetFramework>net7.0</TargetFramework>\\n    <PublishAot>true</PublishAot>\\n  </PropertyGroup>\\n</Project>\\n\", \"msbuild_parameters\": \"publishAOT=False\"},\n            \"expected_output\": \"publish_aot=false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: SDK Version Selection\n\n**As a developer**, I want to pick the newest installed SDK version from a version listing, so the tool can target the latest available toolchain.\n\n**Expected Behavior / Usage:**\n\nThe input is the multi-line text emitted by an SDK-list command. Each meaningful line starts with a dotted version number followed by whitespace and an install path in brackets; lines are scanned and the highest valid version is selected. The result is emitted as `sdk_version=<version>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_sdk_version.json`\n\n```json\n{\n    \"description\": \"Parse the multi-line listing produced by an SDK-list command. Each line begins with a version number followed by an install path in brackets. Return the highest valid version found by scanning the listing.\",\n    \"cases\": [\n        {\n            \"input\": {\"sdk_list_output\": \"1.1.11 [/usr/local/share/dotnet/sdk]\\n2.1.302 [/usr/local/share/dotnet/sdk]\\n2.1.403 [/usr/local/share/dotnet/sdk]\\n2.1.503 [/usr/local/share/dotnet/sdk]\\n2.2.100 [/usr/local/share/dotnet/sdk]\\n\"},\n            \"expected_output\": \"sdk_version=2.2.100\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: POSIX Effective User Resolution\n\n**As a developer**, I want to resolve the effective user id and group id by running two probe commands, so the tool can set correct file ownership on Linux/macOS while staying fully testable with scripted probe results.\n\n**Expected Behavior / Usage:**\n\nThe input is an ordered list of probe results, one per command run (first the user-id probe, then the group-id probe). Each probe result reports `executed`, an `exit_code`, captured `output`, and captured `error`. When both probes execute, exit successfully, and emit numeric output, the resolution succeeds and emits `user_id=<n>` then `group_id=<n>`. When a probe fails (non-zero exit code), the resolver records a diagnostic line `Error executing \"id <flag>\" - exit code <code> <error text>` describing the failed probe, then a warning line noting which value could not be obtained (`Warning: Unable to get effective group from \"id -g\"` for the group probe), and finally `user_resolved=false`. The diagnostic and warning lines are emitted in that order before the `user_resolved=false` line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_posix_user.json`\n\n```json\n{\n    \"description\": \"Resolve the effective user id and group id by running two probe commands in sequence (one for the user id, one for the group id). Each probe reports whether it executed, an exit code, captured output, and captured error. When both probes succeed and emit numeric output, the resolved user id and group id are returned. When a probe fails (non-zero exit), a diagnostic line describing the failed probe is recorded, a warning notes which value could not be obtained, and the user is reported as unresolved.\",\n    \"cases\": [\n        {\n            \"input\": {\"id_results\": [{\"executed\": true, \"exit_code\": 0, \"output\": \"998\", \"error\": \"\"}, {\"executed\": true, \"exit_code\": 0, \"output\": \"999\", \"error\": \"\"}]},\n            \"expected_output\": \"user_id=998\\ngroup_id=999\\n\"\n        },\n        {\n            \"input\": {\"id_results\": [{\"executed\": true, \"exit_code\": 0, \"output\": \"998\", \"error\": \"\"}, {\"executed\": true, \"exit_code\": -1, \"output\": \"\", \"error\": \"Sad trombones\"}]},\n            \"expected_output\": \"Error executing \\\"id -g\\\" - exit code -1 Sad trombones\\nWarning: Unable to get effective group from \\\"id -g\\\"\\nuser_resolved=false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the seven feature areas above as cohesive, decoupled primitives. The physical structure (grouped units, not a single god file and not one file per trivial function) MUST align with the \"Scale-Driven Code Organization\" constraint.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core primitives. It reads a JSON command from stdin (the operation is selected externally, e.g. by the harness), invokes the appropriate primitive, and prints the result lines to stdout, strictly matching the per-leaf-feature contracts above. It must translate any native exception from the core into a normalized `error=<category>` line and must never leak host-language exception identities into stdout. This adapter must be logically (and ideally physically) separated from the core domain.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_env_substitution.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_env_substitution@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- normalize backslashes\n",
+  "oracle_data": {
+    "task_id": "aws__aws-extensions-for-dotnet-cli-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "trailing semicolon",
+          "semicolon at end",
+          "handle extra semicolon",
+          "accept trailing ';'",
+          "what about semicolon"
+        ],
+        "oracle_response": "The constraint describes tolerating a trailing semicolon (';') in the option string without producing an extra key-value pair; the output format remains identical to valid pairs without the trailing character."
+      },
+      {
+        "constraint_id": "C012",
+        "trigger_keywords": [
+          "parent directory",
+          "ancestor path",
+          "relative to ancestor",
+          "descending segments",
+          "Restore wrong path"
+        ],
+        "oracle_response": "When the 'Start' path is an ancestor of 'Relative To', the rule outputs the remaining segments of 'Relative To' marked with .., preserving any trailing slash on 'Relative To' if present. This is distinct from simply appending an '../'; it explicitly handles the directionality based on relativity."
+      },
+      {
+        "constraint_id": "TC_feature2_key_value_parsing",
+        "trigger_keywords": [
+          "test cases for feature2 key value parsing",
+          "show me feature2 key value parsing test cases",
+          "what are the feature2 key value parsing inputs and outputs",
+          "give me the feature2_key_value_parsing test file",
+          "feature2 key value parsing expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_key_value_parsing:\n{\n  \"description\": \"Parse a semicolon-delimited list of key=value pairs into a map, reporting how many pairs were found followed by each key=value. Values may be quoted so they can themselves contain '=' and ';' characters; a trailing ';' is tolerated; an empty value is allowed. A pair with an empty key is rejected as a command-line parse error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"option\": \"\"\n      },\n      \"expected_output\": \"count=0\\n\"\n    },\n    {\n      \"input\": {\n        \"option\": \"Table=Blog\"\n      },\n      \"expected_output\": \"count=1\\nTable=Blog\\n\"\n    },\n    {\n      \"input\": {\n        \"option\": \"Table=Blog;Bucket=MyBucket\"\n      },\n      \"expected_output\": \"count=2\\nTable=Blog\\nBucket=MyBucket\\n\"\n    },\n    {\n      \"input\": {\n        \"option\": \"\\\"ConnectionString\\\"=\\\"User=foo;Password=test\\\"\"\n      },\n      \"expected_output\": \"count=1\\nConnectionString=User=foo;Password=test\\n\"\n    },\n    {\n      \"input\": {\n        \"option\": \"ShouldCreateTable=true;BlogTableName=\"\n      },\n      \"expected_output\": \"count=2\\nShouldCreateTable=true\\nBlogTableName=\\n\"\n    },\n    {\n      \"input\": {\n        \"option\": \"=aaa\"\n      },\n      \"expected_output\": \"error=command_line_parse_error\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_relative_path",
+        "trigger_keywords": [
+          "test cases for feature3 relative path",
+          "show me feature3 relative path test cases",
+          "what are the feature3 relative path inputs and outputs",
+          "give me the feature3_relative_path test file",
+          "feature3 relative path expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_relative_path:\n{\n  \"description\": \"Compute the relative path from a start location to a target location. Both inputs are normalized (backslashes treated as separators, comparison is case-insensitive); each directory left behind on the start side becomes a '../' segment and the remaining target segments are appended with '/'. When the start path is an ancestor of the target the result is just the descending segments; a trailing separator on the target is preserved.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"start\": \"/home/user/Solution/Project\",\n        \"relative_to\": \"/home/user/Solution\"\n      },\n      \"expected_output\": \"relative_path=../\\n\"\n    },\n    {\n      \"input\": {\n        \"start\": \"/home/user/Solution\",\n        \"relative_to\": \"/home/user/Solution/Project\"\n      },\n      \"expected_output\": \"relative_path=Project\\n\"\n    },\n    {\n      \"input\": {\n        \"start\": \"C:\\\\Code\\\\Solution\\\\ProjectA\",\n        \"relative_to\": \"C:\\\\Code\\\\Solution\\\\ProjectB\\\\file.csproj\"\n      },\n      \"expected_output\": \"relative_path=../ProjectB/file.csproj\\n\"\n    },\n    {\n      \"input\": {\n        \"start\": \"user/Solution/\",\n        \"relative_to\": \"user/Solution/Project/\"\n      },\n      \"expected_output\": \"relative_path=Project/\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "normalize backslashes",
+        "actual_meaning": "The rule specified in C036 normalizes backslashes to forward slashes AND performs case-insensitive segment comparison, whereas C011 and C012 seem to cover similar but separate aspects of normalization and relativity that may require grepping for 'case_insensitive' or 'segment_comparison' in the codebase."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_env_substitution.json": {
+      "description": "Substitute $(NAME) tokens inside a string with values from the process environment. Tokens whose name has no matching environment entry are left untouched, and a string with no tokens passes through unchanged. The same token may appear multiple times and every occurrence is replaced.",
+      "cases": [
+        {
+          "input": {
+            "env": {},
+            "text": "some string"
+          },
+          "expected_output": "result=some string\n"
+        },
+        {
+          "input": {
+            "env": {},
+            "text": "some string=$(variable)"
+          },
+          "expected_output": "result=some string=$(variable)\n"
+        },
+        {
+          "input": {
+            "env": {
+              "Key1": "replacement1"
+            },
+            "text": "some string=$(Key1) other $(Key1)"
+          },
+          "expected_output": "result=some string=replacement1 other replacement1\n"
+        }
+      ]
+    },
+    "feature2_key_value_parsing.json": {
+      "description": "Parse a semicolon-delimited list of key=value pairs into a map, reporting how many pairs were found followed by each key=value. Values may be quoted so they can themselves contain '=' and ';' characters; a trailing ';' is tolerated; an empty value is allowed. A pair with an empty key is rejected as a command-line parse error.",
+      "cases": [
+        {
+          "input": {
+            "option": ""
+          },
+          "expected_output": "count=0\n"
+        },
+        {
+          "input": {
+            "option": "Table=Blog"
+          },
+          "expected_output": "count=1\nTable=Blog\n"
+        },
+        {
+          "input": {
+            "option": "Table=Blog;Bucket=MyBucket"
+          },
+          "expected_output": "count=2\nTable=Blog\nBucket=MyBucket\n"
+        },
+        {
+          "input": {
+            "option": "\"ConnectionString\"=\"User=foo;Password=test\""
+          },
+          "expected_output": "count=1\nConnectionString=User=foo;Password=test\n"
+        },
+        {
+          "input": {
+            "option": "ShouldCreateTable=true;BlogTableName="
+          },
+          "expected_output": "count=2\nShouldCreateTable=true\nBlogTableName=\n"
+        },
+        {
+          "input": {
+            "option": "=aaa"
+          },
+          "expected_output": "error=command_line_parse_error\n"
+        }
+      ]
+    },
+    "feature3_relative_path.json": {
+      "description": "Compute the relative path from a start location to a target location. Both inputs are normalized (backslashes treated as separators, comparison is case-insensitive); each directory left behind on the start side becomes a '../' segment and the remaining target segments are appended with '/'. When the start path is an ancestor of the target the result is just the descending segments; a trailing separator on the target is preserved.",
+      "cases": [
+        {
+          "input": {
+            "start": "/home/user/Solution/Project",
+            "relative_to": "/home/user/Solution"
+          },
+          "expected_output": "relative_path=../\n"
+        },
+        {
+          "input": {
+            "start": "/home/user/Solution",
+            "relative_to": "/home/user/Solution/Project"
+          },
+          "expected_output": "relative_path=Project\n"
+        },
+        {
+          "input": {
+            "start": "C:\\Code\\Solution\\ProjectA",
+            "relative_to": "C:\\Code\\Solution\\ProjectB\\file.csproj"
+          },
+          "expected_output": "relative_path=../ProjectB/file.csproj\n"
+        },
+        {
+          "input": {
+            "start": "user/Solution/",
+            "relative_to": "user/Solution/Project/"
+          },
+          "expected_output": "relative_path=Project/\n"
+        }
+      ]
+    },
+    "feature4_argument_parsing.json": {
+      "description": "Parse a list of command-line tokens against a set of declared options. Each option declares a name, a short switch (single dash) and a long switch (double dash), and a value type (string, int, or bool). When a switch is matched, the following token is consumed and coerced to the declared type. The result reports how many options were matched and, for each matched option, its name, value type, and parsed value. Both the short and long switch forms are accepted interchangeably.",
+      "cases": [
+        {
+          "input": {
+            "options": [
+              {
+                "name": "Configuration",
+                "short": "-c",
+                "switch": "--configuration",
+                "type": "string"
+              }
+            ],
+            "args": [
+              "-c",
+              "Release"
+            ]
+          },
+          "expected_output": "count=1\nname=Configuration\ntype=string\nvalue=Release\n"
+        },
+        {
+          "input": {
+            "options": [
+              {
+                "name": "MyInt",
+                "short": "-i",
+                "switch": "--integer",
+                "type": "int"
+              }
+            ],
+            "args": [
+              "--integer",
+              "100"
+            ]
+          },
+          "expected_output": "count=1\nname=MyInt\ntype=int\nvalue=100\n"
+        },
+        {
+          "input": {
+            "options": [
+              {
+                "name": "MyBool",
+                "short": "-b",
+                "switch": "--bool",
+                "type": "bool"
+              }
+            ],
+            "args": [
+              "-b",
+              "true"
+            ]
+          },
+          "expected_output": "count=1\nname=MyBool\ntype=bool\nvalue=true\n"
+        }
+      ]
+    },
+    "feature5_1_target_framework.json": {
+      "description": "Given the text of an XML project manifest, return the value of the project's target framework property. The manifest's SDK style and other properties vary, but the target framework is read regardless of the surrounding structure.",
+      "cases": [
+        {
+          "input": {
+            "project_file": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>netcoreapp3.1</TargetFramework>\n    <OutputType>Library</OutputType>\n  </PropertyGroup>\n</Project>\n"
+          },
+          "expected_output": "target_framework=netcoreapp3.1\n"
+        },
+        {
+          "input": {
+            "project_file": "<Project Sdk=\"Microsoft.NET.Sdk.Web\">\n  <PropertyGroup>\n    <TargetFramework>netcoreapp3.1</TargetFramework>\n  </PropertyGroup>\n</Project>\n"
+          },
+          "expected_output": "target_framework=netcoreapp3.1\n"
+        }
+      ]
+    },
+    "feature5_2_output_type.json": {
+      "description": "Given the text of an XML project manifest, return the value of the project's output type property (for example a library versus an executable).",
+      "cases": [
+        {
+          "input": {
+            "project_file": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>netcoreapp3.1</TargetFramework>\n    <OutputType>Library</OutputType>\n  </PropertyGroup>\n</Project>\n"
+          },
+          "expected_output": "output_type=Library\n"
+        },
+        {
+          "input": {
+            "project_file": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <TargetFramework>net7.0</TargetFramework>\n    <PublishAot>true</PublishAot>\n  </PropertyGroup>\n</Project>\n"
+          },
+          "expected_output": "output_type=Exe\n"
+        }
+      ]
+    },
+    "feature5_3_publish_aot.json": {
+      "description": "Decide whether ahead-of-time (AOT) publishing is requested. An optional build-parameter string is consulted first: if it contains the publish-AOT flag set to true or false (case-insensitive, whitespace ignored) that value wins. Otherwise the project manifest's publish-AOT property is read; if it is absent or not a boolean the result defaults to false.",
+      "cases": [
+        {
+          "input": {
+            "project_file": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>netcoreapp3.1</TargetFramework>\n    <OutputType>Library</OutputType>\n  </PropertyGroup>\n</Project>\n",
+            "msbuild_parameters": null
+          },
+          "expected_output": "publish_aot=false\n"
+        },
+        {
+          "input": {
+            "project_file": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>netcoreapp3.1</TargetFramework>\n    <OutputType>Library</OutputType>\n  </PropertyGroup>\n</Project>\n",
+            "msbuild_parameters": "publishaot=true"
+          },
+          "expected_output": "publish_aot=true\n"
+        },
+        {
+          "input": {
+            "project_file": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <TargetFramework>net7.0</TargetFramework>\n    <PublishAot>true</PublishAot>\n  </PropertyGroup>\n</Project>\n",
+            "msbuild_parameters": null
+          },
+          "expected_output": "publish_aot=true\n"
+        },
+        {
+          "input": {
+            "project_file": "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <TargetFramework>net7.0</TargetFramework>\n    <PublishAot>true</PublishAot>\n  </PropertyGroup>\n</Project>\n",
+            "msbuild_parameters": "publishAOT=False"
+          },
+          "expected_output": "publish_aot=false\n"
+        }
+      ]
+    },
+    "feature6_sdk_version.json": {
+      "description": "Parse the multi-line listing produced by an SDK-list command. Each line begins with a version number followed by an install path in brackets. Return the highest valid version found by scanning the listing.",
+      "cases": [
+        {
+          "input": {
+            "sdk_list_output": "1.1.11 [/usr/local/share/dotnet/sdk]\n2.1.302 [/usr/local/share/dotnet/sdk]\n2.1.403 [/usr/local/share/dotnet/sdk]\n2.1.503 [/usr/local/share/dotnet/sdk]\n2.2.100 [/usr/local/share/dotnet/sdk]\n"
+          },
+          "expected_output": "sdk_version=2.2.100\n"
+        }
+      ]
+    },
+    "feature7_posix_user.json": {
+      "description": "Resolve the effective user id and group id by running two probe commands in sequence (one for the user id, one for the group id). Each probe reports whether it executed, an exit code, captured output, and captured error. When both probes succeed and emit numeric output, the resolved user id and group id are returned. When a probe fails (non-zero exit), a diagnostic line describing the failed probe is recorded, a warning notes which value could not be obtained, and the user is reported as unresolved.",
+      "cases": [
+        {
+          "input": {
+            "id_results": [
+              {
+                "executed": true,
+                "exit_code": 0,
+                "output": "998",
+                "error": ""
+              },
+              {
+                "executed": true,
+                "exit_code": 0,
+                "output": "999",
+                "error": ""
+              }
+            ]
+          },
+          "expected_output": "user_id=998\ngroup_id=999\n"
+        },
+        {
+          "input": {
+            "id_results": [
+              {
+                "executed": true,
+                "exit_code": 0,
+                "output": "998",
+                "error": ""
+              },
+              {
+                "executed": true,
+                "exit_code": -1,
+                "output": "",
+                "error": "Sad trombones"
+              }
+            ]
+          },
+          "expected_output": "Error executing \"id -g\" - exit code -1 Sad trombones\nWarning: Unable to get effective group from \"id -g\"\nuser_resolved=false\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "env_substitution",
+      "input_condition": "Text contains $(NAME) tokens",
+      "output_rule": "Replace all $(NAME) occurrences with env value if present, otherwise leave token unchanged",
+      "exact_values": [
+        "$()"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "env_substitution",
+      "input_condition": "No $(NAME) tokens in text",
+      "output_rule": "Return input text unchanged",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "env_substitution",
+      "input_condition": "Token name not in env map",
+      "output_rule": "Leave the token exactly as written including $( and )",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "env_substitution",
+      "input_condition": "Multiple same-token occurrences",
+      "output_rule": "Replace every occurrence in order",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "key_value_parsing",
+      "input_condition": "Option string is empty",
+      "output_rule": "Output count=0",
+      "exact_values": [
+        "count=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "key_value_parsing",
+      "input_condition": "Option string has valid key=value pairs",
+      "output_rule": "Output count=N followed by N lines of \"key=value\" in parse order",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "key_value_parsing",
+      "input_condition": "Option string ends with semicolon",
+      "output_rule": "Tolerate trailing semicolon, do not produce extra pair",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "key_value_parsing",
+      "input_condition": "Value is quoted",
+      "output_rule": "Strip surrounding double quotes, preserve internal = and ;",
+      "exact_values": [
+        "\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "key_value_parsing",
+      "input_condition": "Key is empty (starts with =)",
+      "output_rule": "Reject with error=command_line_parse_error",
+      "exact_values": [
+        "error=command_line_parse_error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "key_value_parsing",
+      "input_condition": "Pair has empty value (e.g. blog=value=)",
+      "output_rule": "Output key= (nothing after equals)",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "relative_path",
+      "input_condition": "Normalization required",
+      "output_rule": "Treat backslashes as separators, convert to forward slashes; segment comparison is case-insensitive",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C012",
+      "feature": "relative_path",
+      "input_condition": "Start is ancestor of Relative To",
+      "output_rule": "Output remaining descending segments of Relative To joined by /, preserve trailing / if present on Relative To",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "relative_path",
+      "input_condition": "Start is deeper than Relative To",
+      "output_rule": "Output ../ for each directory level of Shared Prefix, then append remaining Relative To segments",
+      "exact_values": [
+        "../"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "relative_path",
+      "input_condition": "Trailing separator on target path",
+      "output_rule": "Preserve the trailing separator in output",
+      "exact_values": [
+        "/"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "arg_parsing",
+      "input_condition": "Match option short or long switch",
+      "output_rule": "Consume next token and coerce to declared type; report name, type, value",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "arg_parsing",
+      "input_condition": "Match multiple options in order",
+      "output_rule": "Output count=N followed by each option's details",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "arg_parsing",
+      "input_condition": "Boolean type string \"true\"",
+      "output_rule": "Coerce to value true",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "arg_parsing",
+      "input_condition": "Boolean type string \"false\"",
+      "output_rule": "Coerce to value false",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "arg_parsing",
+      "input_condition": "Integer type string",
+      "output_rule": "Coerce to decimal integer value",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "arg_parsing",
+      "input_condition": "Option switch match",
+      "output_rule": "Accept both short (single dash) and long (double dash), case-insensitive on the switch text",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "manifest_inspection",
+      "input_condition": "Target Framework property exists",
+      "output_rule": "Extract text content of <TargetFramework> tag",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "manifest_inspection",
+      "input_condition": "Output Type property exists",
+      "output_rule": "Extract text content of <OutputType> tag",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "manifest_inspection",
+      "input_condition": "PublishAot property exists and is valid boolean",
+      "output_rule": "Extract value as true or false",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "publish_aot",
+      "input_condition": "msbuild_parameters contains publish-aot flag set to true or false",
+      "output_rule": "Use msbuild parameter value, case-insensitive flag match, whitespace ignored",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "publish_aot",
+      "input_condition": "msbuild_parameters present but flag missing or value invalid",
+      "output_rule": "Fall through to manifest inspection",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "publish_aot",
+      "input_condition": "Manifest PublishAot is valid boolean",
+      "output_rule": "Use manifest value",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "publish_aot",
+      "input_condition": "Manifest PublishAot is invalid or missing",
+      "output_rule": "Default to false",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "sdk_version",
+      "input_condition": "Line starts with version number followed by [path]",
+      "output_rule": "Parse version string, map to integer for comparison",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "sdk_version",
+      "input_condition": "Multiple lines with valid versions",
+      "output_rule": "Return the highest version found",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "posix_user",
+      "input_condition": "Both id probes execute successfully with numeric output",
+      "output_rule": "Output user_id=X and group_id=Y",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "posix_user",
+      "input_condition": "Group id probe fails (non-zero exit code)",
+      "output_rule": "Output error, warning, and user_resolved=false",
+      "exact_values": [
+        "user_resolved=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "posix_user",
+      "input_condition": "User id probe fails",
+      "output_rule": "Output error, warning, and user_resolved=false",
+      "exact_values": [
+        "user_resolved=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "All features",
+      "input_condition": "N/A",
+      "output_rule": "All outputs must be single line strings formatted as \"key=value\" with a newline at the end",
+      "exact_values": [
+        "\\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "idx_substitution",
+      "input_condition": "Input text",
+      "output_rule": "Replace $(NAME) tokens with env values; leave unmatched tokens unchanged; multiple occurrences all replaced",
+      "exact_values": [
+        "$(NAME)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "key_value_parsing",
+      "input_condition": "Option string format",
+      "output_rule": "Split on ';' then '='; remove surrounding quotes from values; empty value allowed; empty key is error",
+      "exact_values": [
+        "=",
+        ";"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "relative_path",
+      "input_condition": "Path normalization",
+      "output_rule": "Normalize backslashes to forward slashes; case-insensitive segment comparison",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C037",
+      "feature": "arg_parsing",
+      "input_condition": "Type coercion",
+      "output_rule": "String, int, bool; bool values true/false; int values decimal; strings as-is",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "publish_aot",
+      "input_condition": "Msbuild parameters parsing",
+      "output_rule": "Case-insensitive flag match; whitespace ignored; true/false values",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "sdk_version",
+      "input_condition": "Version parsing",
+      "output_rule": "Extract numeric version from line start; higher version wins",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "posix_user",
+      "input_condition": "Result processing",
+      "output_rule": "Execute probes; record output/error; resolve IDs or report failure details",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific sentinel value — ask the PM for the exact string",
+        "exact_values_to_replace": [],
+        "trigger_keywords": [
+          "trailing semicolon",
+          "semicolon at end",
+          "handle extra semicolon",
+          "accept trailing ';'",
+          "what about semicolon"
+        ],
+        "oracle_response": "The constraint describes tolerating a trailing semicolon (';') in the option string without producing an extra key-value pair; the output format remains identical to valid pairs without the trailing character."
+      },
+      {
+        "constraint_id": "C012",
+        "replacement": "follow the same ordering convention as the headers module",
+        "exact_values_to_replace": [],
+        "trigger_keywords": [
+          "parent directory",
+          "ancestor path",
+          "relative to ancestor",
+          "descending segments",
+          "Restore wrong path"
+        ],
+        "oracle_response": "When the 'Start' path is an ancestor of 'Relative To', the rule outputs the remaining segments of 'Relative To' marked with .., preserving any trailing slash on 'Relative To' if present. This is distinct from simply appending an '../'; it explicitly handles the directionality based on relativity."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C036",
+        "vague_phrase": "normalize backslashes",
+        "actual_meaning": "The rule specified in C036 normalizes backslashes to forward slashes AND performs case-insensitive segment comparison, whereas C011 and C012 seem to cover similar but separate aspects of normalization and relativity that may require grepping for 'case_insensitive' or 'segment_comparison' in the codebase."
+      }
+    ]
+  }
+}

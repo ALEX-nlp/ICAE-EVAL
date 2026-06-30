@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need a text templating engine built in Rust (the cobalt-org/liquid-rust project). Basically it should take a template string plus some data and spit out a rendered string. Think of it like how we do the email rendering pipeline — similar idea to what we wired up for the config-gen tool last quarter, just more general purpose.
+
+The engine needs to handle variable substitution (including nested object access), a bunch of built-in filters for strings, numbers, collections, and HTML escaping, control flow like if/else and for loops, variable assignment and capture blocks, whitespace trimming controls, and partial template inclusion. Filters should be chainable with pipe syntax and support arguments.
+
+One thing that's been a real headache with our current approach: bad templates silently produce garbage output or just crash at runtime with no useful signal. We need the new engine to distinguish between a template that's broken at the structure level versus one that fails because the data isn't what we expected — and report those separately so our ops team can triage without digging through stack traces.
+
+The adapter layer should read a JSON blob from stdin and write the result to stdout. If something goes wrong it should print one of those neutral error codes we discussed (refer to the error handling convention we settled on in the parse/render split discussion). Architecture needs to be multi-file, clean separation of concerns — not a single god file. SOLID principles, extensible filter and tag registry, the usual.
+
+Quick follow-up since a couple details came up in review: the stdin payload for the adapter is one JSON object with `template`, `globals`, and `partials`. `template` is the required string with the template source, `globals` is an optional object for the named data bindings, and `partials` is an optional object mapping partial name strings to their source strings. The adapter should build the engine with the standard filter/tag library, register the partials, parse the template, render against globals, and write the raw rendered string to stdout.
+
+Also, the error behavior needs to stay very strict and very boring on purpose. There are exactly two neutral error strings, and they should be printed as a single line only: `error=parse` for compile-time failures and `error=render` for runtime/evaluation failures. No stack traces, no language-specific messages, nothing extra around them. Parse-time failures are things like broken or unterminated `{{ }}` or `{% %}` delimiters, unknown or stray tag names, an opener like `if`, `for`, or `capture` without a matching closer, a bad operator in a condition like `=!` instead of `!=`, an output marker with an empty filter position, or a filter call missing a required argument. If the template parses successfully but then evaluation fails, that is `error=render`.
+
+One specific callout there: if a template references a name that is not present in `globals`, that is a render-time error. It should not quietly turn into empty output. The template itself is still considered valid, but rendering fails and the adapter prints `error=render`. That’s the main line we want between structural template problems and data-availability problems.
+
+On loops, `for` should support an inclusive integer range in the `in` clause, written like `(start..end)`, for example `{% for i in (1..10) %}`. Both bounds are inclusive, and the loop variable gets each integer value in sequence. If `start > end`, that’s just an empty range and it renders nothing.
+
+Last small rendering detail: a boolean value, whether it comes from a binding or is written as a literal, renders as lowercase `true` or `false`. A null or absent literal value renders as the empty string `""`. And just to repeat the contract one more time since this is the bit ops will key off of: the only neutral outputs on failure are `error=parse` and `error=render`.

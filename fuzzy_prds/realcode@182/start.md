@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need a small permissions helper library — something that wraps the raw OS permission result codes into something more usable. right now devs are scattering booleans like isDenied / neverAsk / shouldExplain all over the place and it's a mess, things keep getting conflated especially the 'denied forever' vs 'just denied for now' distinction. we want a typed model with clean predicates so you can just ask 'is this granted?' or 'does any permission in this set still need asking?' without writing loops every time.
+
+also needs a request lifecycle thing — you should be able to attach listeners to a request and get notified when results come in. there's a specific flavor of listener that should fire exactly once and then clean itself up automatically (similar to how we handled the one-time auth callback in the login module, check that for reference). and there should be a builder to assemble a request — it needs to validate its inputs upfront and give back a clear reason when something's missing rather than blowing up weirdly at runtime. the validation order matters here, make sure you check the right thing first.
+
+code organization matters — don't dump everything in one file but don't over-engineer it either. the JSON test harness is just for the adapter layer, keep the core domain totally separate from that. SOLID principles should be visible in the structure.

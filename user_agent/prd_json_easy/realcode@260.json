@@ -1,0 +1,1122 @@
+{
+  "fuzzy_prd": "# Declarative HTTP Client Generator - Interface-Driven Request Binding\n\n## Project Goal\n\nBuild a compile-time code generator and runtime that lets developers describe a remote HTTP API as a plain host-language interface, annotated with declarative metadata, and have a fully working client implementation generated automatically. Developers declare *what* request each method represents (verb, path, query, headers, body, encoding) and the generated client takes care of *how* the request is assembled, addressed, and dispatched, so no hand-written networking boilerplate is needed.\n\n---\n\n## Background & Problem\n\nWithout this tool, developers calling a remote API must hand-write, for every endpoint, the same mechanical plumbing: pick the HTTP verb, concatenate a base address with a relative path, substitute dynamic path segments, append query parameters with correct encoding, assemble headers, choose and serialize the body (raw, form-url-encoded, or multipart), and wire all of that into an HTTP engine. This is repetitive, easy to get subtly wrong (double-encoding, missing slashes, wrong content type), and drifts out of sync as the API evolves.\n\nWith this tool, the API surface is expressed once as an annotated interface. A code generator reads the interface at build time, validates that the declarations are internally consistent, and emits an implementation that produces correctly-formed requests at runtime. Misuse (such as two verbs on one method, a body on a verb that forbids it, or a malformed base address) is caught and reported as a precise, neutral diagnostic rather than producing a broken client.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a complex domain with several distinct responsibilities — interface/metadata parsing, generation-time validation, request assembly, URL resolution, body/encoding handling, parameter conversion, and a runtime dispatch layer. The codebase MUST NOT be a single monolithic file. Provide a clear multi-module/multi-file tree separating the generator (compile-time validation + emission) from the runtime (request building + dispatch) from the execution adapter. Do not over-engineer, but reflect the real separation of concerns.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases in \"Core Features\" define a **black-box contract for the execution adapter only**, not the internal data model. The core generator and runtime MUST be completely decoupled from stdin/stdout and from JSON parsing. The execution adapter is the sole component that translates a JSON request into idiomatic calls against the generator and runtime (it synthesizes an interface from the request spec, drives the real generator over it, loads the generated implementation, invokes it against a capturing transport, and formats the observed result).\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility:** Keep parsing, validation, generation, runtime request assembly, and output formatting in distinct units.\n   - **Open/Closed:** New parameter roles, encodings, or converters must be addable without rewriting the dispatch core.\n   - **Liskov Substitution:** Transport/engine abstractions must be substitutable (the adapter substitutes a capturing transport for a real network engine).\n   - **Interface Segregation:** Converter, transport, and request-builder abstractions must each stay small and cohesive.\n   - **Dependency Inversion:** The runtime depends on a transport abstraction and a converter registry, not on a concrete network stack.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The annotated-interface surface must read naturally in the target language; generated code must be invisible to the caller.\n   - **Resilience:** Every invalid declaration must be modeled as a specific, categorizable failure rather than a generic crash. Generation-time violations are reported as neutral error categories; runtime configuration failures (e.g. base address validation, missing converter) likewise map to neutral categories. Host-language stack traces must never leak into the contract output.\n\n### Neutral request schema (adapter input)\n\nThe execution adapter reads a single JSON object from stdin describing one scenario. Fields:\n\n- `op` (string, optional, default `\"request\"`): `\"request\"` synthesizes and drives an interface method; `\"convert\"` exercises the standalone parameter-conversion path.\n- `lang` (string, optional, default host language): `\"java\"` requests a foreign-language interface (used to exercise interface-shape validation).\n- `withPackage` (bool, optional, default `true`): whether the synthesized interface resides in a package.\n- `generic` (bool, optional, default `false`): whether the synthesized interface carries a type parameter.\n- `baseUrl` (string, optional, default a valid `http://localhost/`): the configured base address.\n- `checkUrl` (bool, optional, default `true`): whether base-address relative-resolution checking is enabled.\n- `suspend` (bool, optional, default `true`): whether the synthesized method is asynchronous.\n- `streaming` (bool, optional, default `false`): whether the method is declared as a streaming/deferred-handle method.\n- `return` (string, optional): an explicit return type override for the synthesized method.\n- `http` (array, for `op=request`): one or more `{ \"verb\": <string>, \"path\": <string>, \"hasBody\": <bool optional>, \"value\": <string optional> }` verb declarations. More than one entry exercises the multiple-verb rule.\n- `encoding` (array of string, optional): zero or more of `\"form\"`, `\"multipart\"`.\n- `headers` (array of string, optional): fixed static headers, each `\"Name:Value\"`.\n- `params` (array, optional): parameter declarations, each `{ \"kind\": <role>, \"key\": <string optional>, \"name\": <string>, \"type\": <string optional>, \"encoded\": <bool optional>, \"requestType\": <string optional>, \"header\": <string optional> }`. `kind` is one of: `path`, `url`, `body`, `field`, `fieldMap`, `part`, `partMap`, `query`, `queryName`, `queryMap`, `header`, `headerMap`, `reqBuilder`.\n- `args` (array, optional): runtime argument values supplied positionally to the synthesized method.\n- For `op=convert`: `from` (string), `to` (string), `value` (string), `converter` (bool — whether a converter supporting the requested conversion is registered).\n\n### Output contract (adapter stdout)\n\nOn success the adapter prints newline-separated `key=value` lines in this order, omitting lines that do not apply:\n\n- `method=<VERB>`\n- `url=<fully resolved absolute URL>`\n- `body=none|text|form|multipart`\n- `text=<payload>` (only when `body=text`)\n- `field=<name>=<value>` per field, sorted by name (only when `body=form`)\n- `header=<name>=<value>` per user-supplied header, sorted by name (static `Accept`/`Accept-Charset` excluded)\n- For `op=convert`: `converted=<value>` then `type=<simple type name>`.\n\nOn any failure the adapter prints one or more `error=<category>` lines (sorted, newline-joined when several apply) and nothing else. Categories are neutral and language-agnostic; the full set is the union of those appearing in the feature cases below.\n\n---\n\n## Core Features\n\n### Feature 1: HTTP method binding\n\n**As a developer**, I want to bind an interface method to an HTTP verb and relative path, so I can declare an endpoint without writing request-construction code.\n\n**Expected Behavior / Usage:**\n\nA method-level declaration names an HTTP verb and a relative path; the generated client issues a request whose method and URL match. A generic verb form may additionally declare that the request carries a body. Declaring more than one verb on the same method is rejected at generation time with `error=[a specific sentinel error category]`. The adapter prints the issued request's method, resolved URL and body kind, or the error category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature01_http_method.json`\n\n```json\n{\n  \"description\": \"Binding of an interface method to an HTTP request line. A declarative method-level annotation names the HTTP verb and a relative path; the generated client must issue a request whose method and URL match. A dedicated generic verb form may additionally declare that the request carries a body. Declaring more than one verb annotation on the same method is rejected at generation time. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category when generation fails.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"user\"}]}, \"expected_output\": \"method=GET\\nurl=http://localhost/user\\nbody=none\"},\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"user/followers\"}, {\"verb\": \"POST\", \"path\": \"repos/foso/experimental/issues\"}]}, \"expected_output\": \"error=[a specific sentinel error category]\"}\n  ]\n}\n```\n\n---\n\n### Feature 2: URL resolution\n\n**As a developer**, I want the final request URL resolved from the configured base address, the static path, and any dynamic full-URL parameter, so I can address endpoints flexibly.\n\n**Expected Behavior / Usage:**\n\nA method may carry a dynamic full-URL parameter that supplies the target when the verb's static path is empty. When neither a non-empty static path nor a dynamic full-URL parameter is present the request cannot be addressed and generation is rejected (`error=[a specific internal error identifier]`). More than one dynamic full-URL parameter is rejected (`error=multiple_url_annotations`). At runtime the resolved absolute URL combines the base address with the relative target; a parameter whose value is itself absolute overrides the base. The adapter prints method, resolved URL and body kind, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature02_url_resolution.json`\n\n```json\n{\n  \"description\": \"Resolution of the final request URL. A method may carry a dynamic full-URL parameter that supplies the request target when the verb's static path is empty. When neither a non-empty static path nor a dynamic full-URL parameter is present the request cannot be addressed and generation is rejected. Declaring more than one dynamic full-URL parameter is also rejected. At runtime the resolved absolute URL combines the configured base address with the relative target, and a parameter whose value is itself an absolute URL overrides the base entirely. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"\"}], \"params\": [{\"kind\": \"url\", \"name\": \"url\"}], \"args\": [\"posts/9\"]}, \"expected_output\": \"method=GET\\nurl=http://localhost/posts/9\\nbody=none\"},\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"\"}]}, \"expected_output\": \"error=[a specific internal error identifier]\"}\n  ]\n}\n```\n\n---\n\n### Feature 3: Base address validation\n\n**As a developer**, I want the configured base address validated before any request is built, so misconfiguration fails fast with a clear category.\n\n**Expected Behavior / Usage:**\n\nThe base address must be present, must end with a path separator, and must use a recognised URL scheme; otherwise client construction fails before any request is issued, producing `error=base_url_required`, `error=base_url_must_end_with_slash`, or `error=base_url_invalid_scheme` respectively. The adapter prints the neutral error category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature03_base_url_validation.json`\n\n```json\n{\n  \"description\": \"Validation of the configured base address. The base address must be present, must end with a path separator, and must use a recognised URL scheme; otherwise client construction fails before any request is issued. The adapter prints a neutral error category for each invalid configuration.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"baseUrl\": \"http://www.example.com\"}, \"expected_output\": \"error=base_url_must_end_with_slash\"}\n  ]\n}\n```\n\n---\n\n### Feature 4: Path-segment substitution\n\n**As a developer**, I want a parameter to fill a named placeholder in the path, so I can build dynamic endpoint URLs.\n\n**Expected Behavior / Usage:**\n\nA parameter marked as a path variable replaces a named placeholder in the relative path. A variant flag marks the supplied value as already URL-encoded so it is inserted verbatim. A path-variable parameter may not be nullable (`error=path_must_not_be_nullable`), and a placeholder-substitution parameter is only meaningful when the verb declares a non-empty relative path (`error=path_requires_relative_url`). The adapter prints method, resolved URL and body kind, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature04_path.json`\n\n```json\n{\n  \"description\": \"Path-segment substitution. A method parameter marked as a path variable replaces a named placeholder inside the relative path. A variant flag marks the supplied value as already URL-encoded so it is inserted verbatim. A path-variable parameter may not be nullable, and a placeholder-substitution parameter is only meaningful when the verb declares a non-empty relative path. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"user/{id}\"}], \"params\": [{\"kind\": \"path\", \"key\": \"id\", \"name\": \"id\"}], \"args\": [\"abc\"]}, \"expected_output\": \"method=GET\\nurl=http://localhost/user/abc\\nbody=none\"},\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"user/{id}\"}], \"params\": [{\"kind\": \"path\", \"key\": \"id\", \"name\": \"id\", \"type\": \"String?\"}], \"args\": [\"x\"]}, \"expected_output\": \"error=path_must_not_be_nullable\"}\n  ]\n}\n```\n\n---\n\n### Feature 5: Query-string construction\n\n**As a developer**, I want parameters to contribute query values in several roles, so I can build flexible query strings.\n\n**Expected Behavior / Usage:**\n\nParameters can contribute a single named query value, a per-element repeated value when the parameter is a list, a bare query name without a value, or a set of named values supplied as a map. Each role has an encoded variant that appends to the already-encoded query section. Map-valued query parameters must be maps keyed by string; other container or key types are rejected at generation time (`error=query_map_must_be_map`, `error=query_map_keys_must_be_string`). The adapter prints method, resolved URL and body kind, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature05_query.json`\n\n```json\n{\n  \"description\": \"Query-string construction. Parameters can contribute a single named query value, a per-element repeated value when the parameter is a list, a bare query name without a value, or a set of named values supplied as a map. Each role has an encoded variant that appends the value to the already-encoded query section. Map-valued query parameters must be maps keyed by string; other key or container types are rejected at generation time. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"params\": [{\"kind\": \"query\", \"key\": \"name\", \"name\": \"q1\"}, {\"kind\": \"query\", \"key\": \"user\", \"encoded\": true, \"name\": \"q2\", \"type\": \"Int\"}], \"args\": [\"bob\", 5]}, \"expected_output\": \"method=GET\\nurl=http://localhost/posts?name=bob&user=5\\nbody=none\"},\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"params\": [{\"kind\": \"queryMap\", \"name\": \"m\", \"type\": \"String\"}], \"args\": [\"x\"]}, \"expected_output\": \"error=query_map_must_be_map\"}\n  ]\n}\n```\n\n---\n\n### Feature 6: Request header construction\n\n**As a developer**, I want to declare static and parameter-driven headers, so I can attach metadata to requests.\n\n**Expected Behavior / Usage:**\n\nA method may declare a fixed list of static headers, a single named header from a parameter, a repeated named header from a list parameter, or a set of named headers supplied as a map; static and parameter-driven headers may be combined. Map-valued header parameters must be maps keyed by string; other container or key types are rejected (`error=header_map_must_be_map`, `error=header_map_keys_must_be_string`). The adapter prints method, resolved URL, body kind, and every user-supplied header sorted by name, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature06_header.json`\n\n```json\n{\n  \"description\": \"Request header construction. A method may declare a fixed list of static headers, a single named header taken from a parameter, a repeated named header taken from a list parameter, or a set of named headers supplied as a map. Static and parameter-driven headers may be combined on one method. Map-valued header parameters must be maps keyed by string; other key or container types are rejected at generation time. The adapter prints the issued request's method, resolved URL, body kind, and every user-supplied header sorted by name, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"headers\": [\"x:y\", \"a:b\"]}, \"expected_output\": \"method=GET\\nurl=http://localhost/posts\\nbody=none\\nheader=a=b\\nheader=x=y\"},\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"params\": [{\"kind\": \"headerMap\", \"name\": \"h\", \"type\": \"Map<String, String>\"}], \"args\": [{\"H1\": \"a\", \"H2\": \"b\"}]}, \"expected_output\": \"method=GET\\nurl=http://localhost/posts\\nbody=none\\nheader=H1=a\\nheader=H2=b\"}\n  ]\n}\n```\n\n---\n\n### Feature 7: Request body attachment\n\n**As a developer**, I want to mark a parameter as the request body, so its value is sent as the payload.\n\n**Expected Behavior / Usage:**\n\nA method may mark a single parameter as the request body, sent as the payload. A body parameter may not be nullable (`error=body_must_not_be_nullable`), may only appear on a verb that permits a body (`error=body_not_allowed_on_non_body_method`), and may not be combined with a form or multipart encoding declaration (`error=body_not_allowed_with_form_encoding`). The adapter prints method, resolved URL, body kind and, for a textual payload, the body text, or the error category for each violation.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature07_body.json`\n\n```json\n{\n  \"description\": \"Request body attachment. A method may mark a single parameter as the request body, which is sent as the request payload. A body parameter may not be nullable, may only appear on a verb that permits a request body, and may not be combined with a form or multipart encoding declaration. The adapter prints the issued request's method, resolved URL, body kind and, for a textual payload, the body text, or a neutral error category for each violation.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"POST\", \"path\": \"user\"}], \"params\": [{\"kind\": \"body\", \"name\": \"id\"}], \"args\": [\"theBody\"]}, \"expected_output\": \"method=POST\\nurl=http://localhost/user\\nbody=text\\ntext=theBody\"},\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"user\"}], \"params\": [{\"kind\": \"body\", \"name\": \"id\"}], \"return\": \"String?\"}, \"expected_output\": \"error=body_not_allowed_on_non_body_method\"}\n  ]\n}\n```\n\n---\n\n### Feature 8: Form-url-encoded field bodies\n\n**As a developer**, I want form-field parameters to contribute name/value pairs to a form body, so I can submit form-encoded data.\n\n**Expected Behavior / Usage:**\n\nWhen a method opts into form encoding, parameters marked as form fields contribute name/value pairs; a map-valued field parameter contributes its entries. A field parameter outside a form-encoded method is rejected (`error=field_requires_form_encoding`). A null field value, and null entries inside a field map, are omitted from the body. Map-valued field parameters must be maps keyed by string (`error=field_map_must_be_map`, `error=field_map_keys_must_be_string`). The adapter prints method, resolved URL, body kind and each form field sorted by name, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature08_form_field.json`\n\n```json\n{\n  \"description\": \"Form-url-encoded field bodies. When a method opts into form encoding, parameters marked as form fields contribute name/value pairs to a form-encoded body; a map-valued field parameter contributes its entries. A field parameter outside a form-encoded method is rejected. A null field value, and null entries inside a field map, are omitted from the body. Map-valued field parameters must be maps keyed by string; other key or container types are rejected at generation time. The adapter prints the issued request's method, resolved URL, body kind and each form field sorted by name, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"POST\", \"path\": \"posts\"}], \"encoding\": [\"form\"], \"params\": [{\"kind\": \"field\", \"key\": \"name\", \"name\": \"f\"}], \"args\": [\"v1\"]}, \"expected_output\": \"method=POST\\nurl=http://localhost/posts\\nbody=form\\nfield=name=v1\"},\n    {\"input\": {\"http\": [{\"verb\": \"POST\", \"path\": \"posts\"}], \"encoding\": [\"form\"], \"params\": [{\"kind\": \"field\", \"key\": \"name\", \"name\": \"f\"}, {\"kind\": \"fieldMap\", \"name\": \"m\", \"type\": \"Map<String, String>\"}], \"args\": [\"v1\", {\"k2\": \"v2\"}]}, \"expected_output\": \"method=POST\\nurl=http://localhost/posts\\nbody=form\\nfield=k2=v2\\nfield=name=v1\"}\n  ]\n}\n```\n\n---\n\n### Feature 9: Encoding declarations and constraints\n\n**As a developer**, I want encoding declarations validated, so a form body is well-formed and mutually-exclusive encodings are caught.\n\n**Expected Behavior / Usage:**\n\nA form-encoding declaration is only valid on a verb that permits a body (`error=form_requires_body_method`) and requires at least one form field (`error=form_requires_field`). At most one encoding declaration (form or multipart) may be applied (`error=multiple_encoding_annotations`). A valid form-encoded method with a field produces a form body. The adapter prints method, resolved URL, body kind and form fields, or the error category for each violation.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature09_form_encoding.json`\n\n```json\n{\n  \"description\": \"Encoding declarations and their constraints. A form-encoding declaration is only valid on a verb that permits a request body and requires at least one form field to be present. At most one encoding declaration (form or multipart) may be applied to a method. A valid form-encoded method with a field produces a form body. The adapter prints the issued request's method, resolved URL, body kind and form fields, or a neutral error category for each violation.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"POST\", \"path\": \"user\"}], \"encoding\": [\"form\"], \"params\": [{\"kind\": \"field\", \"key\": \"id\", \"name\": \"id\"}], \"return\": \"String?\", \"args\": [\"7\"]}, \"expected_output\": \"method=POST\\nurl=http://localhost/user\\nbody=form\\nfield=id=7\"},\n    {\"input\": {\"http\": [{\"verb\": \"POST\", \"path\": \"user\"}], \"encoding\": [\"multipart\", \"form\"], \"params\": [{\"kind\": \"field\", \"key\": \"id\", \"name\": \"id\"}]}, \"expected_output\": \"error=multiple_encoding_annotations\"}\n  ]\n}\n```\n\n---\n\n### Feature 10: Multipart part bodies\n\n**As a developer**, I want part parameters to make the request a multipart payload, so I can upload composite data.\n\n**Expected Behavior / Usage:**\n\nParameters marked as parts, individually or as a map of parts, cause the request body to be sent as a multipart payload. A part parameter may not be nullable (`error=part_must_not_be_nullable`), and a map-of-parts parameter must be a map (`error=part_map_must_be_map`). The adapter prints method, resolved URL and body kind, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_multipart_part.json`\n\n```json\n{\n  \"description\": \"Multipart part bodies. Parameters marked as parts, individually or as a map of parts, cause the request body to be sent as a multipart payload. A part parameter may not be nullable, and a map-of-parts parameter must be a map; other types are rejected at generation time. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"POST\", \"path\": \"posts\"}], \"params\": [{\"kind\": \"part\", \"key\": \"name\", \"name\": \"p\"}], \"args\": [\"v\"]}, \"expected_output\": \"method=POST\\nurl=http://localhost/posts\\nbody=multipart\"},\n    {\"input\": {\"http\": [{\"verb\": \"POST\", \"path\": \"posts\"}], \"suspend\": false, \"params\": [{\"kind\": \"part\", \"name\": \"name\", \"type\": \"String?\"}]}, \"expected_output\": \"error=part_must_not_be_nullable\"}\n  ]\n}\n```\n\n---\n\n### Feature 11: Streaming responses\n\n**As a developer**, I want to declare a method as streaming, so it returns a deferred handle and the request fires when executed.\n\n**Expected Behavior / Usage:**\n\nA method may be declared as streaming, in which case it must return a deferred HTTP-statement handle rather than a decoded value; the underlying request is issued when the handle is executed. Declaring streaming on a method whose return type is not the streaming handle is rejected (`error=streaming_requires_statement_return`). The adapter prints method, resolved URL and body kind, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_streaming.json`\n\n```json\n{\n  \"description\": \"Streaming responses. A method may be declared as streaming, in which case it must return a deferred HTTP-statement handle rather than a decoded value; the underlying request is issued when the handle is executed. Declaring streaming on a method whose return type is not the streaming handle is rejected at generation time. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"streaming\": true}, \"expected_output\": \"method=GET\\nurl=http://localhost/posts\\nbody=none\"},\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"streaming\": true, \"return\": \"String\"}, \"expected_output\": \"error=streaming_requires_statement_return\"}\n  ]\n}\n```\n\n---\n\n### Feature 12: Per-request builder injection\n\n**As a developer**, I want to pass a builder block that mutates the outgoing request, so I can imprint per-call customizations.\n\n**Expected Behavior / Usage:**\n\nA method may accept a parameter that is a builder block applied to the outgoing request, letting the caller imprint arbitrary mutations such as an extra header. At most one builder parameter is allowed (`error=multiple_request_builders`), and the parameter must have the builder block type (`error=req_builder_wrong_type`). The adapter exercises the positive case with a builder that appends one header and prints method, resolved URL, body kind and headers, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_request_builder.json`\n\n```json\n{\n  \"description\": \"Per-request builder injection. A method may accept a parameter that is a builder block applied to the outgoing request, letting the caller imprint arbitrary request mutations such as an extra header. At most one builder parameter is allowed, and the parameter must have the builder block type; other forms are rejected at generation time. The adapter exercises the positive case with a builder that appends one header and prints the issued request's method, resolved URL, body kind and headers, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"params\": [{\"kind\": \"reqBuilder\", \"name\": \"builder\", \"header\": \"X-Custom\"}]}, \"expected_output\": \"method=GET\\nurl=http://localhost/posts\\nbody=none\\nheader=X-Custom=1\"},\n    {\"input\": {\"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}], \"params\": [{\"kind\": \"reqBuilder\", \"name\": \"b1\"}, {\"kind\": \"reqBuilder\", \"name\": \"b2\"}]}, \"expected_output\": \"error=multiple_request_builders\"}\n  ]\n}\n```\n\n---\n\n### Feature 13: Parameter type conversion\n\n**As a developer**, I want supplied values converted to a declared target type via a registered converter, so parameters can be type-adapted before use.\n\n**Expected Behavior / Usage:**\n\nThe client can convert a supplied parameter value to a declared target type using a registered converter before the value is placed into the request; if no converter supports the requested conversion the call fails (`error=no_request_converter`). A parameter may also declare a target request type so its value is converted before being substituted into the request. The adapter prints the converted value and its resulting type, the issued request for the substitution case, or the error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature13_parameter_conversion.json`\n\n```json\n{\n  \"description\": \"Parameter type conversion. The client can convert a supplied parameter value to a declared target type using a registered converter before the value is placed into the request; if no converter supports the requested conversion the call fails. A parameter may also declare a target request type so that its value is converted before being substituted into the request. The adapter prints the converted value and its resulting type, the issued request for the substitution case, or a neutral error category.\",\n  \"cases\": [\n    {\"input\": {\"op\": \"convert\", \"from\": \"String\", \"to\": \"Int\", \"value\": \"4\", \"converter\": true}, \"expected_output\": \"converted=4\\ntype=Int\"},\n    {\"input\": {\"op\": \"convert\", \"from\": \"String\", \"to\": \"Int\", \"value\": \"4\", \"converter\": false}, \"expected_output\": \"error=no_request_converter\"}\n  ]\n}\n```\n\n---\n\n### Feature 14: Interface-shape validation\n\n**As a developer**, I want the declarative API source validated as a well-formed interface, so unsupported shapes are rejected with a clear category.\n\n**Expected Behavior / Usage:**\n\nThe declarative API source must be a host-language interface that resides in a package and carries no type parameters. A foreign-language interface (`error=java_interface_unsupported`), an interface without a package (`error=missing_package`), or an interface with type parameters (`error=type_parameters_unsupported`) is rejected at generation time. The adapter prints the neutral error category for each violation.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature14_interface_validation.json`\n\n```json\n{\n  \"description\": \"Interface-shape validation. The declarative API source must be a host-language interface that resides in a package and carries no type parameters. A foreign-language interface, an interface without a package, or an interface with type parameters is rejected at generation time. The adapter prints a neutral error category for each violation.\",\n  \"cases\": [\n    {\"input\": {\"lang\": \"java\", \"http\": [{\"verb\": \"GET\", \"path\": \"posts\"}]}, \"expected_output\": \"error=java_interface_unsupported\"}\n  ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the features above — a compile-time generator that parses the annotated interface and its declarations, validates them (emitting precise diagnostics for every violation category), and emits a working client implementation; and a runtime that resolves URLs, assembles query strings/headers/bodies (raw, form, multipart), applies per-request builder blocks, performs parameter conversion through a converter registry, and dispatches through a transport abstraction. The generator and runtime must be decoupled from each other and from any I/O concern.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON request (schema above) from stdin, synthesizes the corresponding annotated interface, drives the real generator over it, loads the generated implementation, invokes it against a capturing transport (so the issued request is observable without a network), and prints the normalized output contract — or one or more neutral `error=<category>` lines on any generation-time or runtime failure. It must contain no business logic of its own and must never leak host-language stack traces into the contract output.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature01_http_method.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature01_http_method@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- adhere to the same validation rules as described in the path constraint section regarding nullable values\n- invoke the builder component as defined in the request builder pattern examples\n",
+  "oracle_data": {
+    "task_id": "Foso__Ktorfit-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what happens when I use multiple verbs?",
+          "error reporting for multiple HTTP methods"
+        ],
+        "oracle_response": "The generation fails with the exact error category 'multiple_http_methods'."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "what is the error id for missing static path?",
+          "sun/mon error reasons"
+        ],
+        "oracle_response": "Attempting to generate a request with an empty static path and no URL parameters triggers the exact error category 'missing_url'."
+      },
+      {
+        "constraint_id": "C019",
+        "trigger_keywords": [
+          "how is already encoded query handled?",
+          "sentinel value for doubled encoding"
+        ],
+        "oracle_response": "When an input parameter has an 'encoded' field set to true, the value is inserted without re-encoding, but this behavior is flagged by the system using the exact placeholder 'processed_encoded_query' in validation logs."
+      },
+      {
+        "constraint_id": "TC_feature02_url_resolution",
+        "trigger_keywords": [
+          "test cases for feature02 url resolution",
+          "show me feature02 url resolution test cases",
+          "what are the feature02 url resolution inputs and outputs",
+          "give me the feature02_url_resolution test file",
+          "feature02 url resolution expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature02_url_resolution:\n{\n  \"description\": \"Resolution of the final request URL. A method may carry a dynamic full-URL parameter that supplies the request target when the verb's static path is empty. When neither a non-empty static path nor a dynamic full-URL parameter is present the request cannot be addressed and generation is rejected. Declaring more than one dynamic full-URL parameter is also rejected. At runtime the resolved absolute URL combines the configured base address with the relative target, and a parameter whose value is itself an absolute URL overrides the base entirely. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"http\": [\n          {\n            \"verb\": \"GET\",\n            \"path\": \"\"\n          }\n        ],\n        \"params\": [\n          {\n            \"kind\": \"url\",\n            \"name\": \"url\"\n          }\n        ],\n        \"args\": [\n          \"posts/9\"\n        ]\n      },\n      \"expected_output\": \"method=GET\\nurl=http://localhost/posts/9\\nbody=none\"\n    },\n    {\n      \"input\": {\n        \"http\": [\n          {\n            \"verb\": \"GET\",\n            \"path\": \"\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=missing_url\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "adhere to the same validation rules as described in the path constraint section regarding nullable values",
+        "actual_meaning": "The parameter type validation logic mirrors that found in C017, enforcing that paths with '?' suffixes must not permit null values."
+      },
+      {
+        "vague_reference": "invoke the builder component as defined in the request builder pattern examples",
+        "actual_meaning": "When a parameter has kind 'reqBuilder', the generated code must call the builder's invoke method, consistent with the invoke pattern in C032."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature01_http_method.json": {
+      "description": "Binding of an interface method to an HTTP request line. A declarative method-level annotation names the HTTP verb and a relative path; the generated client must issue a request whose method and URL match. A dedicated generic verb form may additionally declare that the request carries a body. Declaring more than one verb annotation on the same method is rejected at generation time. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category when generation fails.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "user"
+              }
+            ]
+          },
+          "expected_output": "method=GET\nurl=http://localhost/user\nbody=none"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "user/followers"
+              },
+              {
+                "verb": "POST",
+                "path": "repos/foso/experimental/issues"
+              }
+            ]
+          },
+          "expected_output": "error=multiple_http_methods"
+        }
+      ]
+    },
+    "feature02_url_resolution.json": {
+      "description": "Resolution of the final request URL. A method may carry a dynamic full-URL parameter that supplies the request target when the verb's static path is empty. When neither a non-empty static path nor a dynamic full-URL parameter is present the request cannot be addressed and generation is rejected. Declaring more than one dynamic full-URL parameter is also rejected. At runtime the resolved absolute URL combines the configured base address with the relative target, and a parameter whose value is itself an absolute URL overrides the base entirely. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": ""
+              }
+            ],
+            "params": [
+              {
+                "kind": "url",
+                "name": "url"
+              }
+            ],
+            "args": [
+              "posts/9"
+            ]
+          },
+          "expected_output": "method=GET\nurl=http://localhost/posts/9\nbody=none"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": ""
+              }
+            ]
+          },
+          "expected_output": "error=missing_url"
+        }
+      ]
+    },
+    "feature03_base_url_validation.json": {
+      "description": "Validation of the configured base address. The base address must be present, must end with a path separator, and must use a recognised URL scheme; otherwise client construction fails before any request is issued. The adapter prints a neutral error category for each invalid configuration.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "baseUrl": "http://www.example.com"
+          },
+          "expected_output": "error=base_url_must_end_with_slash"
+        }
+      ]
+    },
+    "feature04_path.json": {
+      "description": "Path-segment substitution. A method parameter marked as a path variable replaces a named placeholder inside the relative path. A variant flag marks the supplied value as already URL-encoded so it is inserted verbatim. A path-variable parameter may not be nullable, and a placeholder-substitution parameter is only meaningful when the verb declares a non-empty relative path. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "user/{id}"
+              }
+            ],
+            "params": [
+              {
+                "kind": "path",
+                "key": "id",
+                "name": "id"
+              }
+            ],
+            "args": [
+              "abc"
+            ]
+          },
+          "expected_output": "method=GET\nurl=http://localhost/user/abc\nbody=none"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "user/{id}"
+              }
+            ],
+            "params": [
+              {
+                "kind": "path",
+                "key": "id",
+                "name": "id",
+                "type": "String?"
+              }
+            ],
+            "args": [
+              "x"
+            ]
+          },
+          "expected_output": "error=path_must_not_be_nullable"
+        }
+      ]
+    },
+    "feature05_query.json": {
+      "description": "Query-string construction. Parameters can contribute a single named query value, a per-element repeated value when the parameter is a list, a bare query name without a value, or a set of named values supplied as a map. Each role has an encoded variant that appends the value to the already-encoded query section. Map-valued query parameters must be maps keyed by string; other key or container types are rejected at generation time. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "params": [
+              {
+                "kind": "query",
+                "key": "name",
+                "name": "q1"
+              },
+              {
+                "kind": "query",
+                "key": "user",
+                "encoded": true,
+                "name": "q2",
+                "type": "Int"
+              }
+            ],
+            "args": [
+              "bob",
+              5
+            ]
+          },
+          "expected_output": "method=GET\nurl=http://localhost/posts?name=bob&user=5\nbody=none"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "params": [
+              {
+                "kind": "queryMap",
+                "name": "m",
+                "type": "String"
+              }
+            ],
+            "args": [
+              "x"
+            ]
+          },
+          "expected_output": "error=query_map_must_be_map"
+        }
+      ]
+    },
+    "feature06_header.json": {
+      "description": "Request header construction. A method may declare a fixed list of static headers, a single named header taken from a parameter, a repeated named header taken from a list parameter, or a set of named headers supplied as a map. Static and parameter-driven headers may be combined on one method. Map-valued header parameters must be maps keyed by string; other key or container types are rejected at generation time. The adapter prints the issued request's method, resolved URL, body kind, and every user-supplied header sorted by name, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "headers": [
+              "x:y",
+              "a:b"
+            ]
+          },
+          "expected_output": "method=GET\nurl=http://localhost/posts\nbody=none\nheader=a=b\nheader=x=y"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "params": [
+              {
+                "kind": "headerMap",
+                "name": "h",
+                "type": "Map<String, String>"
+              }
+            ],
+            "args": [
+              {
+                "H1": "a",
+                "H2": "b"
+              }
+            ]
+          },
+          "expected_output": "method=GET\nurl=http://localhost/posts\nbody=none\nheader=H1=a\nheader=H2=b"
+        }
+      ]
+    },
+    "feature07_body.json": {
+      "description": "Request body attachment. A method may mark a single parameter as the request body, which is sent as the request payload. A body parameter may not be nullable, may only appear on a verb that permits a request body, and may not be combined with a form or multipart encoding declaration. The adapter prints the issued request's method, resolved URL, body kind and, for a textual payload, the body text, or a neutral error category for each violation.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "POST",
+                "path": "user"
+              }
+            ],
+            "params": [
+              {
+                "kind": "body",
+                "name": "id"
+              }
+            ],
+            "args": [
+              "theBody"
+            ]
+          },
+          "expected_output": "method=POST\nurl=http://localhost/user\nbody=text\ntext=theBody"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "user"
+              }
+            ],
+            "params": [
+              {
+                "kind": "body",
+                "name": "id"
+              }
+            ],
+            "return": "String?"
+          },
+          "expected_output": "error=body_not_allowed_on_non_body_method"
+        }
+      ]
+    },
+    "feature08_form_field.json": {
+      "description": "Form-url-encoded field bodies. When a method opts into form encoding, parameters marked as form fields contribute name/value pairs to a form-encoded body; a map-valued field parameter contributes its entries. A field parameter outside a form-encoded method is rejected. A null field value, and null entries inside a field map, are omitted from the body. Map-valued field parameters must be maps keyed by string; other key or container types are rejected at generation time. The adapter prints the issued request's method, resolved URL, body kind and each form field sorted by name, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "POST",
+                "path": "posts"
+              }
+            ],
+            "encoding": [
+              "form"
+            ],
+            "params": [
+              {
+                "kind": "field",
+                "key": "name",
+                "name": "f"
+              }
+            ],
+            "args": [
+              "v1"
+            ]
+          },
+          "expected_output": "method=POST\nurl=http://localhost/posts\nbody=form\nfield=name=v1"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "POST",
+                "path": "posts"
+              }
+            ],
+            "encoding": [
+              "form"
+            ],
+            "params": [
+              {
+                "kind": "field",
+                "key": "name",
+                "name": "f"
+              },
+              {
+                "kind": "fieldMap",
+                "name": "m",
+                "type": "Map<String, String>"
+              }
+            ],
+            "args": [
+              "v1",
+              {
+                "k2": "v2"
+              }
+            ]
+          },
+          "expected_output": "method=POST\nurl=http://localhost/posts\nbody=form\nfield=k2=v2\nfield=name=v1"
+        }
+      ]
+    },
+    "feature09_form_encoding.json": {
+      "description": "Encoding declarations and their constraints. A form-encoding declaration is only valid on a verb that permits a request body and requires at least one form field to be present. At most one encoding declaration (form or multipart) may be applied to a method. A valid form-encoded method with a field produces a form body. The adapter prints the issued request's method, resolved URL, body kind and form fields, or a neutral error category for each violation.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "POST",
+                "path": "user"
+              }
+            ],
+            "encoding": [
+              "form"
+            ],
+            "params": [
+              {
+                "kind": "field",
+                "key": "id",
+                "name": "id"
+              }
+            ],
+            "return": "String?",
+            "args": [
+              "7"
+            ]
+          },
+          "expected_output": "method=POST\nurl=http://localhost/user\nbody=form\nfield=id=7"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "POST",
+                "path": "user"
+              }
+            ],
+            "encoding": [
+              "multipart",
+              "form"
+            ],
+            "params": [
+              {
+                "kind": "field",
+                "key": "id",
+                "name": "id"
+              }
+            ]
+          },
+          "expected_output": "error=multiple_encoding_annotations"
+        }
+      ]
+    },
+    "feature10_multipart_part.json": {
+      "description": "Multipart part bodies. Parameters marked as parts, individually or as a map of parts, cause the request body to be sent as a multipart payload. A part parameter may not be nullable, and a map-of-parts parameter must be a map; other types are rejected at generation time. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "POST",
+                "path": "posts"
+              }
+            ],
+            "params": [
+              {
+                "kind": "part",
+                "key": "name",
+                "name": "p"
+              }
+            ],
+            "args": [
+              "v"
+            ]
+          },
+          "expected_output": "method=POST\nurl=http://localhost/posts\nbody=multipart"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "POST",
+                "path": "posts"
+              }
+            ],
+            "suspend": false,
+            "params": [
+              {
+                "kind": "part",
+                "name": "name",
+                "type": "String?"
+              }
+            ]
+          },
+          "expected_output": "error=part_must_not_be_nullable"
+        }
+      ]
+    },
+    "feature11_streaming.json": {
+      "description": "Streaming responses. A method may be declared as streaming, in which case it must return a deferred HTTP-statement handle rather than a decoded value; the underlying request is issued when the handle is executed. Declaring streaming on a method whose return type is not the streaming handle is rejected at generation time. The adapter prints the issued request's method, resolved URL and body kind, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "streaming": true
+          },
+          "expected_output": "method=GET\nurl=http://localhost/posts\nbody=none"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "streaming": true,
+            "return": "String"
+          },
+          "expected_output": "error=streaming_requires_statement_return"
+        }
+      ]
+    },
+    "feature12_request_builder.json": {
+      "description": "Per-request builder injection. A method may accept a parameter that is a builder block applied to the outgoing request, letting the caller imprint arbitrary request mutations such as an extra header. At most one builder parameter is allowed, and the parameter must have the builder block type; other forms are rejected at generation time. The adapter exercises the positive case with a builder that appends one header and prints the issued request's method, resolved URL, body kind and headers, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "params": [
+              {
+                "kind": "reqBuilder",
+                "name": "builder",
+                "header": "X-Custom"
+              }
+            ]
+          },
+          "expected_output": "method=GET\nurl=http://localhost/posts\nbody=none\nheader=X-Custom=1"
+        },
+        {
+          "input": {
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ],
+            "params": [
+              {
+                "kind": "reqBuilder",
+                "name": "b1"
+              },
+              {
+                "kind": "reqBuilder",
+                "name": "b2"
+              }
+            ]
+          },
+          "expected_output": "error=multiple_request_builders"
+        }
+      ]
+    },
+    "feature13_parameter_conversion.json": {
+      "description": "Parameter type conversion. The client can convert a supplied parameter value to a declared target type using a registered converter before the value is placed into the request; if no converter supports the requested conversion the call fails. A parameter may also declare a target request type so that its value is converted before being substituted into the request. The adapter prints the converted value and its resulting type, the issued request for the substitution case, or a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "op": "convert",
+            "from": "String",
+            "to": "Int",
+            "value": "4",
+            "converter": true
+          },
+          "expected_output": "converted=4\ntype=Int"
+        },
+        {
+          "input": {
+            "op": "convert",
+            "from": "String",
+            "to": "Int",
+            "value": "4",
+            "converter": false
+          },
+          "expected_output": "error=no_request_converter"
+        }
+      ]
+    },
+    "feature14_interface_validation.json": {
+      "description": "Interface-shape validation. The declarative API source must be a host-language interface that resides in a package and carries no type parameters. A foreign-language interface, an interface without a package, or an interface with type parameters is rejected at generation time. The adapter prints a neutral error category for each violation.",
+      "cases": [
+        {
+          "input": {
+            "lang": "java",
+            "http": [
+              {
+                "verb": "GET",
+                "path": "posts"
+              }
+            ]
+          },
+          "expected_output": "error=java_interface_unsupported"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "action_dispatch",
+      "input_condition": "input.op",
+      "output_rule": "Determines the execution path: 'request' synthesizes a method and issues a request; 'convert' exercises parameter type conversion.",
+      "exact_values": [
+        "request",
+        "convert"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "action_dispatch",
+      "input_condition": "input.op is not specified",
+      "output_rule": "Default action is 'request'.",
+      "exact_values": [
+        "request"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "validation_language",
+      "input_condition": "input.lang is 'java'",
+      "output_rule": "Generation fails with specific error.",
+      "exact_values": [
+        "java_interface_unsupported"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "validation_language",
+      "input_condition": "input.lang is not 'host_language'",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "java_interface_unsupported"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "validation_package",
+      "input_condition": "input.withPackage is false",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "interface_must_reside_in_package"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "validation_language",
+      "input_condition": "input.generic is true",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "interface_must_not_have_type_params"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "http_method_binding",
+      "input_condition": "input.http array length > 1",
+      "output_rule": "Generation fails at compile/generation time.",
+      "exact_values": [
+        "multiple_http_methods"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "http_method_field_property",
+      "input_condition": "input.http contains multiple entries",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "method_overloaded",
+        "multiple_verbs"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "url_resolution",
+      "input_condition": "input.http static path is empty AND no url params exist",
+      "output_rule": "Generation fails before request assembly.",
+      "exact_values": [
+        "missing_url"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "url_resolution",
+      "input_condition": "input.http static path is empty AND multiple url params exist",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "multiple_url_annotations"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "url_resolution",
+      "input_condition": "param value is absolute URL",
+      "output_rule": "Absolute URL overrides base URL entirely.",
+      "exact_values": [
+        "absolute_url_override"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "url_resolution",
+      "input_condition": "input.heuristic",
+      "output_rule": "Standard concatenation of base URL and relative path.",
+      "exact_values": [
+        "http_base + path"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "validation_base_url",
+      "input_condition": "input.baseUrl is empty or null",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "base_url_required"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "validation_base_url",
+      "input_condition": "input.baseUrl does not end with '/'",
+      "output_rule": "Generation fails at client construction.",
+      "exact_values": [
+        "base_url_must_end_with_slash"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "validation_base_url",
+      "input_condition": "input.baseUrl has unrecognized scheme",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "base_url_invalid_scheme"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "path_substitution",
+      "input_condition": "param kind is 'path'",
+      "output_rule": "Input validation fails.",
+      "exact_values": [
+        "path_must_not_be_nullable"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "path_substitution",
+      "input_condition": "param has 'type' field ending with '?'",
+      "output_rule": "Input validation fails.",
+      "exact_values": [
+        "path_must_not_be_nullable"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "query_constructor",
+      "input_condition": "param kind is 'queryMap' AND value is not a Map<String, String>",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "query_map_must_be_map"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "query_constructor",
+      "input_condition": "param has 'encoded' field set to true",
+      "output_rule": "Value is inserted into already-encoded query section without re-encoding.",
+      "exact_values": [
+        "processed_encoded_query"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "header_constructor",
+      "input_condition": "input.headers array is provided",
+      "output_rule": "Headers are appended to the request. Static 'Accept'/'Accept-Charset' are excluded from output logic.",
+      "exact_values": [
+        "static_headers_filtered"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "header_constructor",
+      "input_condition": "param kind is 'headerMap' AND value is not a Map<String, String>",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "header_map_must_be_map"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "body_attachment",
+      "input_condition": "param kind is 'body' AND input.return is not String or void/null",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "body_not_allowed_on_return_type"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "body_attachment",
+      "input_condition": "param kind is 'body' AND input.verb is GET",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "body_not_allowed_on_non_body_method"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "form_encoding",
+      "input_condition": "input.encoding contains 'form'",
+      "output_rule": "Request body logic: form encoding if present.",
+      "exact_values": [
+        "body_kind=form",
+        "fields_name=value"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "form_encoding",
+      "input_condition": "input.encoding is 'form' AND param has type 'String?' (nullable)",
+      "output_rule": "Field is omitted from body or generation fails.",
+      "exact_values": [
+        "null_value_omitted"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "form_encoding",
+      "input_condition": "input.encoding contains both 'form' and 'multipart'",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "multiple_encoding_annotations"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "multipart_encoding",
+      "input_condition": "input.encoding contains 'multipart'",
+      "output_rule": "Body is declared as multipart.",
+      "exact_values": [
+        "body_kind=multipart"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "multipart_encoding",
+      "input_condition": "param kind is 'part' AND type is nullable (e.g. String?)",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "part_must_not_be_nullable"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "streaming_response",
+      "input_condition": "input.streaming is true",
+      "output_rule": "Generate a request for streaming handle execution, requiring deferred return.",
+      "exact_values": [
+        "deferred_handle_request"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "streaming_response",
+      "input_condition": "input.streaming is true AND input.return is not streaming handle type",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "streaming_requires_statement_return"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "request_builder",
+      "input_condition": "input.params count > 1 AND param.kind is 'reqBuilder'",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "multiple_request_builders"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "request_builder",
+      "input_condition": "param kind is 'reqBuilder'",
+      "output_rule": "Generated implementation invokes the builder.",
+      "exact_values": [
+        "builder_invocation"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "builder_type_check",
+      "input_condition": "param kind is 'reqBuilder' AND type is not builder block type",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "builder_must_be_block_type"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "converter_op",
+      "input_condition": "input.op is 'convert' AND input.converter is false",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "no_request_converter"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "converter_success",
+      "input_condition": "input.op is 'convert' AND input.converter is true",
+      "output_rule": "Output 'converted' value with 'type' of target.",
+      "exact_values": [
+        "converted=value",
+        "type=target_name"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "converter_target",
+      "input_condition": "input.converter argument type does not support from->to conversion",
+      "output_rule": "Generation fails.",
+      "exact_values": [
+        "converter_not_found",
+        "type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "output_formatting",
+      "input_condition": "Success scenario (empty error or neutral)",
+      "output_rule": "Single line per requirement, sorted logically.",
+      "exact_values": [
+        "method=...",
+        "url=...",
+        "body=..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "output_formatting",
+      "input_condition": "Success scenario with text body",
+      "output_rule": "Order: method, url, body, text.",
+      "exact_values": [
+        "method",
+        "url",
+        "body",
+        "text"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "output_formatting",
+      "input_condition": "Success scenario with form body",
+      "output_rule": "Order: method, url, body, field(s) sorted by name.",
+      "exact_values": [
+        "method",
+        "url",
+        "body",
+        "field"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "output_formatting",
+      "input_condition": "Success scenario with headers only",
+      "output_rule": "Order: method, url, body, header(s) sorted by name.",
+      "exact_values": [
+        "method",
+        "url",
+        "body",
+        "header"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C041",
+      "feature": "output_formatting",
+      "input_condition": "Error scenario",
+      "output_rule": "Single line per error, no value lines.",
+      "exact_values": [
+        "keyword=error",
+        "value=category"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C042",
+      "feature": "output_formatting",
+      "input_condition": "Single error",
+      "output_rule": "Only error line printed.",
+      "exact_values": [
+        "error=..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C043",
+      "feature": "output_formatting",
+      "input_condition": "Multiple errors",
+      "output_rule": "Multiple lines sorted by category/alphabetical order, no trailing newline on last.",
+      "exact_values": [
+        "error=1\nerror=2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C044",
+      "feature": "validator",
+      "input_condition": "Output line missing expected field",
+      "output_rule": "Treat as failure or reconciled as neutral error if applicable.",
+      "exact_values": [
+        "missing_field_rejection"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C045",
+      "feature": "case_detection",
+      "input_condition": "No explicit http loop count",
+      "output_rule": "If Check Exists: Loop N times."
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific sentinel error category",
+        "exact_values_to_replace": [
+          "multiple_http_methods"
+        ],
+        "trigger_keywords": [
+          "what happens when I use multiple verbs?",
+          "error reporting for multiple HTTP methods"
+        ],
+        "oracle_response": "The generation fails with the exact error category 'multiple_http_methods'."
+      },
+      {
+        "constraint_id": "C009",
+        "replacement": "a specific internal error identifier",
+        "exact_values_to_replace": [
+          "missing_url"
+        ],
+        "trigger_keywords": [
+          "what is the error id for missing static path?",
+          "sun/mon error reasons"
+        ],
+        "oracle_response": "Attempting to generate a request with an empty static path and no URL parameters triggers the exact error category 'missing_url'."
+      },
+      {
+        "constraint_id": "C019",
+        "replacement": "a specific placeholder value representing processed encoded data",
+        "exact_values_to_replace": [
+          "processed_encoded_query"
+        ],
+        "trigger_keywords": [
+          "how is already encoded query handled?",
+          "sentinel value for doubled encoding"
+        ],
+        "oracle_response": "When an input parameter has an 'encoded' field set to true, the value is inserted without re-encoding, but this behavior is flagged by the system using the exact placeholder 'processed_encoded_query' in validation logs."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C016",
+        "vague_phrase": "adhere to the same validation rules as described in the path constraint section regarding nullable values",
+        "actual_meaning": "The parameter type validation logic mirrors that found in C017, enforcing that paths with '?' suffixes must not permit null values."
+      },
+      {
+        "constraint_id": "C032",
+        "vague_phrase": "invoke the builder component as defined in the request builder pattern examples",
+        "actual_meaning": "When a parameter has kind 'reqBuilder', the generated code must call the builder's invoke method, consistent with the invoke pattern in C032."
+      }
+    ]
+  }
+}

@@ -1,0 +1,1206 @@
+{
+  "fuzzy_prd": "Hey team, we've been getting complaints from a few integrators who are hand-rolling their own InfluxDB write logic and keep running into data corruption bugs — mostly around special characters in measurement names and tags, and weirdly formatted timestamps. We want to build out a proper client adapter library that handles all of this cleanly. It should cover the serialization side (you know, that line protocol thing InfluxDB uses), plus a query builder so people stop concatenating strings directly into queries, and an HTTP write layer that handles the actual sending. Oh, and wire up logging so we can observe what's happening internally — similar to how we did it in that transport abstraction layer from the last sprint, where we just delegated calls through to a caller-provided handler rather than owning the log output ourselves.\n\nA few things I'm not 100% sure about: for the write layer, we had a discussion about compression but I don't remember what threshold we landed on, or whether retries were supposed to be configurable or fixed. Also for the query builder, there was something about how undefined values should behave differently from null — I just can't remember the exact distinction we agreed on. And for timestamps, I think there were some edge cases around non-standard formats that someone on the backend team had opinions about. Can we make sure all that's nailed down before we ship? The integration tests should tell us if we got it right.\n\nQuick follow-up after the team’s questions: on the line protocol side, we do need to be strict about escaping. Spaces and commas in measurement names get escaped with a backslash, so 'meas, 2' becomes 'meas\\,\\ 2', and tags follow that same rule. For field string values, backslashes and double-quote characters both need escaping, with backslash becoming double-backslash and double-quote becoming backslash-double-quote, and then the whole string value stays wrapped in double quotes. Also, both tag keys and field keys need to be sorted alphabetically in the final line protocol output. Tags sit between the measurement name and the field set, sorted ascending by key, and fields are sorted ascending by key too. That still applies after merging default tags with explicit tags.\n\nFor writes, the route is '/api/v2/write?org=<org>&bucket=<bucket>&precision=<precision>'. The authorization header defaults to 'Token <token>'. If a headers map is provided in the write configuration and includes an 'authorization' key, that value overrides the default 'Token <token>' header derived from the server token. The route and body format are unaffected by custom headers. On success handling, only HTTP status 204 (No Content) counts as a successful write. Anything else is treated as a write rejection and should produce output starting with 'error=write_rejected\\nstatus_code=<code>\\n'. In those cases, failed_lines is the number of lines in the rejected batch and success_lines remains 0. Also, request_count in output should reflect total HTTP requests made including retries.\n\nOn compression, the behavior we wanted was tied directly to gzip_threshold in write settings. If that is configured, request bodies at or above that byte threshold are compressed with gzip and the content_encoding header reflects 'gzip'. If no threshold is set or the body is below the threshold, content_encoding is 'identity'. Important detail there: the observable output body is always the decompressed line protocol text.\n\nOne more write-layer thing: once a writer is closed, any attempt to enqueue records or points needs to fail immediately with 'error=writer_closed\\noperation=<operation_name>\\n'. The operation names are exactly: 'single_record', 'multiple_records', 'single_point'. In that state, no data should be written and no HTTP request should be made.\n\nFor logging, this is still the same pattern from the earlier transport work: the logger must delegate to a caller-supplied handler without modifying the message or error payload. The logger feature (Feature 4) where warn and error calls are forwarded unchanged to a caller-supplied logger callback, as described in feature4_logger_delegation.json — the library never owns log output, it only delegates with the original message and optional error argument. The output format is: 'level=<level>\\nmessage=<message>\\nerror=<error_or_empty>\\nargument_count=2\\n'. For error-level calls with both a message and an error object, argument_count is 2. For warn-level calls with only a message (no error), argument_count is still 2 — the second argument is passed as an empty/undefined value.\n\nAnd on the query side, the null vs undefined distinction we were trying to remember is this: in automatic query value conversion (feature2_2_query_value_conversion.json), encoded null produces literal 'null' fragment while encoded undefined produces an empty fragment string; additionally in query templates (feature2_4_query_template_errors.json) an undefined-encoded interpolation value triggers error=missing_interpolation_value. For regex values, use the constructor syntax 'regexp.compile(v: \"/pattern/\")'. With explicit type 'regular_expression', the value is wrapped directly. In automatic conversion mode, an object with encoded type 'regexp' and a 'pattern' field is converted using the same constructor syntax with the pattern wrapped in forward slashes.",
+  "oracle_data": {
+    "task_id": "influxdb-client-adapter-001",
+    "golden_api_signature": "serialize(measurement: string, fields: Field[], tags?: Tag[], timestamp?: Timestamp, settings?: Settings): string",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "what happens to null or missing field values",
+          "how to handle fields with no value provided",
+          "should empty string fields be included in output"
+        ],
+        "oracle_response": "Fields with empty string keys must be omitted entirely. String-typed fields whose value is null, undefined/missing, or not provided must also be omitted. Boolean fields with empty or falsy values should render as 'F'. Integer and float fields with no value present at all are invalid and must produce a validation error rather than being silently dropped."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "how are integer fields formatted",
+          "what suffix do integer values get",
+          "how is a float value coerced to integer type"
+        ],
+        "oracle_response": "Integer-typed fields must have their numeric value truncated to a whole number (floor toward zero) and suffixed with 'i'. So a value of 9.2 with type 'integer' renders as '9i'. Unsigned integers follow similar truncation but must reject negative values and values exceeding 18446744073709551615, producing an invalid_field_value error."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "what error format is used for invalid field values",
+          "how should numeric validation errors be reported",
+          "what does the error output look like for bad field types"
+        ],
+        "oracle_response": "Validation errors for invalid numeric fields must use a language-neutral multi-line format: 'error=invalid_field_value\\nfield_type=<type>\\nfield=<key>\\n'. The type names are exactly: integer, float, unsigned_integer. No runtime exception class names or generated error strings should appear in the output."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "how does the timestamp get handled when it is a float or decimal number",
+          "what happens to a non-integer numeric timestamp",
+          "should timestamps be truncated or rounded"
+        ],
+        "oracle_response": "Numeric timestamps (including floats) must be truncated to a whole integer unit before being appended to the line protocol string. For example, timestamp 1.2 becomes '1'. An empty string timestamp means no timestamp token is appended at all."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what happens with a date-encoded timestamp",
+          "how is a date object timestamp converted",
+          "when timestamp has encoded date type what value is used"
+        ],
+        "oracle_response": "When the timestamp is an object with encoded type 'date', the converted_timestamp from settings must be used as the timestamp token in the output. When encoded type is 'object_to_string', the value field is passed through as a raw text string directly into the line protocol output."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "how do default tags interact with explicit tags",
+          "when a tag key appears in both default and explicit tags which wins",
+          "can explicit tags override default tag values"
+        ],
+        "oracle_response": "Default tags are merged with explicit tags before serialization. If the same key appears in both, the explicit tag value takes precedence and overrides the default. The merged set is then sorted alphabetically by key for line protocol output."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "how does the query builder handle undefined values",
+          "what is the difference between null and undefined in query interpolation",
+          "what does automatic conversion do with undefined"
+        ],
+        "oracle_response": "In automatic query value conversion, null-encoded values render as the literal string 'null', while undefined-encoded values render as an empty string (i.e., the fragment is empty). These are distinct behaviors. An undefined interpolation value inside a query template is a hard error that produces 'error=missing_interpolation_value'."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "what error occurs when query template segment and interpolation counts mismatch",
+          "how is an invalid template shape reported",
+          "what happens if there are more or fewer segments than expected"
+        ],
+        "oracle_response": "A valid query template must have exactly one more segment than interpolation values (segments.length === interpolations.length + 1). If this shape is violated, the output must be 'error=invalid_template_shape\\n'. If an interpolation value is undefined-encoded, the output is 'error=missing_interpolation_value\\n'."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_1_line_protocol_fields",
+        "trigger_keywords": [
+          "test cases for feature1 1 line protocol fields",
+          "show me feature1 1 line protocol fields test cases",
+          "what are the feature1 1 line protocol fields test inputs",
+          "give me the feature1_1_line_protocol_fields test file",
+          "test cases for feature 1",
+          "feature1 1 line protocol fields expected output",
+          "what does feature1 1 line protocol fields expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_line_protocol_fields:\n{\n  \"description\": \"Serializes measurement samples with typed fields, sorted fields, escaped names, escaped tags, omitted empty values, and empty timestamps.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"m0\",\n        \"fields\": [\n          {\n            \"key\": \"a\",\n            \"type\": \"float\",\n            \"value\": 9.2\n          },\n          {\n            \"key\": \"b\",\n            \"type\": \"integer\",\n            \"value\": 9.2\n          },\n          {\n            \"key\": \"\",\n            \"type\": \"string\",\n            \"value\": 9.2\n          },\n          {\n            \"key\": \"d\",\n            \"type\": \"string\",\n            \"value\": null\n          },\n          {\n            \"key\": \"e\",\n            \"type\": \"string\"\n          },\n          {\n            \"key\": \"f\",\n            \"type\": \"string\",\n            \"value\": \"9\"\n          }\n        ],\n        \"timestamp\": \"\"\n      },\n      \"expected_output\": \"line_protocol=m0 a=9.2,b=9i,f=\\\"9\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"meas, 2\",\n        \"tags\": [\n          {\n            \"key\": \"tag3\",\n            \"value\": \"a\"\n          },\n          {\n            \"key\": \"tag2\",\n            \"value\": \"b\"\n          },\n          {\n            \"key\": \"tag1\",\n            \"value\": \"c\"\n          }\n        ],\n        \"fields\": [\n          {\n            \"key\": \"f9\",\n            \"type\": \"float\",\n            \"value\": 9.2\n          },\n          {\n            \"key\": \"f8\",\n            \"type\": \"string\",\n            \"value\": 8.2\n          },\n          {\n            \"key\": \"f7\",\n            \"type\": \"boolean\",\n            \"value\": 7.2\n          },\n          {\n            \"key\": \"f6\",\n            \"type\": \"integer\",\n            \"value\": 6.2\n          }\n        ],\n        \"timestamp\": \"12345\"\n      },\n      \"expected_output\": \"line_protocol=meas\\\\,\\\\ 2,tag1=c,tag2=b,tag3=a f6=6i,f7=T,f8=\\\"8.2\\\",f9=9.2 12345\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"m3\",\n        \"fields\": [\n          {\n            \"key\": \"a\",\n            \"type\": \"integer\",\n            \"value\": \"9.2\"\n          },\n          {\n            \"key\": \"b\",\n            \"type\": \"float\",\n            \"value\": \"8.2\"\n          },\n          {\n            \"key\": \"c\",\n            \"type\": \"boolean\",\n            \"value\": \"\"\n          },\n          {\n            \"key\": \"\",\n            \"type\": \"boolean\",\n            \"value\": \"\"\n          }\n        ],\n        \"timestamp\": \"\"\n      },\n      \"expected_output\": \"line_protocol=m3 a=9i,b=8.2,c=F\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"m11\",\n        \"fields\": [\n          {\n            \"key\": \"f\",\n            \"type\": \"string\",\n            \"value\": \"\\\\\\\"\"\n          }\n        ],\n        \"timestamp\": \"\"\n      },\n      \"expected_output\": \"line_protocol=m11 f=\\\"\\\\\\\\\\\\\\\"\\\"\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_line_protocol_defaults",
+        "trigger_keywords": [
+          "test cases for feature1 2 line protocol defaults",
+          "show me feature1 2 line protocol defaults test cases",
+          "what are the feature1 2 line protocol defaults test inputs",
+          "give me the feature1_2_line_protocol_defaults test file",
+          "test cases for feature 1",
+          "feature1 2 line protocol defaults expected output",
+          "what does feature1 2 line protocol defaults expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_line_protocol_defaults:\n{\n  \"description\": \"Serializes measurement samples while applying default tags, allowing explicit tags to override defaults, and using a provided timestamp converter when no timestamp is embedded in the sample.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"m8\",\n        \"fields\": [\n          {\n            \"key\": \"a\",\n            \"type\": \"boolean\",\n            \"value\": true\n          }\n        ],\n        \"timestamp\": \"\",\n        \"settings\": {\n          \"default_tags\": {\n            \"tag3\": \"a\",\n            \"tag2\": \"b\",\n            \"tag1\": \"c\"\n          }\n        }\n      },\n      \"expected_output\": \"line_protocol=m8,tag1=c,tag2=b,tag3=a a=T\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"m9\",\n        \"tags\": [\n          {\n            \"key\": \"tag2\",\n            \"value\": \"x\"\n          }\n        ],\n        \"fields\": [\n          {\n            \"key\": \"a\",\n            \"type\": \"boolean\",\n            \"value\": true\n          }\n        ],\n        \"timestamp\": \"\",\n        \"settings\": {\n          \"default_tags\": {\n            \"tag3\": \"a\",\n            \"tag2\": \"b\",\n            \"tag1\": \"c\"\n          }\n        }\n      },\n      \"expected_output\": \"line_protocol=m9,tag1=c,tag2=x,tag3=a a=T\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"m10\",\n        \"tags\": [\n          {\n            \"key\": \"tag1\",\n            \"value\": \"x\"\n          }\n        ],\n        \"fields\": [\n          {\n            \"key\": \"a\",\n            \"type\": \"boolean\",\n            \"value\": true\n          }\n        ],\n        \"settings\": {\n          \"default_tags\": {\n            \"tag3\": \"a\",\n            \"tag2\": \"b\",\n            \"tag1\": \"c\"\n          },\n          \"converted_timestamp\": \"11111\"\n        }\n      },\n      \"expected_output\": \"line_protocol=m10,tag1=x,tag2=b,tag3=a a=T 11111\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_line_protocol_timestamps",
+        "trigger_keywords": [
+          "test cases for feature1 3 line protocol timestamps",
+          "show me feature1 3 line protocol timestamps test cases",
+          "what are the feature1 3 line protocol timestamps test inputs",
+          "give me the feature1_3_line_protocol_timestamps test file",
+          "test cases for feature 1",
+          "feature1 3 line protocol timestamps expected output",
+          "what does feature1 3 line protocol timestamps expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_line_protocol_timestamps:\n{\n  \"description\": \"Serializes explicit timestamps by omitting an empty timestamp, truncating numeric timestamps to whole units, converting dates to the selected precision, and passing unknown timestamp values through as text.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"a\",\n        \"fields\": [\n          {\n            \"key\": \"b\",\n            \"type\": \"float\",\n            \"value\": 1\n          }\n        ],\n        \"timestamp\": \"\"\n      },\n      \"expected_output\": \"line_protocol=a b=1\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"a\",\n        \"fields\": [\n          {\n            \"key\": \"b\",\n            \"type\": \"float\",\n            \"value\": 1\n          }\n        ],\n        \"timestamp\": 1.2\n      },\n      \"expected_output\": \"line_protocol=a b=1 1\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"test\",\n        \"fields\": [\n          {\n            \"key\": \"value\",\n            \"type\": \"float\",\n            \"value\": 6\n          }\n        ],\n        \"timestamp\": {\n          \"encoded\": \"date\",\n          \"value\": 3\n        },\n        \"settings\": {\n          \"default_tags\": {\n            \"xtra\": \"1\"\n          },\n          \"converted_timestamp\": \"3000000\"\n        }\n      },\n      \"expected_output\": \"line_protocol=test,xtra=1 value=6 3000000\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"tst\",\n        \"fields\": [\n          {\n            \"key\": \"a\",\n            \"type\": \"float\",\n            \"value\": 1\n          }\n        ],\n        \"timestamp\": {\n          \"encoded\": \"object_to_string\",\n          \"value\": \"any\"\n        }\n      },\n      \"expected_output\": \"line_protocol=tst a=1 any\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_4_line_protocol_invalid_values",
+        "trigger_keywords": [
+          "test cases for feature1 4 line protocol invalid values",
+          "show me feature1 4 line protocol invalid values test cases",
+          "what are the feature1 4 line protocol invalid values test inputs",
+          "give me the feature1_4_line_protocol_invalid_values test file",
+          "test cases for feature 1",
+          "feature1 4 line protocol invalid values expected output",
+          "what does feature1 4 line protocol invalid values expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_4_line_protocol_invalid_values:\n{\n  \"description\": \"Rejects invalid numeric field values using language-neutral field validation errors that identify the field type and field name rather than a runtime exception string.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"m6\",\n        \"fields\": [\n          {\n            \"key\": \"a\",\n            \"type\": \"integer\"\n          }\n        ],\n        \"timestamp\": \"\"\n      },\n      \"expected_output\": \"error=invalid_field_value\\nfield_type=integer\\nfield=a\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"m7\",\n        \"fields\": [\n          {\n            \"key\": \"a\",\n            \"type\": \"float\"\n          }\n        ],\n        \"timestamp\": \"\"\n      },\n      \"expected_output\": \"error=invalid_field_value\\nfield_type=float\\nfield=a\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"uintNegativeNumber\",\n        \"fields\": [\n          {\n            \"key\": \"f\",\n            \"type\": \"unsigned_integer\",\n            \"value\": -1\n          }\n        ],\n        \"timestamp\": \"\"\n      },\n      \"expected_output\": \"error=invalid_field_value\\nfield_type=unsigned_integer\\nfield=f\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"line_protocol\",\n        \"measurement\": \"uintTooLargeString\",\n        \"fields\": [\n          {\n            \"key\": \"f\",\n            \"type\": \"unsigned_integer\",\n            \"value\": \"18446744073709551616\"\n          }\n        ],\n        \"timestamp\": \"\"\n      },\n      \"expected_output\": \"error=invalid_field_value\\nfield_type=unsigned_integer\\nfield=f\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_query_literals",
+        "trigger_keywords": [
+          "test cases for feature2 1 query literals",
+          "show me feature2 1 query literals test cases",
+          "what are the feature2 1 query literals test inputs",
+          "give me the feature2_1_query_literals test file",
+          "test cases for feature 2",
+          "feature2 1 query literals expected output",
+          "what does feature2 1 query literals expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_query_literals:\n{\n  \"description\": \"Renders primitive and wrapped query values as query-language fragments with appropriate quoting, escaping, and constructor syntax.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"raw_expression\",\n        \"value\": \"12345\"\n      },\n      \"expected_output\": \"query_fragment=12345\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"integer\",\n        \"value\": 123\n      },\n      \"expected_output\": \"query_fragment=123\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"boolean\",\n        \"value\": 1\n      },\n      \"expected_output\": \"query_fragment=true\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"duration\",\n        \"value\": \"1ms\"\n      },\n      \"expected_output\": \"query_fragment=duration(v: \\\"1ms\\\")\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"date_time\",\n        \"value\": \"2020-06-06T21:56:00.000Z\"\n      },\n      \"expected_output\": \"query_fragment=time(v: \\\"2020-06-06T21:56:00.000Z\\\")\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"regular_expression\",\n        \"value\": \"/abc/\"\n      },\n      \"expected_output\": \"query_fragment=regexp.compile(v: \\\"/abc/\\\")\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"string\",\n        \"value\": \"abc\"\n      },\n      \"expected_output\": \"query_fragment=\\\"abc\\\"\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_query_value_conversion",
+        "trigger_keywords": [
+          "test cases for feature2 2 query value conversion",
+          "show me feature2 2 query value conversion test cases",
+          "what are the feature2 2 query value conversion test inputs",
+          "give me the feature2_2_query_value_conversion test file",
+          "test cases for feature 2",
+          "feature2 2 query value conversion expected output",
+          "what does feature2 2 query value conversion expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_query_value_conversion:\n{\n  \"description\": \"Automatically converts mixed runtime values into query-language fragments, including null-like values, numbers, dates, regular expressions, arrays, escaped strings, symbols, and values that are already query fragments.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"automatic\",\n        \"value\": {\n          \"encoded\": \"null\"\n        }\n      },\n      \"expected_output\": \"query_fragment=null\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"automatic\",\n        \"value\": {\n          \"encoded\": \"undefined\"\n        }\n      },\n      \"expected_output\": \"query_fragment=\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"automatic\",\n        \"value\": \"abc\\n\\r\\t\\\\\\\"def\"\n      },\n      \"expected_output\": \"query_fragment=\\\"abc\\\\n\\\\r\\\\t\\\\\\\\\\\\\\\"def\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"automatic\",\n        \"value\": {\n          \"encoded\": \"date\",\n          \"value\": 1589521447471\n        }\n      },\n      \"expected_output\": \"query_fragment=2020-05-15T05:44:07.471Z\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"automatic\",\n        \"value\": {\n          \"encoded\": \"regexp\",\n          \"pattern\": \"abc\"\n        }\n      },\n      \"expected_output\": \"query_fragment=regexp.compile(v: \\\"/abc/\\\")\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"automatic\",\n        \"value\": [\n          \"a\\\"$d\"\n        ]\n      },\n      \"expected_output\": \"query_fragment=[\\\"a\\\\\\\"$d\\\"]\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_literal\",\n        \"value_type\": \"automatic\",\n        \"value\": {\n          \"encoded\": \"expression\",\n          \"value\": \"1ms\"\n        }\n      },\n      \"expected_output\": \"query_fragment=1ms\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_query_template_interpolation",
+        "trigger_keywords": [
+          "test cases for feature2 3 query template interpolation",
+          "show me feature2 3 query template interpolation test cases",
+          "what are the feature2 3 query template interpolation test inputs",
+          "give me the feature2_3_query_template_interpolation test file",
+          "test cases for feature 2",
+          "feature2 3 query template interpolation expected output",
+          "what does feature2 3 query template interpolation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_query_template_interpolation:\n{\n  \"description\": \"Builds full query strings by preserving literal query text while safely interpolating numbers, strings, nested query fragments, empty fragments, and wrapped string positions.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"query_template\",\n        \"segments\": [\n          \"from(bucket:\\\"my-bucket\\\") |> range(start: 0) |> filter(fn: (r) => r._measurement == \\\"temperature\\\")\"\n        ],\n        \"interpolations\": []\n      },\n      \"expected_output\": \"query=from(bucket:\\\"my-bucket\\\") |> range(start: 0) |> filter(fn: (r) => r._measurement == \\\"temperature\\\")\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_template\",\n        \"segments\": [\n          \"from(bucket:\\\"my-bucket\\\") |> range(start: \",\n          \") |> filter(fn: (r) => r._measurement == \",\n          \")\"\n        ],\n        \"interpolations\": [\n          0,\n          \"temperature\"\n        ]\n      },\n      \"expected_output\": \"query=from(bucket:\\\"my-bucket\\\") |> range(start: 0) |> filter(fn: (r) => r._measurement == \\\"temperature\\\")\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_template\",\n        \"segments\": [\n          \"from(bucket:\\\"\",\n          \"\\\")\"\n        ],\n        \"interpolations\": [\n          \"my-bucket\"\n        ]\n      },\n      \"expected_output\": \"query=from(bucket:\\\"my-bucket\\\")\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_template\",\n        \"segments\": [\n          \"\",\n          \" |> range(start: \",\n          \")\\\"\"\n        ],\n        \"interpolations\": [\n          {\n            \"encoded\": \"expression\",\n            \"value\": \"from(bucket:\\\"my-bucket\\\")\"\n          },\n          0\n        ]\n      },\n      \"expected_output\": \"query=from(bucket:\\\"my-bucket\\\") |> range(start: 0)\\\"\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_4_query_template_errors",
+        "trigger_keywords": [
+          "test cases for feature2 4 query template errors",
+          "show me feature2 4 query template errors test cases",
+          "what are the feature2 4 query template errors test inputs",
+          "give me the feature2_4_query_template_errors test file",
+          "test cases for feature 2",
+          "feature2 4 query template errors expected output",
+          "what does feature2 4 query template errors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_4_query_template_errors:\n{\n  \"description\": \"Reports language-neutral query-construction errors when a template interpolation is missing or the template shape is invalid.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"query_template\",\n        \"segments\": [\n          \"\",\n          \"\"\n        ],\n        \"interpolations\": [\n          {\n            \"encoded\": \"undefined\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=missing_interpolation_value\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"query_template\",\n        \"segments\": [\n          \"1\",\n          \"2\"\n        ],\n        \"interpolations\": []\n      },\n      \"expected_output\": \"error=invalid_template_shape\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_write_success_and_retry",
+        "trigger_keywords": [
+          "test cases for feature3 1 write success and retry",
+          "show me feature3 1 write success and retry test cases",
+          "what are the feature3 1 write success and retry test inputs",
+          "give me the feature3_1_write_success_and_retry test file",
+          "test cases for feature 3",
+          "feature3 1 write success and retry expected output",
+          "what does feature3 1 write success and retry expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_write_success_and_retry:\n{\n  \"description\": \"Writes line protocol to the configured HTTP write route, retries a retryable response once, then reports the accepted body, authorization header, route, request count, and successful line count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"write_request\",\n        \"destination\": {\n          \"org\": \"org\",\n          \"bucket\": \"bucket\",\n          \"precision\": \"ns\"\n        },\n        \"server\": {\n          \"url\": \"http://fake:8086\",\n          \"token\": \"a\",\n          \"responses\": [\n            204\n          ]\n        },\n        \"write\": {\n          \"flush_interval_ms\": 5,\n          \"batch_size\": 10,\n          \"max_retries\": 1,\n          \"default_tags\": {\n            \"xtra\": \"1\"\n          }\n        },\n        \"points\": [\n          {\n            \"measurement\": \"test\",\n            \"tags\": [\n              {\n                \"key\": \"t\",\n                \"value\": \" \"\n              }\n            ],\n            \"fields\": [\n              {\n                \"key\": \"value\",\n                \"type\": \"float\",\n                \"value\": 1\n              }\n            ],\n            \"timestamp\": \"\"\n          }\n        ],\n        \"expected_observed_lines\": 1\n      },\n      \"expected_output\": \"route=/api/v2/write?org=org&bucket=bucket&precision=ns\\nauthorization=Token a\\ncontent_encoding=identity\\nrequest_count=1\\nsuccess_lines=1\\nfailed_lines=0\\nbody_000=test,t=\\\\ ,xtra=1 value=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_write_gzip",
+        "trigger_keywords": [
+          "test cases for feature3 2 write gzip",
+          "show me feature3 2 write gzip test cases",
+          "what are the feature3 2 write gzip test inputs",
+          "give me the feature3_2_write_gzip test file",
+          "test cases for feature 3",
+          "feature3 2 write gzip expected output",
+          "what does feature3 2 write gzip expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_write_gzip:\n{\n  \"description\": \"Compresses write request bodies when the compression threshold requires it while preserving the decompressed line protocol payload and normal write route semantics.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"write_request\",\n        \"destination\": {\n          \"org\": \"org\",\n          \"bucket\": \"bucket\",\n          \"precision\": \"ns\"\n        },\n        \"server\": {\n          \"url\": \"http://fake:8086\",\n          \"token\": \"a\",\n          \"responses\": [\n            204\n          ]\n        },\n        \"write\": {\n          \"flush_interval_ms\": 5,\n          \"batch_size\": 10,\n          \"max_retries\": 1,\n          \"default_tags\": {\n            \"xtra\": \"1\"\n          },\n          \"gzip_threshold\": 0\n        },\n        \"points\": [\n          {\n            \"measurement\": \"test\",\n            \"tags\": [\n              {\n                \"key\": \"t\",\n                \"value\": \" \"\n              }\n            ],\n            \"fields\": [\n              {\n                \"key\": \"value\",\n                \"type\": \"float\",\n                \"value\": 1\n              }\n            ],\n            \"timestamp\": \"\"\n          }\n        ],\n        \"expected_observed_lines\": 1\n      },\n      \"expected_output\": \"route=/api/v2/write?org=org&bucket=bucket&precision=ns\\nauthorization=Token a\\ncontent_encoding=gzip\\nrequest_count=1\\nsuccess_lines=1\\nfailed_lines=0\\nbody_000=test,t=\\\\ ,xtra=1 value=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_write_rejection",
+        "trigger_keywords": [
+          "test cases for feature3 3 write rejection",
+          "show me feature3 3 write rejection test cases",
+          "what are the feature3 3 write rejection test inputs",
+          "give me the feature3_3_write_rejection test file",
+          "test cases for feature 3",
+          "feature3 3 write rejection expected output",
+          "what does feature3 3 write rejection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_write_rejection:\n{\n  \"description\": \"Treats any HTTP write status other than the no-content success status as a rejected write and reports the route, status code, authorization header, failed line count, and submitted body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"write_request\",\n        \"destination\": {\n          \"org\": \"org\",\n          \"bucket\": \"bucket\",\n          \"precision\": \"ns\"\n        },\n        \"server\": {\n          \"url\": \"http://fake:8086\",\n          \"token\": \"a\",\n          \"responses\": [\n            200\n          ]\n        },\n        \"write\": {\n          \"flush_interval_ms\": 2,\n          \"batch_size\": 10,\n          \"max_retries\": 0,\n          \"default_tags\": {\n            \"xtra\": \"1\"\n          }\n        },\n        \"points\": [\n          {\n            \"measurement\": \"test\",\n            \"fields\": [\n              {\n                \"key\": \"value\",\n                \"type\": \"float\",\n                \"value\": 1\n              }\n            ]\n          }\n        ],\n        \"expected_observed_lines\": 1\n      },\n      \"expected_output\": \"error=write_rejected\\nstatus_code=200\\nroute=/api/v2/write?org=org&bucket=bucket&precision=ns\\nauthorization=Token a\\ncontent_encoding=identity\\nrequest_count=1\\nsuccess_lines=0\\nfailed_lines=1\\nbody_000=test,xtra=1 value=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_4_write_headers",
+        "trigger_keywords": [
+          "test cases for feature3 4 write headers",
+          "show me feature3 4 write headers test cases",
+          "what are the feature3 4 write headers test inputs",
+          "give me the feature3_4_write_headers test file",
+          "test cases for feature 3",
+          "feature3 4 write headers expected output",
+          "what does feature3 4 write headers expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_4_write_headers:\n{\n  \"description\": \"Allows caller-supplied write headers to override the default authorization header while still using the configured write route and body format.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"write_request\",\n        \"destination\": {\n          \"org\": \"org\",\n          \"bucket\": \"bucket\",\n          \"precision\": \"ns\"\n        },\n        \"server\": {\n          \"url\": \"http://fake:8086\",\n          \"token\": \"a\",\n          \"responses\": [\n            204\n          ]\n        },\n        \"write\": {\n          \"flush_interval_ms\": 0,\n          \"batch_size\": 10,\n          \"max_retries\": 0,\n          \"headers\": {\n            \"authorization\": \"Token customToken\"\n          }\n        },\n        \"points\": [\n          {\n            \"measurement\": \"test\",\n            \"fields\": [\n              {\n                \"key\": \"value\",\n                \"type\": \"float\",\n                \"value\": 1\n              }\n            ]\n          }\n        ],\n        \"expected_observed_lines\": 1\n      },\n      \"expected_output\": \"route=/api/v2/write?org=org&bucket=bucket&precision=ns\\nauthorization=Token customToken\\ncontent_encoding=identity\\nrequest_count=1\\nsuccess_lines=1\\nfailed_lines=0\\nbody_000=test value=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_5_writer_closed_state",
+        "trigger_keywords": [
+          "test cases for feature3 5 writer closed state",
+          "show me feature3 5 writer closed state test cases",
+          "what are the feature3 5 writer closed state test inputs",
+          "give me the feature3_5_writer_closed_state test file",
+          "test cases for feature 3",
+          "feature3 5 writer closed state expected output",
+          "what does feature3 5 writer closed state expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_5_writer_closed_state:\n{\n  \"description\": \"Rejects attempts to enqueue additional records or points after a writer has been closed, using a neutral closed-writer error that names the attempted operation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"writer_state\",\n        \"after_close\": \"single_record\",\n        \"record\": \"text value=1\"\n      },\n      \"expected_output\": \"error=writer_closed\\noperation=single_record\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"writer_state\",\n        \"after_close\": \"multiple_records\",\n        \"records\": [\n          \"text value=1\",\n          \"text value=2\"\n        ]\n      },\n      \"expected_output\": \"error=writer_closed\\noperation=multiple_records\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"writer_state\",\n        \"after_close\": \"single_point\",\n        \"point\": {\n          \"measurement\": \"test\",\n          \"fields\": [\n            {\n              \"key\": \"value\",\n              \"type\": \"float\",\n              \"value\": 1\n            }\n          ],\n          \"timestamp\": \"\"\n        }\n      },\n      \"expected_output\": \"error=writer_closed\\noperation=single_point\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_logger_delegation",
+        "trigger_keywords": [
+          "test cases for feature4 logger delegation",
+          "show me feature4 logger delegation test cases",
+          "what are the feature4 logger delegation test inputs",
+          "give me the feature4_logger_delegation test file",
+          "test cases for feature 4",
+          "feature4 logger delegation expected output",
+          "what does feature4 logger delegation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_logger_delegation:\n{\n  \"description\": \"Delegates warning and error log events to a caller-supplied logger without changing the message, optional error payload, or argument count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"domain\": \"logger\",\n        \"level\": \"error\",\n        \"message\": \"    hey\",\n        \"error\": \"you\"\n      },\n      \"expected_output\": \"level=error\\nmessage=    hey\\nerror=you\\nargument_count=2\\n\"\n    },\n    {\n      \"input\": {\n        \"domain\": \"logger\",\n        \"level\": \"warn\",\n        \"message\": \"    hey\"\n      },\n      \"expected_output\": \"level=warn\\nmessage=    hey\\nerror=\\nargument_count=2\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "I don't remember what threshold we landed on, or whether retries were supposed to be configurable or fixed",
+        "actual_meaning": "gzip_threshold is a configurable numeric field in write settings (feature3_2_write_gzip.json, value 0 means always compress); max_retries is also a configurable integer field in write settings (feature3_1_write_success_and_retry.json, value 1 means one retry allowed)."
+      },
+      {
+        "vague_reference": "some edge cases around non-standard formats that someone on the backend team had opinions about",
+        "actual_meaning": "Timestamp handling for encoded objects (feature1_3_line_protocol_timestamps.json): encoded 'date' timestamps use the converted_timestamp from settings, while encoded 'object_to_string' timestamps pass the value field through as raw text without conversion or rejection."
+      }
+    ],
+    "fallback_response": "I don't have more specific details on that aspect from my side — you'll want to look at the existing test cases or check with the backend team who defined the original protocol contracts. The integration tests should be the source of truth for exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_line_protocol_fields.json": {
+      "description": "Serializes measurement samples with typed fields, sorted fields, escaped names, escaped tags, omitted empty values, and empty timestamps.",
+      "cases": [
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "m0",
+            "fields": [
+              {
+                "key": "a",
+                "type": "float",
+                "value": 9.2
+              },
+              {
+                "key": "b",
+                "type": "integer",
+                "value": 9.2
+              },
+              {
+                "key": "",
+                "type": "string",
+                "value": 9.2
+              },
+              {
+                "key": "d",
+                "type": "string",
+                "value": null
+              },
+              {
+                "key": "e",
+                "type": "string"
+              },
+              {
+                "key": "f",
+                "type": "string",
+                "value": "9"
+              }
+            ],
+            "timestamp": ""
+          },
+          "expected_output": "line_protocol=m0 a=9.2,b=9i,f=\"9\"\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "meas, 2",
+            "tags": [
+              {
+                "key": "tag3",
+                "value": "a"
+              },
+              {
+                "key": "tag2",
+                "value": "b"
+              },
+              {
+                "key": "tag1",
+                "value": "c"
+              }
+            ],
+            "fields": [
+              {
+                "key": "f9",
+                "type": "float",
+                "value": 9.2
+              },
+              {
+                "key": "f8",
+                "type": "string",
+                "value": 8.2
+              },
+              {
+                "key": "f7",
+                "type": "boolean",
+                "value": 7.2
+              },
+              {
+                "key": "f6",
+                "type": "integer",
+                "value": 6.2
+              }
+            ],
+            "timestamp": "12345"
+          },
+          "expected_output": "line_protocol=meas\\,\\ 2,tag1=c,tag2=b,tag3=a f6=6i,f7=T,f8=\"8.2\",f9=9.2 12345\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "m3",
+            "fields": [
+              {
+                "key": "a",
+                "type": "integer",
+                "value": "9.2"
+              },
+              {
+                "key": "b",
+                "type": "float",
+                "value": "8.2"
+              },
+              {
+                "key": "c",
+                "type": "boolean",
+                "value": ""
+              },
+              {
+                "key": "",
+                "type": "boolean",
+                "value": ""
+              }
+            ],
+            "timestamp": ""
+          },
+          "expected_output": "line_protocol=m3 a=9i,b=8.2,c=F\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "m11",
+            "fields": [
+              {
+                "key": "f",
+                "type": "string",
+                "value": "\\\""
+              }
+            ],
+            "timestamp": ""
+          },
+          "expected_output": "line_protocol=m11 f=\"\\\\\\\"\"\n"
+        }
+      ]
+    },
+    "feature1_2_line_protocol_defaults.json": {
+      "description": "Serializes measurement samples while applying default tags, allowing explicit tags to override defaults, and using a provided timestamp converter when no timestamp is embedded in the sample.",
+      "cases": [
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "m8",
+            "fields": [
+              {
+                "key": "a",
+                "type": "boolean",
+                "value": true
+              }
+            ],
+            "timestamp": "",
+            "settings": {
+              "default_tags": {
+                "tag3": "a",
+                "tag2": "b",
+                "tag1": "c"
+              }
+            }
+          },
+          "expected_output": "line_protocol=m8,tag1=c,tag2=b,tag3=a a=T\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "m9",
+            "tags": [
+              {
+                "key": "tag2",
+                "value": "x"
+              }
+            ],
+            "fields": [
+              {
+                "key": "a",
+                "type": "boolean",
+                "value": true
+              }
+            ],
+            "timestamp": "",
+            "settings": {
+              "default_tags": {
+                "tag3": "a",
+                "tag2": "b",
+                "tag1": "c"
+              }
+            }
+          },
+          "expected_output": "line_protocol=m9,tag1=c,tag2=x,tag3=a a=T\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "m10",
+            "tags": [
+              {
+                "key": "tag1",
+                "value": "x"
+              }
+            ],
+            "fields": [
+              {
+                "key": "a",
+                "type": "boolean",
+                "value": true
+              }
+            ],
+            "settings": {
+              "default_tags": {
+                "tag3": "a",
+                "tag2": "b",
+                "tag1": "c"
+              },
+              "converted_timestamp": "11111"
+            }
+          },
+          "expected_output": "line_protocol=m10,tag1=x,tag2=b,tag3=a a=T 11111\n"
+        }
+      ]
+    },
+    "feature1_3_line_protocol_timestamps.json": {
+      "description": "Serializes explicit timestamps by omitting an empty timestamp, truncating numeric timestamps to whole units, converting dates to the selected precision, and passing unknown timestamp values through as text.",
+      "cases": [
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "a",
+            "fields": [
+              {
+                "key": "b",
+                "type": "float",
+                "value": 1
+              }
+            ],
+            "timestamp": ""
+          },
+          "expected_output": "line_protocol=a b=1\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "a",
+            "fields": [
+              {
+                "key": "b",
+                "type": "float",
+                "value": 1
+              }
+            ],
+            "timestamp": 1.2
+          },
+          "expected_output": "line_protocol=a b=1 1\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "test",
+            "fields": [
+              {
+                "key": "value",
+                "type": "float",
+                "value": 6
+              }
+            ],
+            "timestamp": {
+              "encoded": "date",
+              "value": 3
+            },
+            "settings": {
+              "default_tags": {
+                "xtra": "1"
+              },
+              "converted_timestamp": "3000000"
+            }
+          },
+          "expected_output": "line_protocol=test,xtra=1 value=6 3000000\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "tst",
+            "fields": [
+              {
+                "key": "a",
+                "type": "float",
+                "value": 1
+              }
+            ],
+            "timestamp": {
+              "encoded": "object_to_string",
+              "value": "any"
+            }
+          },
+          "expected_output": "line_protocol=tst a=1 any\n"
+        }
+      ]
+    },
+    "feature1_4_line_protocol_invalid_values.json": {
+      "description": "Rejects invalid numeric field values using language-neutral field validation errors that identify the field type and field name rather than a runtime exception string.",
+      "cases": [
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "m6",
+            "fields": [
+              {
+                "key": "a",
+                "type": "integer"
+              }
+            ],
+            "timestamp": ""
+          },
+          "expected_output": "error=invalid_field_value\nfield_type=integer\nfield=a\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "m7",
+            "fields": [
+              {
+                "key": "a",
+                "type": "float"
+              }
+            ],
+            "timestamp": ""
+          },
+          "expected_output": "error=invalid_field_value\nfield_type=float\nfield=a\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "uintNegativeNumber",
+            "fields": [
+              {
+                "key": "f",
+                "type": "unsigned_integer",
+                "value": -1
+              }
+            ],
+            "timestamp": ""
+          },
+          "expected_output": "error=invalid_field_value\nfield_type=unsigned_integer\nfield=f\n"
+        },
+        {
+          "input": {
+            "domain": "line_protocol",
+            "measurement": "uintTooLargeString",
+            "fields": [
+              {
+                "key": "f",
+                "type": "unsigned_integer",
+                "value": "18446744073709551616"
+              }
+            ],
+            "timestamp": ""
+          },
+          "expected_output": "error=invalid_field_value\nfield_type=unsigned_integer\nfield=f\n"
+        }
+      ]
+    },
+    "feature2_1_query_literals.json": {
+      "description": "Renders primitive and wrapped query values as query-language fragments with appropriate quoting, escaping, and constructor syntax.",
+      "cases": [
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "raw_expression",
+            "value": "12345"
+          },
+          "expected_output": "query_fragment=12345\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "integer",
+            "value": 123
+          },
+          "expected_output": "query_fragment=123\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "boolean",
+            "value": 1
+          },
+          "expected_output": "query_fragment=true\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "duration",
+            "value": "1ms"
+          },
+          "expected_output": "query_fragment=duration(v: \"1ms\")\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "date_time",
+            "value": "2020-06-06T21:56:00.000Z"
+          },
+          "expected_output": "query_fragment=time(v: \"2020-06-06T21:56:00.000Z\")\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "regular_expression",
+            "value": "/abc/"
+          },
+          "expected_output": "query_fragment=regexp.compile(v: \"/abc/\")\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "string",
+            "value": "abc"
+          },
+          "expected_output": "query_fragment=\"abc\"\n"
+        }
+      ]
+    },
+    "feature2_2_query_value_conversion.json": {
+      "description": "Automatically converts mixed runtime values into query-language fragments, including null-like values, numbers, dates, regular expressions, arrays, escaped strings, symbols, and values that are already query fragments.",
+      "cases": [
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "automatic",
+            "value": {
+              "encoded": "null"
+            }
+          },
+          "expected_output": "query_fragment=null\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "automatic",
+            "value": {
+              "encoded": "undefined"
+            }
+          },
+          "expected_output": "query_fragment=\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "automatic",
+            "value": "abc\n\r\t\\\"def"
+          },
+          "expected_output": "query_fragment=\"abc\\n\\r\\t\\\\\\\"def\"\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "automatic",
+            "value": {
+              "encoded": "date",
+              "value": 1589521447471
+            }
+          },
+          "expected_output": "query_fragment=2020-05-15T05:44:07.471Z\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "automatic",
+            "value": {
+              "encoded": "regexp",
+              "pattern": "abc"
+            }
+          },
+          "expected_output": "query_fragment=regexp.compile(v: \"/abc/\")\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "automatic",
+            "value": [
+              "a\"$d"
+            ]
+          },
+          "expected_output": "query_fragment=[\"a\\\"$d\"]\n"
+        },
+        {
+          "input": {
+            "domain": "query_literal",
+            "value_type": "automatic",
+            "value": {
+              "encoded": "expression",
+              "value": "1ms"
+            }
+          },
+          "expected_output": "query_fragment=1ms\n"
+        }
+      ]
+    },
+    "feature2_3_query_template_interpolation.json": {
+      "description": "Builds full query strings by preserving literal query text while safely interpolating numbers, strings, nested query fragments, empty fragments, and wrapped string positions.",
+      "cases": [
+        {
+          "input": {
+            "domain": "query_template",
+            "segments": [
+              "from(bucket:\"my-bucket\") |> range(start: 0) |> filter(fn: (r) => r._measurement == \"temperature\")"
+            ],
+            "interpolations": []
+          },
+          "expected_output": "query=from(bucket:\"my-bucket\") |> range(start: 0) |> filter(fn: (r) => r._measurement == \"temperature\")\n"
+        },
+        {
+          "input": {
+            "domain": "query_template",
+            "segments": [
+              "from(bucket:\"my-bucket\") |> range(start: ",
+              ") |> filter(fn: (r) => r._measurement == ",
+              ")"
+            ],
+            "interpolations": [
+              0,
+              "temperature"
+            ]
+          },
+          "expected_output": "query=from(bucket:\"my-bucket\") |> range(start: 0) |> filter(fn: (r) => r._measurement == \"temperature\")\n"
+        },
+        {
+          "input": {
+            "domain": "query_template",
+            "segments": [
+              "from(bucket:\"",
+              "\")"
+            ],
+            "interpolations": [
+              "my-bucket"
+            ]
+          },
+          "expected_output": "query=from(bucket:\"my-bucket\")\n"
+        },
+        {
+          "input": {
+            "domain": "query_template",
+            "segments": [
+              "",
+              " |> range(start: ",
+              ")\""
+            ],
+            "interpolations": [
+              {
+                "encoded": "expression",
+                "value": "from(bucket:\"my-bucket\")"
+              },
+              0
+            ]
+          },
+          "expected_output": "query=from(bucket:\"my-bucket\") |> range(start: 0)\"\n"
+        }
+      ]
+    },
+    "feature2_4_query_template_errors.json": {
+      "description": "Reports language-neutral query-construction errors when a template interpolation is missing or the template shape is invalid.",
+      "cases": [
+        {
+          "input": {
+            "domain": "query_template",
+            "segments": [
+              "",
+              ""
+            ],
+            "interpolations": [
+              {
+                "encoded": "undefined"
+              }
+            ]
+          },
+          "expected_output": "error=missing_interpolation_value\n"
+        },
+        {
+          "input": {
+            "domain": "query_template",
+            "segments": [
+              "1",
+              "2"
+            ],
+            "interpolations": []
+          },
+          "expected_output": "error=invalid_template_shape\n"
+        }
+      ]
+    },
+    "feature3_1_write_success_and_retry.json": {
+      "description": "Writes line protocol to the configured HTTP write route, retries a retryable response once, then reports the accepted body, authorization header, route, request count, and successful line count.",
+      "cases": [
+        {
+          "input": {
+            "domain": "write_request",
+            "destination": {
+              "org": "org",
+              "bucket": "bucket",
+              "precision": "ns"
+            },
+            "server": {
+              "url": "http://fake:8086",
+              "token": "a",
+              "responses": [
+                204
+              ]
+            },
+            "write": {
+              "flush_interval_ms": 5,
+              "batch_size": 10,
+              "max_retries": 1,
+              "default_tags": {
+                "xtra": "1"
+              }
+            },
+            "points": [
+              {
+                "measurement": "test",
+                "tags": [
+                  {
+                    "key": "t",
+                    "value": " "
+                  }
+                ],
+                "fields": [
+                  {
+                    "key": "value",
+                    "type": "float",
+                    "value": 1
+                  }
+                ],
+                "timestamp": ""
+              }
+            ],
+            "expected_observed_lines": 1
+          },
+          "expected_output": "route=/api/v2/write?org=org&bucket=bucket&precision=ns\nauthorization=Token a\ncontent_encoding=identity\nrequest_count=1\nsuccess_lines=1\nfailed_lines=0\nbody_000=test,t=\\ ,xtra=1 value=1\n"
+        }
+      ]
+    },
+    "feature3_2_write_gzip.json": {
+      "description": "Compresses write request bodies when the compression threshold requires it while preserving the decompressed line protocol payload and normal write route semantics.",
+      "cases": [
+        {
+          "input": {
+            "domain": "write_request",
+            "destination": {
+              "org": "org",
+              "bucket": "bucket",
+              "precision": "ns"
+            },
+            "server": {
+              "url": "http://fake:8086",
+              "token": "a",
+              "responses": [
+                204
+              ]
+            },
+            "write": {
+              "flush_interval_ms": 5,
+              "batch_size": 10,
+              "max_retries": 1,
+              "default_tags": {
+                "xtra": "1"
+              },
+              "gzip_threshold": 0
+            },
+            "points": [
+              {
+                "measurement": "test",
+                "tags": [
+                  {
+                    "key": "t",
+                    "value": " "
+                  }
+                ],
+                "fields": [
+                  {
+                    "key": "value",
+                    "type": "float",
+                    "value": 1
+                  }
+                ],
+                "timestamp": ""
+              }
+            ],
+            "expected_observed_lines": 1
+          },
+          "expected_output": "route=/api/v2/write?org=org&bucket=bucket&precision=ns\nauthorization=Token a\ncontent_encoding=gzip\nrequest_count=1\nsuccess_lines=1\nfailed_lines=0\nbody_000=test,t=\\ ,xtra=1 value=1\n"
+        }
+      ]
+    },
+    "feature3_3_write_rejection.json": {
+      "description": "Treats any HTTP write status other than the no-content success status as a rejected write and reports the route, status code, authorization header, failed line count, and submitted body.",
+      "cases": [
+        {
+          "input": {
+            "domain": "write_request",
+            "destination": {
+              "org": "org",
+              "bucket": "bucket",
+              "precision": "ns"
+            },
+            "server": {
+              "url": "http://fake:8086",
+              "token": "a",
+              "responses": [
+                200
+              ]
+            },
+            "write": {
+              "flush_interval_ms": 2,
+              "batch_size": 10,
+              "max_retries": 0,
+              "default_tags": {
+                "xtra": "1"
+              }
+            },
+            "points": [
+              {
+                "measurement": "test",
+                "fields": [
+                  {
+                    "key": "value",
+                    "type": "float",
+                    "value": 1
+                  }
+                ]
+              }
+            ],
+            "expected_observed_lines": 1
+          },
+          "expected_output": "error=write_rejected\nstatus_code=200\nroute=/api/v2/write?org=org&bucket=bucket&precision=ns\nauthorization=Token a\ncontent_encoding=identity\nrequest_count=1\nsuccess_lines=0\nfailed_lines=1\nbody_000=test,xtra=1 value=1\n"
+        }
+      ]
+    },
+    "feature3_4_write_headers.json": {
+      "description": "Allows caller-supplied write headers to override the default authorization header while still using the configured write route and body format.",
+      "cases": [
+        {
+          "input": {
+            "domain": "write_request",
+            "destination": {
+              "org": "org",
+              "bucket": "bucket",
+              "precision": "ns"
+            },
+            "server": {
+              "url": "http://fake:8086",
+              "token": "a",
+              "responses": [
+                204
+              ]
+            },
+            "write": {
+              "flush_interval_ms": 0,
+              "batch_size": 10,
+              "max_retries": 0,
+              "headers": {
+                "authorization": "Token customToken"
+              }
+            },
+            "points": [
+              {
+                "measurement": "test",
+                "fields": [
+                  {
+                    "key": "value",
+                    "type": "float",
+                    "value": 1
+                  }
+                ]
+              }
+            ],
+            "expected_observed_lines": 1
+          },
+          "expected_output": "route=/api/v2/write?org=org&bucket=bucket&precision=ns\nauthorization=Token customToken\ncontent_encoding=identity\nrequest_count=1\nsuccess_lines=1\nfailed_lines=0\nbody_000=test value=1\n"
+        }
+      ]
+    },
+    "feature3_5_writer_closed_state.json": {
+      "description": "Rejects attempts to enqueue additional records or points after a writer has been closed, using a neutral closed-writer error that names the attempted operation.",
+      "cases": [
+        {
+          "input": {
+            "domain": "writer_state",
+            "after_close": "single_record",
+            "record": "text value=1"
+          },
+          "expected_output": "error=writer_closed\noperation=single_record\n"
+        },
+        {
+          "input": {
+            "domain": "writer_state",
+            "after_close": "multiple_records",
+            "records": [
+              "text value=1",
+              "text value=2"
+            ]
+          },
+          "expected_output": "error=writer_closed\noperation=multiple_records\n"
+        },
+        {
+          "input": {
+            "domain": "writer_state",
+            "after_close": "single_point",
+            "point": {
+              "measurement": "test",
+              "fields": [
+                {
+                  "key": "value",
+                  "type": "float",
+                  "value": 1
+                }
+              ],
+              "timestamp": ""
+            }
+          },
+          "expected_output": "error=writer_closed\noperation=single_point\n"
+        }
+      ]
+    },
+    "feature4_logger_delegation.json": {
+      "description": "Delegates warning and error log events to a caller-supplied logger without changing the message, optional error payload, or argument count.",
+      "cases": [
+        {
+          "input": {
+            "domain": "logger",
+            "level": "error",
+            "message": "    hey",
+            "error": "you"
+          },
+          "expected_output": "level=error\nmessage=    hey\nerror=you\nargument_count=2\n"
+        },
+        {
+          "input": {
+            "domain": "logger",
+            "level": "warn",
+            "message": "    hey"
+          },
+          "expected_output": "level=warn\nmessage=    hey\nerror=\nargument_count=2\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C016",
+      "C017"
+    ],
+    "kept_c": [
+      "C003",
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

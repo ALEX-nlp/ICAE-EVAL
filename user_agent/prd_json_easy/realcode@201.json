@@ -1,0 +1,1700 @@
+{
+  "fuzzy_prd": "# Container Deployment Command Builder - Generating Docker & SSH Invocations from Declarative Config\n\n## Project Goal\n\nBuild a library that turns a declarative deployment description (one service, an image, registry credentials, a set of servers grouped into roles, environment variables, healthchecks, logging, volumes, and SSH settings) into the exact shell command strings needed to deploy and operate that service with a container runtime over SSH. It lets developers describe *what* they want deployed once, and have every `docker ...` and `ssh ...` command derived deterministically, so they never hand-write or hand-escape these commands.\n\n---\n\n## Background & Problem\n\nWithout this library, operators deploy containerized applications by typing long, fragile `docker run`/`docker ps`/`docker logs` commands by hand and wrapping them in `ssh` invocations per host. These commands carry dozens of flags (restart policy, env injection, healthcheck, log rotation, routing labels, name/label filters), must be quoted and shell-escaped correctly, and must stay consistent across roles, destinations, and versions. Doing this manually is repetitive and error-prone: a missing label breaks routing, a mis-escaped secret leaks into logs, an off-by-one filter targets the wrong container.\n\nWith this library, the operator supplies a structured config object and asks for a named operation (run, start, stop, logs, remove, etc.) for a given role/version/destination. The library returns the precise command string, with all flags ordered, all values shell-escaped, secrets resolved from the host environment and redactable for safe logging, and SSH wrapping applied where remote execution is needed.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a non-trivial domain (config resolution, role specialization, command building, SSH wrapping, secret redaction). It MUST NOT be a single \"god file\". Provide a clear multi-file structure separating configuration/role resolution, command building, shell-escaping/redaction utilities, and the execution adapter.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases below are a **black-box contract** for the execution adapter, NOT the internal data model. Core logic must not know about JSON or stdin/stdout. The adapter translates a JSON command into idiomatic calls on the core and renders the result.\n\n3. **Adherence to SOLID Design Principles:** Separate config resolution, role specialization, command formatting, escaping/redaction, and output rendering into distinct cohesive units. The command builder should be open to new operations without modifying existing ones.\n\n4. **Robustness & Interface Design:** The public interface must be idiomatic to the target language. Resolving a secret whose value is absent from the host environment is an error condition and must be modeled as such (a typed failure), not a silent empty value. The adapter renders such failures as a neutral category (e.g. `error=missing_env`).\n\n---\n\n## Core Features\n\n### Feature 1: Launch a Long-Lived Application Container\n\n**As a developer**, I want one declarative config to produce the full container run command, so I don't hand-assemble restart policy, env injection, healthcheck, logging, and routing flags.\n\n**Expected Behavior / Usage:**\n\n*1.1 Baseline run command — minimal config with one server and a secret env var*\n\nGiven a service name, an image, registry credentials, a single server, and a secret env var (whose value comes from the host environment), produce a detached run command. It always includes: `--detach`, `--restart unless-stopped`, a `--name` of the form `service-role-version`, an injected container-name env var, the resolved env vars, a default HTTP healthcheck hitting `/up` on port 3000 with a 1s interval, a default log-rotation option `max-size=10m`, the service/role labels, the web routing labels (see Feature 6), and finally the `repository:version` image reference. All values are shell-quoted.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_run_basic.json`\n\n```json\n{\n    \"description\": \"Generate the docker run command that launches a long-lived application container in detached mode. The base deployment defines a single service, image, registry credentials, one server, and a secret environment variable resolved from the host environment. The output is the full docker run invocation including restart policy, container name, injected environment variables, default HTTP healthcheck, default log rotation, and the standard service/role/routing labels.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"},\n                \"version\": \"999\",\n                \"role\": \"web\",\n                \"action\": \"run\"\n            },\n            \"expected_output\": \"docker run --detach --restart unless-stopped --name app-web-999 -e MRSK_CONTAINER_NAME=\\\"app-web-999\\\" -e RAILS_MASTER_KEY=\\\"456\\\" --health-cmd \\\"curl -f http://localhost:3000/up || exit 1\\\" --health-interval \\\"1s\\\" --log-opt max-size=\\\"10m\\\" --label service=\\\"app\\\" --label role=\\\"web\\\" --label traefik.http.services.app-web.loadbalancer.server.scheme=\\\"http\\\" --label traefik.http.routers.app-web.rule=\\\"PathPrefix(\\\\`/\\\\`)\\\" --label traefik.http.middlewares.app-web-retry.retry.attempts=\\\"5\\\" --label traefik.http.middlewares.app-web-retry.retry.initialinterval=\\\"500ms\\\" --label traefik.http.routers.app-web.middlewares=\\\"app-web-retry@docker\\\" dhh/app:999\"\n        }\n    ]\n}\n```\n\n*1.2 Run with optional container features — volumes, healthcheck overrides, logging driver*\n\nThe same run command absorbs optional declarations: a bind-mount volume adds a `--volume` argument before the labels; a custom healthcheck `path` changes the URL in the default HTTP healthcheck; a custom healthcheck `cmd` replaces the whole healthcheck command; a role-scoped healthcheck `cmd` does the same for that role; and a logging declaration with a driver and options emits `--log-driver` plus one `--log-opt` per option (replacing the default `max-size=10m`). Each feature appears in its fixed argument position.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_2_run_options.json`\n\n```json\n{\n    \"description\": \"Generate the docker run command when the deployment declares extra container features: a bind-mount volume, a custom HTTP healthcheck path, a custom healthcheck shell command, a role-scoped healthcheck command, or a custom logging driver with options. Each input adds one feature to the base deployment and the output is the full docker run invocation reflecting that feature in the correct argument position.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}, \"volumes\": [\"/local/path:/container/path\"]},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"run\"\n            },\n            \"expected_output\": \"docker run --detach --restart unless-stopped --name app-web-999 -e MRSK_CONTAINER_NAME=\\\"app-web-999\\\" -e RAILS_MASTER_KEY=\\\"456\\\" --health-cmd \\\"curl -f http://localhost:3000/up || exit 1\\\" --health-interval \\\"1s\\\" --log-opt max-size=\\\"10m\\\" --volume /local/path:/container/path --label service=\\\"app\\\" --label role=\\\"web\\\" --label traefik.http.services.app-web.loadbalancer.server.scheme=\\\"http\\\" --label traefik.http.routers.app-web.rule=\\\"PathPrefix(\\\\`/\\\\`)\\\" --label traefik.http.middlewares.app-web-retry.retry.attempts=\\\"5\\\" --label traefik.http.middlewares.app-web-retry.retry.initialinterval=\\\"500ms\\\" --label traefik.http.routers.app-web.middlewares=\\\"app-web-retry@docker\\\" dhh/app:999\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}, \"healthcheck\": {\"path\": \"/healthz\"}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"run\"\n            },\n            \"expected_output\": \"docker run --detach --restart unless-stopped --name app-web-999 -e MRSK_CONTAINER_NAME=\\\"app-web-999\\\" -e RAILS_MASTER_KEY=\\\"456\\\" --health-cmd \\\"curl -f http://localhost:3000/healthz || exit 1\\\" --health-interval \\\"1s\\\" --log-opt max-size=\\\"10m\\\" --label service=\\\"app\\\" --label role=\\\"web\\\" --label traefik.http.services.app-web.loadbalancer.server.scheme=\\\"http\\\" --label traefik.http.routers.app-web.rule=\\\"PathPrefix(\\\\`/\\\\`)\\\" --label traefik.http.middlewares.app-web-retry.retry.attempts=\\\"5\\\" --label traefik.http.middlewares.app-web-retry.retry.initialinterval=\\\"500ms\\\" --label traefik.http.routers.app-web.middlewares=\\\"app-web-retry@docker\\\" dhh/app:999\"\n        }\n    ]\n}\n```\n\n*1.3 Run for a non-web role with a custom command and raw options*\n\nA role that is not web-routed declares its own host list, a startup command, and a map of raw container options. Its run command omits the HTTP healthcheck and the web routing labels, carries only the service/role labels, appends each raw option as a flag (a boolean-true value becomes a value-less flag), and appends the role's startup command after the image reference.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_3_run_custom_role_options.json`\n\n```json\n{\n    \"description\": \"Generate the docker run command for a non-web role that defines its own host list, a startup command, and extra raw container options. A non-web role does not receive the HTTP healthcheck or the web routing labels; instead it carries only service and role labels, its custom option flags, and appends its startup command after the image reference. Option values that are boolean-true become value-less flags.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": {\"web\": [\"1.1.1.1\"], \"jobs\": {\"hosts\": [\"1.1.1.2\"], \"cmd\": \"bin/jobs\", \"options\": {\"mount\": \"somewhere\", \"cap-add\": true}}}, \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"jobs\", \"action\": \"run\"\n            },\n            \"expected_output\": \"docker run --detach --restart unless-stopped --name app-jobs-999 -e MRSK_CONTAINER_NAME=\\\"app-jobs-999\\\" -e RAILS_MASTER_KEY=\\\"456\\\" --log-opt max-size=\\\"10m\\\" --label service=\\\"app\\\" --label role=\\\"jobs\\\" --mount \\\"somewhere\\\" --cap-add dhh/app:999 bin/jobs\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Container Lifecycle Commands\n\n**As a developer**, I want start/stop/info commands derived from the config, so lifecycle operations target exactly the right container by name or label.\n\n**Expected Behavior / Usage:**\n\n*2.1 Start by container name — name composition with optional destination*\n\nStarting a container references it by the composed name `service-role-[destination-]version`. When a destination is configured it is inserted between role and version.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_start.json`\n\n```json\n{\n    \"description\": \"Generate the docker command that starts an already-created container by name. The container name is composed from service, role, optional destination, and version. When a destination is set it is inserted between role and version.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"start\"\n            },\n            \"expected_output\": \"docker start app-web-999\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"destination\": \"staging\", \"role\": \"web\", \"action\": \"start\"\n            },\n            \"expected_output\": \"docker start app-web-staging-999\"\n        }\n    ]\n}\n```\n\n*2.2 Stop — latest running by label, optional grace timeout, or exact version*\n\nBy default stop finds the latest running container by service/role labels and pipes its id into a stop command. A configured graceful stop-wait-time appends a `-t <seconds>` timeout. Supplying an explicit version instead targets that exact container name.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_stop.json`\n\n```json\n{\n    \"description\": \"Generate the docker command that stops a running container. By default it finds the latest running container by service/role labels and pipes its id to docker stop. An optional graceful stop-wait-time appends a timeout flag. Supplying an explicit version instead targets the exact container name rather than the latest running one.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"stop\"\n            },\n            \"expected_output\": \"docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker stop\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"stop\", \"args\": {\"version\": \"123\"}\n            },\n            \"expected_output\": \"docker container ls --all --filter name=^app-web-123$ --quiet | xargs docker stop\"\n        }\n    ]\n}\n```\n\n*2.3 Info — list containers by label with optional destination filter*\n\nInfo lists containers for the service/role. When a destination is configured a destination label filter is inserted between the service filter and the role filter.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_3_info.json`\n\n```json\n{\n    \"description\": \"Generate the docker ps command that lists containers for the service/role. When a destination is configured an extra destination label filter is inserted between the service filter and the role filter.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"info\"\n            },\n            \"expected_output\": \"docker ps --filter label=service=app --filter label=role=web\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"destination\": \"staging\", \"role\": \"web\", \"action\": \"info\"\n            },\n            \"expected_output\": \"docker ps --filter label=service=app --filter label=destination=staging --filter label=role=web\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Log Inspection Commands\n\n**As a developer**, I want to read and stream container logs through derived commands, so I can filter by time window, line count, and text without hand-writing pipelines.\n\n**Expected Behavior / Usage:**\n\n*3.1 Read logs — latest running container with optional since/tail/grep*\n\nLogs finds the latest running container by label, pipes its id into a logs command with stderr merged (`2>&1`), and conditionally appends modifiers in a fixed order: a `--since` time window, a `--tail` line limit, then a `grep '<text>'` filter on the output.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_logs.json`\n\n```json\n{\n    \"description\": \"Generate the docker logs command for the latest running container, piping its id into docker logs with stderr merged into stdout. Optional modifiers append a since time window, a tail line limit, and a grep filter on the output. Each modifier is added in a fixed order: since, tail, then grep.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"logs\"\n            },\n            \"expected_output\": \"docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs 2>&1\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"logs\", \"args\": {\"since\": \"5m\"}\n            },\n            \"expected_output\": \"docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs --since 5m 2>&1\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"logs\", \"args\": {\"grep\": \"my-id\"}\n            },\n            \"expected_output\": \"docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs 2>&1 | grep 'my-id'\"\n        }\n    ]\n}\n```\n\n*3.2 Follow logs over SSH — stream latest running container with optional grep*\n\nFollowing logs builds a remote pipeline (find latest running container, tail its logs with timestamps in follow mode, stderr merged, optional grep) and wraps the whole single-quoted pipeline in an SSH invocation (with TTY) to the named host.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_follow_logs.json`\n\n```json\n{\n    \"description\": \"Generate the SSH-wrapped command to follow (stream) logs of the latest running container on a given host. The remote command finds the running container by service/role labels and tails its logs with timestamps in follow mode, stderr merged. An optional grep filter is appended to the remote pipeline. The whole remote pipeline is single-quoted and wrapped in an ssh invocation to the host.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"follow_logs\", \"args\": {\"host\": \"app-1\"}\n            },\n            \"expected_output\": \"ssh -t root@app-1 'docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs --timestamps --tail 10 --follow 2>&1'\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"follow_logs\", \"args\": {\"host\": \"app-1\", \"grep\": \"Completed\"}\n            },\n            \"expected_output\": \"ssh -t root@app-1 'docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs --timestamps --tail 10 --follow 2>&1 | grep \\\"Completed\\\"'\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: One-Off Command Execution\n\n**As a developer**, I want to run ad-hoc commands either locally-targeted or wrapped over SSH, so I can execute maintenance tasks against fresh or existing containers.\n\n**Expected Behavior / Usage:**\n\n*4.1 Execute locally — fresh ephemeral container or existing container*\n\nTwo variants. A fresh ephemeral run uses `docker run --rm` with the injected environment and the absolute `repository:version` image, then appends the command. An existing-container exec uses `docker exec <container-name>` then appends the command.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_execute_local.json`\n\n```json\n{\n    \"description\": \"Generate docker commands that execute a one-off command against the application. Two variants: a fresh ephemeral container (docker run --rm) that injects the configured environment and uses the absolute image, then appends the command; and an existing container (docker exec) addressed by container name. The interactive variants are not requested here.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"execute_in_new_container\", \"args\": {\"command\": [\"bin/rails\", \"db:setup\"]}\n            },\n            \"expected_output\": \"docker run --rm -e RAILS_MASTER_KEY=\\\"456\\\" dhh/app:999 bin/rails db:setup\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"execute_in_existing_container\", \"args\": {\"command\": [\"bin/rails\", \"db:setup\"]}\n            },\n            \"expected_output\": \"docker exec app-web-999 bin/rails db:setup\"\n        }\n    ]\n}\n```\n\n*4.2 Execute interactively over SSH — fresh or existing container with a TTY*\n\nThe interactive variants add `-it` to the docker command (fresh: `docker run -it --rm ...`; existing: `docker exec -it ...`), single-quote it, and wrap it in an `ssh -t` invocation to the host.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_execute_over_ssh.json`\n\n```json\n{\n    \"description\": \"Generate the SSH-wrapped interactive one-off command. Two variants: a fresh interactive container (docker run -it --rm) and an interactive exec into the existing container (docker exec -it). The docker command is single-quoted and wrapped in an ssh -t invocation to the target host.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"execute_in_new_container_over_ssh\", \"args\": {\"command\": [\"bin/rails\", \"c\"], \"host\": \"app-1\"}\n            },\n            \"expected_output\": \"ssh -t root@app-1 'docker run -it --rm -e RAILS_MASTER_KEY=\\\"456\\\" dhh/app:999 bin/rails c'\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"execute_in_existing_container_over_ssh\", \"args\": {\"command\": [\"bin/rails\", \"c\"], \"host\": \"app-1\"}\n            },\n            \"expected_output\": \"ssh -t root@app-1 'docker exec -it app-web-999 bin/rails c'\"\n        }\n    ]\n}\n```\n\n*4.3 SSH wrapping — login user and jump-proxy resolution*\n\nAny command can be wrapped for remote execution. The wrapper always uses a TTY and addresses the host as `user@host` with the command single-quoted. The login user defaults to `root` but is overridable. A configured proxy adds a jump host (`-J user@proxy`); the jump user defaults to `root` unless the proxy value already embeds a user. Login user and proxy resolve independently.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_run_over_ssh.json`\n\n```json\n{\n    \"description\": \"Wrap an arbitrary shell command for remote execution over SSH. The wrapper always uses a TTY and addresses the host as user@host with the command single-quoted. The login user defaults to root but can be overridden. A configured proxy adds an SSH jump host (-J user@proxy); the jump user defaults to root unless the proxy value already embeds a user. User and proxy options combine independently.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"run_over_ssh\", \"args\": {\"command\": \"ls\", \"host\": \"1.1.1.1\"}\n            },\n            \"expected_output\": \"ssh -t root@1.1.1.1 'ls'\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}, \"ssh\": {\"proxy\": \"2.2.2.2\"}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"run_over_ssh\", \"args\": {\"command\": \"ls\", \"host\": \"1.1.1.1\"}\n            },\n            \"expected_output\": \"ssh -J root@2.2.2.2 -t root@1.1.1.1 'ls'\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Container & Image Discovery and Cleanup\n\n**As a developer**, I want commands that locate, enumerate, and remove containers/images by label or name, so I can introspect deployed versions and prune old ones.\n\n**Expected Behavior / Usage:**\n\n*5.1 Locate containers — latest running id and exact-name lookup*\n\nFind the latest running container id for the service/role (a destination inserts an extra destination filter). A name lookup builds a query matching an exact container name anchored with `^` and `$`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_container_id.json`\n\n```json\n{\n    \"description\": \"Generate docker ps queries that locate containers by label. current_running_container_id returns the id of the latest running container for the service/role; with a destination configured, a destination label filter is inserted. container_id_for builds a query that matches an exact container name anchored with ^ and $.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"current_running_container_id\"\n            },\n            \"expected_output\": \"docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"container_id_for\", \"args\": {\"container_name\": \"app-999\"}\n            },\n            \"expected_output\": \"docker container ls --all --filter name=^app-999$ --quiet\"\n        }\n    ]\n}\n```\n\n*5.2 Extract deployed versions — current running and full list*\n\nVersion queries format container names then extract the trailing dash-delimited segment (the version) via grep/cut. The current-version query restricts to the latest running container; the list query lists all versions and optionally accepts extra flags plus a status filter inserted before those flags.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_versions.json`\n\n```json\n{\n    \"description\": \"Generate docker ps pipelines that extract deployed version identifiers from container names. The pipeline formats names, then uses grep/cut to extract the trailing dash-delimited segment (the version). current_running_version restricts to the latest running container. list_versions lists all versions for the service/role and optionally accepts extra docker flags plus a status filter that is inserted before those flags.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"current_running_version\"\n            },\n            \"expected_output\": \"docker ps --filter label=service=app --filter label=role=web --filter status=running --latest --format \\\"{{.Names}}\\\" | grep -oE \\\"\\\\-[^-]+$\\\" | cut -c 2-\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"list_versions\"\n            },\n            \"expected_output\": \"docker ps --filter label=service=app --filter label=role=web --format \\\"{{.Names}}\\\" | grep -oE \\\"\\\\-[^-]+$\\\" | cut -c 2-\"\n        }\n    ]\n}\n```\n\n*5.3 Enumerate containers — list all and list names*\n\nList all containers (including stopped) by label filters; a destination inserts a destination filter. The names variant appends a name-formatting template.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_3_list_containers.json`\n\n```json\n{\n    \"description\": \"Generate docker commands that enumerate containers for the service/role. list_containers lists all (including stopped) by label filters; with a destination a destination filter is inserted. list_container_names is the same query with a Go-template name format appended.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"list_containers\"\n            },\n            \"expected_output\": \"docker container ls --all --filter label=service=app --filter label=role=web\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"list_container_names\"\n            },\n            \"expected_output\": \"docker container ls --all --filter label=service=app --filter label=role=web --format '{{ .Names }}'\"\n        }\n    ]\n}\n```\n\n*5.4 Remove containers — one by exact name, or prune all by label*\n\nRemove one container by exact name (with destination inserted) by piping its id into a remove command. Prune removes all stopped containers matching the label filters; a destination inserts a destination filter.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_4_remove_containers.json`\n\n```json\n{\n    \"description\": \"Generate docker commands that remove containers. remove_container targets one exact container name (service-role-[destination-]version) anchored with ^ and $, piping its id into docker container rm; a destination is inserted into the name. remove_containers prunes all stopped containers matching the service/role label filters; with a destination an extra destination filter is inserted.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"remove_container\", \"args\": {\"version\": \"999\"}\n            },\n            \"expected_output\": \"docker container ls --all --filter name=^app-web-999$ --quiet | xargs docker container rm\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"remove_containers\"\n            },\n            \"expected_output\": \"docker container prune --force --filter label=service=app --filter label=role=web\"\n        }\n    ]\n}\n```\n\n*5.5 Manage images — list, prune, and tag-as-latest*\n\nList images for the configured repository (registry server joined to image name, or just the image when no server). Prune removes all images matching the label filters (a destination inserts a destination filter). Tag-as-latest tags the current `repository:version` reference as `repository:latest`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_5_images.json`\n\n```json\n{\n    \"description\": \"Generate docker commands that manage images. list_images lists images for the configured repository (registry server plus image name, or just the image when no server). remove_images prunes all images matching the service/role label filters; a destination inserts an extra destination filter. tag_current_as_latest tags the current versioned image reference as :latest for the same repository.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"list_images\"\n            },\n            \"expected_output\": \"docker image ls dhh/app\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\"], \"env\": {\"secret\": [\"RAILS_MASTER_KEY\"]}},\n                \"env\": {\"RAILS_MASTER_KEY\": \"456\"}, \"version\": \"999\", \"role\": \"web\", \"action\": \"tag_current_as_latest\"\n            },\n            \"expected_output\": \"docker tag dhh/app:999 dhh/app:latest\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Role Configuration Resolution\n\n**As a developer**, I want roles resolved from one declarative config (hosts, commands, labels, env, secrets), so each role gets correctly merged settings without duplication.\n\n**Expected Behavior / Usage:**\n\n*6.1 Resolve hosts and startup command per role*\n\nWhen servers is a flat array, a single implicit role owns all hosts and has no startup command. When servers is a map, each named role lists hosts directly or under a `hosts` key and may define its own startup command. Querying hosts returns them one per line; querying the command returns it (empty when none).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_role_hosts_cmd.json`\n\n```json\n{\n    \"description\": \"Resolve the host list and startup command for a named role from the deployment. When servers is a flat array, the single implicit role owns all hosts and has no startup command. When servers is a map, each named role may list hosts directly or under a hosts key and may define its own startup command. role.hosts returns the role's hosts one per line; role.cmd returns the role's startup command (empty when none).\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\", \"1.1.1.2\"], \"env\": {\"REDIS_URL\": \"redis://x/y\"}},\n                \"role\": \"web\", \"action\": \"role.hosts\"\n            },\n            \"expected_output\": \"1.1.1.1\\n1.1.1.2\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": {\"web\": [\"1.1.1.1\", \"1.1.1.2\"], \"workers\": {\"hosts\": [\"1.1.1.3\", \"1.1.1.4\"], \"cmd\": \"bin/jobs\", \"env\": {\"REDIS_URL\": \"redis://a/b\", \"WEB_CONCURRENCY\": 4}}}, \"env\": {\"REDIS_URL\": \"redis://x/y\"}},\n                \"role\": \"workers\", \"action\": \"role.hosts\"\n            },\n            \"expected_output\": \"1.1.1.3\\n1.1.1.4\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\", \"1.1.1.2\"], \"env\": {\"REDIS_URL\": \"redis://x/y\"}},\n                \"role\": \"web\", \"action\": \"role.cmd\"\n            },\n            \"expected_output\": \"cmd=\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": {\"web\": [\"1.1.1.1\", \"1.1.1.2\"], \"workers\": {\"hosts\": [\"1.1.1.3\", \"1.1.1.4\"], \"cmd\": \"bin/jobs\", \"env\": {\"REDIS_URL\": \"redis://a/b\", \"WEB_CONCURRENCY\": 4}}}, \"env\": {\"REDIS_URL\": \"redis://x/y\"}},\n                \"role\": \"workers\", \"action\": \"role.cmd\"\n            },\n            \"expected_output\": \"cmd=bin/jobs\"\n        }\n    ]\n}\n```\n\n*6.2 Resolve label arguments per role, including web routing labels*\n\nA non-routed role gets only service and role labels. The web role (and any role explicitly opted into routing) additionally gets a fixed set of reverse-proxy routing labels whose keys embed the `service-role` identifier: a loadbalancer scheme, a path-prefix router rule, a retry middleware with attempts and initial interval, and a router-to-middleware binding. These are derived purely from the service and role names.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_role_label_args.json`\n\n```json\n{\n    \"description\": \"Compute the docker --label arguments for a role. A non-web role without traffic-routing enabled gets only the service and role labels. The web role (and any role explicitly opted into routing) additionally gets a fixed set of reverse-proxy routing labels whose keys embed the service-role identifier: a loadbalancer scheme, a path-prefix router rule, a retry middleware with attempts and initial interval, and a router-to-middleware binding. The routing labels are derived purely from the service and role names.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": {\"web\": [\"1.1.1.1\", \"1.1.1.2\"], \"workers\": {\"hosts\": [\"1.1.1.3\", \"1.1.1.4\"], \"cmd\": \"bin/jobs\", \"env\": {\"REDIS_URL\": \"redis://a/b\", \"WEB_CONCURRENCY\": 4}}}, \"env\": {\"REDIS_URL\": \"redis://x/y\"}},\n                \"role\": \"workers\", \"action\": \"role.label_args\"\n            },\n            \"expected_output\": \"--label service=\\\"app\\\" --label role=\\\"workers\\\"\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\", \"1.1.1.2\"], \"env\": {\"REDIS_URL\": \"redis://x/y\"}},\n                \"role\": \"web\", \"action\": \"role.label_args\"\n            },\n            \"expected_output\": \"--label service=\\\"app\\\" --label role=\\\"web\\\" --label traefik.http.services.app-web.loadbalancer.server.scheme=\\\"http\\\" --label traefik.http.routers.app-web.rule=\\\"PathPrefix(\\\\`/\\\\`)\\\" --label traefik.http.middlewares.app-web-retry.retry.attempts=\\\"5\\\" --label traefik.http.middlewares.app-web-retry.retry.initialinterval=\\\"500ms\\\" --label traefik.http.routers.app-web.middlewares=\\\"app-web-retry@docker\\\"\"\n        }\n    ]\n}\n```\n\n*6.3 Resolve a single custom label with override precedence*\n\nCustom labels declared at the deployment level apply to every role. A role-level custom label of the same key overrides the deployment value. A custom label that reuses a default routing-label key overrides that default. Querying a label key returns the resolved `key=value`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_role_custom_labels.json`\n\n```json\n{\n    \"description\": \"Resolve the value of a single label for a role, given a label key. Custom labels declared at the deployment level apply to every role. A role-level custom label of the same key overrides the deployment-level value. A custom label that uses the same key as a default routing label overrides that default. The query returns the resolved key=value for the requested label key.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": [\"1.1.1.1\", \"1.1.1.2\"], \"env\": {\"REDIS_URL\": \"redis://x/y\"}, \"labels\": {\"my.custom.label\": \"50\"}},\n                \"role\": \"web\", \"action\": \"role.label\", \"args\": {\"key\": \"my.custom.label\"}\n            },\n            \"expected_output\": \"my.custom.label=50\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": {\"web\": [\"1.1.1.1\", \"1.1.1.2\"], \"workers\": {\"hosts\": [\"1.1.1.3\", \"1.1.1.4\"], \"cmd\": \"bin/jobs\", \"labels\": {\"my.custom.label\": \"70\"}}}, \"env\": {\"REDIS_URL\": \"redis://x/y\"}, \"labels\": {\"my.custom.label\": \"50\"}},\n                \"role\": \"workers\", \"action\": \"role.label\", \"args\": {\"key\": \"my.custom.label\"}\n            },\n            \"expected_output\": \"my.custom.label=70\"\n        }\n    ]\n}\n```\n\n*6.4 Resolve plain (non-secret) env with role override*\n\nDeployment-level env applies to all roles; a role's own env merges over it, so a role can override a value for a key. Querying one key returns its resolved value. Rendering the full env args produces an ordered list of `-e KEY=\"value\"` pairs; the output shows an unredacted line and a redacted line (identical here, as none of these values are secret).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_4_role_env_merge.json`\n\n```json\n{\n    \"description\": \"Resolve environment variables for a role and render them as docker -e arguments. Deployment-level clear env applies to all roles; a role's own env merges over it, so a role can override a deployment value for a given key. role.env_value returns the resolved value for one key. role.env_args renders the full ordered list of -e KEY=\\\"value\\\" pairs; the output shows both an unredacted line (real values) and a redacted line (here identical, since none of these values are secret).\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": {\"web\": [\"1.1.1.1\", \"1.1.1.2\"], \"workers\": {\"hosts\": [\"1.1.1.3\", \"1.1.1.4\"], \"cmd\": \"bin/jobs\", \"env\": {\"REDIS_URL\": \"redis://a/b\", \"WEB_CONCURRENCY\": 4}}}, \"env\": {\"REDIS_URL\": \"redis://x/y\"}},\n                \"role\": \"workers\", \"action\": \"role.env_value\", \"args\": {\"key\": \"REDIS_URL\"}\n            },\n            \"expected_output\": \"REDIS_URL=redis://a/b\"\n        },\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": {\"web\": [\"1.1.1.1\", \"1.1.1.2\"], \"workers\": {\"hosts\": [\"1.1.1.3\", \"1.1.1.4\"], \"cmd\": \"bin/jobs\", \"env\": {\"REDIS_URL\": \"redis://a/b\", \"WEB_CONCURRENCY\": 4}}}, \"env\": {\"REDIS_URL\": \"redis://x/y\"}},\n                \"role\": \"workers\", \"action\": \"role.env_args\"\n            },\n            \"expected_output\": \"unredacted: -e REDIS_URL=\\\"redis://a/b\\\" -e WEB_CONCURRENCY=\\\"4\\\"\\nredacted: -e REDIS_URL=\\\"redis://a/b\\\" -e WEB_CONCURRENCY=\\\"4\\\"\"\n        }\n    ]\n}\n```\n\n*6.5 Resolve secret env with redaction and concatenation order*\n\nEnv may split into a clear map (literal values) and a secret list (names whose values are read from the host environment at render time). Secrets and clear values may be declared at the deployment level, the role level, or both; the secret name lists from both levels are concatenated (deployment first, then role) ahead of the merged clear values. Rendering shows an unredacted line (real resolved secret values, shell-escaped) and a redacted line (secret values masked, clear values shown). Resolution order is significant and quoting must survive special characters.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_5_role_env_secrets.json`\n\n```json\n{\n    \"description\": \"Resolve environment variables when secrets are involved and render docker -e arguments with redaction. Env may be split into a clear map (literal values) and a secret list (names whose values are read from the host environment at render time). Secrets and clear values can be declared at the deployment level, at the role level, or both; secret name lists from both levels are concatenated (deployment secrets first, then role secrets) ahead of the merged clear values. Each rendered line shows the unredacted arguments (real resolved secret values, shell-escaped) and the redacted arguments (secret values masked, clear values shown). Secret resolution is order-sensitive and quoting must survive special characters.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"deploy\": {\"service\": \"app\", \"image\": \"dhh/app\", \"registry\": {\"username\": \"dhh\", \"password\": \"secret\"}, \"servers\": {\"web\": [\"1.1.1.1\", \"1.1.1.2\"], \"workers\": {\"hosts\": [\"1.1.1.3\", \"1.1.1.4\"], \"cmd\": \"bin/jobs\", \"env\": {\"clear\": {\"REDIS_URL\": \"redis://a/b\", \"WEB_CONCURRENCY\": 4}, \"secret\": [\"DB_PASSWORD\"]}}}, \"env\": {\"clear\": {\"REDIS_URL\": \"redis://a/b\"}, \"secret\": [\"REDIS_PASSWORD\"]}},\n                \"env\": {\"REDIS_PASSWORD\": \"secret456\", \"DB_PASSWORD\": \"secret&\\\"123\"},\n                \"role\": \"workers\", \"action\": \"role.env_args\"\n            },\n            \"expected_output\": \"unredacted: -e REDIS_PASSWORD=\\\"secret456\\\" -e DB_PASSWORD=\\\"secret&\\\\\\\"123\\\" -e REDIS_URL=\\\"redis://a/b\\\" -e WEB_CONCURRENCY=\\\"4\\\"\\nredacted: -e REDIS_PASSWORD=[REDACTED] -e DB_PASSWORD=[REDACTED] -e REDIS_URL=\\\"redis://a/b\\\" -e WEB_CONCURRENCY=\\\"4\\\"\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing config/role resolution, command building, shell-escaping/redaction, and SSH wrapping, with clear logical separation and no monolithic file.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON command object from stdin, invokes the appropriate core logic, and prints the resulting command string (or resolved value) to stdout, strictly matching the per-leaf-feature contracts above. Native runtime failures (e.g. a missing secret env var) are rendered as a neutral category line, never leaking host-language exception details. The adapter is logically separated from the core domain.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_1_run_basic.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_1_run_basic@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` contains only the raw stdout of the program under test (no PASS/FAIL or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the exact flag ordering shown in the prior test cases\n",
+  "oracle_data": {
+    "task_id": "basecamp__kamal-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "web role labels",
+          "non web labels",
+          "service label web",
+          "role label web",
+          "traefik labels non web"
+        ],
+        "oracle_response": "For non-web roles, omit all 'service', 'role', and 'traefik' labels; only include role-specific labels: --label service=\"<service>\" --label role=\"<role>\" (if applicable), excluding any web-specific routing or healthcheck configurations."
+      },
+      {
+        "constraint_id": "C013",
+        "trigger_keywords": [
+          "stop multiple containers",
+          "conditional stop logic",
+          "stop if version arg",
+          "filter by service role",
+          "xargs stop command"
+        ],
+        "oracle_response": "If args.version exists: use 'docker container ls --all --filter name=^<name>$ --quiet | xargs docker stop'. Otherwise: use 'docker ps --quiet --filter label=service=<s> --filter label=role=<r> --filter status=running --latest | xargs docker stop'. Use the format matching the exact string in the expected output."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the exact flag ordering shown in the prior test cases",
+        "actual_meaning": "The output must strictly adhere to the sequence of flags starting with 'docker' or action prefix, any intermediate quality-of-service flags (volumes, etc.), healthcheck flags, labels, and then the final action flag (run, start, stop, etc.), as defined in the reference implementation."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_run_basic.json": {
+      "description": "Generate the docker run command that launches a long-lived application container in detached mode. The base deployment defines a single service, image, registry credentials, one server, and a secret environment variable resolved from the host environment. The output is the full docker run invocation including restart policy, container name, injected environment variables, default HTTP healthcheck, default log rotation, and the standard service/role/routing labels.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "run"
+          },
+          "expected_output": "docker run --detach --restart unless-stopped --name app-web-999 -e MRSK_CONTAINER_NAME=\"app-web-999\" -e RAILS_MASTER_KEY=\"456\" --health-cmd \"curl -f http://localhost:3000/up || exit 1\" --health-interval \"1s\" --log-opt max-size=\"10m\" --label service=\"app\" --label role=\"web\" --label traefik.http.services.app-web.loadbalancer.server.scheme=\"http\" --label traefik.http.routers.app-web.rule=\"PathPrefix(\\`/\\`)\" --label traefik.http.middlewares.app-web-retry.retry.attempts=\"5\" --label traefik.http.middlewares.app-web-retry.retry.initialinterval=\"500ms\" --label traefik.http.routers.app-web.middlewares=\"app-web-retry@docker\" dhh/app:999"
+        }
+      ]
+    },
+    "feature1_2_run_options.json": {
+      "description": "Generate the docker run command when the deployment declares extra container features: a bind-mount volume, a custom HTTP healthcheck path, a custom healthcheck shell command, a role-scoped healthcheck command, or a custom logging driver with options. Each input adds one feature to the base deployment and the output is the full docker run invocation reflecting that feature in the correct argument position.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              },
+              "volumes": [
+                "/local/path:/container/path"
+              ]
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "run"
+          },
+          "expected_output": "docker run --detach --restart unless-stopped --name app-web-999 -e MRSK_CONTAINER_NAME=\"app-web-999\" -e RAILS_MASTER_KEY=\"456\" --health-cmd \"curl -f http://localhost:3000/up || exit 1\" --health-interval \"1s\" --log-opt max-size=\"10m\" --volume /local/path:/container/path --label service=\"app\" --label role=\"web\" --label traefik.http.services.app-web.loadbalancer.server.scheme=\"http\" --label traefik.http.routers.app-web.rule=\"PathPrefix(\\`/\\`)\" --label traefik.http.middlewares.app-web-retry.retry.attempts=\"5\" --label traefik.http.middlewares.app-web-retry.retry.initialinterval=\"500ms\" --label traefik.http.routers.app-web.middlewares=\"app-web-retry@docker\" dhh/app:999"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              },
+              "healthcheck": {
+                "path": "/healthz"
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "run"
+          },
+          "expected_output": "docker run --detach --restart unless-stopped --name app-web-999 -e MRSK_CONTAINER_NAME=\"app-web-999\" -e RAILS_MASTER_KEY=\"456\" --health-cmd \"curl -f http://localhost:3000/healthz || exit 1\" --health-interval \"1s\" --log-opt max-size=\"10m\" --label service=\"app\" --label role=\"web\" --label traefik.http.services.app-web.loadbalancer.server.scheme=\"http\" --label traefik.http.routers.app-web.rule=\"PathPrefix(\\`/\\`)\" --label traefik.http.middlewares.app-web-retry.retry.attempts=\"5\" --label traefik.http.middlewares.app-web-retry.retry.initialinterval=\"500ms\" --label traefik.http.routers.app-web.middlewares=\"app-web-retry@docker\" dhh/app:999"
+        }
+      ]
+    },
+    "feature1_3_run_custom_role_options.json": {
+      "description": "Generate the docker run command for a non-web role that defines its own host list, a startup command, and extra raw container options. A non-web role does not receive the HTTP healthcheck or the web routing labels; instead it carries only service and role labels, its custom option flags, and appends its startup command after the image reference. Option values that are boolean-true become value-less flags.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": {
+                "web": [
+                  "1.1.1.1"
+                ],
+                "jobs": {
+                  "hosts": [
+                    "1.1.1.2"
+                  ],
+                  "cmd": "bin/jobs",
+                  "options": {
+                    "mount": "somewhere",
+                    "cap-add": true
+                  }
+                }
+              },
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "jobs",
+            "action": "run"
+          },
+          "expected_output": "docker run --detach --restart unless-stopped --name app-jobs-999 -e MRSK_CONTAINER_NAME=\"app-jobs-999\" -e RAILS_MASTER_KEY=\"456\" --log-opt max-size=\"10m\" --label service=\"app\" --label role=\"jobs\" --mount \"somewhere\" --cap-add dhh/app:999 bin/jobs"
+        }
+      ]
+    },
+    "feature2_1_start.json": {
+      "description": "Generate the docker command that starts an already-created container by name. The container name is composed from service, role, optional destination, and version. When a destination is set it is inserted between role and version.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "start"
+          },
+          "expected_output": "docker start app-web-999"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "destination": "staging",
+            "role": "web",
+            "action": "start"
+          },
+          "expected_output": "docker start app-web-staging-999"
+        }
+      ]
+    },
+    "feature2_2_stop.json": {
+      "description": "Generate the docker command that stops a running container. By default it finds the latest running container by service/role labels and pipes its id to docker stop. An optional graceful stop-wait-time appends a timeout flag. Supplying an explicit version instead targets the exact container name rather than the latest running one.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "stop"
+          },
+          "expected_output": "docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker stop"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "stop",
+            "args": {
+              "version": "123"
+            }
+          },
+          "expected_output": "docker container ls --all --filter name=^app-web-123$ --quiet | xargs docker stop"
+        }
+      ]
+    },
+    "feature2_3_info.json": {
+      "description": "Generate the docker ps command that lists containers for the service/role. When a destination is configured an extra destination label filter is inserted between the service filter and the role filter.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "info"
+          },
+          "expected_output": "docker ps --filter label=service=app --filter label=role=web"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "destination": "staging",
+            "role": "web",
+            "action": "info"
+          },
+          "expected_output": "docker ps --filter label=service=app --filter label=destination=staging --filter label=role=web"
+        }
+      ]
+    },
+    "feature3_1_logs.json": {
+      "description": "Generate the docker logs command for the latest running container, piping its id into docker logs with stderr merged into stdout. Optional modifiers append a since time window, a tail line limit, and a grep filter on the output. Each modifier is added in a fixed order: since, tail, then grep.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "logs"
+          },
+          "expected_output": "docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs 2>&1"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "logs",
+            "args": {
+              "since": "5m"
+            }
+          },
+          "expected_output": "docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs --since 5m 2>&1"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "logs",
+            "args": {
+              "grep": "my-id"
+            }
+          },
+          "expected_output": "docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs 2>&1 | grep 'my-id'"
+        }
+      ]
+    },
+    "feature3_2_follow_logs.json": {
+      "description": "Generate the SSH-wrapped command to follow (stream) logs of the latest running container on a given host. The remote command finds the running container by service/role labels and tails its logs with timestamps in follow mode, stderr merged. An optional grep filter is appended to the remote pipeline. The whole remote pipeline is single-quoted and wrapped in an ssh invocation to the host.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "follow_logs",
+            "args": {
+              "host": "app-1"
+            }
+          },
+          "expected_output": "ssh -t root@app-1 'docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs --timestamps --tail 10 --follow 2>&1'"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "follow_logs",
+            "args": {
+              "host": "app-1",
+              "grep": "Completed"
+            }
+          },
+          "expected_output": "ssh -t root@app-1 'docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest | xargs docker logs --timestamps --tail 10 --follow 2>&1 | grep \"Completed\"'"
+        }
+      ]
+    },
+    "feature4_1_execute_local.json": {
+      "description": "Generate docker commands that execute a one-off command against the application. Two variants: a fresh ephemeral container (docker run --rm) that injects the configured environment and uses the absolute image, then appends the command; and an existing container (docker exec) addressed by container name. The interactive variants are not requested here.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "execute_in_new_container",
+            "args": {
+              "command": [
+                "bin/rails",
+                "db:setup"
+              ]
+            }
+          },
+          "expected_output": "docker run --rm -e RAILS_MASTER_KEY=\"456\" dhh/app:999 bin/rails db:setup"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "execute_in_existing_container",
+            "args": {
+              "command": [
+                "bin/rails",
+                "db:setup"
+              ]
+            }
+          },
+          "expected_output": "docker exec app-web-999 bin/rails db:setup"
+        }
+      ]
+    },
+    "feature4_2_execute_over_ssh.json": {
+      "description": "Generate the SSH-wrapped interactive one-off command. Two variants: a fresh interactive container (docker run -it --rm) and an interactive exec into the existing container (docker exec -it). The docker command is single-quoted and wrapped in an ssh -t invocation to the target host.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "execute_in_new_container_over_ssh",
+            "args": {
+              "command": [
+                "bin/rails",
+                "c"
+              ],
+              "host": "app-1"
+            }
+          },
+          "expected_output": "ssh -t root@app-1 'docker run -it --rm -e RAILS_MASTER_KEY=\"456\" dhh/app:999 bin/rails c'"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "execute_in_existing_container_over_ssh",
+            "args": {
+              "command": [
+                "bin/rails",
+                "c"
+              ],
+              "host": "app-1"
+            }
+          },
+          "expected_output": "ssh -t root@app-1 'docker exec -it app-web-999 bin/rails c'"
+        }
+      ]
+    },
+    "feature4_3_run_over_ssh.json": {
+      "description": "Wrap an arbitrary shell command for remote execution over SSH. The wrapper always uses a TTY and addresses the host as user@host with the command single-quoted. The login user defaults to root but can be overridden. A configured proxy adds an SSH jump host (-J user@proxy); the jump user defaults to root unless the proxy value already embeds a user. User and proxy options combine independently.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "run_over_ssh",
+            "args": {
+              "command": "ls",
+              "host": "1.1.1.1"
+            }
+          },
+          "expected_output": "ssh -t root@1.1.1.1 'ls'"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              },
+              "ssh": {
+                "proxy": "2.2.2.2"
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "run_over_ssh",
+            "args": {
+              "command": "ls",
+              "host": "1.1.1.1"
+            }
+          },
+          "expected_output": "ssh -J root@2.2.2.2 -t root@1.1.1.1 'ls'"
+        }
+      ]
+    },
+    "feature5_1_container_id.json": {
+      "description": "Generate docker ps queries that locate containers by label. current_running_container_id returns the id of the latest running container for the service/role; with a destination configured, a destination label filter is inserted. container_id_for builds a query that matches an exact container name anchored with ^ and $.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "current_running_container_id"
+          },
+          "expected_output": "docker ps --quiet --filter label=service=app --filter label=role=web --filter status=running --latest"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "container_id_for",
+            "args": {
+              "container_name": "app-999"
+            }
+          },
+          "expected_output": "docker container ls --all --filter name=^app-999$ --quiet"
+        }
+      ]
+    },
+    "feature5_2_versions.json": {
+      "description": "Generate docker ps pipelines that extract deployed version identifiers from container names. The pipeline formats names, then uses grep/cut to extract the trailing dash-delimited segment (the version). current_running_version restricts to the latest running container. list_versions lists all versions for the service/role and optionally accepts extra docker flags plus a status filter that is inserted before those flags.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "current_running_version"
+          },
+          "expected_output": "docker ps --filter label=service=app --filter label=role=web --filter status=running --latest --format \"{{.Names}}\" | grep -oE \"\\-[^-]+$\" | cut -c 2-"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "list_versions"
+          },
+          "expected_output": "docker ps --filter label=service=app --filter label=role=web --format \"{{.Names}}\" | grep -oE \"\\-[^-]+$\" | cut -c 2-"
+        }
+      ]
+    },
+    "feature5_3_list_containers.json": {
+      "description": "Generate docker commands that enumerate containers for the service/role. list_containers lists all (including stopped) by label filters; with a destination a destination filter is inserted. list_container_names is the same query with a Go-template name format appended.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "list_containers"
+          },
+          "expected_output": "docker container ls --all --filter label=service=app --filter label=role=web"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "list_container_names"
+          },
+          "expected_output": "docker container ls --all --filter label=service=app --filter label=role=web --format '{{ .Names }}'"
+        }
+      ]
+    },
+    "feature5_4_remove_containers.json": {
+      "description": "Generate docker commands that remove containers. remove_container targets one exact container name (service-role-[destination-]version) anchored with ^ and $, piping its id into docker container rm; a destination is inserted into the name. remove_containers prunes all stopped containers matching the service/role label filters; with a destination an extra destination filter is inserted.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "remove_container",
+            "args": {
+              "version": "999"
+            }
+          },
+          "expected_output": "docker container ls --all --filter name=^app-web-999$ --quiet | xargs docker container rm"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "remove_containers"
+          },
+          "expected_output": "docker container prune --force --filter label=service=app --filter label=role=web"
+        }
+      ]
+    },
+    "feature5_5_images.json": {
+      "description": "Generate docker commands that manage images. list_images lists images for the configured repository (registry server plus image name, or just the image when no server). remove_images prunes all images matching the service/role label filters; a destination inserts an extra destination filter. tag_current_as_latest tags the current versioned image reference as :latest for the same repository.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "list_images"
+          },
+          "expected_output": "docker image ls dhh/app"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1"
+              ],
+              "env": {
+                "secret": [
+                  "RAILS_MASTER_KEY"
+                ]
+              }
+            },
+            "env": {
+              "RAILS_MASTER_KEY": "456"
+            },
+            "version": "999",
+            "role": "web",
+            "action": "tag_current_as_latest"
+          },
+          "expected_output": "docker tag dhh/app:999 dhh/app:latest"
+        }
+      ]
+    },
+    "feature6_1_role_hosts_cmd.json": {
+      "description": "Resolve the host list and startup command for a named role from the deployment. When servers is a flat array, the single implicit role owns all hosts and has no startup command. When servers is a map, each named role may list hosts directly or under a hosts key and may define its own startup command. role.hosts returns the role's hosts one per line; role.cmd returns the role's startup command (empty when none).",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1",
+                "1.1.1.2"
+              ],
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              }
+            },
+            "role": "web",
+            "action": "role.hosts"
+          },
+          "expected_output": "1.1.1.1\n1.1.1.2"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": {
+                "web": [
+                  "1.1.1.1",
+                  "1.1.1.2"
+                ],
+                "workers": {
+                  "hosts": [
+                    "1.1.1.3",
+                    "1.1.1.4"
+                  ],
+                  "cmd": "bin/jobs",
+                  "env": {
+                    "REDIS_URL": "redis://a/b",
+                    "WEB_CONCURRENCY": 4
+                  }
+                }
+              },
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              }
+            },
+            "role": "workers",
+            "action": "role.hosts"
+          },
+          "expected_output": "1.1.1.3\n1.1.1.4"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1",
+                "1.1.1.2"
+              ],
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              }
+            },
+            "role": "web",
+            "action": "role.cmd"
+          },
+          "expected_output": "cmd="
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": {
+                "web": [
+                  "1.1.1.1",
+                  "1.1.1.2"
+                ],
+                "workers": {
+                  "hosts": [
+                    "1.1.1.3",
+                    "1.1.1.4"
+                  ],
+                  "cmd": "bin/jobs",
+                  "env": {
+                    "REDIS_URL": "redis://a/b",
+                    "WEB_CONCURRENCY": 4
+                  }
+                }
+              },
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              }
+            },
+            "role": "workers",
+            "action": "role.cmd"
+          },
+          "expected_output": "cmd=bin/jobs"
+        }
+      ]
+    },
+    "feature6_2_role_label_args.json": {
+      "description": "Compute the docker --label arguments for a role. A non-web role without traffic-routing enabled gets only the service and role labels. The web role (and any role explicitly opted into routing) additionally gets a fixed set of reverse-proxy routing labels whose keys embed the service-role identifier: a loadbalancer scheme, a path-prefix router rule, a retry middleware with attempts and initial interval, and a router-to-middleware binding. The routing labels are derived purely from the service and role names.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": {
+                "web": [
+                  "1.1.1.1",
+                  "1.1.1.2"
+                ],
+                "workers": {
+                  "hosts": [
+                    "1.1.1.3",
+                    "1.1.1.4"
+                  ],
+                  "cmd": "bin/jobs",
+                  "env": {
+                    "REDIS_URL": "redis://a/b",
+                    "WEB_CONCURRENCY": 4
+                  }
+                }
+              },
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              }
+            },
+            "role": "workers",
+            "action": "role.label_args"
+          },
+          "expected_output": "--label service=\"app\" --label role=\"workers\""
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1",
+                "1.1.1.2"
+              ],
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              }
+            },
+            "role": "web",
+            "action": "role.label_args"
+          },
+          "expected_output": "--label service=\"app\" --label role=\"web\" --label traefik.http.services.app-web.loadbalancer.server.scheme=\"http\" --label traefik.http.routers.app-web.rule=\"PathPrefix(\\`/\\`)\" --label traefik.http.middlewares.app-web-retry.retry.attempts=\"5\" --label traefik.http.middlewares.app-web-retry.retry.initialinterval=\"500ms\" --label traefik.http.routers.app-web.middlewares=\"app-web-retry@docker\""
+        }
+      ]
+    },
+    "feature6_3_role_custom_labels.json": {
+      "description": "Resolve the value of a single label for a role, given a label key. Custom labels declared at the deployment level apply to every role. A role-level custom label of the same key overrides the deployment-level value. A custom label that uses the same key as a default routing label overrides that default. The query returns the resolved key=value for the requested label key.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": [
+                "1.1.1.1",
+                "1.1.1.2"
+              ],
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              },
+              "labels": {
+                "my.custom.label": "50"
+              }
+            },
+            "role": "web",
+            "action": "role.label",
+            "args": {
+              "key": "my.custom.label"
+            }
+          },
+          "expected_output": "my.custom.label=50"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": {
+                "web": [
+                  "1.1.1.1",
+                  "1.1.1.2"
+                ],
+                "workers": {
+                  "hosts": [
+                    "1.1.1.3",
+                    "1.1.1.4"
+                  ],
+                  "cmd": "bin/jobs",
+                  "labels": {
+                    "my.custom.label": "70"
+                  }
+                }
+              },
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              },
+              "labels": {
+                "my.custom.label": "50"
+              }
+            },
+            "role": "workers",
+            "action": "role.label",
+            "args": {
+              "key": "my.custom.label"
+            }
+          },
+          "expected_output": "my.custom.label=70"
+        }
+      ]
+    },
+    "feature6_4_role_env_merge.json": {
+      "description": "Resolve environment variables for a role and render them as docker -e arguments. Deployment-level clear env applies to all roles; a role's own env merges over it, so a role can override a deployment value for a given key. role.env_value returns the resolved value for one key. role.env_args renders the full ordered list of -e KEY=\"value\" pairs; the output shows both an unredacted line (real values) and a redacted line (here identical, since none of these values are secret).",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": {
+                "web": [
+                  "1.1.1.1",
+                  "1.1.1.2"
+                ],
+                "workers": {
+                  "hosts": [
+                    "1.1.1.3",
+                    "1.1.1.4"
+                  ],
+                  "cmd": "bin/jobs",
+                  "env": {
+                    "REDIS_URL": "redis://a/b",
+                    "WEB_CONCURRENCY": 4
+                  }
+                }
+              },
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              }
+            },
+            "role": "workers",
+            "action": "role.env_value",
+            "args": {
+              "key": "REDIS_URL"
+            }
+          },
+          "expected_output": "REDIS_URL=redis://a/b"
+        },
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": {
+                "web": [
+                  "1.1.1.1",
+                  "1.1.1.2"
+                ],
+                "workers": {
+                  "hosts": [
+                    "1.1.1.3",
+                    "1.1.1.4"
+                  ],
+                  "cmd": "bin/jobs",
+                  "env": {
+                    "REDIS_URL": "redis://a/b",
+                    "WEB_CONCURRENCY": 4
+                  }
+                }
+              },
+              "env": {
+                "REDIS_URL": "redis://x/y"
+              }
+            },
+            "role": "workers",
+            "action": "role.env_args"
+          },
+          "expected_output": "unredacted: -e REDIS_URL=\"redis://a/b\" -e WEB_CONCURRENCY=\"4\"\nredacted: -e REDIS_URL=\"redis://a/b\" -e WEB_CONCURRENCY=\"4\""
+        }
+      ]
+    },
+    "feature6_5_role_env_secrets.json": {
+      "description": "Resolve environment variables when secrets are involved and render docker -e arguments with redaction. Env may be split into a clear map (literal values) and a secret list (names whose values are read from the host environment at render time). Secrets and clear values can be declared at the deployment level, at the role level, or both; secret name lists from both levels are concatenated (deployment secrets first, then role secrets) ahead of the merged clear values. Each rendered line shows the unredacted arguments (real resolved secret values, shell-escaped) and the redacted arguments (secret values masked, clear values shown). Secret resolution is order-sensitive and quoting must survive special characters.",
+      "cases": [
+        {
+          "input": {
+            "deploy": {
+              "service": "app",
+              "image": "dhh/app",
+              "registry": {
+                "username": "dhh",
+                "password": "secret"
+              },
+              "servers": {
+                "web": [
+                  "1.1.1.1",
+                  "1.1.1.2"
+                ],
+                "workers": {
+                  "hosts": [
+                    "1.1.1.3",
+                    "1.1.1.4"
+                  ],
+                  "cmd": "bin/jobs",
+                  "env": {
+                    "clear": {
+                      "REDIS_URL": "redis://a/b",
+                      "WEB_CONCURRENCY": 4
+                    },
+                    "secret": [
+                      "DB_PASSWORD"
+                    ]
+                  }
+                }
+              },
+              "env": {
+                "clear": {
+                  "REDIS_URL": "redis://a/b"
+                },
+                "secret": [
+                  "REDIS_PASSWORD"
+                ]
+              }
+            },
+            "env": {
+              "REDIS_PASSWORD": "secret456",
+              "DB_PASSWORD": "secret&\"123"
+            },
+            "role": "workers",
+            "action": "role.env_args"
+          },
+          "expected_output": "unredacted: -e REDIS_PASSWORD=\"secret456\" -e DB_PASSWORD=\"secret&\\\"123\" -e REDIS_URL=\"redis://a/b\" -e WEB_CONCURRENCY=\"4\"\nredacted: -e REDIS_PASSWORD=[REDACTED] -e DB_PASSWORD=[REDACTED] -e REDIS_URL=\"redis://a/b\" -e WEB_CONCURRENCY=\"4\""
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND role == \"web\"",
+      "output_rule": "Generate a detached docker run command with specific default healthcheck, logging, and volume settings followed by labels.",
+      "exact_values": [
+        "docker run",
+        "--detach",
+        "--restart unless-stopped",
+        "--name <service>-<role>-<version>",
+        "-e MRSK_CONTAINER_NAME=<name>",
+        "-e \"<resolved_secret>=\"<value>{}\"",
+        "--health-cmd \"curl -f http://localhost:3000/<path> || exit 1\"",
+        "--health-interval \"1s\"",
+        "--log-opt max-size=\"10m\"",
+        "--label service=\"<service>\"",
+        "--label role=\"<role>\"",
+        "--label traefik.http.services.<service>-<role>.loadbalancer.server.scheme=\"http\"",
+        "--label traefik.http.routers.<service>-<role>.rule=\"PathPrefix(\\`/\\`)\"",
+        "--label traefik.http.middlewares.<service>-<role>-retry.retry.attempts=\"5\"",
+        "--label traefik.http.middlewares.<service>-<role>-retry.retry.initialinterval=\"500ms\"",
+        "--label traefik.http.routers.<service>-<role>.middlewares=\"<service>-<role>-retry@docker\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND role == \"web\" AND input.deploy.volumes exists",
+      "output_rule": "Insert --volume <mount> before all labels.",
+      "exact_values": [
+        "--volume <source>:<target>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND role == \"web\" AND input.deploy.healthcheck.path exists",
+      "output_rule": "Replace the default healthcheck path in the curl command with the provided path.",
+      "exact_values": [
+        "curl -f http://localhost:3000/<path>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND role == \"web\" AND input.deploy.healthcheck.cmd exists",
+      "output_rule": "Replace the entire health-check flag structure (health-cmd, health-interval) with the provided custom cmd.",
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND role == \"web\" AND input.deploy.healthcheck.role_custom_cmd exists",
+      "output_rule": "Replace the entire health-check flag structure with the role-specific custom command.",
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND input.deploy.servers is a string instead of object",
+      "output_rule": "Treat as a single host list",
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND role is NOT \"web\"",
+      "output_rule": "Generate run command WITHOUT http healthcheck, WITHOUT traefik labels, WITH role labels only.",
+      "exact_values": [
+        "--label service=\"<service>\"",
+        "--label role=\"<role>\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND role is NOT \"web\" AND input.deploy.servers.cmd exists",
+      "output_rule": "Append the startup command after the image reference.",
+      "exact_values": [
+        "<image>:<version> <startup_command>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run\" AND role is NOT \"web\" AND input.deploy.servers.options exists",
+      "output_rule": "Iterate options: if boolean true, output value-less flag; else output \"--<key> <value>\".",
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "command_line_generation",
+      "input_condition": "action != \"run\"",
+      "output_rule": "Generate lifecycle command.",
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"start\" OR action == \"stop\" OR action == \"info\"",
+      "output_rule": "Compose container name as service-role-[-destination-]version.",
+      "exact_values": [
+        "<service>-<role>-<version>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"start\"",
+      "output_rule": "Output: docker start <name>.",
+      "exact_values": [
+        "docker start"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"stop\"",
+      "output_rule": "If args.version present: docker container ls --all --filter name=^<name>$ --quiet | xargs docker stop. Else: docker ps --quiet --filter label=service=<s> --filter label=role=<r> --filter status=running --latest | xargs docker stop.",
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"info\"",
+      "output_rule": "Output: docker ps --filter label=service=<s> --filter label=role=<r>. If destination present insert destination filter between service and role filters.",
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"logs\"",
+      "output_rule": "Output: docker ps --quiet --filter label=service=<s> --filter label=role=<r> --filter status=running --latest | xargs docker logs 2>&1.",
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"logs\" AND args.since present",
+      "output_rule": "Insert --since <val> before 2>&1.",
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"logs\" AND args.tail present",
+      "output_rule": "Insert --tail <val> before 2>&1.",
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"follow_logs\"",
+      "output_rule": "Output: ssh -t user@<host> '<pipeline>'. Pipeline: find container id | docker logs --timestamps --tail 10 --follow 2>&1.",
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"follow_logs\" AND args.grep present",
+      "output_rule": "Append | grep \"<val>\" to pipeline.",
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "command_line_generation",
+      "input_condition": "action in [\"execute_in_new_container\", \"execute_in_existing_container\"]",
+      "output_rule": "Generate docker command. New container adds --rm. New container adds env vars to docker run.",
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "command_line_generation",
+      "input_condition": "action in [\"execute_in_new_container_over_ssh\", \"execute_in_existing_container_over_ssh\"]",
+      "output_rule": "Wrap docker command in single quotes inside ssh -t command. Add -it flags to docker.",
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run_over_ssh\"",
+      "output_rule": "Output: ssh -t user@host '<command>'. Apply proxy rules.",
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"run_over_ssh\" AND input.deploy.ssh.proxy exists",
+      "output_rule": "Add -J user@<proxy> flag before connection target.",
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "command_line_generation",
+      "input_condition": "action in [\"follow_logs\", \"run_over_ssh\"]",
+      "output_rule": "Use username 'root' by default if not in input args (except run_over_ssh where proxy might imply user, but default in test is root).",
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"current_running_container_id\"",
+      "output_rule": "Output: docker ps --quiet --filter label=service=<s> --filter label=role=<r> --filter status=running --latest.",
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "command_line_generation",
+      "input_condition": "action == \"container_id_for\" AND args.container_name present",
+      "output_rule": "Output: docker container ls --all --filter name=^<name>$ --quiet.",
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "command_line_generation",
+      "input_condition": "deployment provides secret environment variable",
+      "output_rule": "Replace <resolved_secret> with env var value. Quote if special chars likely (as per test case 1: \"456\" becomes \"456\" but with key wrapping).",
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "argument_ordering",
+      "input_condition": "output is generated",
+      "output_rule": "Flags and values must be in the exact order shown in the expected_output JSON strings for specific action types.",
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "specific exclusion rules",
+        "exact_values_to_replace": [
+          "--label service=\"<service>\"",
+          "--label role=\"<role>\""
+        ],
+        "trigger_keywords": [
+          "web role labels",
+          "non web labels",
+          "service label web",
+          "role label web",
+          "traefik labels non web"
+        ],
+        "oracle_response": "For non-web roles, omit all 'service', 'role', and 'traefik' labels; only include role-specific labels: --label service=\"<service>\" --label role=\"<role>\" (if applicable), excluding any web-specific routing or healthcheck configurations."
+      },
+      {
+        "constraint_id": "C013",
+        "replacement": "complex conditional stopping logic",
+        "exact_values_to_replace": [
+          "docker container ls --all --filter name=^<name>$ --quiet | xargs docker stop.",
+          "docker ps --quiet --filter label=service=<s> --filter label=role=<r> --filter status=running --latest | xargs docker stop."
+        ],
+        "trigger_keywords": [
+          "stop multiple containers",
+          "conditional stop logic",
+          "stop if version arg",
+          "filter by service role",
+          "xargs stop command"
+        ],
+        "oracle_response": "If args.version exists: use 'docker container ls --all --filter name=^<name>$ --quiet | xargs docker stop'. Otherwise: use 'docker ps --quiet --filter label=service=<s> --filter label=role=<r> --filter status=running --latest | xargs docker stop'. Use the format matching the exact string in the expected output."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C028",
+        "vague_phrase": "follow the exact flag ordering shown in the prior test cases",
+        "actual_meaning": "The output must strictly adhere to the sequence of flags starting with 'docker' or action prefix, any intermediate quality-of-service flags (volumes, etc.), healthcheck flags, labels, and then the final action flag (run, start, stop, etc.), as defined in the reference implementation."
+      }
+    ]
+  }
+}

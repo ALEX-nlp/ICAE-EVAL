@@ -1,0 +1,348 @@
+## Product Requirement Document
+
+# Edge Proxy Configuration Builder - A Toolkit for Programmatic L7 Proxy Config
+
+## Project Goal
+
+Build a configuration toolkit that lets platform developers assemble the runtime configuration of a layer-7 edge proxy — listeners, upstream clusters, endpoints, routes, virtual hosts, and TLS material — through small, composable builder functions instead of hand-writing large, error-prone configuration documents. The toolkit must produce configuration that is internally consistent (routes only reference clusters that exist, TLS chains round-trip exactly, websocket upgrades and timeouts are always set) and must parse operator-supplied settings maps into a strongly-typed settings object.
+
+## Background & Problem
+
+A modern ingress gateway is driven by a dynamic control plane that pushes proxy configuration at runtime. Without a toolkit, developers hand-author deeply nested configuration objects for every listener, cluster, route, and TLS filter chain. This is repetitive, easy to get wrong (a route pointing at a missing cluster silently blackholes traffic; a forgotten websocket upgrade breaks streaming; a mis-encoded certificate breaks TLS), and hard to keep consistent across many ingress definitions.
+
+With this toolkit, each configuration element is produced by a focused builder that bakes in the safe defaults the platform requires: endpoints always advertise IPv4-compat, clusters opt into explicit HTTP/2 only when asked, forwarding routes always enable websocket upgrades, route configurations always validate their cluster references, and TLS filter chains embed certificate/key bytes verbatim. A separate settings parser turns an operator's string map into a typed object with a sane default and a clear error on malformed input.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain has multiple distinct responsibilities (endpoint/cluster building, route building, virtual-host building, listener/TLS building, connection-manager building, settings parsing). It MUST NOT be a single "god file": separate the builders by resource type, keep the settings parser independent, and keep the execution adapter physically separate from the core builders.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core builders. The core builders must remain decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic builder calls and rendering the resulting objects (and normalized errors) to stdout.
+
+3. **Adherence to SOLID Design Principles:**
+   - **Single Responsibility:** Parsing, routing of commands, core building, and output formatting live in distinct units.
+   - **Open/Closed:** Adding a new resource builder must not require modifying existing ones.
+   - **Liskov Substitution:** Builder outputs of the same resource family must be interchangeable wherever that family is accepted.
+   - **Interface Segregation:** Each builder exposes only the inputs relevant to its resource.
+   - **Dependency Inversion:** The adapter depends on the builders' public surface, not on their internals.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** Builders should be small, pure functions returning fully-formed configuration objects.
+   - **Resilience:** Malformed settings input must surface as a normalized, language-neutral error category rather than a raw runtime fault.
+
+---
+
+## Core Features
+
+### Feature 1: Load-Balancer Endpoint Builder
+
+**As a developer**, I want to turn a backend IP address and port into a load-balancer endpoint, so I can attach concrete upstream targets to a cluster.
+
+**Expected Behavior / Usage:**
+
+The input is an upstream IPv4 address and a port number. The output describes a single TCP socket address: the transport protocol is `TCP`, the address and port echo the input, and IPv4-compat is always enabled (`true`). Output is one `key=value` line per attribute.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_lb_endpoint.json`
+
+```json
+{
+    "description": "Builds a single load-balancer endpoint from an upstream IP address and port. The endpoint is rendered as a TCP socket address that downstream proxies use to reach the backend. IPv4-compat is always enabled.",
+    "cases": [
+        {
+            "input": {"op": "lb_endpoint", "ip": "127.0.0.1", "port": 8080},
+            "expected_output": "[a specific protocol literal — ask the PM for the exact string]\naddress=127.0.0.1\nport=8080\nipv4_compat=true\n"
+        },
+        {
+            "input": {"op": "lb_endpoint", "ip": "10.0.0.5", "port": 1234},
+            "expected_output": "[a specific protocol literal — ask the PM for the exact string]\naddress=10.0.0.5\nport=1234\nipv4_compat=true\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Upstream Cluster Builder
+
+**As a developer**, I want to assemble an upstream cluster from a name, connect timeout, endpoints, an HTTP/2 toggle, and a service-discovery type, so I can describe a backend pool and how the proxy talks to it.
+
+**Expected Behavior / Usage:**
+
+The input is a cluster name, a connect timeout in seconds, a list of endpoints (each an IP/port pair), a boolean HTTP/2 toggle, and a discovery-type keyword (e.g. `STATIC`). The output reports the cluster name, the connect timeout in seconds, the resolved discovery type, and whether explicit HTTP/2 upstream protocol options were attached (`http2=true` only when requested, otherwise `http2=false`). It then lists each endpoint's address and port in the order supplied. An unrecognized discovery-type keyword produces a normalized error line `error=unknown_discovery_type` with the offending value on its own field line.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_cluster.json`
+
+```json
+{
+    "description": "Builds an upstream cluster from a name, a connect timeout, a list of endpoints, an HTTP/2 toggle, and a discovery type. When HTTP/2 is requested the cluster carries explicit HTTP/2 upstream protocol options; otherwise no protocol options are attached. The endpoints are echoed back under the cluster's load assignment.",
+    "cases": [
+        {
+            "input": {"op": "cluster", "name": "myTestCluster_12345", "connect_timeout_seconds": 5, "http2": true, "discovery_type": "STATIC", "endpoints": [{"ip": "127.0.0.1", "port": 1234}, {"ip": "127.0.0.2", "port": 1234}]},
+            "expected_output": "cluster=myTestCluster_12345\nconnect_timeout_seconds=5\ndiscovery_type=STATIC\nhttp2=true\nendpoint address=127.0.0.1 port=1234\nendpoint address=127.0.0.2 port=1234\n"
+        },
+        {
+            "input": {"op": "cluster", "name": "myTestCluster_12345", "connect_timeout_seconds": 5, "http2": false, "discovery_type": "STATIC", "endpoints": [{"ip": "127.0.0.1", "port": 1234}, {"ip": "127.0.0.2", "port": 1234}]},
+            "expected_output": "cluster=myTestCluster_12345\nconnect_timeout_seconds=5\ndiscovery_type=STATIC\nhttp2=false\nendpoint address=127.0.0.1 port=1234\nendpoint address=127.0.0.2 port=1234\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 3: Weighted Cluster Builder
+
+**As a developer**, I want to declare a weighted destination for traffic splitting, optionally injecting request headers, so I can route a percentage of traffic to a named cluster.
+
+**Expected Behavior / Usage:**
+
+The input is a target cluster name, an integer traffic weight, and an optional map of request headers to inject. The output reports the cluster name and weight, followed by one line per injected header. Every injected header sets `append=false`, meaning the value is set (overwriting) rather than appended. Header lines are emitted in ascending key order so output is deterministic regardless of input map ordering.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_weighted_cluster.json`
+
+```json
+{
+    "description": "Builds a weighted cluster entry for traffic splitting: a target cluster name, an integer traffic weight, and an optional set of request headers to inject. Each header is emitted with append disabled, meaning the header is set (overwritten) rather than appended. Header lines are emitted in ascending key order.",
+    "cases": [
+        {
+            "input": {"op": "weighted_cluster", "name": "test", "weight": 50, "headers": {"foo": "bar"}},
+            "expected_output": "cluster=test\nweight=50\nheader key=foo value=bar append=false\n"
+        },
+        {
+            "input": {"op": "weighted_cluster", "name": "split-a", "weight": 75, "headers": {"baz": "lol", "foo": "bar"}},
+            "expected_output": "cluster=split-a\nweight=75\nheader key=baz value=lol append=false\nheader key=foo value=bar append=false\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: Forwarding Route Builder
+
+**As a developer**, I want to build a forwarding route that matches a path prefix and optional headers and forwards to weighted clusters, so I can express routing rules with websocket support and timeouts.
+
+**Expected Behavior / Usage:**
+
+The input is a route name, a path prefix, an optional list of exact header matches (each a header name and the exact value to match), a request timeout in seconds, optionally a host-rewrite literal, and optional request headers to inject. The output reports the route name and matched path prefix, one line per header match, a websocket upgrade line that is always present and enabled, and the timeout in seconds. When a host-rewrite literal is supplied it appears on its own line. Injected request headers (if any) follow, in ascending key order with `append=false`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_route.json`
+
+```json
+{
+    "description": "Builds a routing rule that matches a request path prefix and optional exact header matches, then forwards to weighted clusters. Every forwarding route enables websocket upgrades and carries a request timeout. An optional host-rewrite literal overrides the upstream Host header. Optional request headers are injected with append disabled and emitted in ascending key order.",
+    "cases": [
+        {
+            "input": {"op": "route", "name": "testRoute_12345", "path": "/my_route", "header_match": [{"name": "myHeader", "exact": "strict"}], "timeout_seconds": 0},
+            "expected_output": "route=testRoute_12345\npath_prefix=/my_route\nheader_match name=myHeader exact=strict\nupgrade type=websocket enabled=true\ntimeout_seconds=0\n"
+        },
+        {
+            "input": {"op": "route", "name": "testRoute_12345", "path": "/my_route", "host_rewrite": "test.host", "timeout_seconds": 0},
+            "expected_output": "route=testRoute_12345\npath_prefix=/my_route\nupgrade type=websocket enabled=true\ntimeout_seconds=0\nhost_rewrite=test.host\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 5: Virtual Host Builder
+
+**As a developer**, I want to group routes under a named virtual host that matches a set of domains, optionally enabling external authorization, so I can organize routing by hostname and apply per-host auth policy.
+
+**Expected Behavior / Usage:**
+
+*5.1 Plain Virtual Host — group domains and routes without external authorization*
+
+The input is a virtual host name, a list of domains, and a list of route names. The output reports the name, one line per domain (in input order), one line per route name (in input order), and `ext_authz=false` to indicate no external-authorization filter configuration is attached.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_1_virtual_host_plain.json`
+
+```json
+{
+    "description": "Builds a plain virtual host from a name, a list of matching domains, and a list of route names. No external-authorization per-filter configuration is attached.",
+    "cases": [
+        {
+            "input": {"op": "virtual_host", "name": "test", "domains": ["foo", "bar"], "routes": ["baz"], "ext_authz": false},
+            "expected_output": "virtual_host=test\ndomain=foo\ndomain=bar\nroute=baz\next_authz=false\n"
+        }
+    ]
+}
+```
+
+*5.2 Virtual Host with External Authorization — same shape plus an external-auth per-route filter*
+
+The input is the same (name, domains, routes) but external authorization is requested. The output is identical in structure to the plain virtual host except that `ext_authz=true`, signalling that an external-authorization per-route filter configuration is now attached. Name, domains, and routes are preserved exactly.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_2_virtual_host_ext_authz.json`
+
+```json
+{
+    "description": "Builds a virtual host that additionally carries an external-authorization per-route filter configuration. The name, domains, and routes are preserved exactly as for a plain virtual host, but the external-authorization filter configuration is now present.",
+    "cases": [
+        {
+            "input": {"op": "virtual_host", "name": "test", "domains": ["foo", "bar"], "routes": ["baz"], "ext_authz": true},
+            "expected_output": "virtual_host=test\ndomain=foo\ndomain=bar\nroute=baz\next_authz=true\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 6: HTTP Connection Manager Builder
+
+**As a developer**, I want to build the HTTP connection manager that fronts a listener and points it at a named route configuration, so I can wire request handling and optional access logging.
+
+**Expected Behavior / Usage:**
+
+The input is the name of the route configuration the manager should consult and a boolean access-log toggle. The output reports a fixed statistics prefix `ingress_http`, an auto-detected codec type `AUTO`, and the route configuration name. When access logging is enabled, the output additionally reports `access_log=true` and an access-log path of `/dev/stdout`; when disabled it reports `access_log=false` and no path line.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature6_connection_manager.json`
+
+```json
+{
+    "description": "Builds an HTTP connection manager that forwards routing decisions to a named route configuration fetched dynamically. The codec is auto-detected and a fixed statistics prefix is used. When access logging is enabled, request logs are written to the standard output path; when disabled, no access log is attached.",
+    "cases": [
+        {
+            "input": {"op": "connection_manager", "route_config_name": "test", "access_log": true},
+            "expected_output": "stat_prefix=ingress_http\ncodec_type=AUTO\nroute_config_name=test\naccess_log=true\naccess_log_path=/dev/stdout\n"
+        },
+        {
+            "input": {"op": "connection_manager", "route_config_name": "test", "access_log": false},
+            "expected_output": "stat_prefix=ingress_http\ncodec_type=AUTO\nroute_config_name=test\naccess_log=false\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 7: Route Configuration Builder
+
+**As a developer**, I want to bundle virtual hosts into a named route configuration with cluster-reference validation enabled, so the proxy never serves routes that point at missing clusters.
+
+**Expected Behavior / Usage:**
+
+The input is a route-configuration name and a list of virtual host names. The output reports the configuration name, one line per virtual host (in input order), and `validate_clusters=true`, which is always set so the configuration cannot reference non-existent clusters.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_route_config.json`
+
+```json
+{
+    "description": "Builds a route configuration from a name and a list of virtual host names. Cluster validation is always enabled so the configuration cannot reference non-existent clusters.",
+    "cases": [
+        {
+            "input": {"op": "route_config", "name": "test", "virtual_hosts": ["test"]},
+            "expected_output": "route_config=test\nvirtual_host=test\nvalidate_clusters=true\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 8: Listener Builder
+
+**As a developer**, I want to build network listeners bound to a port — plain HTTP, single-certificate HTTPS, or SNI-multiplexed HTTPS — so I can terminate connections with the right transport.
+
+**Expected Behavior / Usage:**
+
+*8.1 Plain HTTP Listener — bind a port with no TLS*
+
+The input is a port number. The output reports a listener name derived from the port (`listener_<port>`), the transport protocol `TCP`, the bind address `0.0.0.0`, the port, and `tls=false`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_1_http_listener.json`
+
+```json
+{
+    "description": "Builds a plain HTTP listener bound to all interfaces on a given port. The listener name is derived from the port. No TLS transport is configured.",
+    "cases": [
+        {
+            "input": {"op": "http_listener", "port": 8080},
+            "expected_output": "listener=listener_8080\n[a specific protocol literal — ask the PM for the exact string]\naddress=0.0.0.0\nport=8080\ntls=false\n"
+        }
+    ]
+}
+```
+
+*8.2 HTTPS Listener — bind a port with a single TLS certificate*
+
+The input is a port number, a certificate chain, and a private key (as strings). The output reports the same listener header (name, protocol, address, port), then `tls=true`, and then the certificate chain and private key, which round-trip back to exactly the input bytes — proving the TLS material is embedded verbatim and decodable.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_2_https_listener.json`
+
+```json
+{
+    "description": "Builds an HTTPS listener bound to all interfaces on a given port, backed by a single TLS filter chain built from a certificate chain and a private key. The certificate chain and private key embedded in the listener round-trip back to the original input bytes.",
+    "cases": [
+        {
+            "input": {"op": "https_listener", "port": 8081, "certificate_chain": "some_certificate_chain", "private_key": "some_private_key"},
+            "expected_output": "listener=listener_8081\n[a specific protocol literal — ask the PM for the exact string]\naddress=0.0.0.0\nport=8081\ntls=true\ncertificate_chain=some_certificate_chain\nprivate_key=some_private_key\n"
+        }
+    ]
+}
+```
+
+*8.3 SNI HTTPS Listener — select a certificate by requested server name*
+
+The input is a port number and a list of SNI matches, each carrying one or more host names, a certificate chain, and a private key. The output reports the listener header, then `tls_inspector=true` (a TLS-inspector listener filter is attached so the requested server name can be detected), then one `sni` line per match. Each `sni` line carries the match's server names, certificate chain, and private key; the certificate and key round-trip back to the input bytes. SNI lines are emitted in ascending server-name order so output is deterministic.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_3_sni_listener.json`
+
+```json
+{
+    "description": "Builds an HTTPS listener that selects a TLS filter chain by the requested server name (SNI). For each SNI match a dedicated filter chain is created carrying that match's host names, certificate chain, and private key. A TLS-inspector listener filter is attached so the requested server name can be detected. SNI lines are emitted in ascending server-name order, and each match's certificate/key round-trips back to its input bytes.",
+    "cases": [
+        {
+            "input": {"op": "sni_listener", "port": 8443, "sni_matches": [{"hosts": ["some_host.com"], "certificate_chain": "cert1", "private_key": "key1"}, {"hosts": ["another_host.com"], "certificate_chain": "cert2", "private_key": "key2"}]},
+            "expected_output": "listener=listener_8443\n[a specific protocol literal — ask the PM for the exact string]\naddress=0.0.0.0\nport=8443\ntls_inspector=true\nsni server_names=another_host.com certificate_chain=cert2 private_key=key2\nsni server_names=some_host.com certificate_chain=cert1 private_key=key1\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 9: Settings Map Parser
+
+**As a developer**, I want to parse an operator-supplied string settings map into a typed settings object with a sensible default and clear validation, so misconfiguration is caught early.
+
+**Expected Behavior / Usage:**
+
+The input is a string-keyed settings map. The only recognized key toggles service access logging and must hold a boolean string (`true`/`false`). When the key is absent the setting defaults to enabled (`true`). When present with a valid boolean, that value is used. When present with a non-boolean string the parse fails and the output is a normalized error: `error=invalid_boolean` followed by a field line naming the offending key. The error is language-neutral and never leaks any runtime exception type.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature9_parse_config.json`
+
+```json
+{
+    "description": "Parses a string-keyed configuration map into the gateway settings object. The only recognized key toggles service access logging and must hold a boolean string. When the key is absent the setting defaults to enabled. When the key holds a non-boolean string the parse fails with a normalized invalid-boolean error naming the offending key.",
+    "cases": [
+        {
+            "input": {"op": "parse_config", "data": {}},
+            "expected_output": "enable_service_access_logging=true\n"
+        },
+        {
+            "input": {"op": "parse_config", "data": {"enable-service-access-logging": "false"}},
+            "expected_output": "enable_service_access_logging=false\n"
+        },
+        {
+            "input": {"op": "parse_config", "data": {"enable-service-access-logging": "foo"}},
+            "expected_output": "error=invalid_boolean\nkey=enable-service-access-logging\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured set of configuration builders (endpoint, cluster, weighted cluster, route, virtual host, connection manager, route configuration, listener/TLS) plus an independent settings-map parser. The physical structure must separate builders by resource type and keep the parser independent, without over-engineering.
+
+2. **The Execution/Test Adapter:** A runnable program that reads a single JSON command object from stdin, invokes the appropriate builder or parser, and prints the language-neutral line-oriented result (or a normalized error) to stdout, strictly matching the per-feature contracts above. This adapter must be logically and physically separated from the core builders.
+
+3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_lb_endpoint.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_lb_endpoint@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.

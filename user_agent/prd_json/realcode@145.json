@@ -1,0 +1,842 @@
+{
+  "fuzzy_prd": "hey team, we need to wrap up the persistent worker integration layer we've been discussing. basically the idea is that instead of spinning up the app on every single request, we keep it alive and reuse it — similar to what we did with that session isolation approach in the login module, but applied to the whole request lifecycle here. the main pain points we keep hearing from ops: the server gets stuck in a broken state after certain errors and keeps serving garbage responses until someone manually restarts it; stale database connections are causing intermittent failures on long-running workers; and context from one user's request is bleeding into the next person's error reports which is a compliance nightmare. we also need the worker to gracefully announce when it's starting and stopping so the load balancer can react properly. there's also a thing where some errors should be tolerated (like known app-level stuff) without triggering a full restart, but truly unexpected errors should force a clean rebuild. the metrics setup needs to happen at boot time, not lazily. and the debug dump tool needs to be wired into the request profiler when running in HTTP mode instead of just spewing to stdout. rough priority: get the recycling logic right first, then lifecycle signals, then the db cleanup middleware, then the rest. let me know if anything is unclear, i'll try to get more specs together soon.",
+  "oracle_data": {
+    "task_id": "RRB-PERSISTENT-WORKER-001",
+    "golden_api_signature": "WorkerLoop::run(RequestQueue $queue, RecyclingPolicy $policy, MiddlewareStack $middleware): void",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "how should multiple recycling policies be combined",
+          "what happens when you chain several reboot voters together",
+          "aggregate policy voting logic when more than one strategy is present"
+        ],
+        "oracle_response": "The aggregate recycling policy uses logical OR: it votes to recycle if and only if at least one member policy votes yes. An empty aggregate (zero members) never votes to recycle. The result is a single boolean decision: should_reboot=true or should_reboot=false."
+      },
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "which errors should not trigger a worker restart",
+          "how does the allow-list work for tolerated error categories",
+          "do child categories of an allowed error type also get tolerated"
+        ],
+        "oracle_response": "The error-driven recycling policy checks whether the observed error's category is on the configured allow-list, and this check is hierarchical: an error whose category is a sub-type (prefix match, e.g. 'app_child' is a child of 'app') of an allowed category is also tolerated and does not trigger a recycle vote. Only errors whose category is not covered by the allow-list (directly or via hierarchy) cause a recycle vote."
+      },
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "how do you force a recycle with a reason message",
+          "what gets emitted when a forced reboot signal is received",
+          "can you clear or reset the recycling state mid-request"
+        ],
+        "oracle_response": "A force signal carries a human-readable reason string. When processed, the policy records the reason and votes to recycle; the reason is emitted as 'forced_reboot_reason=<reason>' before the 'should_reboot=true' line. A clear/reset signal wipes all accumulated error and force state, returning the policy to abstain (should_reboot=false), regardless of what was observed before the reset."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "what lifecycle events does the worker emit",
+          "in what order are start and stop events fired",
+          "does the worker announce itself even with an empty request queue"
+        ],
+        "oracle_response": "The worker always emits 'event=worker_start' before processing any requests and 'event=worker_stop' after the request loop ends. Even with zero queued requests, both events are emitted in that order. A rebuild/recycle emits 'event=kernel_rebooted' between the request completion and the next request (or before worker_stop if it is the last)."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "what happens when the request handler throws an exception",
+          "does the worker continue serving requests after a handler failure",
+          "is the original error message exposed to the client"
+        ],
+        "oracle_response": "If the handler throws, the worker sends a generic HTTP 500 response to the client, stops the underlying worker, and terminates the request loop without processing further queued requests. In non-debug mode the original exception message is suppressed from the response body. In debug mode the message is included. The worker_stopped state is true and lifecycle events still show worker_start then worker_stop."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "how is the deferred trailing work handled relative to the response",
+          "when does post-response work run compared to sending the reply",
+          "does deferred work execute before or after the client receives the response"
+        ],
+        "oracle_response": "The worker sends the response to the client first, and only after the response has been dispatched does it execute any trailing/deferred work the handler registered. The output confirms this ordering: deferred_work_ran=true appears in the summary after responses=1 and first_response_content are reported."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "how does the REMOTE_ADDR token work in the trusted proxy list",
+          "what happens to the special peer address token at request time",
+          "how is the immediate connection address substituted into the proxy list"
+        ],
+        "oracle_response": "The special token 'REMOTE_ADDR' in the configured trusted-proxy list is resolved at request time to the actual remote address of the incoming connection (the peer address). The resolved list replaces the token with the concrete IP, so the output shows trusted_proxies with the literal remote_addr value substituted in place of REMOTE_ADDR."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "how are metrics declared at startup",
+          "what fields does a metric collector definition support",
+          "what is the output format for metric declarations"
+        ],
+        "oracle_response": "At worker startup, each configured collector is declared with: type (gauge, counter, or histogram), namespace, subsystem, help text, label names (comma-separated), and bucket boundaries (comma-separated, histograms only). Fields not supplied in the definition are output as empty strings. Output per collector: metric=<name>, type=<type>, namespace=, subsystem=, help=, labels=, buckets=. Order of collectors matches the input map order."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "how does the database connection recycling middleware decide to close a connection",
+          "when is the liveness probe skipped entirely",
+          "what triggers a full application rebuild due to entity manager state"
+        ],
+        "oracle_response": "The connection recycling middleware only probes connections that are both initialized (present) and currently in a connected state. If either condition is false, no probe is attempted and no close occurs. If the liveness probe fails, the connection is closed. For entity managers: a closed/unusable manager forces a full application rebuild (reboot_forced=true); a lazy proxy manager is skipped (framework handles it); an open healthy manager needs no action."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "how is per-request error reporting context isolated between requests",
+          "does a breadcrumb from request one appear in request two's error event",
+          "how is sentry or error reporter scope reset between requests"
+        ],
+        "oracle_response": "The error-reporting middleware creates a fresh isolated scope for each request. Breadcrumbs or context added during one request must not appear on error events captured during any subsequent request. The test validates this by checking that the final request's captured error event has exactly 0 breadcrumbs when the second request did not add any, even if the first request did add one."
+      },
+      {
+        "constraint_id": "C011",
+        "trigger_keywords": [
+          "how does the var dumper get redirected in HTTP mode",
+          "what changes about the debug dump facility when running as an HTTP worker",
+          "is the dump output rerouted to the request profiler"
+        ],
+        "oracle_response": "When the worker starts under the HTTP runtime mode, the global debug-dump facility (var dumper) is rerouted to the worker-provided dumper so that dumped values are captured by the request profiler rather than written to process stdout. Output confirms: handler_redirected=true and dumped_value=<the value passed>."
+      },
+      {
+        "constraint_id": "C012",
+        "trigger_keywords": [
+          "how are gRPC services registered during container build",
+          "what happens when a service implements multiple gRPC contract interfaces",
+          "are non-contract interfaces on a gRPC service registered"
+        ],
+        "oracle_response": "During container build, services tagged as gRPC services are scanned and registered once per service-contract interface they implement. A service implementing one contract produces one registration; a service implementing multiple contracts produces one registration per contract. Non-contract interfaces the service also implements are ignored entirely. Output format per registration: 'register service=<id> interface=<contract_alias>' in discovery order."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid op field values",
+          "what values can op take",
+          "list all supported op values",
+          "what actions does the dispatcher handle",
+          "which op strings does the adapter support",
+          "what are the possible op inputs",
+          "tell me all the op names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'op' field. Valid values are: 'reboot_chain', 'on_exception', 'worker_trusted_proxies', 'worker_events', 'worker_handle', 'worker_error', 'worker_reboot'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature1_1_chain_reboot",
+        "trigger_keywords": [
+          "test cases for feature1 1 chain reboot",
+          "show me feature1 1 chain reboot test cases",
+          "what are the feature1 1 chain reboot test inputs",
+          "give me the feature1_1_chain_reboot test file",
+          "test cases for feature 1",
+          "feature1 1 chain reboot expected output",
+          "what does feature1 1 chain reboot expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_chain_reboot:\n{\n  \"description\": \"Combine several independent reboot voters into one aggregate decision. The aggregate votes to recycle the worker if and only if at least one member votes yes; an empty set never recycles. Input lists each member's vote (true=wants recycle); output reports the aggregate decision.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"reboot_chain\",\n        \"strategies\": []\n      },\n      \"expected_output\": \"should_reboot=false\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"reboot_chain\",\n        \"strategies\": [\n          true,\n          false\n        ]\n      },\n      \"expected_output\": \"should_reboot=true\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"reboot_chain\",\n        \"strategies\": [\n          false,\n          true\n        ]\n      },\n      \"expected_output\": \"should_reboot=true\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"reboot_chain\",\n        \"strategies\": [\n          false,\n          false\n        ]\n      },\n      \"expected_output\": \"should_reboot=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_1_on_exception_reboot",
+        "trigger_keywords": [
+          "test cases for feature1 2 1 on exception reboot",
+          "show me feature1 2 1 on exception reboot test cases",
+          "what are the feature1 2 1 on exception reboot test inputs",
+          "give me the feature1_2_1_on_exception_reboot test file",
+          "test cases for feature 1",
+          "feature1 2 1 on exception reboot expected output",
+          "what does feature1 2 1 on exception reboot expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_1_on_exception_reboot:\n{\n  \"description\": \"A reboot voter that decides per-request whether the worker must recycle based on errors seen while handling the request. A fresh voter abstains. Any unexpected error makes it vote to recycle; an error whose category is on the allow-list (including categories that are sub-types of an allowed category) does not. Input is the allow-list of tolerated error categories plus an ordered list of signals observed during the request; output reports the final decision.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"on_exception\",\n        \"allowed\": [\n          \"app\"\n        ],\n        \"actions\": []\n      },\n      \"expected_output\": \"should_reboot=false\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"on_exception\",\n        \"allowed\": [\n          \"app\"\n        ],\n        \"actions\": [\n          {\n            \"type\": \"exception\",\n            \"category\": \"runtime\"\n          }\n        ]\n      },\n      \"expected_output\": \"should_reboot=true\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"on_exception\",\n        \"allowed\": [\n          \"app\"\n        ],\n        \"actions\": [\n          {\n            \"type\": \"exception\",\n            \"category\": \"app\"\n          }\n        ]\n      },\n      \"expected_output\": \"should_reboot=false\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"on_exception\",\n        \"allowed\": [\n          \"app\"\n        ],\n        \"actions\": [\n          {\n            \"type\": \"exception\",\n            \"category\": \"app_child\"\n          }\n        ]\n      },\n      \"expected_output\": \"should_reboot=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_2_force_reboot_and_clear",
+        "trigger_keywords": [
+          "test cases for feature1 2 2 force reboot and clear",
+          "show me feature1 2 2 force reboot and clear test cases",
+          "what are the feature1 2 2 force reboot and clear test inputs",
+          "give me the feature1_2_2_force_reboot_and_clear test file",
+          "test cases for feature 1",
+          "feature1 2 2 force reboot and clear expected output",
+          "what does feature1 2 2 force reboot and clear expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_2_force_reboot_and_clear:\n{\n  \"description\": \"The same per-request reboot voter can also be told to recycle explicitly via a force-reboot signal carrying a human-readable reason, and its per-request state can be reset. When forced, the voter both records the reason (emitted as a dedicated field) and votes to recycle. Resetting the voter clears any previously observed error or force signal, returning it to abstain. Input is the ordered list of signals (errors, force-with-reason, reset); output reports any forced reason followed by the final decision.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"on_exception\",\n        \"allowed\": [\n          \"app\"\n        ],\n        \"actions\": [\n          {\n            \"type\": \"force\",\n            \"reason\": \"something bad happened\"\n          }\n        ]\n      },\n      \"expected_output\": \"forced_reboot_reason=something bad happened\\nshould_reboot=true\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"on_exception\",\n        \"allowed\": [\n          \"app\"\n        ],\n        \"actions\": [\n          {\n            \"type\": \"exception\",\n            \"category\": \"runtime\"\n          },\n          {\n            \"type\": \"clear\"\n          }\n        ]\n      },\n      \"expected_output\": \"should_reboot=false\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"reboot\",\n        \"op\": \"on_exception\",\n        \"allowed\": [\n          \"app\"\n        ],\n        \"actions\": [\n          {\n            \"type\": \"force\",\n            \"reason\": \"manual recycle\"\n          },\n          {\n            \"type\": \"clear\"\n          }\n        ]\n      },\n      \"expected_output\": \"should_reboot=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_trusted_proxies",
+        "trigger_keywords": [
+          "test cases for feature2 1 trusted proxies",
+          "show me feature2 1 trusted proxies test cases",
+          "what are the feature2 1 trusted proxies test inputs",
+          "give me the feature2_1_trusted_proxies test file",
+          "test cases for feature 2",
+          "feature2 1 trusted proxies expected output",
+          "what does feature2 1 trusted proxies expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_trusted_proxies:\n{\n  \"description\": \"On startup the worker can be configured with a trusted-proxy list so client IP / forwarded headers are honored only from those proxies. The special token meaning 'the immediate peer address' is resolved at request time to the actual remote address of the incoming connection. Input provides the configured proxy list (which may include that special token), the trusted-header bitmask, and the peer address of an incoming request; output reports the effective resolved proxy list and the active trusted-header set.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"worker\",\n        \"op\": \"worker_trusted_proxies\",\n        \"requests\": 1,\n        \"responder\": \"ok\",\n        \"trusted_proxies\": \"10.0.0.1,REMOTE_ADDR\",\n        \"trusted_headers\": 1,\n        \"remote_addr\": \"10.0.0.2\"\n      },\n      \"expected_output\": \"trusted_proxies=10.0.0.1,10.0.0.2\\ntrusted_header_set=1\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"worker\",\n        \"op\": \"worker_trusted_proxies\",\n        \"requests\": 1,\n        \"responder\": \"ok\",\n        \"trusted_proxies\": \"192.168.0.1,REMOTE_ADDR\",\n        \"trusted_headers\": 1,\n        \"remote_addr\": \"203.0.113.7\"\n      },\n      \"expected_output\": \"trusted_proxies=192.168.0.1,203.0.113.7\\ntrusted_header_set=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_lifecycle_events",
+        "trigger_keywords": [
+          "test cases for feature2 2 lifecycle events",
+          "show me feature2 2 lifecycle events test cases",
+          "what are the feature2 2 lifecycle events test inputs",
+          "give me the feature2_2_lifecycle_events test file",
+          "test cases for feature 2",
+          "feature2 2 lifecycle events expected output",
+          "what does feature2 2 lifecycle events expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_lifecycle_events:\n{\n  \"description\": \"The worker emits lifecycle events as it runs: a start event before it begins accepting requests and a stop event once the request loop ends. With no requests queued, the worker still announces start then stop. Input is the number of queued requests (here none); output is the ordered list of lifecycle events emitted.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"worker\",\n        \"op\": \"worker_events\",\n        \"requests\": 0,\n        \"responder\": \"none\"\n      },\n      \"expected_output\": \"event=worker_start\\nevent=worker_stop\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_handle_request",
+        "trigger_keywords": [
+          "test cases for feature2 3 handle request",
+          "show me feature2 3 handle request test cases",
+          "what are the feature2 3 handle request test inputs",
+          "give me the feature2_3_handle_request test file",
+          "test cases for feature 2",
+          "feature2 3 handle request expected output",
+          "what does feature2 3 handle request expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_handle_request:\n{\n  \"description\": \"For each queued request the worker invokes the application handler and sends the produced response to the client. The handler may continue doing deferred work after the response has been sent (the response is dispatched before that trailing work runs). Input is a queued request whose handler yields a body and then performs deferred work; output reports the lifecycle events, the number of responses sent, the first response body, and whether the deferred work executed.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"worker\",\n        \"op\": \"worker_handle\",\n        \"requests\": 1,\n        \"responder\": \"ok\"\n      },\n      \"expected_output\": \"event=worker_start\\nevent=worker_stop\\nresponses=1\\nfirst_response_content=hello\\ndeferred_work_ran=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_4_error_stops_worker",
+        "trigger_keywords": [
+          "test cases for feature2 4 error stops worker",
+          "show me feature2 4 error stops worker test cases",
+          "what are the feature2 4 error stops worker test inputs",
+          "give me the feature2_4_error_stops_worker test file",
+          "test cases for feature 2",
+          "feature2 4 error stops worker expected output",
+          "what does feature2 4 error stops worker expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_4_error_stops_worker:\n{\n  \"description\": \"If the application handler throws while processing a request, the worker sends a generic 500 error response to the client, stops the underlying worker, and ends the request loop (it does not proceed to the next queued request). In non-debug mode the original exception message is hidden from the response body; in debug mode the message is included to aid debugging. Input queues two requests against a throwing handler, with a debug flag and the thrown message; output reports the response status, whether the thrown message leaked into the body, whether the worker was stopped, and the lifecycle events.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"worker\",\n        \"op\": \"worker_error\",\n        \"requests\": 2,\n        \"responder\": \"throw\",\n        \"message\": \"internal failure detail\",\n        \"debug\": false\n      },\n      \"expected_output\": \"response_status=500\\nerror_message_in_body=false\\nworker_stopped=true\\nevent=worker_start\\nevent=worker_stop\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"worker\",\n        \"op\": \"worker_error\",\n        \"requests\": 2,\n        \"responder\": \"throw\",\n        \"message\": \"internal failure detail\",\n        \"debug\": true\n      },\n      \"expected_output\": \"response_status=500\\nerror_message_in_body=true\\nworker_stopped=true\\nevent=worker_start\\nevent=worker_stop\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_5_reboot_after_request",
+        "trigger_keywords": [
+          "test cases for feature2 5 reboot after request",
+          "show me feature2 5 reboot after request test cases",
+          "what are the feature2 5 reboot after request test inputs",
+          "give me the feature2_5_reboot_after_request test file",
+          "test cases for feature 2",
+          "feature2 5 reboot after request expected output",
+          "what does feature2 5 reboot after request expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_5_reboot_after_request:\n{\n  \"description\": \"After each handled request the worker consults its reboot voter. If the voter abstains, the application state is preserved across requests and no rebuild happens. If the voter votes to recycle, the worker rebuilds the application state and emits a kernel-rebooted event before continuing. Input is one queued request plus the per-request reboot votes; output reports how many rebuilds occurred and the ordered lifecycle events.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"worker\",\n        \"op\": \"worker_reboot\",\n        \"requests\": 1,\n        \"responder\": \"ok\",\n        \"reboot_per_call\": [\n          false\n        ]\n      },\n      \"expected_output\": \"reboots=0\\nevent=worker_start\\nevent=worker_stop\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"worker\",\n        \"op\": \"worker_reboot\",\n        \"requests\": 1,\n        \"responder\": \"ok\",\n        \"reboot_per_call\": [\n          true\n        ]\n      },\n      \"expected_output\": \"reboots=1\\nevent=worker_start\\nevent=kernel_rebooted\\nevent=worker_stop\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_declare_metrics",
+        "trigger_keywords": [
+          "test cases for feature3 1 declare metrics",
+          "show me feature3 1 declare metrics test cases",
+          "what are the feature3 1 declare metrics test inputs",
+          "give me the feature3_1_declare_metrics test file",
+          "test cases for feature 3",
+          "feature3 1 declare metrics expected output",
+          "what does feature3 1 declare metrics expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_declare_metrics:\n{\n  \"description\": \"At worker startup, configured metric collector definitions are declared to the metrics backend. Each definition has a type (gauge, counter, or histogram) plus optional namespace, subsystem, help text, label names, and (for histograms) bucket boundaries. The declaration preserves exactly the fields supplied, leaving the rest empty. Input is a map of collector name to its definition; output lists each declared collector with its resolved type, namespace, subsystem, help, labels, and buckets.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"metrics\",\n        \"collectors\": {\n          \"gauge\": {\n            \"type\": \"gauge\",\n            \"labels\": [\n              \"hello\"\n            ]\n          },\n          \"counter\": {\n            \"type\": \"counter\",\n            \"namespace\": \"foo\",\n            \"help\": \"count something\"\n          },\n          \"histo\": {\n            \"type\": \"histogram\",\n            \"buckets\": [\n              0.1,\n              0.5,\n              1\n            ],\n            \"subsystem\": \"bar\"\n          }\n        }\n      },\n      \"expected_output\": \"metric=gauge\\ntype=gauge\\nnamespace=\\nsubsystem=\\nhelp=\\nlabels=hello\\nbuckets=\\nmetric=counter\\ntype=counter\\nnamespace=foo\\nsubsystem=\\nhelp=count something\\nlabels=\\nbuckets=\\nmetric=histo\\ntype=histogram\\nnamespace=\\nsubsystem=bar\\nhelp=\\nlabels=\\nbuckets=0.1,0.5,1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_grpc_service_registration",
+        "trigger_keywords": [
+          "test cases for feature4 grpc service registration",
+          "show me feature4 grpc service registration test cases",
+          "what are the feature4 grpc service registration test inputs",
+          "give me the feature4_grpc_service_registration test file",
+          "test cases for feature 4",
+          "feature4 grpc service registration expected output",
+          "what does feature4 grpc service registration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_grpc_service_registration:\n{\n  \"description\": \"During container build, services tagged as gRPC services are scanned and registered against every service-contract interface they implement. A service implementing one contract registers once; a service implementing several contracts registers once per contract; any non-contract interface it also implements is ignored. Input is the list of tagged services, each with an id and which contract-implementation shape it has; output lists each registration as a (service id, contract alias) pair in discovery order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"grpc\",\n        \"services\": [\n          {\n            \"id\": \"simple\",\n            \"kind\": \"single\"\n          },\n          {\n            \"id\": \"multiple\",\n            \"kind\": \"multi\"\n          }\n        ]\n      },\n      \"expected_output\": \"register service=simple interface=grpc_single\\nregister service=multiple interface=grpc_foo\\nregister service=multiple interface=grpc_bar\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_connection_recycling",
+        "trigger_keywords": [
+          "test cases for feature5 1 connection recycling",
+          "show me feature5 1 connection recycling test cases",
+          "what are the feature5 1 connection recycling test inputs",
+          "give me the feature5_1_connection_recycling test file",
+          "test cases for feature 5",
+          "feature5 1 connection recycling expected output",
+          "what does feature5 1 connection recycling expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_connection_recycling:\n{\n  \"description\": \"Before handling a request, the middleware recycles stale database connections so a long-lived worker never reuses a dead socket. It only inspects connections that have actually been initialized and are currently connected; for those it issues a lightweight liveness probe and closes the connection if the probe fails, leaving healthy connections untouched. Input describes whether the connection service was initialized, whether it reports connected, and whether the liveness probe succeeds; output reports whether a probe was attempted and whether the connection was closed.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"doctrine\",\n        \"connection_present\": false,\n        \"connected\": false,\n        \"manager\": \"none\"\n      },\n      \"expected_output\": \"ping_attempted=false\\nconnection_closed=false\\nreboot_forced=false\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"doctrine\",\n        \"connection_present\": true,\n        \"connected\": false,\n        \"manager\": \"none\"\n      },\n      \"expected_output\": \"ping_attempted=false\\nconnection_closed=false\\nreboot_forced=false\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"doctrine\",\n        \"connection_present\": true,\n        \"connected\": true,\n        \"pingable\": false,\n        \"manager\": \"none\"\n      },\n      \"expected_output\": \"ping_attempted=true\\nconnection_closed=true\\nreboot_forced=false\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"doctrine\",\n        \"connection_present\": true,\n        \"connected\": true,\n        \"pingable\": true,\n        \"manager\": \"none\"\n      },\n      \"expected_output\": \"ping_attempted=true\\nconnection_closed=false\\nreboot_forced=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_manager_reset",
+        "trigger_keywords": [
+          "test cases for feature5 2 manager reset",
+          "show me feature5 2 manager reset test cases",
+          "what are the feature5 2 manager reset test inputs",
+          "give me the feature5_2_manager_reset test file",
+          "test cases for feature 5",
+          "feature5 2 manager reset expected output",
+          "what does feature5 2 manager reset expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_manager_reset:\n{\n  \"description\": \"After handling a request, the same middleware inspects each initialized entity manager. A closed (unusable) manager cannot be reopened in-place, so the middleware forces a full application rebuild for the next request. A manager that is a lazy proxy is skipped (the framework reopens it automatically), and a healthy open manager needs no action. Input describes the entity manager's state (closed, lazy proxy, or open); output reports whether an application rebuild was forced.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"doctrine\",\n        \"connection_present\": true,\n        \"connected\": false,\n        \"manager\": \"closed\"\n      },\n      \"expected_output\": \"ping_attempted=false\\nconnection_closed=false\\nreboot_forced=true\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"doctrine\",\n        \"connection_present\": true,\n        \"connected\": false,\n        \"manager\": \"lazy\"\n      },\n      \"expected_output\": \"ping_attempted=false\\nconnection_closed=false\\nreboot_forced=false\\n\"\n    },\n    {\n      \"input\": {\n        \"handler\": \"doctrine\",\n        \"connection_present\": true,\n        \"connected\": false,\n        \"manager\": \"open\"\n      },\n      \"expected_output\": \"ping_attempted=false\\nconnection_closed=false\\nreboot_forced=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_error_scope_isolation",
+        "trigger_keywords": [
+          "test cases for feature6 error scope isolation",
+          "show me feature6 error scope isolation test cases",
+          "what are the feature6 error scope isolation test inputs",
+          "give me the feature6_error_scope_isolation test file",
+          "test cases for feature 6",
+          "feature6 error scope isolation expected output",
+          "what does feature6 error scope isolation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_error_scope_isolation:\n{\n  \"description\": \"The error-reporting middleware isolates each request's reporting scope so context recorded during one request never leaks into a later one. A breadcrumb added while handling the first request must not appear on the error event captured during the second request. Input is a sequence of requests, each flagged for whether it adds a breadcrumb before capturing an error; output reports the number of breadcrumbs attached to the error event captured by the final request.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"sentry\",\n        \"requests\": [\n          {\n            \"add_breadcrumb\": true\n          },\n          {\n            \"add_breadcrumb\": false\n          }\n        ]\n      },\n      \"expected_output\": \"last_event_breadcrumbs=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_dump_handler_redirect",
+        "trigger_keywords": [
+          "test cases for feature7 dump handler redirect",
+          "show me feature7 dump handler redirect test cases",
+          "what are the feature7 dump handler redirect test inputs",
+          "give me the feature7_dump_handler_redirect test file",
+          "test cases for feature 7",
+          "feature7 dump handler redirect expected output",
+          "what does feature7 dump handler redirect expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_dump_handler_redirect:\n{\n  \"description\": \"When the worker starts under the HTTP runtime, the global debug-dump facility is rerouted to the worker-provided dumper so dumped values are captured by the request profiler instead of being written to the process output. Input is the runtime mode and a value to dump; output reports whether the dump facility was rerouted and the captured value.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"handler\": \"vardumper\",\n        \"mode\": \"http\",\n        \"value\": \"foo\"\n      },\n      \"expected_output\": \"handler_redirected=true\\ndumped_value=foo\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "similar to what we did with that session isolation approach in the login module",
+        "actual_meaning": "The per-request error scope isolation middleware described in Feature 6 (feature6_error_scope_isolation.json), which ensures Sentry/error-reporter breadcrumbs and context do not bleed between consecutive requests handled by the same persistent worker process."
+      },
+      {
+        "vague_reference": "known app-level stuff should be tolerated without triggering a full restart",
+        "actual_meaning": "The allow-list mechanism in the OnExceptionRecyclingPolicy (feature1_2_1_on_exception_reboot.json): errors whose category matches or is a sub-type/prefix of an entry in the 'allowed' list do not cause a recycle vote, while all other categories do."
+      },
+      {
+        "vague_reference": "the debug dump tool needs to be wired into the request profiler when running in HTTP mode",
+        "actual_meaning": "Feature 7 (feature7_dump_handler_redirect.json): the VarDumper handler redirection that reroutes the global dump facility to the worker-provided dumper when mode='http', so output is captured by the profiler rather than sent to stdout."
+      },
+      {
+        "vague_reference": "metrics setup needs to happen at boot time, not lazily",
+        "actual_meaning": "Feature 3 (feature3_1_declare_metrics.json): collector definitions (gauge, counter, histogram) with their namespace, subsystem, help, labels, and buckets are declared to the metrics backend during worker startup, not on first use."
+      }
+    ],
+    "fallback_response": "That detail isn't fully specified in the current ticket. Could you check the relevant test case files under rcb_tests/public_test_cases/ for the exact input/output contract, or look at the PRD section for that feature? Happy to clarify further once you've had a look."
+  },
+  "public_test_cases": {
+    "feature1_1_chain_reboot.json": {
+      "description": "Combine several independent reboot voters into one aggregate decision. The aggregate votes to recycle the worker if and only if at least one member votes yes; an empty set never recycles. Input lists each member's vote (true=wants recycle); output reports the aggregate decision.",
+      "cases": [
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "reboot_chain",
+            "strategies": []
+          },
+          "expected_output": "should_reboot=false\n"
+        },
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "reboot_chain",
+            "strategies": [
+              true,
+              false
+            ]
+          },
+          "expected_output": "should_reboot=true\n"
+        },
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "reboot_chain",
+            "strategies": [
+              false,
+              true
+            ]
+          },
+          "expected_output": "should_reboot=true\n"
+        },
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "reboot_chain",
+            "strategies": [
+              false,
+              false
+            ]
+          },
+          "expected_output": "should_reboot=false\n"
+        }
+      ]
+    },
+    "feature1_2_1_on_exception_reboot.json": {
+      "description": "A reboot voter that decides per-request whether the worker must recycle based on errors seen while handling the request. A fresh voter abstains. Any unexpected error makes it vote to recycle; an error whose category is on the allow-list (including categories that are sub-types of an allowed category) does not. Input is the allow-list of tolerated error categories plus an ordered list of signals observed during the request; output reports the final decision.",
+      "cases": [
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "on_exception",
+            "allowed": [
+              "app"
+            ],
+            "actions": []
+          },
+          "expected_output": "should_reboot=false\n"
+        },
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "on_exception",
+            "allowed": [
+              "app"
+            ],
+            "actions": [
+              {
+                "type": "exception",
+                "category": "runtime"
+              }
+            ]
+          },
+          "expected_output": "should_reboot=true\n"
+        },
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "on_exception",
+            "allowed": [
+              "app"
+            ],
+            "actions": [
+              {
+                "type": "exception",
+                "category": "app"
+              }
+            ]
+          },
+          "expected_output": "should_reboot=false\n"
+        },
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "on_exception",
+            "allowed": [
+              "app"
+            ],
+            "actions": [
+              {
+                "type": "exception",
+                "category": "app_child"
+              }
+            ]
+          },
+          "expected_output": "should_reboot=false\n"
+        }
+      ]
+    },
+    "feature1_2_2_force_reboot_and_clear.json": {
+      "description": "The same per-request reboot voter can also be told to recycle explicitly via a force-reboot signal carrying a human-readable reason, and its per-request state can be reset. When forced, the voter both records the reason (emitted as a dedicated field) and votes to recycle. Resetting the voter clears any previously observed error or force signal, returning it to abstain. Input is the ordered list of signals (errors, force-with-reason, reset); output reports any forced reason followed by the final decision.",
+      "cases": [
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "on_exception",
+            "allowed": [
+              "app"
+            ],
+            "actions": [
+              {
+                "type": "force",
+                "reason": "something bad happened"
+              }
+            ]
+          },
+          "expected_output": "forced_reboot_reason=something bad happened\nshould_reboot=true\n"
+        },
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "on_exception",
+            "allowed": [
+              "app"
+            ],
+            "actions": [
+              {
+                "type": "exception",
+                "category": "runtime"
+              },
+              {
+                "type": "clear"
+              }
+            ]
+          },
+          "expected_output": "should_reboot=false\n"
+        },
+        {
+          "input": {
+            "handler": "reboot",
+            "op": "on_exception",
+            "allowed": [
+              "app"
+            ],
+            "actions": [
+              {
+                "type": "force",
+                "reason": "manual recycle"
+              },
+              {
+                "type": "clear"
+              }
+            ]
+          },
+          "expected_output": "should_reboot=false\n"
+        }
+      ]
+    },
+    "feature2_1_trusted_proxies.json": {
+      "description": "On startup the worker can be configured with a trusted-proxy list so client IP / forwarded headers are honored only from those proxies. The special token meaning 'the immediate peer address' is resolved at request time to the actual remote address of the incoming connection. Input provides the configured proxy list (which may include that special token), the trusted-header bitmask, and the peer address of an incoming request; output reports the effective resolved proxy list and the active trusted-header set.",
+      "cases": [
+        {
+          "input": {
+            "handler": "worker",
+            "op": "worker_trusted_proxies",
+            "requests": 1,
+            "responder": "ok",
+            "trusted_proxies": "10.0.0.1,REMOTE_ADDR",
+            "trusted_headers": 1,
+            "remote_addr": "10.0.0.2"
+          },
+          "expected_output": "trusted_proxies=10.0.0.1,10.0.0.2\ntrusted_header_set=1\n"
+        },
+        {
+          "input": {
+            "handler": "worker",
+            "op": "worker_trusted_proxies",
+            "requests": 1,
+            "responder": "ok",
+            "trusted_proxies": "192.168.0.1,REMOTE_ADDR",
+            "trusted_headers": 1,
+            "remote_addr": "203.0.113.7"
+          },
+          "expected_output": "trusted_proxies=192.168.0.1,203.0.113.7\ntrusted_header_set=1\n"
+        }
+      ]
+    },
+    "feature2_2_lifecycle_events.json": {
+      "description": "The worker emits lifecycle events as it runs: a start event before it begins accepting requests and a stop event once the request loop ends. With no requests queued, the worker still announces start then stop. Input is the number of queued requests (here none); output is the ordered list of lifecycle events emitted.",
+      "cases": [
+        {
+          "input": {
+            "handler": "worker",
+            "op": "worker_events",
+            "requests": 0,
+            "responder": "none"
+          },
+          "expected_output": "event=worker_start\nevent=worker_stop\n"
+        }
+      ]
+    },
+    "feature2_3_handle_request.json": {
+      "description": "For each queued request the worker invokes the application handler and sends the produced response to the client. The handler may continue doing deferred work after the response has been sent (the response is dispatched before that trailing work runs). Input is a queued request whose handler yields a body and then performs deferred work; output reports the lifecycle events, the number of responses sent, the first response body, and whether the deferred work executed.",
+      "cases": [
+        {
+          "input": {
+            "handler": "worker",
+            "op": "worker_handle",
+            "requests": 1,
+            "responder": "ok"
+          },
+          "expected_output": "event=worker_start\nevent=worker_stop\nresponses=1\nfirst_response_content=hello\ndeferred_work_ran=true\n"
+        }
+      ]
+    },
+    "feature2_4_error_stops_worker.json": {
+      "description": "If the application handler throws while processing a request, the worker sends a generic 500 error response to the client, stops the underlying worker, and ends the request loop (it does not proceed to the next queued request). In non-debug mode the original exception message is hidden from the response body; in debug mode the message is included to aid debugging. Input queues two requests against a throwing handler, with a debug flag and the thrown message; output reports the response status, whether the thrown message leaked into the body, whether the worker was stopped, and the lifecycle events.",
+      "cases": [
+        {
+          "input": {
+            "handler": "worker",
+            "op": "worker_error",
+            "requests": 2,
+            "responder": "throw",
+            "message": "internal failure detail",
+            "debug": false
+          },
+          "expected_output": "response_status=500\nerror_message_in_body=false\nworker_stopped=true\nevent=worker_start\nevent=worker_stop\n"
+        },
+        {
+          "input": {
+            "handler": "worker",
+            "op": "worker_error",
+            "requests": 2,
+            "responder": "throw",
+            "message": "internal failure detail",
+            "debug": true
+          },
+          "expected_output": "response_status=500\nerror_message_in_body=true\nworker_stopped=true\nevent=worker_start\nevent=worker_stop\n"
+        }
+      ]
+    },
+    "feature2_5_reboot_after_request.json": {
+      "description": "After each handled request the worker consults its reboot voter. If the voter abstains, the application state is preserved across requests and no rebuild happens. If the voter votes to recycle, the worker rebuilds the application state and emits a kernel-rebooted event before continuing. Input is one queued request plus the per-request reboot votes; output reports how many rebuilds occurred and the ordered lifecycle events.",
+      "cases": [
+        {
+          "input": {
+            "handler": "worker",
+            "op": "worker_reboot",
+            "requests": 1,
+            "responder": "ok",
+            "reboot_per_call": [
+              false
+            ]
+          },
+          "expected_output": "reboots=0\nevent=worker_start\nevent=worker_stop\n"
+        },
+        {
+          "input": {
+            "handler": "worker",
+            "op": "worker_reboot",
+            "requests": 1,
+            "responder": "ok",
+            "reboot_per_call": [
+              true
+            ]
+          },
+          "expected_output": "reboots=1\nevent=worker_start\nevent=kernel_rebooted\nevent=worker_stop\n"
+        }
+      ]
+    },
+    "feature3_1_declare_metrics.json": {
+      "description": "At worker startup, configured metric collector definitions are declared to the metrics backend. Each definition has a type (gauge, counter, or histogram) plus optional namespace, subsystem, help text, label names, and (for histograms) bucket boundaries. The declaration preserves exactly the fields supplied, leaving the rest empty. Input is a map of collector name to its definition; output lists each declared collector with its resolved type, namespace, subsystem, help, labels, and buckets.",
+      "cases": [
+        {
+          "input": {
+            "handler": "metrics",
+            "collectors": {
+              "gauge": {
+                "type": "gauge",
+                "labels": [
+                  "hello"
+                ]
+              },
+              "counter": {
+                "type": "counter",
+                "namespace": "foo",
+                "help": "count something"
+              },
+              "histo": {
+                "type": "histogram",
+                "buckets": [
+                  0.1,
+                  0.5,
+                  1
+                ],
+                "subsystem": "bar"
+              }
+            }
+          },
+          "expected_output": "metric=gauge\ntype=gauge\nnamespace=\nsubsystem=\nhelp=\nlabels=hello\nbuckets=\nmetric=counter\ntype=counter\nnamespace=foo\nsubsystem=\nhelp=count something\nlabels=\nbuckets=\nmetric=histo\ntype=histogram\nnamespace=\nsubsystem=bar\nhelp=\nlabels=\nbuckets=0.1,0.5,1\n"
+        }
+      ]
+    },
+    "feature4_grpc_service_registration.json": {
+      "description": "During container build, services tagged as gRPC services are scanned and registered against every service-contract interface they implement. A service implementing one contract registers once; a service implementing several contracts registers once per contract; any non-contract interface it also implements is ignored. Input is the list of tagged services, each with an id and which contract-implementation shape it has; output lists each registration as a (service id, contract alias) pair in discovery order.",
+      "cases": [
+        {
+          "input": {
+            "handler": "grpc",
+            "services": [
+              {
+                "id": "simple",
+                "kind": "single"
+              },
+              {
+                "id": "multiple",
+                "kind": "multi"
+              }
+            ]
+          },
+          "expected_output": "register service=simple interface=grpc_single\nregister service=multiple interface=grpc_foo\nregister service=multiple interface=grpc_bar\n"
+        }
+      ]
+    },
+    "feature5_1_connection_recycling.json": {
+      "description": "Before handling a request, the middleware recycles stale database connections so a long-lived worker never reuses a dead socket. It only inspects connections that have actually been initialized and are currently connected; for those it issues a lightweight liveness probe and closes the connection if the probe fails, leaving healthy connections untouched. Input describes whether the connection service was initialized, whether it reports connected, and whether the liveness probe succeeds; output reports whether a probe was attempted and whether the connection was closed.",
+      "cases": [
+        {
+          "input": {
+            "handler": "doctrine",
+            "connection_present": false,
+            "connected": false,
+            "manager": "none"
+          },
+          "expected_output": "ping_attempted=false\nconnection_closed=false\nreboot_forced=false\n"
+        },
+        {
+          "input": {
+            "handler": "doctrine",
+            "connection_present": true,
+            "connected": false,
+            "manager": "none"
+          },
+          "expected_output": "ping_attempted=false\nconnection_closed=false\nreboot_forced=false\n"
+        },
+        {
+          "input": {
+            "handler": "doctrine",
+            "connection_present": true,
+            "connected": true,
+            "pingable": false,
+            "manager": "none"
+          },
+          "expected_output": "ping_attempted=true\nconnection_closed=true\nreboot_forced=false\n"
+        },
+        {
+          "input": {
+            "handler": "doctrine",
+            "connection_present": true,
+            "connected": true,
+            "pingable": true,
+            "manager": "none"
+          },
+          "expected_output": "ping_attempted=true\nconnection_closed=false\nreboot_forced=false\n"
+        }
+      ]
+    },
+    "feature5_2_manager_reset.json": {
+      "description": "After handling a request, the same middleware inspects each initialized entity manager. A closed (unusable) manager cannot be reopened in-place, so the middleware forces a full application rebuild for the next request. A manager that is a lazy proxy is skipped (the framework reopens it automatically), and a healthy open manager needs no action. Input describes the entity manager's state (closed, lazy proxy, or open); output reports whether an application rebuild was forced.",
+      "cases": [
+        {
+          "input": {
+            "handler": "doctrine",
+            "connection_present": true,
+            "connected": false,
+            "manager": "closed"
+          },
+          "expected_output": "ping_attempted=false\nconnection_closed=false\nreboot_forced=true\n"
+        },
+        {
+          "input": {
+            "handler": "doctrine",
+            "connection_present": true,
+            "connected": false,
+            "manager": "lazy"
+          },
+          "expected_output": "ping_attempted=false\nconnection_closed=false\nreboot_forced=false\n"
+        },
+        {
+          "input": {
+            "handler": "doctrine",
+            "connection_present": true,
+            "connected": false,
+            "manager": "open"
+          },
+          "expected_output": "ping_attempted=false\nconnection_closed=false\nreboot_forced=false\n"
+        }
+      ]
+    },
+    "feature6_error_scope_isolation.json": {
+      "description": "The error-reporting middleware isolates each request's reporting scope so context recorded during one request never leaks into a later one. A breadcrumb added while handling the first request must not appear on the error event captured during the second request. Input is a sequence of requests, each flagged for whether it adds a breadcrumb before capturing an error; output reports the number of breadcrumbs attached to the error event captured by the final request.",
+      "cases": [
+        {
+          "input": {
+            "handler": "sentry",
+            "requests": [
+              {
+                "add_breadcrumb": true
+              },
+              {
+                "add_breadcrumb": false
+              }
+            ]
+          },
+          "expected_output": "last_event_breadcrumbs=0\n"
+        }
+      ]
+    },
+    "feature7_dump_handler_redirect.json": {
+      "description": "When the worker starts under the HTTP runtime, the global debug-dump facility is rerouted to the worker-provided dumper so dumped values are captured by the request profiler instead of being written to the process output. Input is the runtime mode and a value to dump; output reports whether the dump facility was rerouted and the captured value.",
+      "cases": [
+        {
+          "input": {
+            "handler": "vardumper",
+            "mode": "http",
+            "value": "foo"
+          },
+          "expected_output": "handler_redirected=true\ndumped_value=foo\n"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to ship the lifecycle container runtime we've been talking about. Basically the idea is that every 'region' of the app (a screen, a session, a subsystem) should be a named thing that lives in a tree, and when you kill a parent everything underneath it cleans up automatically — no more manually wiring teardown in 50 call sites. We've had a bunch of production incidents where background jobs keep running after the screen they belong to is gone, and also cases where cleanup callbacks blow up because they try to use something that's already been released.
+
+The container should let you plug in observers that get notified when it starts up and shuts down. Registration should be safe to call multiple times without blowing things up. There's also that builder pattern we used in the auth flow last time — same idea here where observers attached during construction shouldn't fire until the thing is actually ready.
+
+Background work needs to be tied to the container lifetime in a specific order — the work stuff has to stop BEFORE the regular cleanup callbacks run. Also need ancestor-walking for service and dependency lookups, and a neutral error story (no raw exceptions leaking out) for destroyed containers, missing deps, unnamed work scopes, etc. Check the existing test scaffolding for the exact shape of the ops.

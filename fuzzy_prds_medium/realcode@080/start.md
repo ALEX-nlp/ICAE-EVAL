@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need a small parsing/routing library for the image-copy service — basically a collection of pure helper functions that run before we touch any network or cloud API. The idea is to stop having all that fragile string munging scattered everywhere and make the core logic actually testable in isolation.
+
+We need a few things: something to pull the cloud region out of a registry hostname (you know, the managed container registry URLs we use), a credential classifier so we know whether to go fetch a secret or just use the value directly, and a parser for those object-storage archive location strings we use for image archives in the bucket system. The archive transport thing also needs to expose its scheme identifier and should flat-out reject any policy scope you throw at it — that transport just doesn't support scopes, period.
+
+Also need a utility that reads a stream but hard-caps how much it buffers — we had that incident last quarter where an oversized payload caused memory issues, so this is important.
+
+For the docker reference normalization, just follow the same convention we use in the login module — you'll know it when you see it in the codebase. The output format should be the same key=value style we already use in the other adapters. Make sure the test harness can be pointed at different case directories without overwriting previous runs.
+
+One quick follow-up from the questions that came in: for the registry region helper, the match is just the .dkr.ecr.<region>.amazonaws.com pattern anywhere inside the URI string, and we only want the single dot-separated token between the 'dkr.ecr.' label and the '.amazonaws.com' suffix. So scheme, path, and tag are all ignored for that. If the URI does not contain a recognizable ECR hostname pattern (<account>.dkr.ecr.<region>.amazonaws.com), the function must report a fixed default region. The spec does not pin the exact string — it just must be a consistent, hardcoded fallback — but the output line format is always region=<value>.
+
+Also clarifying the credential classifier because priority matters here: the three credential categories are checked in strict priority order. First, if the string starts with 'arn:aws', classify as SECRET_ARN. Otherwise, if the string contains a colon, classify as SECRET_TEXT. Otherwise, including empty string, classify as SECRET_NAME. An ARN always wins even though it also contains colons, so that prefix check has to happen first.
+
+On the reference parsing side, an empty ref string is explicitly a rejection case for parse_reference, and in that situation it must output valid=false with no additional fields. For the archive reference format, it is //<bucket>[/<key>][:<suffix>]. The text immediately after '//' up to the first '/' is the bucket. Everything after that first '/' and before the first ':' is the key. A trailing slash with no key yields an empty key. The suffix after the first ':' is either a docker image reference or a source index prefixed with '@'.
+
+For docker refs embedded in that archive reference, normalize them to the canonical fully-qualified repository form. Short names like 'busybox' expand to 'docker.io/library/busybox:latest', and a missing tag always defaults to 'latest'. References carrying a content digest (e.g., @sha256:...) are rejected and cause the entire parse to return valid=false. Same normalization rule in general too: expand bare short names to docker.io/library/<name>:latest, always default missing tags to 'latest', and reject digest-bearing references — as specified in the parse_reference contract in feature 3.1.
+
+And just to make the harness/output expectation super explicit, stdout should be one key=value pair per line, each line newline-terminated, exactly matching the expected_output strings in the JSON test case files under rcb_tests/public_test_cases/.

@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need to build out this page-processing library thing that the data pipeline folks have been asking about for a while. Basically the problem is that right now every team that wants to work with column pages has to write their own decoding logic before they can do any kind of row filtering or value extraction, and they keep getting it wrong especially when those weird compressed page formats come into play. We want one consistent interface they can all use.
+
+The library needs to handle at least three kinds of page layouts — you know, the normal one, the one where every row is the same value, and the dictionary-compressed one. For the dictionary case specifically there's some tricky fallback behavior we discussed in the arch review last month that needs to be baked in.
+
+It should support two main operations: picking which rows pass a condition (either a numeric window check or a remainder-based check, same ones we used in the billing filter module), and then pulling out the actual values for a given set of rows. Row sets can be described either as a straight range or as an explicit list.
+
+The whole thing needs a CLI adapter that reads JSON from stdin and writes results to stdout so the test harness can drive it. There's also some metadata reporting that pipeline tooling depends on — make sure that part is stable. Please follow the same separation pattern we used on the auth refactor.
+
+One small follow-up after the questions that came in: for the range-style filter, the rule is strictly greater than 3 and strictly less than 11, so 3 and 11 do not count. In practice that means the passing values are 4, 5, 6, 7, 8, 9, 10. And when filter_range is false, we use the modulo version instead, which is value modulo 3 equals 1. So values 1, 4, 7, 10, 13 would pass there.
+
+Also worth being extra clear on the positions input since a few folks asked. There are two supported shapes. The range form uses offset and size, with offset being the zero-based starting row index and size being the number of rows to include, which means it selects rows offset through offset+size-1 inclusive. The other form is just an explicit array of zero-based row position integers, and those should be projected in exactly the order they appear. The output values should follow that same order too.
+
+On the metadata side, the filter component should output component=filter, deterministic=true, input_channels=[3]. For the projection component it’s those same three fields plus output_type=bigint. The input_channels value is always the literal list [3] for both components, and there is no pass/fail word in metadata output.
+
+Last thing on dictionary pages because that fallback behavior is easy to misunderstand: if all dictionary entries are valid, projection reports result_encoding=dictionary. If there are invalid entries, meaning negative values, but none of the selected rows actually point at those bad entries, projection should still succeed, just materialize the referenced values as a plain result and report result_encoding=plain. Same idea for dictionary pages that contain unused invalid (negative) entries — fall back to plain result encoding and report result_encoding=plain in stdout rather than result_encoding=dictionary. If any selected rows do reference invalid entries, that should be treated as an error.

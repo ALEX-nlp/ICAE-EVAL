@@ -1,0 +1,1171 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out the time-tracking plain-text engine we've been talking about. The core idea is that people write their work days in a simple text file — date at the top, some notes, then a list of time entries underneath — and the system can parse all of that, validate it, compute totals, and spit it back out in a clean format. Think of it like how we handled the structured-input parsing in that invoicing module we shipped last quarter, but for time logs.\n\nThe tricky parts are around the clock time handling — people write times in all sorts of ways (12h, 24h, crossing midnight, etc.) and we need to support all of that gracefully. There's also the question of what happens when someone leaves a timer running and never closes it — we need to handle that 'open' state sensibly depending on the current time. Date grouping (weeks, months, quarters, years) needs to work correctly even at year boundaries. We also want to flag likely mistakes — duplicate open timers, overlapping time blocks, future-dated entries, that kind of thing.\n\nOutputs should include parsed structure, totals, diffs against targets, filtered views by date range or tag, and sorted listings. The whole thing should be well-organized code, not one giant file. We'll have a thin JSON adapter for testing but the core logic should be totally separate from that.\n\nOne more pass on the edge cases the team asked about. For duration formatting, zero minutes needs to come out as '0m' everywhere, including the signed version. So even in signed form we do not stick anything on it — it stays '0m', not '+0m'. On parsing, if a duration includes both hours and minutes, that minute piece has to stay in the 0–59 range. So '1h60m' is rejected with error 'unrepresentable_duration'. But if there’s no hour part, minutes can go past 59 just fine, so '120m' parses to 120 minutes without error.\n\nOn the open-range behavior in hypothetical_total, let’s keep it narrow. An open range only gets closed at the reference timestamp if the record date is the same day as the reference timestamp or the day before. If it’s from an earlier record, it does not count. The 'ongoing' flag is true only when an open range was actually closed and contributed time to the total. The reference value for this is the 'until' ISO-8601 timestamp parameter, and yes, the reference timestamp is provided as an ISO-8601 string with UTC offset. This is the same rule for the hypothetical_total feature (feature9_3): open ranges are closed at a reference timestamp only when the record date is the same day or the previous day relative to the reference; controlled by the 'until' ISO-8601 timestamp parameter.\n\nFor filtering, date ranges are inclusive, so records on the boundary dates stay in. Tag filtering is a little more specific than just “record matches or not”: a record is included if its summary OR any of its entries contains the required tags, but the total_minutes in a tag-filtered result should count only the minutes from entries that match the tag, not the full record total. If a record ends up with no tag-matching entries, exclude it entirely.\n\nOn week grouping, we’re using ISO weeks, so Monday through Sunday. Given any date, period_week returns the Monday and Sunday of the week containing that date as since/until, plus the Monday and Sunday of the immediately preceding week as previous_since/previous_until. This needs to behave correctly across month and year edges, so for example 2009-01-02 belongs to the week starting 2008-12-29.\n\nWarnings are just four types, and each one reports its kind and the date of the offending record. Those are (1) 'unclosed_open_range' — a record in the past (before the reference date) that contains an open range entry; (2) 'future_entry' — any record dated after the reference timestamp's date; (3) 'overlapping_ranges' — two or more time ranges within a single record whose intervals overlap; (4) 'record_exceeds_day' — a record whose total tracked time exceeds 1440 minutes (24 hours). Also, keeping the exact phrasing here because someone asked, s date; (3) is part of that list exactly as written above.\n\nFor the plain-text output, canonical serialisation should use 4-space indentation for entries beneath a record date, and continuation summary lines for an entry use 8-space indentation. Range formatting has a single space on each side of the dash, exactly like '11:25 - 17:10'. And the should-total annotation format is '(Xh Ym!)' using the compact duration form inside the parentheses and then the !.\n\nOn parse errors, each one should report 'code', 'line', 'position', and 'length'. 'line' is 1-based. 'position' is a 0-based character offset within the line excluding leading indentation/whitespace. 'length' is the number of erroneous characters. The example to follow is: in '2020-01-01 (asdf!)' the malformed should-total 'asdf' starts at position 12 (after '2020-01-01 (') and has length 4.\n\nAnd just to restate the architecture bit since it came up again, the JSON stdin/stdout adapter pattern described in the Architecture section still stands: a thin execution adapter translates JSON commands into domain calls without coupling core logic to I/O — see the 'Strict Separation of Concerns' NFR in start.md.",
+  "oracle_data": {
+    "task_id": "klog-time-tracking-engine-001",
+    "golden_api_signature": "execute(action: str, params: dict) -> str",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "what does 24:00 mean as a time",
+          "midnight next day parsing",
+          "special case for end of day time"
+        ],
+        "oracle_response": "The special time '24:00' is valid and means midnight of the next day: hour=0, minute=0, day_shift=+1. '<24:00' means midnight of the current day: hour=0, minute=0, day_shift=0. Any other value like '25:12' or '3:60' that is syntactically valid but out of range yields 'invalid_time'."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "day shift markers on time",
+          "previous day time prefix",
+          "next day time suffix meaning"
+        ],
+        "oracle_response": "A time string may carry a day-shift marker: '<' as a prefix means the time belongs to the previous day (day_shift=-1), '>' as a suffix means the time belongs to the next day (day_shift=+1). Shift markers on both sides simultaneously is malformed and yields 'malformed_time'. The midnight-offset of a shifted time projects it onto a continuous axis: day_shift=-1 makes the offset negative, day_shift=+1 makes it exceed 1440."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "add duration to time crossing day boundary",
+          "what is impossible_operation for time addition",
+          "shifting time more than one day"
+        ],
+        "oracle_response": "Adding minutes to a time is only valid if the result stays within one day-shift of the original (i.e. the result's day_shift relative to the base date is at most 1 in either direction, bounded by -1 to +1). If adding minutes would push the result more than one day away, the operation is rejected as 'impossible_operation'. For example, adding 1 minute to '23:59>' (already day_shift=+1) would require day_shift=+2, which is rejected."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "ISO week year boundary",
+          "week number near end of year",
+          "week_year differs from calendar year"
+        ],
+        "oracle_response": "The ISO week number and its associated week_year may differ from the calendar year near year boundaries. For example, 2021-01-01 falls in ISO week 53 of year 2020, so week_year=2020 and week_number=53 even though the calendar year is 2021. The weekday uses Monday=1 through Sunday=7."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "tag extraction rules",
+          "what characters are valid in a hashtag",
+          "tag termination character"
+        ],
+        "oracle_response": "A tag starts with '#' followed by one or more letters, digits, or underscores. It ends at the first character outside that set. Tags are returned lowercased, de-duplicated, and sorted alphabetically. For example, '#GREAT-ish' yields only '#great' because the hyphen terminates the tag. A '#' not followed by at least one valid character does not form a tag."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "fuzzy tag matching with ellipsis",
+          "prefix match on tag query",
+          "tag query ending in three dots"
+        ],
+        "oracle_response": "A tag query ending in '...' is a fuzzy prefix match: it succeeds if any extracted tag starts with the given prefix (case-insensitively, with or without a leading '#'). A plain query (no '...') is an exact match. The query is echoed back in the output exactly as supplied, and matches is true/false. For example, 'WoRl...' matches '#world' because 'world' starts with 'worl'."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "record summary vs entry summary validation rules",
+          "difference between record-level and entry-level summary",
+          "blank first line in summary"
+        ],
+        "oracle_response": "Record-level summaries (text beneath the date line) require every line to be non-empty and must not begin with any whitespace character — a leading space triggers 'malformed_summary'. Entry-level summaries (text after/beside an entry) allow the first line to be empty or blank, but every subsequent line must be non-empty and non-blank. A trailing empty line after content is thus invalid for entry summaries."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "open range in parsed document",
+          "entry type for unclosed timer",
+          "open_range minutes value"
+        ],
+        "oracle_response": "An open range (e.g. '11:00 - ?') is a distinct entry type called 'open_range'. Its minutes contribution is always 0 in a normal parse/total — it only contributes time in the hypothetical_total operation, where it is closed at a provided reference timestamp. Only one open range per record is allowed; a second one triggers a 'duplicate_open_range' parse error."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid action field values",
+          "what values can action take",
+          "list all supported action values",
+          "what actions does the dispatcher handle",
+          "which action strings does the adapter support",
+          "what are the possible action inputs",
+          "tell me all the action names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'action' field. Valid values are: 'filter', 'sort', 'period_week', 'period_month', 'period_quarter', 'period_year', 'warnings', 'format_duration', 'parse_duration', 'parse_time', 'add_duration_to_time', 'time_midnight_offset', 'parse_date', 'date_attributes', 'add_days', 'range_duration', 'extract_tags', 'match_tag', 'validate_record_summary', 'validate_entry_summary', 'parse_document', 'parse_errors', 'serialise_roundtrip', 'total', 'should_total_diff', 'hypothetical_total'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature10_1_filter",
+        "trigger_keywords": [
+          "test cases for feature10 1 filter",
+          "show me feature10 1 filter test cases",
+          "what are the feature10 1 filter test inputs",
+          "give me the feature10_1_filter test file",
+          "test cases for feature 10",
+          "feature10 1 filter expected output",
+          "what does feature10 1 filter expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_1_filter:\n{\n  \"description\": \"Filter records in a document. A record is kept only if it satisfies all of the supplied clauses: on/after a date, on/before a date, and containing all of a set of tags (tags may match the record summary or be narrowed to matching entries). The result reports the count, the matching dates, and the total minutes of the matching (possibly tag-reduced) records.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"filter\",\n        \"after\": \"2000-01-01\",\n        \"text\": \"1999-12-31\\n    5h #bar\\n\\n2000-01-01\\n#foo\\n    6h #bar\\n\\n2000-01-03\\n#foo\\n    4h #bar\"\n      },\n      \"expected_output\": \"matched=2\\ndates=2000-01-01,2000-01-03\\ntotal_minutes=600\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"filter\",\n        \"tags\": [\n          \"bar\"\n        ],\n        \"text\": \"1999-12-31\\n    5h #bar\\n\\n2000-01-01\\n#foo\\n    15m\\n    6h #bar\\n\\n2000-01-02\\n#foo\\n    7h\"\n      },\n      \"expected_output\": \"matched=2\\ndates=1999-12-31,2000-01-01\\ntotal_minutes=660\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_2_sort",
+        "trigger_keywords": [
+          "test cases for feature10 2 sort",
+          "show me feature10 2 sort test cases",
+          "what are the feature10 2 sort test inputs",
+          "give me the feature10_2_sort test file",
+          "test cases for feature 10",
+          "feature10 2 sort expected output",
+          "what does feature10 2 sort expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_2_sort:\n{\n  \"description\": \"Sort the records of a document by date, either oldest-first (ascending) or newest-first (descending), returning the resulting date order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"sort\",\n        \"ascending\": true,\n        \"text\": \"2000-01-02\\n    1h\\n\\n1999-12-31\\n    1h\\n\\n2000-01-01\\n    1h\"\n      },\n      \"expected_output\": \"dates=1999-12-31,2000-01-01,2000-01-02\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"sort\",\n        \"ascending\": false,\n        \"text\": \"2000-01-02\\n    1h\\n\\n1999-12-31\\n    1h\\n\\n2000-01-01\\n    1h\"\n      },\n      \"expected_output\": \"dates=2000-01-02,2000-01-01,1999-12-31\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_1_period_week",
+        "trigger_keywords": [
+          "test cases for feature11 1 period week",
+          "show me feature11 1 period week test cases",
+          "what are the feature11 1 period week test inputs",
+          "give me the feature11_1_period_week test file",
+          "test cases for feature 11",
+          "feature11 1 period week expected output",
+          "what does feature11 1 period week expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_1_period_week:\n{\n  \"description\": \"Given a date, compute the Monday-to-Sunday calendar week that contains it, plus the preceding week, expressed as inclusive start/end dates. Weeks may straddle month and year boundaries.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"period_week\",\n        \"date\": \"1987-05-19\"\n      },\n      \"expected_output\": \"since=1987-05-18\\nuntil=1987-05-24\\nprevious_since=1987-05-11\\nprevious_until=1987-05-17\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"period_week\",\n        \"date\": \"2009-01-02\"\n      },\n      \"expected_output\": \"since=2008-12-29\\nuntil=2009-01-04\\nprevious_since=2008-12-22\\nprevious_until=2008-12-28\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_2_period_month",
+        "trigger_keywords": [
+          "test cases for feature11 2 period month",
+          "show me feature11 2 period month test cases",
+          "what are the feature11 2 period month test inputs",
+          "give me the feature11_2_period_month test file",
+          "test cases for feature 11",
+          "feature11 2 period month expected output",
+          "what does feature11 2 period month expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_2_period_month:\n{\n  \"description\": \"Given a calendar month written as YYYY-MM, compute its inclusive first/last day and those of the preceding month, accounting for varying month lengths and leap years; reject malformed month strings.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"period_month\",\n        \"value\": \"2018-02\"\n      },\n      \"expected_output\": \"since=2018-02-01\\nuntil=2018-02-28\\nprevious_since=2018-01-01\\nprevious_until=2018-01-31\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"period_month\",\n        \"value\": \"2016-02\"\n      },\n      \"expected_output\": \"since=2016-02-01\\nuntil=2016-02-29\\nprevious_since=2016-01-01\\nprevious_until=2016-01-31\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_3_period_quarter",
+        "trigger_keywords": [
+          "test cases for feature11 3 period quarter",
+          "show me feature11 3 period quarter test cases",
+          "what are the feature11 3 period quarter test inputs",
+          "give me the feature11_3_period_quarter test file",
+          "test cases for feature 11",
+          "feature11 3 period quarter expected output",
+          "what does feature11 3 period quarter expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_3_period_quarter:\n{\n  \"description\": \"Given a date, compute the calendar quarter (three months) that contains it, plus the preceding quarter, expressed as inclusive start/end dates.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"period_quarter\",\n        \"date\": \"2005-05-19\"\n      },\n      \"expected_output\": \"since=2005-04-01\\nuntil=2005-06-30\\nprevious_since=2005-01-01\\nprevious_until=2005-03-31\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"period_quarter\",\n        \"date\": \"1999-01-19\"\n      },\n      \"expected_output\": \"since=1999-01-01\\nuntil=1999-03-31\\nprevious_since=1998-10-01\\nprevious_until=1998-12-31\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_4_period_year",
+        "trigger_keywords": [
+          "test cases for feature11 4 period year",
+          "show me feature11 4 period year test cases",
+          "what are the feature11 4 period year test inputs",
+          "give me the feature11_4_period_year test file",
+          "test cases for feature 11",
+          "feature11 4 period year expected output",
+          "what does feature11 4 period year expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_4_period_year:\n{\n  \"description\": \"Given a calendar year written as YYYY, compute its inclusive first/last day and those of the preceding year; reject malformed or out-of-range year strings.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"period_year\",\n        \"value\": \"2008\"\n      },\n      \"expected_output\": \"since=2008-01-01\\nuntil=2008-12-31\\nprevious_since=2007-01-01\\nprevious_until=2007-12-31\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature12_warnings",
+        "trigger_keywords": [
+          "test cases for feature12 warnings",
+          "show me feature12 warnings test cases",
+          "what are the feature12 warnings test inputs",
+          "give me the feature12_warnings test file",
+          "test cases for feature 12",
+          "feature12 warnings expected output",
+          "what does feature12 warnings expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_warnings:\n{\n  \"description\": \"Scan records against a reference timestamp for likely mistakes and report each warning's neutral kind and the date of the offending record. Checks cover unclosed open ranges in the past, entries dated in the future, overlapping time ranges within a record, and records whose total exceeds 24 hours.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"warnings\",\n        \"now\": \"2000-03-05T12:00:00-0000\",\n        \"text\": \"2000-03-03\\n    8:00 - ?\\n\\n2000-03-05\"\n      },\n      \"expected_output\": \"warnings=1\\nwarning[0].kind=unclosed_open_range\\nwarning[0].date=2000-03-03\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"warnings\",\n        \"now\": \"2000-03-05T12:00:00-0000\",\n        \"text\": \"2000-03-05\\n    8:00 - 9:00\\n    8:30 - 9:30\"\n      },\n      \"expected_output\": \"warnings=1\\nwarning[0].kind=overlapping_ranges\\nwarning[0].date=2000-03-05\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_1_format_duration",
+        "trigger_keywords": [
+          "test cases for feature1 1 format duration",
+          "show me feature1 1 format duration test cases",
+          "what are the feature1 1 format duration test inputs",
+          "give me the feature1_1_format_duration test file",
+          "test cases for feature 1",
+          "feature1 1 format duration expected output",
+          "what does feature1 1 format duration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_format_duration:\n{\n  \"description\": \"Render a signed minute amount into the canonical compact duration string, both without and with an explicit leading plus sign.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"format_duration\",\n        \"minutes\": 0\n      },\n      \"expected_output\": \"plain=0m\\nsigned=0m\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"format_duration\",\n        \"minutes\": 150\n      },\n      \"expected_output\": \"plain=2h30m\\nsigned=+2h30m\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"format_duration\",\n        \"minutes\": -198\n      },\n      \"expected_output\": \"plain=-3h18m\\nsigned=-3h18m\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_parse_duration",
+        "trigger_keywords": [
+          "test cases for feature1 2 parse duration",
+          "show me feature1 2 parse duration test cases",
+          "what are the feature1 2 parse duration test inputs",
+          "give me the feature1_2_parse_duration test file",
+          "test cases for feature 1",
+          "feature1 2 parse duration expected output",
+          "what does feature1 2 parse duration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_parse_duration:\n{\n  \"description\": \"Parse a duration string into a signed total number of minutes; reject malformed text and minute parts that exceed 59 when an hour part is present.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"parse_duration\",\n        \"text\": \"2h6m\"\n      },\n      \"expected_output\": \"minutes=126\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_duration\",\n        \"text\": \"-2h5m\"\n      },\n      \"expected_output\": \"minutes=-125\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_duration\",\n        \"text\": \"1h60m\"\n      },\n      \"expected_output\": \"error=unrepresentable_duration\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_parse_time",
+        "trigger_keywords": [
+          "test cases for feature2 1 parse time",
+          "show me feature2 1 parse time test cases",
+          "what are the feature2 1 parse time test inputs",
+          "give me the feature2_1_parse_time test file",
+          "test cases for feature 2",
+          "feature2 1 parse time expected output",
+          "what does feature2 1 parse time expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_parse_time:\n{\n  \"description\": \"Parse a wall-clock time string into its hour, minute, day-shift (yesterday/today/tomorrow) and clock convention (24-hour vs 12-hour), including the 24:00 boundary; reject malformed and out-of-range values.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"parse_time\",\n        \"text\": \"9:42\"\n      },\n      \"expected_output\": \"hour=9\\nminute=42\\nday_shift=0\\nclock=24h\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_time\",\n        \"text\": \"1:45pm\"\n      },\n      \"expected_output\": \"hour=13\\nminute=45\\nday_shift=0\\nclock=12h\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_time\",\n        \"text\": \"<3:43\"\n      },\n      \"expected_output\": \"hour=3\\nminute=43\\nday_shift=-1\\nclock=24h\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_time\",\n        \"text\": \"24:00\"\n      },\n      \"expected_output\": \"hour=0\\nminute=0\\nday_shift=1\\nclock=24h\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_add_duration_to_time",
+        "trigger_keywords": [
+          "test cases for feature2 2 add duration to time",
+          "show me feature2 2 add duration to time test cases",
+          "what are the feature2 2 add duration to time test inputs",
+          "give me the feature2_2_add_duration_to_time test file",
+          "test cases for feature 2",
+          "feature2 2 add duration to time expected output",
+          "what does feature2 2 add duration to time expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_add_duration_to_time:\n{\n  \"description\": \"Add a signed minute amount to a wall-clock time, allowing the result to shift to the adjacent day; reject shifts of more than one day in either direction.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"add_duration_to_time\",\n        \"time\": \"11:30\",\n        \"minutes\": 30\n      },\n      \"expected_output\": \"result=12:00\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"add_duration_to_time\",\n        \"time\": \"<23:45\",\n        \"minutes\": 735\n      },\n      \"expected_output\": \"result=12:00\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"add_duration_to_time\",\n        \"time\": \"23:59>\",\n        \"minutes\": 1\n      },\n      \"expected_output\": \"error=impossible_operation\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_time_midnight_offset",
+        "trigger_keywords": [
+          "test cases for feature2 3 time midnight offset",
+          "show me feature2 3 time midnight offset test cases",
+          "what are the feature2 3 time midnight offset test inputs",
+          "give me the feature2_3_time_midnight_offset test file",
+          "test cases for feature 2",
+          "feature2 3 time midnight offset expected output",
+          "what does feature2 3 time midnight offset expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_time_midnight_offset:\n{\n  \"description\": \"Compute the number of minutes from midnight to a wall-clock time; times shifted to the previous day are negative, times shifted to the next day exceed a full day.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"time_midnight_offset\",\n        \"text\": \"0:01\"\n      },\n      \"expected_output\": \"minutes=1\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"time_midnight_offset\",\n        \"text\": \"<18:35\"\n      },\n      \"expected_output\": \"minutes=-325\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"time_midnight_offset\",\n        \"text\": \"5:35>\"\n      },\n      \"expected_output\": \"minutes=1775\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_parse_date",
+        "trigger_keywords": [
+          "test cases for feature3 1 parse date",
+          "show me feature3 1 parse date test cases",
+          "what are the feature3 1 parse date test inputs",
+          "give me the feature3_1_parse_date test file",
+          "test cases for feature 3",
+          "feature3 1 parse date expected output",
+          "what does feature3 1 parse date expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_parse_date:\n{\n  \"description\": \"Parse a calendar date string in either dashed (YYYY-MM-DD) or slashed (YYYY/MM/DD) form, preserving which separator style was used; reject malformed strings and calendar-invalid dates.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"parse_date\",\n        \"text\": \"1856-10-22\"\n      },\n      \"expected_output\": \"year=1856\\nmonth=10\\nday=22\\nformat=dashes\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_date\",\n        \"text\": \"1856/10/22\"\n      },\n      \"expected_output\": \"year=1856\\nmonth=10\\nday=22\\nformat=slashes\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_date\",\n        \"text\": \"01.01.2000\"\n      },\n      \"expected_output\": \"error=malformed_date\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_date_attributes",
+        "trigger_keywords": [
+          "test cases for feature3 2 date attributes",
+          "show me feature3 2 date attributes test cases",
+          "what are the feature3 2 date attributes test inputs",
+          "give me the feature3_2_date_attributes test file",
+          "test cases for feature 3",
+          "feature3 2 date attributes expected output",
+          "what does feature3 2 date attributes expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_date_attributes:\n{\n  \"description\": \"Given a calendar date by its numeric year/month/day, derive its weekday (Monday=1..Sunday=7), its quarter (1-4), and its ISO week number together with the year that week number belongs to; reject calendar-invalid dates.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"date_attributes\",\n        \"year\": 2005,\n        \"month\": 4,\n        \"day\": 15\n      },\n      \"expected_output\": \"weekday=5\\nquarter=2\\nweek_year=2005\\nweek_number=15\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"date_attributes\",\n        \"year\": 2021,\n        \"month\": 1,\n        \"day\": 1\n      },\n      \"expected_output\": \"weekday=5\\nquarter=1\\nweek_year=2020\\nweek_number=53\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"date_attributes\",\n        \"year\": 2005,\n        \"month\": 13,\n        \"day\": 15\n      },\n      \"expected_output\": \"error=unrepresentable_date\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_add_days",
+        "trigger_keywords": [
+          "test cases for feature3 3 add days",
+          "show me feature3 3 add days test cases",
+          "what are the feature3 3 add days test inputs",
+          "give me the feature3_3_add_days test file",
+          "test cases for feature 3",
+          "feature3 3 add days expected output",
+          "what does feature3 3 add days expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_add_days:\n{\n  \"description\": \"Add (or subtract) a number of days to a calendar date, rolling correctly across month and year boundaries and accounting for leap years.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"add_days\",\n        \"year\": 2005,\n        \"month\": 12,\n        \"day\": 31,\n        \"days\": 1\n      },\n      \"expected_output\": \"date=2006-01-01\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"add_days\",\n        \"year\": 2020,\n        \"month\": 2,\n        \"day\": 28,\n        \"days\": 1\n      },\n      \"expected_output\": \"date=2020-02-29\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"add_days\",\n        \"year\": 2005,\n        \"month\": 12,\n        \"day\": 31,\n        \"days\": -1\n      },\n      \"expected_output\": \"date=2005-12-30\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_range_duration",
+        "trigger_keywords": [
+          "test cases for feature4 range duration",
+          "show me feature4 range duration test cases",
+          "what are the feature4 range duration test inputs",
+          "give me the feature4_range_duration test file",
+          "test cases for feature 4",
+          "feature4 range duration expected output",
+          "what does feature4 range duration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_range_duration:\n{\n  \"description\": \"Build a time range from a start and end wall-clock time and compute its serialised form and its duration in minutes; ranges may span the adjacent day via shifted times; reject ranges whose end precedes their start.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"range_duration\",\n        \"start\": \"11:25\",\n        \"end\": \"17:10\"\n      },\n      \"expected_output\": \"value=11:25 - 17:10\\nminutes=345\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"range_duration\",\n        \"start\": \"<23:30\",\n        \"end\": \"8:10\"\n      },\n      \"expected_output\": \"value=<23:30 - 8:10\\nminutes=520\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"range_duration\",\n        \"start\": \"15:00\",\n        \"end\": \"14:00\"\n      },\n      \"expected_output\": \"error=illegal_range\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_extract_tags",
+        "trigger_keywords": [
+          "test cases for feature5 1 extract tags",
+          "show me feature5 1 extract tags test cases",
+          "what are the feature5 1 extract tags test inputs",
+          "give me the feature5_1_extract_tags test file",
+          "test cases for feature 5",
+          "feature5 1 extract tags expected output",
+          "what does feature5 1 extract tags expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_extract_tags:\n{\n  \"description\": \"Extract all hashtags from one or more lines of free text, returning them lowercased, de-duplicated and sorted; a tag is a '#' followed by letters, digits or underscores and ends at the first other character.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"extract_tags\",\n        \"lines\": [\n          \"Hello #world, I feel #great #TODAY\"\n        ]\n      },\n      \"expected_output\": \"tags=#great,#today,#world\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"extract_tags\",\n        \"lines\": [\n          \"Hello #world, I feel\",\n          \"#GREAT-ish today #123_test!\"\n        ]\n      },\n      \"expected_output\": \"tags=#123_test,#great,#world\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_match_tag",
+        "trigger_keywords": [
+          "test cases for feature5 2 match tag",
+          "show me feature5 2 match tag test cases",
+          "what are the feature5 2 match tag test inputs",
+          "give me the feature5_2_match_tag test file",
+          "test cases for feature 5",
+          "feature5 2 match tag expected output",
+          "what does feature5 2 match tag expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_match_tag:\n{\n  \"description\": \"Test whether a set of extracted tags contains a query tag. An exact query matches a whole tag; a query ending in '...' matches any tag that starts with the given prefix (fuzzy match).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"match_tag\",\n        \"lines\": [\n          \"Hello #world, I feel #GREAT-ish today #123_test!\"\n        ],\n        \"query\": \"#123_...\"\n      },\n      \"expected_output\": \"tags=#123_test,#great,#world\\nquery=#123_...\\nmatches=true\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"match_tag\",\n        \"lines\": [\n          \"Hello #world, I feel #GREAT-ish today #123_test!\"\n        ],\n        \"query\": \"worl\"\n      },\n      \"expected_output\": \"tags=#123_test,#great,#world\\nquery=worl\\nmatches=false\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"match_tag\",\n        \"lines\": [\n          \"Hello #world, I feel #GREAT-ish today #123_test!\"\n        ],\n        \"query\": \"WoRl...\"\n      },\n      \"expected_output\": \"tags=#123_test,#great,#world\\nquery=WoRl...\\nmatches=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_validate_record_summary",
+        "trigger_keywords": [
+          "test cases for feature6 1 validate record summary",
+          "show me feature6 1 validate record summary test cases",
+          "what are the feature6 1 validate record summary test inputs",
+          "give me the feature6_1_validate_record_summary test file",
+          "test cases for feature 6",
+          "feature6 1 validate record summary expected output",
+          "what does feature6 1 validate record summary expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_validate_record_summary:\n{\n  \"description\": \"Validate a record-level summary (the text under the date). Every line must be non-empty and must not begin with any blank character (space, tab, or other Unicode space separators).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"validate_record_summary\",\n        \"lines\": [\n          \"First line\"\n        ]\n      },\n      \"expected_output\": \"valid=true\\nline_count=1\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"validate_record_summary\",\n        \"lines\": [\n          \"First line\",\n          \"Second line\"\n        ]\n      },\n      \"expected_output\": \"valid=true\\nline_count=2\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"validate_record_summary\",\n        \"lines\": [\n          \" Hello\"\n        ]\n      },\n      \"expected_output\": \"error=malformed_summary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_2_validate_entry_summary",
+        "trigger_keywords": [
+          "test cases for feature6 2 validate entry summary",
+          "show me feature6 2 validate entry summary test cases",
+          "what are the feature6 2 validate entry summary test inputs",
+          "give me the feature6_2_validate_entry_summary test file",
+          "test cases for feature 6",
+          "feature6 2 validate entry summary expected output",
+          "what does feature6 2 validate entry summary expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_2_validate_entry_summary:\n{\n  \"description\": \"Validate an entry-level summary (the text behind an entry). The first line may be empty or blank, but every subsequent line must be non-empty and non-blank.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"validate_entry_summary\",\n        \"lines\": [\n          \"\",\n          \"Foo\"\n        ]\n      },\n      \"expected_output\": \"valid=true\\nline_count=2\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"validate_entry_summary\",\n        \"lines\": [\n          \"Foo\",\n          \"\"\n        ]\n      },\n      \"expected_output\": \"error=malformed_summary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_1_parse_document",
+        "trigger_keywords": [
+          "test cases for feature7 1 parse document",
+          "show me feature7 1 parse document test cases",
+          "what are the feature7 1 parse document test inputs",
+          "give me the feature7_1_parse_document test file",
+          "test cases for feature 7",
+          "feature7 1 parse document expected output",
+          "what does feature7 1 parse document expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_1_parse_document:\n{\n  \"description\": \"Parse a plain-text document into structured records. Each record exposes its date, optional should-total (in minutes), optional record summary, and its ordered entries; each entry exposes its kind (duration / range / open_range), serialised value, duration in minutes, and summary (lines joined by '|').\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"parse_document\",\n        \"text\": \"2000-01-01\"\n      },\n      \"expected_output\": \"records=1\\nrecord[0].date=2000-01-01\\nrecord[0].should_total=0\\nrecord[0].summary=\\nrecord[0].entries=0\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_document\",\n        \"text\": \"1970-08-29 (8h15m!)\\nRecord summary\\n    1h Work\\n    8:00 - 9:30\\n    11:00 - ?\\n        Open range\"\n      },\n      \"expected_output\": \"records=1\\nrecord[0].date=1970-08-29\\nrecord[0].should_total=495\\nrecord[0].summary=Record summary\\nrecord[0].entries=3\\nrecord[0].entry[0].type=duration\\nrecord[0].entry[0].value=1h\\nrecord[0].entry[0].minutes=60\\nrecord[0].entry[0].summary=Work\\nrecord[0].entry[1].type=range\\nrecord[0].entry[1].value=8:00 - 9:30\\nrecord[0].entry[1].minutes=90\\nrecord[0].entry[1].summary=\\nrecord[0].entry[2].type=open_range\\nrecord[0].entry[2].value=11:00 - ?\\nrecord[0].entry[2].minutes=0\\nrecord[0].entry[2].summary=|Open range\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_document\",\n        \"text\": \"1999-05-31\\n\\n1999-06-03\\n  1h\"\n      },\n      \"expected_output\": \"records=2\\nrecord[0].date=1999-05-31\\nrecord[0].should_total=0\\nrecord[0].summary=\\nrecord[0].entries=0\\nrecord[1].date=1999-06-03\\nrecord[1].should_total=0\\nrecord[1].summary=\\nrecord[1].entries=1\\nrecord[1].entry[0].type=duration\\nrecord[1].entry[0].value=1h\\nrecord[1].entry[0].minutes=60\\nrecord[1].entry[0].summary=\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_2_parse_errors",
+        "trigger_keywords": [
+          "test cases for feature7 2 parse errors",
+          "show me feature7 2 parse errors test cases",
+          "what are the feature7 2 parse errors test inputs",
+          "give me the feature7_2_parse_errors test file",
+          "test cases for feature 7",
+          "feature7 2 parse errors expected output",
+          "what does feature7 2 parse errors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_2_parse_errors:\n{\n  \"description\": \"Report the structural errors found while parsing a document. Each error carries a neutral category, the 1-based line number, the cursor position within the line (excluding indentation), and the number of erroneous characters.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"parse_errors\",\n        \"text\": \"Hello 123\"\n      },\n      \"expected_output\": \"errors=1\\nerror[0].code=invalid_date\\nerror[0].line=1\\nerror[0].position=0\\nerror[0].length=5\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_errors\",\n        \"text\": \"2020-01-01 (asdf!)\"\n      },\n      \"expected_output\": \"errors=1\\nerror[0].code=malformed_should_total\\nerror[0].line=1\\nerror[0].position=12\\nerror[0].length=4\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"parse_errors\",\n        \"text\": \"2020-01-01\\n\\t8:00- ?\\n\\t09:00 - ?\"\n      },\n      \"expected_output\": \"errors=1\\nerror[0].code=duplicate_open_range\\nerror[0].line=3\\nerror[0].position=1\\nerror[0].length=9\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_serialise_roundtrip",
+        "trigger_keywords": [
+          "test cases for feature8 serialise roundtrip",
+          "show me feature8 serialise roundtrip test cases",
+          "what are the feature8 serialise roundtrip test inputs",
+          "give me the feature8_serialise_roundtrip test file",
+          "test cases for feature 8",
+          "feature8 serialise roundtrip expected output",
+          "what does feature8 serialise roundtrip expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_serialise_roundtrip:\n{\n  \"description\": \"Parse a document and re-serialise it into the canonical text representation. The canonical form uses 4-space indentation, a single space around range dashes, and places continuation summary lines at double indentation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"serialise_roundtrip\",\n        \"text\": \"1999-05-31 (8h30m!)\\nSummary that consists of multiple\\nlines and contains a #tag as well.\\n    5h30m This and that\\n    -2h Something else\\n    <18:00 - 4:00 Foo\\n        Bar\\n    19:00 - 20:00\\n    20:01 - 0:15>\\n    1:00am - 3:12pm\\n    7:00 - ?\\n\"\n      },\n      \"expected_output\": \"1999-05-31 (8h30m!)\\nSummary that consists of multiple\\nlines and contains a #tag as well.\\n    5h30m This and that\\n    -2h Something else\\n    <18:00 - 4:00 Foo\\n        Bar\\n    19:00 - 20:00\\n    20:01 - 0:15>\\n    1:00am - 3:12pm\\n    7:00 - ?\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"serialise_roundtrip\",\n        \"text\": \"2020-01-15\"\n      },\n      \"expected_output\": \"2020-01-15\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_1_total",
+        "trigger_keywords": [
+          "test cases for feature9 1 total",
+          "show me feature9 1 total test cases",
+          "what are the feature9 1 total test inputs",
+          "give me the feature9_1_total test file",
+          "test cases for feature 9",
+          "feature9 1 total expected output",
+          "what does feature9 1 total expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_1_total:\n{\n  \"description\": \"Compute the total tracked time (in minutes) across all records in a document by summing every entry; durations and ranges contribute, open ranges contribute zero.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"total\",\n        \"text\": \"2020-01-01\\n    3h\\n    1h33m\\n    13:49 - 17:12\\n    1:02 - ?\"\n      },\n      \"expected_output\": \"records=1\\ntotal_minutes=476\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"total\",\n        \"text\": \"2020-01-01\"\n      },\n      \"expected_output\": \"records=1\\ntotal_minutes=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_2_should_total_diff",
+        "trigger_keywords": [
+          "test cases for feature9 2 should total diff",
+          "show me feature9 2 should total diff test cases",
+          "what are the feature9 2 should total diff test inputs",
+          "give me the feature9_2_should_total_diff test file",
+          "test cases for feature 9",
+          "feature9 2 should total diff expected output",
+          "what does feature9 2 should total diff expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_2_should_total_diff:\n{\n  \"description\": \"Compute the aggregate should-total of all records, the actual total, and the difference (actual minus should), all in minutes.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"should_total_diff\",\n        \"text\": \"2020-01-01 (8h!)\\n    6h\\n\\n2020-01-02 (8h!)\\n    9h\"\n      },\n      \"expected_output\": \"should_total=960\\nactual=900\\ndiff=-60\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_3_hypothetical_total",
+        "trigger_keywords": [
+          "test cases for feature9 3 hypothetical total",
+          "show me feature9 3 hypothetical total test cases",
+          "what are the feature9 3 hypothetical total test inputs",
+          "give me the feature9_3_hypothetical_total test file",
+          "test cases for feature 9",
+          "feature9 3 hypothetical total expected output",
+          "what does feature9 3 hypothetical total expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_3_hypothetical_total:\n{\n  \"description\": \"Compute the total tracked time as if every open range were closed at a given reference timestamp, and report whether an open range was actually counted (i.e. the record is ongoing). Open ranges only count if their record is the reference day or the day before.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"hypothetical_total\",\n        \"until\": \"2020-01-01T05:06:59-0000\",\n        \"text\": \"2020-01-01\\n    2h14m\\n    <23:00 - 4:00\\n    5:07 - ?\"\n      },\n      \"expected_output\": \"total_minutes=434\\nongoing=false\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"hypothetical_total\",\n        \"until\": \"2020-01-01T10:48:13-0000\",\n        \"text\": \"2020-01-01\\n    2h14m\\n    <23:00 - 4:00\\n    5:07 - ?\"\n      },\n      \"expected_output\": \"total_minutes=775\\nongoing=true\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "date grouping needs to work correctly even at year boundaries",
+        "actual_meaning": "The ISO week boundary edge case in feature3_2 and feature11_1: week_year can differ from calendar year (e.g. 2021-01-01 is week 53 of 2020), and period_week must correctly straddle month/year boundaries"
+      },
+      {
+        "vague_reference": "flag likely mistakes — duplicate open timers, overlapping time blocks, future-dated entries",
+        "actual_meaning": "The warnings feature (feature12): four warning kinds — unclosed_open_range, overlapping_ranges, future_entry, record_exceeds_day — checked against a 'now' reference ISO-8601 timestamp"
+      }
+    ],
+    "fallback_response": "That detail isn't something I can clarify off the top of my head — you'll need to dig into the existing codebase or the spec to confirm the exact behavior. Try searching for related test cases or the relevant feature section in the PRD."
+  },
+  "public_test_cases": {
+    "feature10_1_filter.json": {
+      "description": "Filter records in a document. A record is kept only if it satisfies all of the supplied clauses: on/after a date, on/before a date, and containing all of a set of tags (tags may match the record summary or be narrowed to matching entries). The result reports the count, the matching dates, and the total minutes of the matching (possibly tag-reduced) records.",
+      "cases": [
+        {
+          "input": {
+            "action": "filter",
+            "after": "2000-01-01",
+            "text": "1999-12-31\n    5h #bar\n\n2000-01-01\n#foo\n    6h #bar\n\n2000-01-03\n#foo\n    4h #bar"
+          },
+          "expected_output": "matched=2\ndates=2000-01-01,2000-01-03\ntotal_minutes=600\n"
+        },
+        {
+          "input": {
+            "action": "filter",
+            "tags": [
+              "bar"
+            ],
+            "text": "1999-12-31\n    5h #bar\n\n2000-01-01\n#foo\n    15m\n    6h #bar\n\n2000-01-02\n#foo\n    7h"
+          },
+          "expected_output": "matched=2\ndates=1999-12-31,2000-01-01\ntotal_minutes=660\n"
+        }
+      ]
+    },
+    "feature10_2_sort.json": {
+      "description": "Sort the records of a document by date, either oldest-first (ascending) or newest-first (descending), returning the resulting date order.",
+      "cases": [
+        {
+          "input": {
+            "action": "sort",
+            "ascending": true,
+            "text": "2000-01-02\n    1h\n\n1999-12-31\n    1h\n\n2000-01-01\n    1h"
+          },
+          "expected_output": "dates=1999-12-31,2000-01-01,2000-01-02\n"
+        },
+        {
+          "input": {
+            "action": "sort",
+            "ascending": false,
+            "text": "2000-01-02\n    1h\n\n1999-12-31\n    1h\n\n2000-01-01\n    1h"
+          },
+          "expected_output": "dates=2000-01-02,2000-01-01,1999-12-31\n"
+        }
+      ]
+    },
+    "feature11_1_period_week.json": {
+      "description": "Given a date, compute the Monday-to-Sunday calendar week that contains it, plus the preceding week, expressed as inclusive start/end dates. Weeks may straddle month and year boundaries.",
+      "cases": [
+        {
+          "input": {
+            "action": "period_week",
+            "date": "1987-05-19"
+          },
+          "expected_output": "since=1987-05-18\nuntil=1987-05-24\nprevious_since=1987-05-11\nprevious_until=1987-05-17\n"
+        },
+        {
+          "input": {
+            "action": "period_week",
+            "date": "2009-01-02"
+          },
+          "expected_output": "since=2008-12-29\nuntil=2009-01-04\nprevious_since=2008-12-22\nprevious_until=2008-12-28\n"
+        }
+      ]
+    },
+    "feature11_2_period_month.json": {
+      "description": "Given a calendar month written as YYYY-MM, compute its inclusive first/last day and those of the preceding month, accounting for varying month lengths and leap years; reject malformed month strings.",
+      "cases": [
+        {
+          "input": {
+            "action": "period_month",
+            "value": "2018-02"
+          },
+          "expected_output": "since=2018-02-01\nuntil=2018-02-28\nprevious_since=2018-01-01\nprevious_until=2018-01-31\n"
+        },
+        {
+          "input": {
+            "action": "period_month",
+            "value": "2016-02"
+          },
+          "expected_output": "since=2016-02-01\nuntil=2016-02-29\nprevious_since=2016-01-01\nprevious_until=2016-01-31\n"
+        }
+      ]
+    },
+    "feature11_3_period_quarter.json": {
+      "description": "Given a date, compute the calendar quarter (three months) that contains it, plus the preceding quarter, expressed as inclusive start/end dates.",
+      "cases": [
+        {
+          "input": {
+            "action": "period_quarter",
+            "date": "2005-05-19"
+          },
+          "expected_output": "since=2005-04-01\nuntil=2005-06-30\nprevious_since=2005-01-01\nprevious_until=2005-03-31\n"
+        },
+        {
+          "input": {
+            "action": "period_quarter",
+            "date": "1999-01-19"
+          },
+          "expected_output": "since=1999-01-01\nuntil=1999-03-31\nprevious_since=1998-10-01\nprevious_until=1998-12-31\n"
+        }
+      ]
+    },
+    "feature11_4_period_year.json": {
+      "description": "Given a calendar year written as YYYY, compute its inclusive first/last day and those of the preceding year; reject malformed or out-of-range year strings.",
+      "cases": [
+        {
+          "input": {
+            "action": "period_year",
+            "value": "2008"
+          },
+          "expected_output": "since=2008-01-01\nuntil=2008-12-31\nprevious_since=2007-01-01\nprevious_until=2007-12-31\n"
+        }
+      ]
+    },
+    "feature12_warnings.json": {
+      "description": "Scan records against a reference timestamp for likely mistakes and report each warning's neutral kind and the date of the offending record. Checks cover unclosed open ranges in the past, entries dated in the future, overlapping time ranges within a record, and records whose total exceeds 24 hours.",
+      "cases": [
+        {
+          "input": {
+            "action": "warnings",
+            "now": "2000-03-05T12:00:00-0000",
+            "text": "2000-03-03\n    8:00 - ?\n\n2000-03-05"
+          },
+          "expected_output": "warnings=1\nwarning[0].kind=unclosed_open_range\nwarning[0].date=2000-03-03\n"
+        },
+        {
+          "input": {
+            "action": "warnings",
+            "now": "2000-03-05T12:00:00-0000",
+            "text": "2000-03-05\n    8:00 - 9:00\n    8:30 - 9:30"
+          },
+          "expected_output": "warnings=1\nwarning[0].kind=overlapping_ranges\nwarning[0].date=2000-03-05\n"
+        }
+      ]
+    },
+    "feature1_1_format_duration.json": {
+      "description": "Render a signed minute amount into the canonical compact duration string, both without and with an explicit leading plus sign.",
+      "cases": [
+        {
+          "input": {
+            "action": "format_duration",
+            "minutes": 0
+          },
+          "expected_output": "plain=0m\nsigned=0m\n"
+        },
+        {
+          "input": {
+            "action": "format_duration",
+            "minutes": 150
+          },
+          "expected_output": "plain=2h30m\nsigned=+2h30m\n"
+        },
+        {
+          "input": {
+            "action": "format_duration",
+            "minutes": -198
+          },
+          "expected_output": "plain=-3h18m\nsigned=-3h18m\n"
+        }
+      ]
+    },
+    "feature1_2_parse_duration.json": {
+      "description": "Parse a duration string into a signed total number of minutes; reject malformed text and minute parts that exceed 59 when an hour part is present.",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_duration",
+            "text": "2h6m"
+          },
+          "expected_output": "minutes=126\n"
+        },
+        {
+          "input": {
+            "action": "parse_duration",
+            "text": "-2h5m"
+          },
+          "expected_output": "minutes=-125\n"
+        },
+        {
+          "input": {
+            "action": "parse_duration",
+            "text": "1h60m"
+          },
+          "expected_output": "error=unrepresentable_duration\n"
+        }
+      ]
+    },
+    "feature2_1_parse_time.json": {
+      "description": "Parse a wall-clock time string into its hour, minute, day-shift (yesterday/today/tomorrow) and clock convention (24-hour vs 12-hour), including the 24:00 boundary; reject malformed and out-of-range values.",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_time",
+            "text": "9:42"
+          },
+          "expected_output": "hour=9\nminute=42\nday_shift=0\nclock=24h\n"
+        },
+        {
+          "input": {
+            "action": "parse_time",
+            "text": "1:45pm"
+          },
+          "expected_output": "hour=13\nminute=45\nday_shift=0\nclock=12h\n"
+        },
+        {
+          "input": {
+            "action": "parse_time",
+            "text": "<3:43"
+          },
+          "expected_output": "hour=3\nminute=43\nday_shift=-1\nclock=24h\n"
+        },
+        {
+          "input": {
+            "action": "parse_time",
+            "text": "24:00"
+          },
+          "expected_output": "hour=0\nminute=0\nday_shift=1\nclock=24h\n"
+        }
+      ]
+    },
+    "feature2_2_add_duration_to_time.json": {
+      "description": "Add a signed minute amount to a wall-clock time, allowing the result to shift to the adjacent day; reject shifts of more than one day in either direction.",
+      "cases": [
+        {
+          "input": {
+            "action": "add_duration_to_time",
+            "time": "11:30",
+            "minutes": 30
+          },
+          "expected_output": "result=12:00\n"
+        },
+        {
+          "input": {
+            "action": "add_duration_to_time",
+            "time": "<23:45",
+            "minutes": 735
+          },
+          "expected_output": "result=12:00\n"
+        },
+        {
+          "input": {
+            "action": "add_duration_to_time",
+            "time": "23:59>",
+            "minutes": 1
+          },
+          "expected_output": "error=impossible_operation\n"
+        }
+      ]
+    },
+    "feature2_3_time_midnight_offset.json": {
+      "description": "Compute the number of minutes from midnight to a wall-clock time; times shifted to the previous day are negative, times shifted to the next day exceed a full day.",
+      "cases": [
+        {
+          "input": {
+            "action": "time_midnight_offset",
+            "text": "0:01"
+          },
+          "expected_output": "minutes=1\n"
+        },
+        {
+          "input": {
+            "action": "time_midnight_offset",
+            "text": "<18:35"
+          },
+          "expected_output": "minutes=-325\n"
+        },
+        {
+          "input": {
+            "action": "time_midnight_offset",
+            "text": "5:35>"
+          },
+          "expected_output": "minutes=1775\n"
+        }
+      ]
+    },
+    "feature3_1_parse_date.json": {
+      "description": "Parse a calendar date string in either dashed (YYYY-MM-DD) or slashed (YYYY/MM/DD) form, preserving which separator style was used; reject malformed strings and calendar-invalid dates.",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_date",
+            "text": "1856-10-22"
+          },
+          "expected_output": "year=1856\nmonth=10\nday=22\nformat=dashes\n"
+        },
+        {
+          "input": {
+            "action": "parse_date",
+            "text": "1856/10/22"
+          },
+          "expected_output": "year=1856\nmonth=10\nday=22\nformat=slashes\n"
+        },
+        {
+          "input": {
+            "action": "parse_date",
+            "text": "01.01.2000"
+          },
+          "expected_output": "error=malformed_date\n"
+        }
+      ]
+    },
+    "feature3_2_date_attributes.json": {
+      "description": "Given a calendar date by its numeric year/month/day, derive its weekday (Monday=1..Sunday=7), its quarter (1-4), and its ISO week number together with the year that week number belongs to; reject calendar-invalid dates.",
+      "cases": [
+        {
+          "input": {
+            "action": "date_attributes",
+            "year": 2005,
+            "month": 4,
+            "day": 15
+          },
+          "expected_output": "weekday=5\nquarter=2\nweek_year=2005\nweek_number=15\n"
+        },
+        {
+          "input": {
+            "action": "date_attributes",
+            "year": 2021,
+            "month": 1,
+            "day": 1
+          },
+          "expected_output": "weekday=5\nquarter=1\nweek_year=2020\nweek_number=53\n"
+        },
+        {
+          "input": {
+            "action": "date_attributes",
+            "year": 2005,
+            "month": 13,
+            "day": 15
+          },
+          "expected_output": "error=unrepresentable_date\n"
+        }
+      ]
+    },
+    "feature3_3_add_days.json": {
+      "description": "Add (or subtract) a number of days to a calendar date, rolling correctly across month and year boundaries and accounting for leap years.",
+      "cases": [
+        {
+          "input": {
+            "action": "add_days",
+            "year": 2005,
+            "month": 12,
+            "day": 31,
+            "days": 1
+          },
+          "expected_output": "date=2006-01-01\n"
+        },
+        {
+          "input": {
+            "action": "add_days",
+            "year": 2020,
+            "month": 2,
+            "day": 28,
+            "days": 1
+          },
+          "expected_output": "date=2020-02-29\n"
+        },
+        {
+          "input": {
+            "action": "add_days",
+            "year": 2005,
+            "month": 12,
+            "day": 31,
+            "days": -1
+          },
+          "expected_output": "date=2005-12-30\n"
+        }
+      ]
+    },
+    "feature4_range_duration.json": {
+      "description": "Build a time range from a start and end wall-clock time and compute its serialised form and its duration in minutes; ranges may span the adjacent day via shifted times; reject ranges whose end precedes their start.",
+      "cases": [
+        {
+          "input": {
+            "action": "range_duration",
+            "start": "11:25",
+            "end": "17:10"
+          },
+          "expected_output": "value=11:25 - 17:10\nminutes=345\n"
+        },
+        {
+          "input": {
+            "action": "range_duration",
+            "start": "<23:30",
+            "end": "8:10"
+          },
+          "expected_output": "value=<23:30 - 8:10\nminutes=520\n"
+        },
+        {
+          "input": {
+            "action": "range_duration",
+            "start": "15:00",
+            "end": "14:00"
+          },
+          "expected_output": "error=illegal_range\n"
+        }
+      ]
+    },
+    "feature5_1_extract_tags.json": {
+      "description": "Extract all hashtags from one or more lines of free text, returning them lowercased, de-duplicated and sorted; a tag is a '#' followed by letters, digits or underscores and ends at the first other character.",
+      "cases": [
+        {
+          "input": {
+            "action": "extract_tags",
+            "lines": [
+              "Hello #world, I feel #great #TODAY"
+            ]
+          },
+          "expected_output": "tags=#great,#today,#world\n"
+        },
+        {
+          "input": {
+            "action": "extract_tags",
+            "lines": [
+              "Hello #world, I feel",
+              "#GREAT-ish today #123_test!"
+            ]
+          },
+          "expected_output": "tags=#123_test,#great,#world\n"
+        }
+      ]
+    },
+    "feature5_2_match_tag.json": {
+      "description": "Test whether a set of extracted tags contains a query tag. An exact query matches a whole tag; a query ending in '...' matches any tag that starts with the given prefix (fuzzy match).",
+      "cases": [
+        {
+          "input": {
+            "action": "match_tag",
+            "lines": [
+              "Hello #world, I feel #GREAT-ish today #123_test!"
+            ],
+            "query": "#123_..."
+          },
+          "expected_output": "tags=#123_test,#great,#world\nquery=#123_...\nmatches=true\n"
+        },
+        {
+          "input": {
+            "action": "match_tag",
+            "lines": [
+              "Hello #world, I feel #GREAT-ish today #123_test!"
+            ],
+            "query": "worl"
+          },
+          "expected_output": "tags=#123_test,#great,#world\nquery=worl\nmatches=false\n"
+        },
+        {
+          "input": {
+            "action": "match_tag",
+            "lines": [
+              "Hello #world, I feel #GREAT-ish today #123_test!"
+            ],
+            "query": "WoRl..."
+          },
+          "expected_output": "tags=#123_test,#great,#world\nquery=WoRl...\nmatches=true\n"
+        }
+      ]
+    },
+    "feature6_1_validate_record_summary.json": {
+      "description": "Validate a record-level summary (the text under the date). Every line must be non-empty and must not begin with any blank character (space, tab, or other Unicode space separators).",
+      "cases": [
+        {
+          "input": {
+            "action": "validate_record_summary",
+            "lines": [
+              "First line"
+            ]
+          },
+          "expected_output": "valid=true\nline_count=1\n"
+        },
+        {
+          "input": {
+            "action": "validate_record_summary",
+            "lines": [
+              "First line",
+              "Second line"
+            ]
+          },
+          "expected_output": "valid=true\nline_count=2\n"
+        },
+        {
+          "input": {
+            "action": "validate_record_summary",
+            "lines": [
+              " Hello"
+            ]
+          },
+          "expected_output": "error=malformed_summary\n"
+        }
+      ]
+    },
+    "feature6_2_validate_entry_summary.json": {
+      "description": "Validate an entry-level summary (the text behind an entry). The first line may be empty or blank, but every subsequent line must be non-empty and non-blank.",
+      "cases": [
+        {
+          "input": {
+            "action": "validate_entry_summary",
+            "lines": [
+              "",
+              "Foo"
+            ]
+          },
+          "expected_output": "valid=true\nline_count=2\n"
+        },
+        {
+          "input": {
+            "action": "validate_entry_summary",
+            "lines": [
+              "Foo",
+              ""
+            ]
+          },
+          "expected_output": "error=malformed_summary\n"
+        }
+      ]
+    },
+    "feature7_1_parse_document.json": {
+      "description": "Parse a plain-text document into structured records. Each record exposes its date, optional should-total (in minutes), optional record summary, and its ordered entries; each entry exposes its kind (duration / range / open_range), serialised value, duration in minutes, and summary (lines joined by '|').",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_document",
+            "text": "2000-01-01"
+          },
+          "expected_output": "records=1\nrecord[0].date=2000-01-01\nrecord[0].should_total=0\nrecord[0].summary=\nrecord[0].entries=0\n"
+        },
+        {
+          "input": {
+            "action": "parse_document",
+            "text": "1970-08-29 (8h15m!)\nRecord summary\n    1h Work\n    8:00 - 9:30\n    11:00 - ?\n        Open range"
+          },
+          "expected_output": "records=1\nrecord[0].date=1970-08-29\nrecord[0].should_total=495\nrecord[0].summary=Record summary\nrecord[0].entries=3\nrecord[0].entry[0].type=duration\nrecord[0].entry[0].value=1h\nrecord[0].entry[0].minutes=60\nrecord[0].entry[0].summary=Work\nrecord[0].entry[1].type=range\nrecord[0].entry[1].value=8:00 - 9:30\nrecord[0].entry[1].minutes=90\nrecord[0].entry[1].summary=\nrecord[0].entry[2].type=open_range\nrecord[0].entry[2].value=11:00 - ?\nrecord[0].entry[2].minutes=0\nrecord[0].entry[2].summary=|Open range\n"
+        },
+        {
+          "input": {
+            "action": "parse_document",
+            "text": "1999-05-31\n\n1999-06-03\n  1h"
+          },
+          "expected_output": "records=2\nrecord[0].date=1999-05-31\nrecord[0].should_total=0\nrecord[0].summary=\nrecord[0].entries=0\nrecord[1].date=1999-06-03\nrecord[1].should_total=0\nrecord[1].summary=\nrecord[1].entries=1\nrecord[1].entry[0].type=duration\nrecord[1].entry[0].value=1h\nrecord[1].entry[0].minutes=60\nrecord[1].entry[0].summary=\n"
+        }
+      ]
+    },
+    "feature7_2_parse_errors.json": {
+      "description": "Report the structural errors found while parsing a document. Each error carries a neutral category, the 1-based line number, the cursor position within the line (excluding indentation), and the number of erroneous characters.",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_errors",
+            "text": "Hello 123"
+          },
+          "expected_output": "errors=1\nerror[0].code=invalid_date\nerror[0].line=1\nerror[0].position=0\nerror[0].length=5\n"
+        },
+        {
+          "input": {
+            "action": "parse_errors",
+            "text": "2020-01-01 (asdf!)"
+          },
+          "expected_output": "errors=1\nerror[0].code=malformed_should_total\nerror[0].line=1\nerror[0].position=12\nerror[0].length=4\n"
+        },
+        {
+          "input": {
+            "action": "parse_errors",
+            "text": "2020-01-01\n\t8:00- ?\n\t09:00 - ?"
+          },
+          "expected_output": "errors=1\nerror[0].code=duplicate_open_range\nerror[0].line=3\nerror[0].position=1\nerror[0].length=9\n"
+        }
+      ]
+    },
+    "feature8_serialise_roundtrip.json": {
+      "description": "Parse a document and re-serialise it into the canonical text representation. The canonical form uses 4-space indentation, a single space around range dashes, and places continuation summary lines at double indentation.",
+      "cases": [
+        {
+          "input": {
+            "action": "serialise_roundtrip",
+            "text": "1999-05-31 (8h30m!)\nSummary that consists of multiple\nlines and contains a #tag as well.\n    5h30m This and that\n    -2h Something else\n    <18:00 - 4:00 Foo\n        Bar\n    19:00 - 20:00\n    20:01 - 0:15>\n    1:00am - 3:12pm\n    7:00 - ?\n"
+          },
+          "expected_output": "1999-05-31 (8h30m!)\nSummary that consists of multiple\nlines and contains a #tag as well.\n    5h30m This and that\n    -2h Something else\n    <18:00 - 4:00 Foo\n        Bar\n    19:00 - 20:00\n    20:01 - 0:15>\n    1:00am - 3:12pm\n    7:00 - ?\n"
+        },
+        {
+          "input": {
+            "action": "serialise_roundtrip",
+            "text": "2020-01-15"
+          },
+          "expected_output": "2020-01-15\n"
+        }
+      ]
+    },
+    "feature9_1_total.json": {
+      "description": "Compute the total tracked time (in minutes) across all records in a document by summing every entry; durations and ranges contribute, open ranges contribute zero.",
+      "cases": [
+        {
+          "input": {
+            "action": "total",
+            "text": "2020-01-01\n    3h\n    1h33m\n    13:49 - 17:12\n    1:02 - ?"
+          },
+          "expected_output": "records=1\ntotal_minutes=476\n"
+        },
+        {
+          "input": {
+            "action": "total",
+            "text": "2020-01-01"
+          },
+          "expected_output": "records=1\ntotal_minutes=0\n"
+        }
+      ]
+    },
+    "feature9_2_should_total_diff.json": {
+      "description": "Compute the aggregate should-total of all records, the actual total, and the difference (actual minus should), all in minutes.",
+      "cases": [
+        {
+          "input": {
+            "action": "should_total_diff",
+            "text": "2020-01-01 (8h!)\n    6h\n\n2020-01-02 (8h!)\n    9h"
+          },
+          "expected_output": "should_total=960\nactual=900\ndiff=-60\n"
+        }
+      ]
+    },
+    "feature9_3_hypothetical_total.json": {
+      "description": "Compute the total tracked time as if every open range were closed at a given reference timestamp, and report whether an open range was actually counted (i.e. the record is ongoing). Open ranges only count if their record is the reference day or the day before.",
+      "cases": [
+        {
+          "input": {
+            "action": "hypothetical_total",
+            "until": "2020-01-01T05:06:59-0000",
+            "text": "2020-01-01\n    2h14m\n    <23:00 - 4:00\n    5:07 - ?"
+          },
+          "expected_output": "total_minutes=434\nongoing=false\n"
+        },
+        {
+          "input": {
+            "action": "hypothetical_total",
+            "until": "2020-01-01T10:48:13-0000",
+            "text": "2020-01-01\n    2h14m\n    <23:00 - 4:00\n    5:07 - ?"
+          },
+          "expected_output": "total_minutes=775\nongoing=true\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C016"
+    ],
+    "kept_c": [
+      "C003",
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

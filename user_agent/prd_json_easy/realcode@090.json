@@ -1,0 +1,990 @@
+{
+  "fuzzy_prd": "# Delimited-Text Conversion Library — Configurable CSV Encoding, Decoding, and Streaming\n\n## Project Goal\n\nBuild a reusable delimited-text (CSV) conversion library that lets developers turn in-memory rows of values into CSV text and parse CSV text back into rows, with full control over delimiters, quoting, escaping, value typing, header handling, and incremental (streaming) processing, so applications can interoperate with spreadsheets and data feeds without hand-rolling a brittle parser for every edge case.\n\n---\n\n## Background & Problem\n\nCSV looks trivial but is full of corner cases: fields that contain the delimiter, embedded line breaks, quote characters that must be escaped, byte-order marks, spreadsheet \"delimiter hint\" preambles, ambiguous delimiters that must be guessed, blank lines, and data that arrives in arbitrary network chunks rather than one complete string. Without a shared library, developers reimplement these rules inconsistently, producing parsers that corrupt data the moment a value contains a comma or a newline.\n\nThis library provides one well-defined contract for both directions. On the encoding side it joins rows with a configurable field delimiter and line delimiter, quotes fields only when necessary (or [a specific quote mode string], or only textual values), and escapes embedded quotes. On the decoding side it splits text into rows and fields, honors quoted regions, strips a leading byte-order mark, can infer the delimiter, can read a `sep=` hint, can skip blank lines, can coerce values to numbers and booleans, and can treat the first row as a header. Both directions also work incrementally: rows can be fed or produced one chunk at a time, with the parser correctly stitching together tokens that straddle chunk boundaries.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Adapter Output Contract\n\nThe execution adapter reads one JSON command object from stdin and prints a plain-text result to stdout. Every command carries an `op` field selecting the behavior; an optional `config` object carries conversion settings (`fieldDelimiter`, `lineDelimiter`, `quoteCharacter`, `escapeCharacter`, `quoteMode` of `necessary`/`[a specific quote mode string]`/`[a specific quote mode string]`, `addBom`, `autoDetect`, `skipEmptyLines`, `parseHeaders`, `dynamicTyping`). Defaults are: comma field delimiter, carriage-return-plus-line-feed line delimiter, double-quote quote and escape character, `necessary` quoting, no byte-order mark, delimiter auto-detection on, blank-line skipping on, headers off, value typing off.\n\nEncoding operations print the resulting CSV text verbatim (the wire format itself, including any byte-order mark, quotes, and line delimiters). Decoding operations print a structured rendering: a first line `rows=<n>`, then one line per row `row[<i>]: <field> | <field> | ...`; each field is rendered as `<tag>=<json>` where `<tag>` is the neutral value-type category (`str`, `int`, `double`, or `bool`) and `<json>` is the JSON encoding of the value (so textual fields appear quoted and control characters stay unambiguous). Header-aware decoding renders each field as `<json-header>: <tag>=<json>`. Batch operations print `batches=<n>` then one line per batch `batch[<i>] rows=<k>: [ <row> ] [ <row> ] ...`. Errors are reported as neutral category lines of the form `error=<category>`.\n\n---\n\n## Core Features\n\n### Feature 1: Encode Rows Into CSV Text\n\n**As a developer**, I want to turn a list of rows of values into a single CSV string with correct delimiting, quoting, and escaping, so I can serialize tabular data safely.\n\n**Expected Behavior / Usage:**\n\n*1.1 Field and row joining — flat serialization of values*\n\nGiven rows of values, fields within a row are joined by the field delimiter and consecutive rows are separated by the line delimiter. No line delimiter is appended after the final row. The output is the raw CSV text.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_encode_join.json`\n\n```json\n{\n    \"description\": \"Encode a list of rows into a single CSV text. Fields within a row are joined by the field delimiter and consecutive rows are separated by the line delimiter; no trailing line delimiter is appended after the final row.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"encode\", \"rows\": [[\"A\", \"b\", \"c\"]]}, \"expected_output\": \"A,b,c\"},\n        {\"input\": {\"op\": \"encode\", \"rows\": [[\"A\", \"b\", \"c\"], [\"d\", \"E\", \"f\"]]}, \"expected_output\": \"A,b,c\\r\\nd,E,f\"}\n    ]\n}\n```\n\n*1.2 Necessary quoting and quote escaping — quote only fields that require it*\n\nUnder the default quoting policy a field is wrapped in the quote character only when it contains the field delimiter, a line break, or the quote character itself. An embedded quote character is escaped by doubling it (prefixing it with the escape character, which defaults to the quote character).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_encode_quoting.json`\n\n```json\n{\n    \"description\": \"Encode rows where some fields require quoting. Under the default quoting policy a field is wrapped in the quote character only when it contains the field delimiter, a line break, or the quote character itself. An embedded quote character is escaped by doubling it (prefixing it with the escape character, which defaults to the quote character).\",\n    \"cases\": [\n        {\"input\": {\"op\": \"encode\", \"rows\": [[\"A\", \"B,B\", \"C\"]]}, \"expected_output\": \"A,\\\"B,B\\\",C\"},\n        {\"input\": {\"op\": \"encode\", \"rows\": [[\"A\", \"B\\\"B\", \"C\"]]}, \"expected_output\": \"A,\\\"B\\\"\\\"B\\\",C\"}\n    ]\n}\n```\n\n*1.3 Quote-mode policies — [a specific quote mode string]-quote and quote-textual-only*\n\nBeyond the default, two explicit policies exist. The `[a specific quote mode string]` policy quotes only fields whose runtime value is textual, leaving numeric and boolean values unquoted. The `[a specific quote mode string]` policy quotes every field regardless of its type or content.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_encode_quote_modes.json`\n\n```json\n{\n    \"description\": \"Encode rows under explicit quoting policies other than the default. The '[a specific quote mode string]' policy quotes only fields whose runtime value is textual, leaving numeric and boolean values unquoted. The '[a specific quote mode string]' policy quotes every field regardless of its type or content.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"encode\", \"config\": {\"quoteMode\": \"[a specific quote mode string]\"}, \"rows\": [[1, \"1\", true, \"true\"]]}, \"expected_output\": \"1,\\\"1\\\",true,\\\"true\\\"\"},\n        {\"input\": {\"op\": \"encode\", \"config\": {\"quoteMode\": \"[a specific quote mode string]\"}, \"rows\": [[1, \"A\"]]}, \"expected_output\": \"\\\"1\\\",\\\"A\\\"\"}\n    ]\n}\n```\n\n*1.4 Custom escape character — escape embedded quotes with a different character*\n\nWhen a custom escape character different from the quote character is configured, an embedded quote character inside a quoted field is preceded by the escape character instead of being doubled.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_encode_escape_char.json`\n\n```json\n{\n    \"description\": \"Encode using a custom escape character that differs from the quote character. When a quoted field contains the quote character, the configured escape character is placed before it instead of doubling the quote.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"encode\", \"config\": {\"escapeCharacter\": \"\\\\\"}, \"rows\": [[\"A\\\"B\"]]}, \"expected_output\": \"\\\"A\\\\\\\"B\\\"\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Spreadsheet-Compatible Encoding Preset\n\n**As a developer**, I want a one-shot preset that produces output a common spreadsheet program opens cleanly, so I do not have to remember the exact delimiter and byte-order-mark combination.\n\n**Expected Behavior / Usage:**\n\nThe spreadsheet preset encodes with a semicolon field delimiter and prepends a UTF-8 byte-order mark to the output. The default necessary-quoting policy still applies, so a field containing the semicolon delimiter is quoted.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_excel_encode.json`\n\n```json\n{\n    \"description\": \"Encode using the spreadsheet-compatible preset: a semicolon field delimiter and a UTF-8 byte order mark prepended to the output. Fields that contain the semicolon delimiter are still quoted under the default necessary-quoting policy.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"encode\", \"preset\": \"excel\", \"rows\": [[\"Header1\", \"Header2\"], [\"Value1\", \"Value;2\"]]}, \"expected_output\": \"\\ufeffHeader1;Header2\\r\\nValue1;\\\"Value;2\\\"\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Decode CSV Text Into Rows\n\n**As a developer**, I want to parse CSV text into rows of fields with correct handling of quoting, delimiters, byte-order marks, and blank lines, so I can read tabular data reliably.\n\n**Expected Behavior / Usage:**\n\n*3.1 Basic field and row parsing — split on delimiters and line breaks*\n\nFields are separated by the delimiter and rows by line breaks. Empty fields between consecutive delimiters are preserved as empty [a specific quote mode string], and a single trailing line break does not create an extra empty row.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_decode_basic.json`\n\n```json\n{\n    \"description\": \"Decode CSV text into a list of rows of string fields. Fields are separated by the delimiter and rows by line breaks. Empty fields between consecutive delimiters are preserved as empty [a specific quote mode string], and a single trailing line break does not create an extra empty row. Each decoded field is reported with a neutral type tag (here [a specific quote mode string] textual) and its value.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode\", \"input\": \"A,b,c\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A\\\" | str=\\\"b\\\" | str=\\\"c\\\"\\n\"},\n        {\"input\": {\"op\": \"decode\", \"input\": \"a,b,,,c,d\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"a\\\" | str=\\\"b\\\" | str=\\\"\\\" | str=\\\"\\\" | str=\\\"c\\\" | str=\\\"d\\\"\\n\"}\n    ]\n}\n```\n\n*3.2 Quoted-field parsing — honor quoted regions and escapes*\n\nA field wrapped in the quote character may itself contain the delimiter, line breaks, or escaped quote characters (a doubled quote decodes to a single quote). Surrounding whitespace inside a quoted field is preserved, whitespace in an unquoted field is kept verbatim, a stray quote in the middle of an otherwise unquoted field is treated literally, and runs of escaped quotes around a delimiter decode correctly.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_decode_quoted.json`\n\n```json\n{\n    \"description\": \"Decode CSV text containing quoted fields. A field wrapped in the quote character may itself contain the delimiter, line breaks, or escaped quote characters (a doubled quote decodes to a single quote). Surrounding whitespace inside a quoted field is preserved, whitespace in an unquoted field is kept verbatim, a stray quote in the middle of an otherwise unquoted field is treated literally, and runs of escaped quotes around a delimiter decode correctly.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode\", \"input\": \"A,\\\"B,B\\\",C\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A\\\" | str=\\\"B,B\\\" | str=\\\"C\\\"\\n\"},\n        {\"input\": {\"op\": \"decode\", \"input\": \"A,\\\"B\\\"\\\"B\\\",C\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\\\\\"B\\\" | str=\\\"C\\\"\\n\"}\n    ]\n}\n```\n\n*3.3 Delimiter auto-detection — infer the separator from content*\n\nWhen the delimiter is not supplied, it is inferred from the content. The detector considers common candidates (comma, semicolon, tab, pipe) and picks the one that best and most consistently separates fields across the leading lines.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_decode_autodetect.json`\n\n```json\n{\n    \"description\": \"Decode CSV text without being told the delimiter, letting it be inferred from the content. The detector considers common candidates (comma, semicolon, tab, pipe) and picks the one that best and most consistently separates fields across the leading lines.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode\", \"input\": \"A;B;C\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\" | str=\\\"C\\\"\\n\"},\n        {\"input\": {\"op\": \"decode\", \"input\": \"A\\tB\\tC\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\" | str=\\\"C\\\"\\n\"}\n    ]\n}\n```\n\n*3.4 Byte-order-mark stripping — drop a leading BOM*\n\nA UTF-8 byte-order mark at the start of the input is consumed and never becomes part of the first field, whether the delimiter is supplied explicitly or inferred automatically.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_decode_bom.json`\n\n```json\n{\n    \"description\": \"Decode CSV text that begins with a UTF-8 byte order mark. The byte order mark is consumed and never becomes part of the first field, whether the delimiter is supplied explicitly or inferred automatically.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode\", \"input\": \"\\ufeffA,B,C\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\" | str=\\\"C\\\"\\n\"}\n    ]\n}\n```\n\n*3.5 Delimiter hint line — read a `sep=` preamble*\n\nWhen the input opens with a hint line of the form `sep=<char>`, that delimiter is used for the rest of the document and the hint line itself is not emitted as data; subsequent content is split on the hinted delimiter rather than any auto-detected one.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_decode_sep_hint.json`\n\n```json\n{\n    \"description\": \"Decode CSV text that opens with a spreadsheet-style delimiter hint line of the form sep=<char>. When present, the hint sets the delimiter for the rest of the document and the hint line itself is not emitted as data; subsequent content is then split on that delimiter rather than any auto-detected one.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode\", \"input\": \"sep=;\\r\\nA;B;C\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\" | str=\\\"C\\\"\\n\"},\n        {\"input\": {\"op\": \"decode\", \"input\": \"sep=;\\r\\nA,B,C\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A,B,C\\\"\\n\"}\n    ]\n}\n```\n\n*3.6 Blank-line handling — skip or keep empty rows*\n\nWith empty-line skipping enabled (the default), rows that consist solely of empty fields are dropped. With skipping disabled, every physical line — including blank ones — becomes a row.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_decode_skip_empty.json`\n\n```json\n{\n    \"description\": \"Decode CSV text that contains blank lines, controlling whether they are kept. With empty-line skipping enabled (the default), rows that consist solely of empty fields are dropped. With skipping disabled, every physical line — including blank ones — becomes a row.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode\", \"config\": {\"skipEmptyLines\": true}, \"input\": \"A,B\\n\\nC,D\\n\\n\"}, \"expected_output\": \"rows=2\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\"\\nrow[1]: str=\\\"C\\\" | str=\\\"D\\\"\\n\"},\n        {\"input\": {\"op\": \"decode\", \"config\": {\"skipEmptyLines\": false}, \"input\": \"A,B\\n\\nC,D\\n\\n\"}, \"expected_output\": \"rows=4\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\"\\nrow[1]: str=\\\"\\\"\\nrow[2]: str=\\\"C\\\" | str=\\\"D\\\"\\nrow[3]: str=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Automatic Value Typing\n\n**As a developer**, I want decoded fields optionally coerced to numbers and booleans, so I get typed data instead of raw [a specific quote mode string].\n\n**Expected Behavior / Usage:**\n\nWhen value typing is enabled, each field is examined and converted to an integer, floating-point number, or boolean when its full text matches that form; otherwise it stays textual. Boolean recognition is exact and case-sensitive, and even quoted fields are subject to typing. The reported neutral type tag reflects the inferred type of each field.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_dynamic_typing.json`\n\n```json\n{\n    \"description\": \"Decode CSV text with automatic value typing enabled. Each field is examined and converted to an integer, floating-point number, or boolean when its full text matches that form; otherwise it stays textual. Boolean recognition is exact and case-sensitive, and even quoted fields are subject to typing. The reported neutral type tag reflects the inferred type of each field.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode\", \"config\": {\"dynamicTyping\": true}, \"input\": \"123,-456\"}, \"expected_output\": \"rows=1\\nrow[0]: int=123 | int=-456\\n\"},\n        {\"input\": {\"op\": \"decode\", \"config\": {\"dynamicTyping\": true}, \"input\": \"123,true,hello,1.5\"}, \"expected_output\": \"rows=1\\nrow[0]: int=123 | bool=true | str=\\\"hello\\\" | double=1.5\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Header-Aware Decoding\n\n**As a developer**, I want the first row treated as a header so subsequent rows are addressable by column name, so I can read fields without tracking positional indices.\n\n**Expected Behavior / Usage:**\n\nWhen header parsing is enabled, the first line is consumed as the header row and each following row is exposed as a mapping from header name to the corresponding field value, in column order, while remaining addressable by position.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature13_headers.json`\n\n```json\n{\n    \"description\": \"Decode CSV text while treating the first line as a header row, exposing each subsequent row by header name as well as by position. The result reports each data row as a mapping from header name to the corresponding typed field value, in column order.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_headers\", \"input\": \"id,name\\n1,Alice\\n2,Bob\"}, \"expected_output\": \"rows=2\\nrow[0]: \\\"id\\\": str=\\\"1\\\" | \\\"name\\\": str=\\\"Alice\\\"\\nrow[1]: \\\"id\\\": str=\\\"2\\\" | \\\"name\\\": str=\\\"Bob\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Configurable Multi-Character Delimiter\n\n**As a developer**, I want to use a delimiter longer than one character, so I can parse formats that separate fields with multi-character markers.\n\n**Expected Behavior / Usage:**\n\nWhen an explicit multi-character delimiter is configured, the whole delimiter sequence separates fields, and single characters that merely begin the delimiter sequence are treated as ordinary content.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature14_multi_char_delim.json`\n\n```json\n{\n    \"description\": \"Decode CSV text using an explicitly configured multi-character delimiter. The whole delimiter sequence separates fields, and single characters that merely begin the delimiter sequence are treated as ordinary content.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode\", \"config\": {\"autoDetect\": false, \"fieldDelimiter\": \"::\"}, \"input\": \"a::b::c\"}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"a\\\" | str=\\\"b\\\" | str=\\\"c\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Streaming Chunked Decoding\n\n**As a developer**, I want to decode CSV that arrives in arbitrary chunks, with tokens correctly reassembled across chunk edges, so I can parse large or networked inputs without buffering everything first.\n\n**Expected Behavior / Usage:**\n\nThe chunked decoder is fed an ordered list of string chunks and emits the same rows it would produce from the concatenated text. Partial tokens at a chunk boundary are buffered until completed.\n\n*7.1 Arbitrary chunk boundaries — split rows and quoted fields*\n\nRow and field boundaries, including quoted fields that contain a line break, may be split anywhere across chunk edges; the decoder reconstructs each completed row in order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature15_chunked_decode.json`\n\n```json\n{\n    \"description\": \"Decode CSV text delivered as a sequence of arbitrary chunks, where row and field boundaries may be split across chunk edges. The decoder buffers partial content and reconstructs exactly the same rows it would produce from the concatenated text, emitting each completed row in order.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_chunks\", \"config\": {\"autoDetect\": false, \"fieldDelimiter\": \",\"}, \"chunks\": [\"A,B,C\\nd\", \",e,f\"]}, \"expected_output\": \"rows=2\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\" | str=\\\"C\\\"\\nrow[1]: str=\\\"d\\\" | str=\\\"e\\\" | str=\\\"f\\\"\\n\"},\n        {\"input\": {\"op\": \"decode_chunks\", \"config\": {\"autoDetect\": false, \"fieldDelimiter\": \",\"}, \"chunks\": [\"A,\\\"B\\n\", \"B\\\",C\"]}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"A\\\" | str=\\\"B\\\\nB\\\" | str=\\\"C\\\"\\n\"}\n    ]\n}\n```\n\n*7.2 Split line terminator — a carriage-return/line-feed pair split across chunks*\n\nA carriage-return/line-feed line terminator whose carriage return ends one chunk and whose line feed begins the next must be recognized as a single line terminator, not two, so no spurious empty row appears regardless of the blank-line-skipping setting.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature16_split_crlf.json`\n\n```json\n{\n    \"description\": \"Decode chunked CSV text where a carriage-return/line-feed pair that ends a line is split so the carriage return ends one chunk and the line feed begins the next. The pair must be recognized as a single line terminator rather than producing a spurious empty row, regardless of the empty-line-skipping setting.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_chunks\", \"config\": {\"autoDetect\": false, \"fieldDelimiter\": \",\"}, \"chunks\": [\"a\\r\", \"\\nb\"]}, \"expected_output\": \"rows=2\\nrow[0]: str=\\\"a\\\"\\nrow[1]: str=\\\"b\\\"\\n\"}\n    ]\n}\n```\n\n*7.3 Split escaped quote at every position — exhaustive boundary robustness*\n\nWhen a quoted field containing an escaped quote sequence is split into two chunks at every possible position, every split must reconstruct the identical row — including the case where the escaped quote surrounds a delimiter that therefore becomes part of the field value. The result lists the decoded row for each split index.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature17_split_escape.json`\n\n```json\n{\n    \"description\": \"Decode chunked CSV text containing an escaped quote sequence inside a quoted field, verifying correctness for every possible split point. The input is fed as two chunks for each split position from start to end, and every split must reconstruct the identical row, including the case where the escaped quote surrounds a delimiter that is therefore part of the field value.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_split_scan\", \"config\": {\"autoDetect\": false, \"fieldDelimiter\": \",\"}, \"input\": \"a,\\\"b\\\"\\\"c\\\",d\"}, \"expected_output\": \"[a method for handling byte-level splits]10\\nsplit[0]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[1]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[2]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[3]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[4]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[5]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[6]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[7]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[8]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[9]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\nsplit[10]: [ str=\\\"a\\\" | str=\\\"b\\\\\\\"c\\\" | str=\\\"d\\\" ]\\n\"}\n    ]\n}\n```\n\n*7.4 Split multi-character delimiter — partial delimiter across chunks*\n\nA multi-character delimiter split across a chunk boundary, including a split immediately after a closing quote, must be buffered and rejoined so fields separate correctly.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature18_split_multi_char.json`\n\n```json\n{\n    \"description\": \"Decode chunked CSV text using a multi-character delimiter that is split across a chunk boundary, including the case where the split occurs immediately after a closing quote. The partial delimiter at a chunk edge must be buffered and rejoined so the fields separate correctly.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_chunks\", \"config\": {\"autoDetect\": false, \"fieldDelimiter\": \"::\"}, \"chunks\": [\"a:\", \":b\"]}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"a\\\" | str=\\\"b\\\"\\n\"},\n        {\"input\": {\"op\": \"decode_chunks\", \"config\": {\"autoDetect\": false, \"fieldDelimiter\": \"::\"}, \"chunks\": [\"\\\"a\\\":\", \":b\"]}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"a\\\" | str=\\\"b\\\"\\n\"}\n    ]\n}\n```\n\n*7.5 Maximal fragmentation with detection — one character at a time*\n\nWhen the input is streamed one character at a time, delimiter detection and the `sep=` hint must still work: the decoder buffers until it can determine the delimiter, then yields the same rows as a single-shot decode.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature19_small_chunk_detect.json`\n\n```json\n{\n    \"description\": \"Decode CSV text streamed one character at a time, forcing delimiter detection and the spreadsheet delimiter hint to work under maximal fragmentation. Even when no chunk individually contains enough context, the decoder buffers until it can determine the delimiter and then yields the same rows as a single-shot decode.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_chunks\", \"chunks\": [\"s\", \"e\", \"p\", \"=\", \";\", \"\\r\", \"\\n\", \"a\", \";\", \"b\", \";\", \"c\"]}, \"expected_output\": \"rows=1\\nrow[0]: str=\\\"a\\\" | str=\\\"b\\\" | str=\\\"c\\\"\\n\"},\n        {\"input\": {\"op\": \"decode_chunks\", \"chunks\": [\"a\", \",\", \"b\", \",\", \"c\", \"\\n\", \"1\", \",\", \"2\", \",\", \"3\"]}, \"expected_output\": \"rows=2\\nrow[0]: str=\\\"a\\\" | str=\\\"b\\\" | str=\\\"c\\\"\\nrow[1]: str=\\\"1\\\" | str=\\\"2\\\" | str=\\\"3\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 8: Streaming Encoding\n\n**As a developer**, I want to encode rows one at a time through a streaming pipeline, so I can produce CSV incrementally without holding all rows in memory.\n\n**Expected Behavior / Usage:**\n\nRows are fed one at a time and each produces an output fragment; the concatenation of all fragments equals the full CSV text. The first row contributes no leading line delimiter and each later row is prefixed by the line delimiter.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature20_streaming_encode.json`\n\n```json\n{\n    \"description\": \"Encode rows fed one at a time through a streaming pipeline, where each row produces an output fragment and the concatenation of all fragments equals the full CSV text. The first row contributes no leading line delimiter and each later row is prefixed by the line delimiter.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"encode_stream\", \"rows\": [[\"A\", \"B\"], [\"C\", \"D\"]]}, \"expected_output\": \"A,B\\r\\nC,D\"}\n    ]\n}\n```\n\n---\n\n### Feature 9: Batch-Oriented Codec Adapter\n\n**As a developer**, I want a codec adapter that delivers decoded rows in batches aligned to input chunks, with an optional cap on batch size, so I can integrate with pipelines that consume groups of rows.\n\n**Expected Behavior / Usage:**\n\n*9.1 Chunk-aligned batching — one batch per input chunk*\n\nRows decoded from a single input chunk are forwarded together as one batch, so the number and contents of the batches reflect how the input was chunked. Rows that straddle chunk edges are reconstructed correctly before being grouped. When the delimiter must be auto-detected, the rows from the buffered prefix are emitted as a single batch once detection completes.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature21_codec_batching.json`\n\n```json\n{\n    \"description\": \"Decode chunked CSV text through the batch-oriented codec adapter, where rows decoded from one input chunk are forwarded together as a single batch so natural chunk boundaries are preserved. Rows that straddle chunk edges (split fields, split line terminators, split escaped quotes, single-character feeding) are reconstructed correctly, and the number and contents of the emitted batches reflect how the input was chunked.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_batches\", \"config\": {\"autoDetect\": true}, \"chunks\": [\"a,b\\r\\n1,2\\r\\n3,4\\r\\n\"]}, \"expected_output\": \"batches=1\\nbatch[0] rows=3: [ str=\\\"a\\\" | str=\\\"b\\\" ] [ str=\\\"1\\\" | str=\\\"2\\\" ] [ str=\\\"3\\\" | str=\\\"4\\\" ]\\n\"},\n        {\"input\": {\"op\": \"decode_batches\", \"config\": {\"autoDetect\": false}, \"chunks\": [\"a,b\\r\\n\", \"c,d\\r\\n\"]}, \"expected_output\": \"batches=2\\nbatch[0] rows=1: [ str=\\\"a\\\" | str=\\\"b\\\" ]\\nbatch[1] rows=1: [ str=\\\"c\\\" | str=\\\"d\\\" ]\\n\"}\n    ]\n}\n```\n\n*9.2 Row-count cap per batch — bound batch size*\n\nWhen a maximum number of rows per batch is configured, a single chunk that decodes to more rows than the cap is split into multiple batches of at most that size; the cap composes with chunk boundaries and with split line terminators, and a cap larger than the available rows yields one batch.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature22_codec_max_rows.json`\n\n```json\n{\n    \"description\": \"Decode chunked CSV text through the batch-oriented codec adapter with a cap on the number of rows per emitted batch. A single chunk that decodes to more rows than the cap is split into multiple batches of at most that size, the cap composes with chunk boundaries and with split line terminators, and a cap larger than the available rows yields one batch.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_batches\", \"config\": {\"autoDetect\": false}, \"maxRowsPerBatch\": 1, \"chunks\": [\"a,b\\r\\nc,d\\r\\ne,f\\r\\n\"]}, \"expected_output\": \"batches=3\\nbatch[0] rows=1: [ str=\\\"a\\\" | str=\\\"b\\\" ]\\nbatch[1] rows=1: [ str=\\\"c\\\" | str=\\\"d\\\" ]\\nbatch[2] rows=1: [ str=\\\"e\\\" | str=\\\"f\\\" ]\\n\"},\n        {\"input\": {\"op\": \"decode_batches\", \"config\": {\"autoDetect\": false}, \"maxRowsPerBatch\": 3, \"chunks\": [\"0,row0\\r\\n1,row1\\r\\n2,row2\\r\\n3,row3\\r\\n4,row4\\r\\n5,row5\\r\\n6,row6\\r\\n7,row7\\r\\n8,row8\\r\\n9,row9\\r\\n\"]}, \"expected_output\": \"batches=4\\nbatch[0] rows=3: [ str=\\\"0\\\" | str=\\\"row0\\\" ] [ str=\\\"1\\\" | str=\\\"row1\\\" ] [ str=\\\"2\\\" | str=\\\"row2\\\" ]\\nbatch[1] rows=3: [ str=\\\"3\\\" | str=\\\"row3\\\" ] [ str=\\\"4\\\" | str=\\\"row4\\\" ] [ str=\\\"5\\\" | str=\\\"row5\\\" ]\\nbatch[2] rows=3: [ str=\\\"6\\\" | str=\\\"row6\\\" ] [ str=\\\"7\\\" | str=\\\"row7\\\" ] [ str=\\\"8\\\" | str=\\\"row8\\\" ]\\nbatch[3] rows=1: [ str=\\\"9\\\" | str=\\\"row9\\\" ]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 10: Decoder Configuration Validation\n\n**As a developer**, I want invalid decoder settings rejected up front with a clear category, so misconfiguration fails fast instead of corrupting output.\n\n**Expected Behavior / Usage:**\n\nThe quote character and the escape character must each be exactly one character. Supplying a multi-character value is rejected with a neutral configuration-error category that identifies which option was invalid (`[an error returned when a multi-character escape character is invalid]` or `error=invalid_escape_character`), while a valid single-character configuration is accepted (`valid=true`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature23_decoder_validation.json`\n\n```json\n{\n    \"description\": \"Validate decoder configuration up front. The quote character and the escape character must each be exactly one character; supplying a multi-character value is rejected with a neutral configuration-error category identifying which option was invalid, while a valid single-character configuration is accepted.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"validate_decoder\", \"config\": {\"quoteCharacter\": \"xx\"}}, \"expected_output\": \"[an error returned when a multi-character escape character is invalid]\\n\"},\n        {\"input\": {\"op\": \"validate_decoder\", \"config\": {\"quoteCharacter\": \"\\\"\", \"escapeCharacter\": \"\\\\\"}}, \"expected_output\": \"valid=true\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the encoding, decoding, typing, header, streaming, and batching features described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint, ensuring high maintainability without over-engineering. The core conversion logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON command from stdin and prints the result (or a neutral error line) to stdout, matching the per-feature contracts above. The command's `op` selects behavior: `encode` and `encode_stream` serialize rows; `decode`, `decode_headers`, `decode_chunks`, `decode_split_scan`, and `decode_batches` parse text or chunk lists; `validate_decoder` checks configuration. Field values in decoded output are rendered with the neutral type tag and JSON-encoded value defined in the Adapter Output Contract. Native exceptions raised by the core must be translated by the adapter into neutral `error=<category>` lines without leaking host-language runtime details.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- conforms to the row drop policy established in legacy macros\n- overrides the standard trim logic unless explicitly disabled\n",
+  "oracle_data": {
+    "task_id": "close2__csv-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "quoteMode strings",
+          "quoteMode always",
+          "always quote all fields",
+          "quote only text fields",
+          "config.quoteMode behavior"
+        ],
+        "oracle_response": "The valid quote mode strings are 'strings' and 'always'. The value 'strings' quotes fields containing delimiters, quotes, or newlines. The value 'always' quotes every field regardless of content or type."
+      },
+      {
+        "constraint_id": "C024",
+        "trigger_keywords": [
+          "invalid_escape_character error",
+          "multi-char escape char rejection",
+          "neutral config-error",
+          "escape char validation failure",
+          "C024 response"
+        ],
+        "oracle_response": "The response string is 'error=invalid_escape_character', not 'error=invalid_quote_character'."
+      },
+      {
+        "constraint_id": "C030",
+        "trigger_keywords": [
+          "decode_split_scan split",
+          "decode_chunks split",
+          "byte reconstitution error",
+          "array for split index",
+          "return len"
+        ],
+        "oracle_response": "The return value is an array of string segments corresponding to the split points, or a single reconstituted string if no split occurred. It does not include a 'len=' prefix."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "conforms to the row drop policy established in legacy macros",
+        "actual_meaning": "config.skipEmptyLines must be set to 'true' to trigger this behavior; otherwise, blank lines are retained as rows."
+      },
+      {
+        "vague_reference": "overrides the standard trim logic unless explicitly disabled",
+        "actual_meaning": "This constraint is currently a 'Redeferred' placeholder with no active logic; the actual trim-except implementation resides in a pending refactoring ticket."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_decode_sep_hint.json": {
+      "description": "Decode CSV text that opens with a spreadsheet-style delimiter hint line of the form sep=<char>. When present, the hint sets the delimiter for the rest of the document and the hint line itself is not emitted as data; subsequent content is then split on that delimiter rather than any auto-detected one.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "input": "sep=;\r\nA;B;C"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A\" | str=\"B\" | str=\"C\"\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "input": "sep=;\r\nA,B,C"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A,B,C\"\n"
+        }
+      ]
+    },
+    "feature11_decode_skip_empty.json": {
+      "description": "Decode CSV text that contains blank lines, controlling whether they are kept. With empty-line skipping enabled (the default), rows that consist solely of empty fields are dropped. With skipping disabled, every physical line — including blank ones — becomes a row.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "config": {
+              "skipEmptyLines": true
+            },
+            "input": "A,B\n\nC,D\n\n"
+          },
+          "expected_output": "rows=2\nrow[0]: str=\"A\" | str=\"B\"\nrow[1]: str=\"C\" | str=\"D\"\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "config": {
+              "skipEmptyLines": false
+            },
+            "input": "A,B\n\nC,D\n\n"
+          },
+          "expected_output": "rows=4\nrow[0]: str=\"A\" | str=\"B\"\nrow[1]: str=\"\"\nrow[2]: str=\"C\" | str=\"D\"\nrow[3]: str=\"\"\n"
+        }
+      ]
+    },
+    "feature12_dynamic_typing.json": {
+      "description": "Decode CSV text with automatic value typing enabled. Each field is examined and converted to an integer, floating-point number, or boolean when its full text matches that form; otherwise it stays textual. Boolean recognition is exact and case-sensitive, and even quoted fields are subject to typing. The reported neutral type tag reflects the inferred type of each field.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "config": {
+              "dynamicTyping": true
+            },
+            "input": "123,-456"
+          },
+          "expected_output": "rows=1\nrow[0]: int=123 | int=-456\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "config": {
+              "dynamicTyping": true
+            },
+            "input": "123,true,hello,1.5"
+          },
+          "expected_output": "rows=1\nrow[0]: int=123 | bool=true | str=\"hello\" | double=1.5\n"
+        }
+      ]
+    },
+    "feature13_headers.json": {
+      "description": "Decode CSV text while treating the first line as a header row, exposing each subsequent row by header name as well as by position. The result reports each data row as a mapping from header name to the corresponding typed field value, in column order.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_headers",
+            "input": "id,name\n1,Alice\n2,Bob"
+          },
+          "expected_output": "rows=2\nrow[0]: \"id\": str=\"1\" | \"name\": str=\"Alice\"\nrow[1]: \"id\": str=\"2\" | \"name\": str=\"Bob\"\n"
+        }
+      ]
+    },
+    "feature14_multi_char_delim.json": {
+      "description": "Decode CSV text using an explicitly configured multi-character delimiter. The whole delimiter sequence separates fields, and single characters that merely begin the delimiter sequence are treated as ordinary content.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "config": {
+              "autoDetect": false,
+              "fieldDelimiter": "::"
+            },
+            "input": "a::b::c"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"a\" | str=\"b\" | str=\"c\"\n"
+        }
+      ]
+    },
+    "feature15_chunked_decode.json": {
+      "description": "Decode CSV text delivered as a sequence of arbitrary chunks, where row and field boundaries may be split across chunk edges. The decoder buffers partial content and reconstructs exactly the same rows it would produce from the concatenated text, emitting each completed row in order.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_chunks",
+            "config": {
+              "autoDetect": false,
+              "fieldDelimiter": ","
+            },
+            "chunks": [
+              "A,B,C\nd",
+              ",e,f"
+            ]
+          },
+          "expected_output": "rows=2\nrow[0]: str=\"A\" | str=\"B\" | str=\"C\"\nrow[1]: str=\"d\" | str=\"e\" | str=\"f\"\n"
+        },
+        {
+          "input": {
+            "op": "decode_chunks",
+            "config": {
+              "autoDetect": false,
+              "fieldDelimiter": ","
+            },
+            "chunks": [
+              "A,\"B\n",
+              "B\",C"
+            ]
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A\" | str=\"B\\nB\" | str=\"C\"\n"
+        }
+      ]
+    },
+    "feature16_split_crlf.json": {
+      "description": "Decode chunked CSV text where a carriage-return/line-feed pair that ends a line is split so the carriage return ends one chunk and the line feed begins the next. The pair must be recognized as a single line terminator rather than producing a spurious empty row, regardless of the empty-line-skipping setting.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_chunks",
+            "config": {
+              "autoDetect": false,
+              "fieldDelimiter": ","
+            },
+            "chunks": [
+              "a\r",
+              "\nb"
+            ]
+          },
+          "expected_output": "rows=2\nrow[0]: str=\"a\"\nrow[1]: str=\"b\"\n"
+        }
+      ]
+    },
+    "feature17_split_escape.json": {
+      "description": "Decode chunked CSV text containing an escaped quote sequence inside a quoted field, verifying correctness for every possible split point. The input is fed as two chunks for each split position from start to end, and every split must reconstruct the identical row, including the case where the escaped quote surrounds a delimiter that is therefore part of the field value.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_split_scan",
+            "config": {
+              "autoDetect": false,
+              "fieldDelimiter": ","
+            },
+            "input": "a,\"b\"\"c\",d"
+          },
+          "expected_output": "len=10\nsplit[0]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[1]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[2]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[3]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[4]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[5]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[6]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[7]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[8]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[9]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\nsplit[10]: [ str=\"a\" | str=\"b\\\"c\" | str=\"d\" ]\n"
+        }
+      ]
+    },
+    "feature18_split_multi_char.json": {
+      "description": "Decode chunked CSV text using a multi-character delimiter that is split across a chunk boundary, including the case where the split occurs immediately after a closing quote. The partial delimiter at a chunk edge must be buffered and rejoined so the fields separate correctly.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_chunks",
+            "config": {
+              "autoDetect": false,
+              "fieldDelimiter": "::"
+            },
+            "chunks": [
+              "a:",
+              ":b"
+            ]
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"a\" | str=\"b\"\n"
+        },
+        {
+          "input": {
+            "op": "decode_chunks",
+            "config": {
+              "autoDetect": false,
+              "fieldDelimiter": "::"
+            },
+            "chunks": [
+              "\"a\":",
+              ":b"
+            ]
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"a\" | str=\"b\"\n"
+        }
+      ]
+    },
+    "feature19_small_chunk_detect.json": {
+      "description": "Decode CSV text streamed one character at a time, forcing delimiter detection and the spreadsheet delimiter hint to work under maximal fragmentation. Even when no chunk individually contains enough context, the decoder buffers until it can determine the delimiter and then yields the same rows as a single-shot decode.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_chunks",
+            "chunks": [
+              "s",
+              "e",
+              "p",
+              "=",
+              ";",
+              "\r",
+              "\n",
+              "a",
+              ";",
+              "b",
+              ";",
+              "c"
+            ]
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"a\" | str=\"b\" | str=\"c\"\n"
+        },
+        {
+          "input": {
+            "op": "decode_chunks",
+            "chunks": [
+              "a",
+              ",",
+              "b",
+              ",",
+              "c",
+              "\n",
+              "1",
+              ",",
+              "2",
+              ",",
+              "3"
+            ]
+          },
+          "expected_output": "rows=2\nrow[0]: str=\"a\" | str=\"b\" | str=\"c\"\nrow[1]: str=\"1\" | str=\"2\" | str=\"3\"\n"
+        }
+      ]
+    },
+    "feature1_1_encode_join.json": {
+      "description": "Encode a list of rows into a single CSV text. Fields within a row are joined by the field delimiter and consecutive rows are separated by the line delimiter; no trailing line delimiter is appended after the final row.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "rows": [
+              [
+                "A",
+                "b",
+                "c"
+              ]
+            ]
+          },
+          "expected_output": "A,b,c"
+        },
+        {
+          "input": {
+            "op": "encode",
+            "rows": [
+              [
+                "A",
+                "b",
+                "c"
+              ],
+              [
+                "d",
+                "E",
+                "f"
+              ]
+            ]
+          },
+          "expected_output": "A,b,c\r\nd,E,f"
+        }
+      ]
+    },
+    "feature20_streaming_encode.json": {
+      "description": "Encode rows fed one at a time through a streaming pipeline, where each row produces an output fragment and the concatenation of all fragments equals the full CSV text. The first row contributes no leading line delimiter and each later row is prefixed by the line delimiter.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode_stream",
+            "rows": [
+              [
+                "A",
+                "B"
+              ],
+              [
+                "C",
+                "D"
+              ]
+            ]
+          },
+          "expected_output": "A,B\r\nC,D"
+        }
+      ]
+    },
+    "feature21_codec_batching.json": {
+      "description": "Decode chunked CSV text through the batch-oriented codec adapter, where rows decoded from one input chunk are forwarded together as a single batch so natural chunk boundaries are preserved. Rows that straddle chunk edges (split fields, split line terminators, split escaped quotes, single-character feeding) are reconstructed correctly, and the number and contents of the emitted batches reflect how the input was chunked.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_batches",
+            "config": {
+              "autoDetect": true
+            },
+            "chunks": [
+              "a,b\r\n1,2\r\n3,4\r\n"
+            ]
+          },
+          "expected_output": "batches=1\nbatch[0] rows=3: [ str=\"a\" | str=\"b\" ] [ str=\"1\" | str=\"2\" ] [ str=\"3\" | str=\"4\" ]\n"
+        },
+        {
+          "input": {
+            "op": "decode_batches",
+            "config": {
+              "autoDetect": false
+            },
+            "chunks": [
+              "a,b\r\n",
+              "c,d\r\n"
+            ]
+          },
+          "expected_output": "batches=2\nbatch[0] rows=1: [ str=\"a\" | str=\"b\" ]\nbatch[1] rows=1: [ str=\"c\" | str=\"d\" ]\n"
+        }
+      ]
+    },
+    "feature22_codec_max_rows.json": {
+      "description": "Decode chunked CSV text through the batch-oriented codec adapter with a cap on the number of rows per emitted batch. A single chunk that decodes to more rows than the cap is split into multiple batches of at most that size, the cap composes with chunk boundaries and with split line terminators, and a cap larger than the available rows yields one batch.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_batches",
+            "config": {
+              "autoDetect": false
+            },
+            "maxRowsPerBatch": 1,
+            "chunks": [
+              "a,b\r\nc,d\r\ne,f\r\n"
+            ]
+          },
+          "expected_output": "batches=3\nbatch[0] rows=1: [ str=\"a\" | str=\"b\" ]\nbatch[1] rows=1: [ str=\"c\" | str=\"d\" ]\nbatch[2] rows=1: [ str=\"e\" | str=\"f\" ]\n"
+        },
+        {
+          "input": {
+            "op": "decode_batches",
+            "config": {
+              "autoDetect": false
+            },
+            "maxRowsPerBatch": 3,
+            "chunks": [
+              "0,row0\r\n1,row1\r\n2,row2\r\n3,row3\r\n4,row4\r\n5,row5\r\n6,row6\r\n7,row7\r\n8,row8\r\n9,row9\r\n"
+            ]
+          },
+          "expected_output": "batches=4\nbatch[0] rows=3: [ str=\"0\" | str=\"row0\" ] [ str=\"1\" | str=\"row1\" ] [ str=\"2\" | str=\"row2\" ]\nbatch[1] rows=3: [ str=\"3\" | str=\"row3\" ] [ str=\"4\" | str=\"row4\" ] [ str=\"5\" | str=\"row5\" ]\nbatch[2] rows=3: [ str=\"6\" | str=\"row6\" ] [ str=\"7\" | str=\"row7\" ] [ str=\"8\" | str=\"row8\" ]\nbatch[3] rows=1: [ str=\"9\" | str=\"row9\" ]\n"
+        }
+      ]
+    },
+    "feature23_decoder_validation.json": {
+      "description": "Validate decoder configuration up front. The quote character and the escape character must each be exactly one character; supplying a multi-character value is rejected with a neutral configuration-error category identifying which option was invalid, while a valid single-character configuration is accepted.",
+      "cases": [
+        {
+          "input": {
+            "op": "validate_decoder",
+            "config": {
+              "quoteCharacter": "xx"
+            }
+          },
+          "expected_output": "error=invalid_quote_character\n"
+        },
+        {
+          "input": {
+            "op": "validate_decoder",
+            "config": {
+              "quoteCharacter": "\"",
+              "escapeCharacter": "\\"
+            }
+          },
+          "expected_output": "valid=true\n"
+        }
+      ]
+    },
+    "feature2_encode_quoting.json": {
+      "description": "Encode rows where some fields require quoting. Under the default quoting policy a field is wrapped in the quote character only when it contains the field delimiter, a line break, or the quote character itself. An embedded quote character is escaped by doubling it (prefixing it with the escape character, which defaults to the quote character).",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "rows": [
+              [
+                "A",
+                "B,B",
+                "C"
+              ]
+            ]
+          },
+          "expected_output": "A,\"B,B\",C"
+        },
+        {
+          "input": {
+            "op": "encode",
+            "rows": [
+              [
+                "A",
+                "B\"B",
+                "C"
+              ]
+            ]
+          },
+          "expected_output": "A,\"B\"\"B\",C"
+        }
+      ]
+    },
+    "feature3_encode_quote_modes.json": {
+      "description": "Encode rows under explicit quoting policies other than the default. The 'strings' policy quotes only fields whose runtime value is textual, leaving numeric and boolean values unquoted. The 'always' policy quotes every field regardless of its type or content.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "config": {
+              "quoteMode": "strings"
+            },
+            "rows": [
+              [
+                1,
+                "1",
+                true,
+                "true"
+              ]
+            ]
+          },
+          "expected_output": "1,\"1\",true,\"true\""
+        },
+        {
+          "input": {
+            "op": "encode",
+            "config": {
+              "quoteMode": "always"
+            },
+            "rows": [
+              [
+                1,
+                "A"
+              ]
+            ]
+          },
+          "expected_output": "\"1\",\"A\""
+        }
+      ]
+    },
+    "feature4_encode_escape_char.json": {
+      "description": "Encode using a custom escape character that differs from the quote character. When a quoted field contains the quote character, the configured escape character is placed before it instead of doubling the quote.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "config": {
+              "escapeCharacter": "\\"
+            },
+            "rows": [
+              [
+                "A\"B"
+              ]
+            ]
+          },
+          "expected_output": "\"A\\\"B\""
+        }
+      ]
+    },
+    "feature5_excel_encode.json": {
+      "description": "Encode using the spreadsheet-compatible preset: a semicolon field delimiter and a UTF-8 byte order mark prepended to the output. Fields that contain the semicolon delimiter are still quoted under the default necessary-quoting policy.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "preset": "excel",
+            "rows": [
+              [
+                "Header1",
+                "Header2"
+              ],
+              [
+                "Value1",
+                "Value;2"
+              ]
+            ]
+          },
+          "expected_output": "﻿Header1;Header2\r\nValue1;\"Value;2\""
+        }
+      ]
+    },
+    "feature6_decode_basic.json": {
+      "description": "Decode CSV text into a list of rows of string fields. Fields are separated by the delimiter and rows by line breaks. Empty fields between consecutive delimiters are preserved as empty strings, and a single trailing line break does not create an extra empty row. Each decoded field is reported with a neutral type tag (here always textual) and its value.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "input": "A,b,c"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A\" | str=\"b\" | str=\"c\"\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "input": "a,b,,,c,d"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"a\" | str=\"b\" | str=\"\" | str=\"\" | str=\"c\" | str=\"d\"\n"
+        }
+      ]
+    },
+    "feature7_decode_quoted.json": {
+      "description": "Decode CSV text containing quoted fields. A field wrapped in the quote character may itself contain the delimiter, line breaks, or escaped quote characters (a doubled quote decodes to a single quote). Surrounding whitespace inside a quoted field is preserved, whitespace in an unquoted field is kept verbatim, a stray quote in the middle of an otherwise unquoted field is treated literally, and runs of escaped quotes around a delimiter decode correctly.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "input": "A,\"B,B\",C"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A\" | str=\"B,B\" | str=\"C\"\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "input": "A,\"B\"\"B\",C"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A\" | str=\"B\\\"B\" | str=\"C\"\n"
+        }
+      ]
+    },
+    "feature8_decode_autodetect.json": {
+      "description": "Decode CSV text without being told the delimiter, letting it be inferred from the content. The detector considers common candidates (comma, semicolon, tab, pipe) and picks the one that best and most consistently separates fields across the leading lines.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "input": "A;B;C"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A\" | str=\"B\" | str=\"C\"\n"
+        },
+        {
+          "input": {
+            "op": "decode",
+            "input": "A\tB\tC"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A\" | str=\"B\" | str=\"C\"\n"
+        }
+      ]
+    },
+    "feature9_decode_bom.json": {
+      "description": "Decode CSV text that begins with a UTF-8 byte order mark. The byte order mark is consumed and never becomes part of the first field, whether the delimiter is supplied explicitly or inferred automatically.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "input": "﻿A,B,C"
+          },
+          "expected_output": "rows=1\nrow[0]: str=\"A\" | str=\"B\" | str=\"C\"\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Protocol Syntax",
+      "input_condition": "All input commands",
+      "output_rule": "Every command must contain an 'op' field to select behavior, an optional 'config' object for settings, and for decoding, an optional 'input' field (string) or 'chunks' array. Errors must be reported as lines starting with 'error='.",
+      "exact_values": [
+        "op=encode",
+        "op=decode",
+        "op=decode_headers",
+        "op=decode_chunks",
+        "op=decode_split_scan",
+        "op=decode_batches",
+        "op=validate_decoder",
+        "op=encode_stream",
+        "op=excel"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Default Configuration",
+      "input_condition": "When 'config' object is omitted or has missing keys",
+      "output_rule": "Default values apply unless overwritten.",
+      "exact_values": {
+        "fieldDelimiter": "comma",
+        "lineDelimiter": "\\r\\n",
+        "quoteCharacter": "\"",
+        "escapeCharacter": "\"",
+        "quoteMode": "necessary",
+        "addBom": false,
+        "autoDetect": true,
+        "skipEmptyLines": true,
+        "parseHeaders": false,
+        "dynamicTyping": false
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Encoding - Joining",
+      "input_condition": "op=encode with rows",
+      "output_rule": "Fields within a row are joined by the field delimiter. Consecutive rows are separated by the line delimiter. NO line delimiter is appended after the final row.",
+      "exact_values": {
+        "trailing_newline": false
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Encoding - Quoting Policy",
+      "input_condition": "op=encode with rows (default or quoteMode=necessary)",
+      "output_rule": "A field is wrapped in the quote character ONLY if it contains the field delimiter, a line break, or the quote character itself.",
+      "exact_values": {
+        "wrapping_condition": "contains delimiter OR newline OR quote"
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Encoding - Quote Escaping",
+      "input_condition": "Encoded field contains the quote character inside quotes",
+      "output_rule": "An embedded quote character is escaped by prefixing it with the escape character (defaulting to the same character as the quote character, i.e., doubling it).",
+      "exact_values": {
+        "default_escape_policy": "double"
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Encoding - Custom Escape Character",
+      "input_condition": "config.escapeCharacter is specified and differs from config.quoteCharacter",
+      "output_rule": "An embedded quote character inside a quoted field is preceded by the configured escape character instead of being doubled.",
+      "exact_values": {
+        "policy": "escape_character_prefix"
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Encoding - Quote Modes",
+      "input_condition": "config.quoteMode=strings OR config.quoteMode=always",
+      "output_rule": "If 'strings', quote only fields with textual runtime values. If 'always', quote every field regardless of type or content.",
+      "exact_values": [
+        "strings",
+        "always"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Encoding - Excel Preset",
+      "input_condition": "op=encode with preset=excel",
+      "output_rule": "Encode using a semicolon field delimiter. Prepend a UTF-8 byte-order mark (U+FEFF) to the output start.",
+      "exact_values": [
+        "fieldDelimiter",
+        "semicol"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Decoding - BOM Handling",
+      "input_condition": "op=decode with input starting with UTF-8 BOM (U+FEFF)",
+      "output_rule": "The BOM is consumed and stripped. It never becomes part of the first field value, even if the delimiter was auto-detected.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Decoding - Delimiter Hint",
+      "input_condition": "op=decode with input starting with a line 'sep=<char>'",
+      "output_rule": "The delimiter is set to the character specified after 'sep='. The hint line itself is NOT emitted as data. Subsequent lines use this delimiter.",
+      "exact_values": {
+        "format": "sep=<char>"
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Decoding - Auto-Detection",
+      "input_condition": "op=decode with autoDetect=true and no explicit delimiter",
+      "output_rule": "The detector inspects leading lines and picks the delimiter (comma, semicolon, tab, pipe) that most consistently separates fields across them.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Decoding - Blank Line Skipping",
+      "input_condition": "config.skipEmptyLines=true (default)",
+      "output_rule": "Rows consisting solely of empty fields are dropped.",
+      "exact_values": {
+        "behavior": "drop"
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Decoding - Blank Line Retention",
+      "input_condition": "config.skipEmptyLines=false",
+      "output_rule": "Every physical line (including blank ones with no chars) is emitted as a row (an empty string field list).",
+      "exact_values": {
+        "behavior": "keep"
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Decoding - Dynamic Typing",
+      "input_condition": "config.dynamicTyping=true",
+      "output_rule": "Fields are coerced to int, double, or bool if the full text matches. Otherwise str. Boolean check is exact/case-sensitive.",
+      "exact_values": [
+        "int",
+        "double",
+        "bool",
+        "str"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Decoding - Headers",
+      "input_condition": "op=decode_headers",
+      "output_rule": "First line is treated as headers. Data rows are rendered as key-value pairs using header names as keys, preserving column order.",
+      "exact_values": {
+        "first_line_role": "header"
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Encoding - Output Layout",
+      "input_condition": "op=encode/decode_headers returning data",
+      "output_rule": "Output is the raw CSV string. Headers/decode output must include 'rows=<n>' and row details.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Decoding - Output Layout",
+      "input_condition": "op=decode / decode_headers",
+      "output_rule": "First line: 'rows=<n>'. Subsequent lines: 'row[<i>]: <tag>=\"<val>\" | <tag>=\"<val>\"...'. Trailing newline included.",
+      "exact_values": [
+        "prefix",
+        "rows=",
+        "row[",
+        "]:",
+        "tag=|",
+        "quotes for str"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Decoding - Multi-character Delimiter",
+      "input_condition": "config.fieldDelimiter is a multi-char string (e.g., '::') AND autoDetect=false",
+      "output_rule": "The FULL multi-char sequence separates fields. Single chars within that sequence are content.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Encoding - Multi-char Delimiter",
+      "input_condition": "config.fieldDelimiter is a multi-char string",
+      "output_rule": "Fields are joined by the exact multi-char string.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Streaming - Encode Packet",
+      "input_condition": "op=encode_stream",
+      "output_rule": "Each row produces a fragment. First row has NO leading delimiter. Each subsequent row is prefixed by the line delimiter.",
+      "exact_values": {
+        "prefix_first_row": false
+      },
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Streaming - Decode Chunk Optimization",
+      "input_condition": "op=decode_chunks with single character chunks or split delimiters",
+      "output_rule": "Buffer partial data. Reconstruct exactly what full concatenation would produce. Handle split line terminators (\\r split) as a single newline.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Bundling",
+      "input_condition": "op=decode_batches",
+      "output_rule": "Rows decoded from the SAME input chunk are grouped into ONE batch. (Unless maxRowsPerBatch forces a split). Output reflects chunk boundaries.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Validation - Quote Char",
+      "input_condition": "config.quoteCharacter is a multi-character value or string literal with length > 1",
+      "output_rule": "Reject with 'error=invalid_quote_character'.",
+      "exact_values": [
+        "error=invalid_quote_character"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Validation - Escape Char",
+      "input_condition": "config.escapeCharacter is a multi-character value or string literal with length > 1",
+      "output_rule": "Reject with 'error=invalid_escape_character' (implied by 'neutral configuration-error').",
+      "exact_values": [
+        "error=invalid_quote_character"
+      ],
+      "ambiguous": true
+    },
+    {
+      "id": "C025",
+      "feature": "CSV Parsing - Quoted Fields",
+      "input_condition": "A field is wrapped in the quote character",
+      "output_rule": "The delimiter and newline are treated as literal part of the field content inside the quotes. Escaped quotes (double) collapse to single.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "CSV Parsing - Trailing Line Break",
+      "input_condition": "End of text is a single line delimiter (\\r\\n)",
+      "output_rule": "Do NOT create an extra empty row. Ignore trailing newline tokens perfectly.",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Encoding - Quoted Field Trim Exception",
+      "input_condition": "Redeferred",
+      "output_rule": "None",
+      "exact_values": {},
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Validate Scenario",
+      "input_condition": "op=validate_decoder returns valid=true or error=...",
+      "output_rule": "Return 'valid=true' if config is within constraints, otherwise 'error=<specific_invalid_option>'.",
+      "exact_values": [
+        "valid=",
+        "error="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "Empty Field Representation",
+      "input_condition": "Adjacent delimiters or quotes with no internal content",
+      "output_rule": "Output as empty string. Rendered as str=\"\"",
+      "exact_values": [
+        "empty string = \"\"",
+        "str tag"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Stream Reconstitution",
+      "input_condition": "Op decode_split_scan or decode_chunks where split occurs inside a byte",
+      "output_rule": "Must return an array for each split index (or reconstitute input chunks with split points) demonstrating identical results.",
+      "exact_values": [
+        "len="
+      ],
+      "ambiguous": true
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific quote mode string",
+        "exact_values_to_replace": [
+          "strings",
+          "always"
+        ],
+        "trigger_keywords": [
+          "quoteMode strings",
+          "quoteMode always",
+          "always quote all fields",
+          "quote only text fields",
+          "config.quoteMode behavior"
+        ],
+        "oracle_response": "The valid quote mode strings are 'strings' and 'always'. The value 'strings' quotes fields containing delimiters, quotes, or newlines. The value 'always' quotes every field regardless of content or type."
+      },
+      {
+        "constraint_id": "C024",
+        "replacement": "an error returned when a multi-character escape character is invalid",
+        "exact_values_to_replace": [
+          "error=invalid_quote_character"
+        ],
+        "trigger_keywords": [
+          "invalid_escape_character error",
+          "multi-char escape char rejection",
+          "neutral config-error",
+          "escape char validation failure",
+          "C024 response"
+        ],
+        "oracle_response": "The response string is 'error=invalid_escape_character', not 'error=invalid_quote_character'."
+      },
+      {
+        "constraint_id": "C030",
+        "replacement": "a method for handling byte-level splits",
+        "exact_values_to_replace": [
+          "len="
+        ],
+        "trigger_keywords": [
+          "decode_split_scan split",
+          "decode_chunks split",
+          "byte reconstitution error",
+          "array for split index",
+          "return len"
+        ],
+        "oracle_response": "The return value is an array of string segments corresponding to the split points, or a single reconstituted string if no split occurred. It does not include a 'len=' prefix."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "conforms to the row drop policy established in legacy macros",
+        "actual_meaning": "config.skipEmptyLines must be set to 'true' to trigger this behavior; otherwise, blank lines are retained as rows."
+      },
+      {
+        "constraint_id": "C027",
+        "vague_phrase": "overrides the standard trim logic unless explicitly disabled",
+        "actual_meaning": "This constraint is currently a 'Redeferred' placeholder with no active logic; the actual trim-except implementation resides in a pending refactoring ticket."
+      }
+    ]
+  }
+}

@@ -1,0 +1,672 @@
+{
+  "fuzzy_prd": "# Mobile Telemetry Runtime Support - Session, Buffering, Persistence, and Enrichment Contracts\n\n## Project Goal\n\nBuild a mobile telemetry runtime support library that allows developers to attach session context, enrich telemetry records, buffer signals until exporters become available, persist retryable signal batches, and schedule lightweight background work without duplicating fragile lifecycle and storage logic.\n\n---\n\n## Background & Problem\n\nWithout this library, developers are forced to manually track application foreground/background transitions, rotate session identifiers, attach contextual attributes to every telemetry item, coordinate delayed exporter setup, and manage temporary disk storage. This leads to repetitive code, missed edge cases around timeouts and retries, inconsistent telemetry metadata, and maintenance issues across application modules.\n\nWith this library, telemetry clients get a consistent runtime layer for session lifecycle decisions, signal buffering, disk export retries, storage directory management, periodic retry execution, log enrichment, and slow-rendering polling configuration.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Session Timeout Evaluation\n\n**As a developer**, I want session timeout decisions to respect app lifecycle state and activity bumps, so I can rotate telemetry sessions only when inactivity rules require it.\n\n**Expected Behavior / Usage:**\n\nThe input provides a timeout duration in milliseconds and a sequence of lifecycle/time operations. `background` places the app in background timeout mode, `foreground` marks the next activity as the first foreground activity after backgrounding, `advance` moves the clock forward by the given milliseconds, `bump` records telemetry activity and resets the timeout counter, and `check` emits one line. While already foregrounded, checks must not time out regardless of elapsed time. While backgrounded, a check must time out once elapsed time since the latest bump reaches the configured timeout. After returning to foreground, the first activity check still observes the background timeout window; a following bump returns the app to normal foreground behavior.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_session_timeout.json`\n\n```json\n{\n  \"description\": \"Evaluate whether a mobile telemetry session has timed out after lifecycle changes, activity bumps, and elapsed time advances.\",\n  \"cases\": [\n    {\n      \"input\": {\"timeout_ms\": 900000, \"events\": [{\"op\": \"background\"}, {\"op\": \"bump\"}, {\"op\": \"advance\", \"ms\": 900000}, {\"op\": \"check\"}, {\"op\": \"bump\"}, {\"op\": \"check\"}]},\n      \"expected_output\": \"timed_out=true\\ntimed_out=false\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 2: Session Identifier Stability and Rotation\n\n**As a developer**, I want session identifiers to be stable during an active session and rotate after lifetime or timeout expiration, so telemetry can be grouped into correct user sessions.\n\n**Expected Behavior / Usage:**\n\nThe input provides a maximum session lifetime, an ordered sequence of timeout responses, and `get`/`advance` events. Each `get` emits the request index, whether the returned identifier is a 32-character lowercase hexadecimal value, and whether it is new, the same as the previous request, or changed from the previous request. The first request creates a valid identifier. Repeated requests before expiration reuse the identifier. A request at or beyond the configured lifetime, or a request for which the timeout source reports expiration, rotates to a different valid identifier.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_session_identity.json`\n\n```json\n{\n  \"description\": \"Request telemetry session identifiers over time and report whether identifiers are well formed and whether each request reused or rotated the active identifier.\",\n  \"cases\": [\n    {\n      \"input\": {\"lifetime_ms\": 14400000, \"timeout_sequence\": [false, false], \"events\": [{\"op\": \"get\"}, {\"op\": \"get\"}, {\"op\": \"advance\", \"ms\": 14400000}, {\"op\": \"get\"}]},\n      \"expected_output\": \"session_index=0\\nformat=hex32\\nrelation=new\\nsession_index=1\\nformat=hex32\\nrelation=same\\nsession_index=2\\nformat=hex32\\nrelation=changed\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 3: In-Memory Signal Buffering Before Exporter Attachment\n\n**As a developer**, I want telemetry exports, flushes, and shutdowns issued before the real exporter is attached to be buffered and completed later, so startup telemetry is not lost during delayed exporter initialization.\n\n**Expected Behavior / Usage:**\n\nThe input selects a signal type (`span` or `log`), a buffer capacity, and ordered operations. `export` before delegate attachment stores items up to capacity and returns a pending result if at least one item was accepted; if the buffer is already full, the extra export returns `error:buffer_overflow` and the new items are not delivered. `flush` and `shutdown` before delegate attachment return pending results and are invoked once the delegate is attached. After `set_delegate`, buffered items are exported in a single delegate export call and pending flush/shutdown calls are forwarded. Operations after delegate attachment return success immediately and are sent directly to the delegate. Output reports every operation result plus delegate-observable item delivery and call counts.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_buffering_exporter.json`\n\n```json\n{\n  \"description\": \"Apply export, flush, shutdown, and delegate-attachment operations to an in-memory telemetry exporter and report buffered item delivery plus operation result states.\",\n  \"cases\": [\n    {\n      \"input\": {\"signal\": \"span\", \"capacity\": 2, \"operations\": [{\"op\": \"export\", \"items\": [\"first\", \"second\"]}, {\"op\": \"export\", \"items\": [\"third\"]}, {\"op\": \"flush\"}, {\"op\": \"set_delegate\"}]},\n      \"expected_output\": \"export_result=0:pending\\nexport_result=1:error:buffer_overflow\\nflush_result=2:pending\\ndelegate_items=first,second\\ndelegate_exports=1\\ndelegate_flushes=1\\ndelegate_shutdowns=0\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 4: Stored Signal Batch Export Coordination\n\n**As a developer**, I want stored span, metric, and log batches to be exported with a consistent timeout and combined success signal, so retry loops can continue only while useful work is being drained.\n\n**Expected Behavior / Usage:**\n\nThe input declares which stored-signal exporters are available, the boolean result sequence each exporter should return, an optional timeout in milliseconds, and an operation: `spans`, `metrics`, `logs`, or `each`. Single-signal operations call only the requested available exporter and return its boolean result; if that exporter is unavailable, they return false and make no calls. The `each` operation attempts all three signal kinds in span, metric, and log order and returns true if any one of the available exports succeeds. Every actual exporter call receives the configured timeout, or 5000 milliseconds when no timeout is provided. Output reports the combined exported result, call counts, and timeout values for called exporters.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_disk_export_batches.json`\n\n```json\n{\n  \"description\": \"Attempt to export one stored batch for spans, metrics, and logs with configured exporter availability, exporter outcomes, and export timeout.\",\n  \"cases\": [\n    {\n      \"input\": {\"availability\": {\"spans\": true, \"metrics\": true, \"logs\": true}, \"results\": {\"spans\": [false], \"metrics\": [true], \"logs\": [false]}, \"operation\": \"each\"},\n      \"expected_output\": \"exported=true\\nspans_calls=1\\nspans_timeout_ms=5000\\nmetrics_calls=1\\nmetrics_timeout_ms=5000\\nlogs_calls=1\\nlogs_timeout_ms=5000\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 5: Disk Persistence Directories and Size Limits\n\n**As a developer**, I want telemetry persistence paths and size limits to be resolved consistently, so signal buffering uses predictable directories and safe temporary workspace cleanup.\n\n**Expected Behavior / Usage:**\n\nThe input provides an application cache directory and an operation. For `signals_dir`, the system returns a custom signal directory when one is supplied; otherwise it returns `<cache_dir>/opentelemetry/signals`, creating the directory if needed. For `temporary_dir`, the system returns `<cache_dir>/opentelemetry/temp`, creates it if needed, and removes all preexisting files and nested files before returning it. For `max_file_size`, the configured maximum file size is returned unchanged. For `max_folder_size`, the per-signal folder quota is the configured total cache size divided by three using integer division. Output reports paths relative to the test root, existence, remaining entry count, or computed size.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_disk_storage_paths.json`\n\n```json\n{\n  \"description\": \"Resolve disk storage directories and cache sizing for telemetry persistence, including default paths, custom signal paths, temporary-directory cleanup, and per-signal folder quotas.\",\n  \"cases\": [\n    {\n      \"input\": {\"cache_dir\": \"cache\", \"operation\": \"temporary_dir\", \"preexisting\": [\"old.tmp\", \"nested/old.tmp\"]},\n      \"expected_output\": \"path=cache/opentelemetry/temp\\nexists=true\\nentries=0\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 6: Periodic Runnable Delay and Rescheduling\n\n**As a developer**, I want reusable periodic work to honor a minimum delay and stop policy, so background retry tasks do not run too frequently and can stop rescheduling themselves.\n\n**Expected Behavior / Usage:**\n\nThe input provides a minimum delay and a sequence of run attempts. Before each attempt, the clock advances by `advance_ms`, and `stop_after_run` controls whether the task should stop after an actual execution. The first attempt is eligible immediately. Later attempts execute only when the current time is at least the previous execution time plus the minimum delay. After each attempt, the task enqueues itself for another loop unless its stop policy is true after execution. Output reports the attempt index, total number of actual executions so far, and total enqueue requests so far.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_periodic_work.json`\n\n```json\n{\n  \"description\": \"Run a reusable periodic task with a minimum delay and stop policy, then report execution count and whether the task scheduled itself for another loop.\",\n  \"cases\": [\n    {\n      \"input\": {\"minimum_delay_ms\": 5000, \"runs\": [{\"advance_ms\": 0, \"stop_after_run\": false}, {\"advance_ms\": 4999, \"stop_after_run\": false}, {\"advance_ms\": 1, \"stop_after_run\": true}]},\n      \"expected_output\": \"run_index=0\\ntimes_run=1\\nenqueued=1\\nrun_index=1\\ntimes_run=1\\nenqueued=2\\nrun_index=2\\ntimes_run=2\\nenqueued=2\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 7: Log Record Attribute Enrichment\n\n**As a developer**, I want log records to be enriched with session, screen, or global attributes at emit time, so downstream telemetry has consistent contextual metadata.\n\n**Expected Behavior / Usage:**\n\nThe input selects an enrichment processor. `session` reads the current session identifier from the supplied provider and attaches it as `session.id`. `screen` reads the current visible screen name and attaches it as `screen.name`. `global` accepts one or more supplied attribute sets and emits one log record per set; each emit must use the supplier's current attributes rather than caching an earlier value. Output reports the attached attribute key/value pair or, for global enrichment, each emit index and the complete attached attribute set in key-sorted `key=value` form.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_log_enrichment.json`\n\n```json\n{\n  \"description\": \"Emit log records through enrichment processors and report the telemetry attributes attached from session identity, current screen name, or a supplied global attribute set.\",\n  \"cases\": [\n    {\n      \"input\": {\"processor\": \"global\", \"attribute_sets\": [{\"service.name\": \"checkout\"}, {\"device.model\": \"tablet\"}]},\n      \"expected_output\": \"emit_index=0\\nattributes=service.name=checkout\\nemit_index=1\\nattributes=device.model=tablet\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 8: Slow-Rendering Poll Interval Configuration\n\n**As a developer**, I want slow-rendering detection to expose a positive polling interval setting, so frame monitoring can be tuned without accepting invalid intervals.\n\n**Expected Behavior / Usage:**\n\nThe input provides an ordered list of interval updates in milliseconds. The default interval is 1000 milliseconds. A positive update replaces the current interval. A zero or negative update is rejected and leaves the current interval unchanged. Output reports the retained interval after all updates.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_slow_rendering_config.json`\n\n```json\n{\n  \"description\": \"Configure the polling interval for slow-rendering detection and report the interval retained after each update attempt.\",\n  \"cases\": [\n    {\n      \"input\": {\"updates_ms\": [3000, -1000]},\n      \"expected_output\": \"interval_ms=3000\\n\"\n    }\n  ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint, ensuring high maintainability without over-engineering.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system. It reads a JSON command from stdin, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-leaf-feature contracts above. This adapter must be logically (and ideally physically) separated from the core domain.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_[name].json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_[name]@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- when  θερπογραμματοratio indicates activity\n- for emit_index logic\n",
+  "oracle_data": {
+    "task_id": "open-telemetry__opentelemetry-android-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C023",
+        "trigger_keywords": [
+          "custom signal directory",
+          "cache dir signal path",
+          "empty signal path",
+          "directory structure for signals",
+          "where do signals go"
+        ],
+        "oracle_response": "The path is constructed by concatenating the provided cache_dir input with the literal string '/opentelemetry/signals', resulting in '<cache_dir>/opentelemetry/signals'."
+      },
+      {
+        "constraint_id": "C025",
+        "trigger_keywords": [
+          "maximum folder size calculation",
+          "how to get max folder size",
+          "formula for folder limit",
+          "integer division rule",
+          "calculate max folder capacity"
+        ],
+        "oracle_response": "The value is calculated using integer division: total_size_int divided by 3."
+      },
+      {
+        "constraint_id": "TC_feature5_disk_storage_paths",
+        "trigger_keywords": [
+          "test cases for feature5 disk storage paths",
+          "show me feature5 disk storage paths test cases",
+          "what are the feature5 disk storage paths inputs and outputs",
+          "give me the feature5_disk_storage_paths test file",
+          "feature5 disk storage paths expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_disk_storage_paths:\n{\n  \"description\": \"Resolve disk storage directories and cache sizing for telemetry persistence, including default paths, custom signal paths, temporary-directory cleanup, and per-signal folder quotas.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"cache_dir\": \"cache\",\n        \"operation\": \"temporary_dir\",\n        \"preexisting\": [\n          \"old.tmp\",\n          \"nested/old.tmp\"\n        ]\n      },\n      \"expected_output\": \"path=cache/opentelemetry/temp\\nexists=true\\nentries=0\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "when  θερπογραμματοratio indicates activity",
+        "actual_meaning": "This refers to the specific output rule logic being triggered when the service transitions from background to foreground, specifically regarding 'bump' events."
+      },
+      {
+        "vague_reference": "for emit_index logic",
+        "actual_meaning": "This refers to the specific output rule formatting emitted for each attribute_set when the processor is set to 'global'."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_session_timeout.json": {
+      "description": "Evaluate whether a mobile telemetry session has timed out after lifecycle changes, activity bumps, and elapsed time advances.",
+      "cases": [
+        {
+          "input": {
+            "timeout_ms": 900000,
+            "events": [
+              {
+                "op": "background"
+              },
+              {
+                "op": "bump"
+              },
+              {
+                "op": "advance",
+                "ms": 900000
+              },
+              {
+                "op": "check"
+              },
+              {
+                "op": "bump"
+              },
+              {
+                "op": "check"
+              }
+            ]
+          },
+          "expected_output": "timed_out=true\ntimed_out=false\n"
+        }
+      ]
+    },
+    "feature2_session_identity.json": {
+      "description": "Request telemetry session identifiers over time and report whether identifiers are well formed and whether each request reused or rotated the active identifier.",
+      "cases": [
+        {
+          "input": {
+            "lifetime_ms": 14400000,
+            "timeout_sequence": [
+              false,
+              false
+            ],
+            "events": [
+              {
+                "op": "get"
+              },
+              {
+                "op": "get"
+              },
+              {
+                "op": "advance",
+                "ms": 14400000
+              },
+              {
+                "op": "get"
+              }
+            ]
+          },
+          "expected_output": "session_index=0\nformat=hex32\nrelation=new\nsession_index=1\nformat=hex32\nrelation=same\nsession_index=2\nformat=hex32\nrelation=changed\n"
+        }
+      ]
+    },
+    "feature3_buffering_exporter.json": {
+      "description": "Apply export, flush, shutdown, and delegate-attachment operations to an in-memory telemetry exporter and report buffered item delivery plus operation result states.",
+      "cases": [
+        {
+          "input": {
+            "signal": "span",
+            "capacity": 2,
+            "operations": [
+              {
+                "op": "export",
+                "items": [
+                  "first",
+                  "second"
+                ]
+              },
+              {
+                "op": "export",
+                "items": [
+                  "third"
+                ]
+              },
+              {
+                "op": "flush"
+              },
+              {
+                "op": "set_delegate"
+              }
+            ]
+          },
+          "expected_output": "export_result=0:pending\nexport_result=1:error:buffer_overflow\nflush_result=2:pending\ndelegate_items=first,second\ndelegate_exports=1\ndelegate_flushes=1\ndelegate_shutdowns=0\n"
+        }
+      ]
+    },
+    "feature4_disk_export_batches.json": {
+      "description": "Attempt to export one stored batch for spans, metrics, and logs with configured exporter availability, exporter outcomes, and export timeout.",
+      "cases": [
+        {
+          "input": {
+            "availability": {
+              "spans": true,
+              "metrics": true,
+              "logs": true
+            },
+            "results": {
+              "spans": [
+                false
+              ],
+              "metrics": [
+                true
+              ],
+              "logs": [
+                false
+              ]
+            },
+            "operation": "each"
+          },
+          "expected_output": "exported=true\nspans_calls=1\nspans_timeout_ms=5000\nmetrics_calls=1\nmetrics_timeout_ms=5000\nlogs_calls=1\nlogs_timeout_ms=5000\n"
+        }
+      ]
+    },
+    "feature5_disk_storage_paths.json": {
+      "description": "Resolve disk storage directories and cache sizing for telemetry persistence, including default paths, custom signal paths, temporary-directory cleanup, and per-signal folder quotas.",
+      "cases": [
+        {
+          "input": {
+            "cache_dir": "cache",
+            "operation": "temporary_dir",
+            "preexisting": [
+              "old.tmp",
+              "nested/old.tmp"
+            ]
+          },
+          "expected_output": "path=cache/opentelemetry/temp\nexists=true\nentries=0\n"
+        }
+      ]
+    },
+    "feature6_periodic_work.json": {
+      "description": "Run a reusable periodic task with a minimum delay and stop policy, then report execution count and whether the task scheduled itself for another loop.",
+      "cases": [
+        {
+          "input": {
+            "minimum_delay_ms": 5000,
+            "runs": [
+              {
+                "advance_ms": 0,
+                "stop_after_run": false
+              },
+              {
+                "advance_ms": 4999,
+                "stop_after_run": false
+              },
+              {
+                "advance_ms": 1,
+                "stop_after_run": true
+              }
+            ]
+          },
+          "expected_output": "run_index=0\ntimes_run=1\nenqueued=1\nrun_index=1\ntimes_run=1\nenqueued=2\nrun_index=2\ntimes_run=2\nenqueued=2\n"
+        }
+      ]
+    },
+    "feature7_log_enrichment.json": {
+      "description": "Emit log records through enrichment processors and report the telemetry attributes attached from session identity, current screen name, or a supplied global attribute set.",
+      "cases": [
+        {
+          "input": {
+            "processor": "global",
+            "attribute_sets": [
+              {
+                "service.name": "checkout"
+              },
+              {
+                "device.model": "tablet"
+              }
+            ]
+          },
+          "expected_output": "emit_index=0\nattributes=service.name=checkout\nemit_index=1\nattributes=device.model=tablet\n"
+        }
+      ]
+    },
+    "feature8_slow_rendering_config.json": {
+      "description": "Configure the polling interval for slow-rendering detection and report the interval retained after each update attempt.",
+      "cases": [
+        {
+          "input": {
+            "updates_ms": [
+              3000,
+              -1000
+            ]
+          },
+          "expected_output": "interval_ms=3000\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "feature1_session_timeout",
+      "input_condition": "event.op == 'check'",
+      "output_rule": "Output a single line with 'timed_out=true' or 'timed_out=false'",
+      "exact_values": [
+        "timed_out=true",
+        "timed_out=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "feature1_session_timeout",
+      "input_condition": "Current state is 'foreground' and no request is in progress",
+      "output_rule": "timed_out must always be 'false' regardless of elapsed time",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "feature1_session_timeout",
+      "input_condition": "State is 'background' (immediately after last event)",
+      "output_rule": "timed_out is 'true' ONLY if elapsed time since the last 'bump' exceeds the configured timeout",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "feature1_session_timeout",
+      "input_condition": "Forwarding time while in 'background' state",
+      "output_rule": "If total elapsed time since last bump >= timeout_ms, timed_out becomes true",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "feature1_session_timeout",
+      "input_condition": "Transitioning from 'background' back to 'foreground' ( θερπογραμματοratio implies bump/activity)",
+      "output_rule": "timed_out state resets to 'false' based on immediate state check, ignoring historical background duration if current check is for the foreground activity",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "feature2_session_identity",
+      "input_condition": "event.op == 'get' and system time < lifetime_ms",
+      "output_rule": "Output 'relation=same' (reusing the currently valid identifier)",
+      "exact_values": [
+        "same"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "feature2_session_identity",
+      "input_condition": "event.op == 'get' and system time > lifetime_ms (or timeout_sequence indicates false)",
+      "output_rule": "Output 'relation=changed' (generate new identifier)",
+      "exact_values": [
+        "changed"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "feature2_session_identity",
+      "input_condition": "event.op == 'get' and system time < lifetime_ms (first request)",
+      "output_rule": "Output 'relation=new' (generate initial identifier)",
+      "exact_values": [
+        "new"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "feature2_session_identity",
+      "input_condition": "event.op == 'get' always executed",
+      "output_rule": "Output 'format=hex32' on the line immediately following the index/relation line",
+      "exact_values": [
+        "hex32"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "feature2_session_identity",
+      "input_condition": "event.op == 'get'",
+      "output_rule": "Output 'session_index=N' where N is the 0-based count of GETs executed so far",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "feature3_buffering_exporter",
+      "input_condition": "event.op == 'export' and buffers currently full",
+      "output_rule": "Return immediate result 'error:buffer_overflow' for the operation index",
+      "exact_values": [
+        "error:buffer_overflow"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "feature3_buffering_exporter",
+      "input_condition": "event.op == 'export' and buffers NOT full",
+      "output_rule": "Mark result as 'pending'. Do NOT call delegate immediately.",
+      "exact_values": [
+        "pending"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "feature3_buffering_exporter",
+      "input_condition": "event.op == 'flush' before delegate attached",
+      "output_rule": "Mark result as 'pending'. Count towards delegate_flushes later.",
+      "exact_values": [
+        "pending"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "feature3_buffering_exporter",
+      "input_condition": "event.op == 'shutdown' before delegate attached",
+      "output_rule": "Mark result as 'pending'. Count towards delegate_shutdowns later.",
+      "exact_values": [
+        "pending"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "feature3_buffering_exporter",
+      "input_condition": "event.op == 'set_delegate' triggered",
+      "output_rule": "Trigger immediate output of date_friday items, exports count, flushes count, and shutdowns count",
+      "exact_values": [
+        "delegate_items=",
+        "delegate_exports=",
+        "delegate_flushes=",
+        "delegate_shutdowns="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "feature3_buffering_exporter",
+      "input_condition": "event.op == 'export' after delegate attached",
+      "output_rule": "Return immediate success (no pending state reported for the specific export action in the device line)",
+      "exact_values": [
+        "success"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "feature4_disk_export_batches",
+      "input_condition": "event.op == 'each'",
+      "output_rule": "Output 'exported=true' regardless of individual result sequence",
+      "exact_values": [
+        "exported=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "feature4_disk_export_batches",
+      "input_condition": "event.op == 'spans' and availability.spans is false",
+      "output_rule": "Do not call the exporter. Result logic implies no call count for this signal type",
+      "exact_values": [
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "feature4_disk_export_batches",
+      "input_condition": "Any exporter called",
+      "output_rule": "All called exporters must report 'timeout_ms=5000' (default timeout)",
+      "exact_values": [
+        "5000"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "feature4_disk_export_batches",
+      "input_condition": "Availability declared for signal type S",
+      "output_rule": "Output call count incremented for S",
+      "exact_values": [
+        "calls=1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "feature5_disk_storage_paths",
+      "input_condition": "operation == 'temporary_dir' and input.preexisting array is provided",
+      "output_rule": "entries in output must be '0' regardless of input preexisting count (due to cleanup)",
+      "exact_values": [
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "feature5_disk_storage_paths",
+      "input_condition": "operation == 'temporary_dir' and input.preexisting is empty",
+      "output_rule": "entries in output must be '0'",
+      "exact_values": [
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "feature5_disk_storage_paths",
+      "input_condition": "input.cache_dir is provided",
+      "output_rule": "Custom signal_dir uses 'path={cache_dir}/opentelemetry/signals'",
+      "exact_values": [
+        "cache/opentelemetry/signals"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "feature5_disk_storage_paths",
+      "input_condition": "No custom signal_dir and default operation",
+      "output_rule": "Directory path defaults to '<cache_dir>/opentelemetry/signals'",
+      "exact_values": [
+        "cache/opentelemetry/signals"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "feature5_disk_storage_paths",
+      "input_condition": "operation == 'maximum_folder_size'",
+      "output_rule": "Calculate as total_size_int / 3 (integer division)",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "feature5_disk_storage_paths",
+      "input_condition": "operation == 'max_file_size'",
+      "output_rule": "Return the configured max_file_size value exactly (no division or modification)",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "feature6_periodic_work",
+      "input_condition": "Run index 0",
+      "output_rule": "Always execute the first run regardless of time",
+      "exact_values": [
+        "times_run=1",
+        "enqueued=1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "feature6_periodic_work",
+      "input_condition": "Run index > 0 and (advance_since_last_run < minimum_delay)",
+      "output_rule": "Do NOT execute. times_run remains same as previous run.",
+      "exact_values": [
+        "times_run=<previous>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "feature6_periodic_work",
+      "input_condition": "Run index > 0 and (advance_since_last_run >= minimum_delay)",
+      "output_rule": "Execute the task",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "feature6_periodic_work",
+      "input_condition": "stop_after_run is true in the current run config",
+      "output_rule": "Do not enqueue for the next run.",
+      "exact_values": [
+        "enqueued=<current_reject>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "feature6_periodic_work",
+      "input_condition": "stop_after_run is false in the current run config",
+      "output_rule": "Enqueue for the next run (increments enqueued count for next iteration)",
+      "exact_values": [
+        "enqueued=<current>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "feature7_log_enrichment",
+      "input_condition": "processor == 'global'",
+      "output_rule": "Output one line per attribute_set in the sequence",
+      "exact_values": [
+        "emit_index=",
+        "attributes="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "feature7_log_enrichment",
+      "input_condition": "processor == 'global'",
+      "output_rule": "Each attribute line must be sorted by key and formatted 'key=value'",
+      "exact_values": [
+        "key=value"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "feature8_slow_rendering_config",
+      "input_condition": "updates_ms contains a negative value",
+      "output_rule": "The negative value is rejected; the interval remains unchanged from the previous valid update",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "feature8_slow_rendering_config",
+      "input_condition": "updates_ms contains zero",
+      "output_rule": "Zero is rejected; interval unchanged",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "feature8_slow_rendering_config",
+      "input_condition": "updates_ms contains a positive value",
+      "output_rule": "Update interval to this positive value",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "feature4_disk_export_batches",
+      "input_condition": "Availability for all signals is true and one succeeds",
+      "output_rule": "Exported must be 'true'",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "feature4_disk_export_batches",
+      "input_condition": "Availability for a signal is false",
+      "output_rule": "Output call count for that signal must be 0 (or not appear if only failed? based on test: spans_calls=1 implies even if fail, if avail=true. If avail=false, call=0)",
+      "exact_values": [
+        "0"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C023",
+        "replacement": "a path combining the cache directory with a subfolder for signal storage",
+        "exact_values_to_replace": [
+          "cache/opentelemetry/signals"
+        ],
+        "trigger_keywords": [
+          "custom signal directory",
+          "cache dir signal path",
+          "empty signal path",
+          "directory structure for signals",
+          "where do signals go"
+        ],
+        "oracle_response": "The path is constructed by concatenating the provided cache_dir input with the literal string '/opentelemetry/signals', resulting in '<cache_dir>/opentelemetry/signals'."
+      },
+      {
+        "constraint_id": "C025",
+        "replacement": "a formula involving total storage usage and an integer divisor",
+        "exact_values_to_replace": [
+          ""
+        ],
+        "trigger_keywords": [
+          "maximum folder size calculation",
+          "how to get max folder size",
+          "formula for folder limit",
+          "integer division rule",
+          "calculate max folder capacity"
+        ],
+        "oracle_response": "The value is calculated using integer division: total_size_int divided by 3."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C005",
+        "vague_phrase": "when  θερπογραμματοratio indicates activity",
+        "actual_meaning": "This refers to the specific output rule logic being triggered when the service transitions from background to foreground, specifically regarding 'bump' events."
+      },
+      {
+        "constraint_id": "C032",
+        "vague_phrase": "for emit_index logic",
+        "actual_meaning": "This refers to the specific output rule formatting emitted for each attribute_set when the processor is set to 'global'."
+      }
+    ]
+  }
+}

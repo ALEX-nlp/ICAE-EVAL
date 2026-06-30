@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need a traffic throttling library built in Rust that devs can drop into any service to control how fast work gets processed. The basic idea is you configure an allowance — like '50 requests per second' or '2 per minute' — and then ask the library 'can this go through?' and it says yes or no, and if no it tells you exactly how long to wait before retrying. We also need it to handle bulkier workloads where you want to admit like 5 or 10 units at once, not just one at a time.
+
+One big thing: it needs to be fully testable without depending on the system clock — remember how we solved that in the auth middleware last quarter? Same kind of pattern, the clock needs to be injectable so tests are deterministic.
+
+Also need per-key isolation, so different tenants or endpoints each get their own independent budget under one shared config. And there should be a way to clean up stale keys periodically so memory doesn't grow forever.
+
+Finally, a 'state reporting' mode where admitted requests also reveal how much budget is left — useful for dashboards or client hints.
+
+All durations should be in nanoseconds internally. The adapter layer should read a single JSON command from stdin and write plain text lines to stdout. Exact output format details are in the test cases but basically think 'check allow', 'check deny wait_ns=...', that kind of thing.
+
+Quick follow-up from the questions that came in: for the time-shaped quotas, the defaults should be predictable. For per_second, per_minute, and per_hour, if someone gives a count and doesn’t say otherwise, the default burst_size equals that count, so per_second=50 gives burst_size=50. replenish_interval_ns should be the time base in nanoseconds divided by the count, and burst_replenish_all_ns should be replenish_interval_ns multiplied by burst_size. Also, any zero replenishment period is invalid. For quota_build, if with_period_ms is 0, or if a new quota would have zero total replenishment time, the system outputs exactly 'error=invalid_period\n' and nothing else for that result — no quota properties are printed.
+
+A couple adapter format details to lock down too. check_key_n needs to print exactly 'check_key_n key=<K> n=<N> allow\n' or 'check_key_n key=<K> n=<N> deny wait_ns=<w>\n' or 'check_key_n key=<K> n=<N> error=insufficient_capacity max=<m>\n'. The key= and n= fields always come before the result word. Along the same lines, when check_n or check_key_n is called with n greater than the quota's burst_size, the system outputs 'check_n n=<N> error=insufficient_capacity max=<burst_size>\n' or the keyed form, and that’s not something waiting can fix — if n is bigger than s burst_size, the system outputs that insufficient capacity result regardless of clock time.
+
+For the bookkeeping ops, len always outputs 'len count=<n> empty=<bool>\n'. The bool should literally be 'true' or 'false' in lowercase, with count=0 meaning empty is 'true' and count>=1 meaning 'false'. The virtual clock also needs to be very literal: every simulate action starts at exactly zero nanoseconds, advance_ms stacks additively, and the output should report the absolute total as 'advance now_ns=<total_ns>'.
+
+And just to be explicit on the testability piece, this should use an injectable clock abstraction, a Clock trait/interface, so we can swap in a deterministic VirtualClock instead of real wall-clock time in tests. That’s the same intent as the earlier note about not depending on the system clock. Last thing: we do want retain_recent to evict keys whose state has fully replenished back to initial, and shrink_to_fit to compact internal storage allocation, used together as part of the keyed-state cleanup story.

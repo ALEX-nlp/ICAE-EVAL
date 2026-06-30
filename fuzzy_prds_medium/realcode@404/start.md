@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to build out the spreadsheet export engine for the next release. Basically we want something that can take a bunch of in-memory spreadsheet data and spit out the right XML chunks that get assembled into a real .xlsx file. There are a bunch of little conversion helpers we need too — like turning grid coordinates into the letter-number cell names people are used to seeing, figuring out what type a value is when nobody tells us explicitly, and converting calendar dates into the weird number format spreadsheets use internally.
+
+We also need serialization for all the layout-y stuff — margins, print settings, column widths, row heights, merged cells, filters, that kind of thing. Oh and protection settings with the password thing — similar to how we handled it in the auth module a while back, just a short hash, not storing it in plain text obviously.
+
+The whole thing should be broken up into sensible files, not just one giant blob. Each operation should get called via a JSON command on stdin and print the result to stdout with no extra junk. Errors should come back as a clean normalized token, not raw exceptions.
+
+Range references need to handle both relative and absolute forms, and the absolute ones need the sheet name quoted properly with special characters escaped. Date handling needs to support two different epoch modes. Basically just make sure all the edge cases are solid — invalid inputs, out-of-range numbers, unrecognized enum values, etc.
+
+One extra pass on the edge cases the team asked about: the column ordinals are zero-based, and the letters follow the bijective base-26 pattern spreadsheets use. So ordinal 0 → A, ordinal 25 → Z, ordinal 26 → AA, ordinal 702 → AAA, ordinal 727 → AAZ, ordinal 728 → ABA, ordinal 2048 → BZU. There is no 'zero' letter in there, so after Z it grows to AA rather than restarting.
+
+On the date side, we do need both epoch conventions working exactly. The default is date1904=false, and in that mode day-zero is before 1900-01-01, which means 1900-01-01 serializes to 2.0 and 1893-08-05 serializes to -2338.0. The alternate is date1904=true, where 1904-01-01 is day 0.0. Time values are still just fractional days added onto the integer day count, same idea as normal spreadsheet date serial numbers.
+
+A couple more specifics on value inference and formula handling too. If a string starts with '=' and escape_formulas=false, treat it as a formula: strip the leading '=' and put the expression in a <f> element, with t="str" on the <c>. If it is an array formula wrapped in braces like '{=SUM(...)}', serialize it as <f t="array" ref="cellref"> and remove the braces and leading =. But if escape_formulas=true, then do not treat it as a formula at all — emit the string verbatim as an inline string with t="inlineStr" and <is><t> wrapping. For inferred string types, only classify as iso_8601 when the string matches the combined date-and-time format WITHOUT a timezone offset, like '2008-08-30T01:45:36.123' → iso_8601. If it has a timezone offset like '+09:00' or 'Z', it stays a plain string. Also, scientific notation strings that are in range should be float, but out-of-range ones like '1e309' should fall back to string.
+
+For the command runner behavior, please keep it really strict: write the result string to stdout with NO trailing newline and nothing else. No logs, prompts, or metadata. If one response includes multiple result items, join them with a single newline ('\n') character between them.
+
+Also worth being explicit that boolean XML attributes should always come out as '1' for true and '0' for false, never the words 'true' or 'false'. That applies everywhere in these fragments, including printOptions, sheetProtection, pane attributes, filter column flags, and the rest.
+
+And on protection, the password is never stored verbatim. It needs to be converted using the legacy XOR-based spreadsheet password hash algorithm, then emitted as the `password` attribute on the sheetProtection element as a short uppercase hexadecimal hash digest. For example, the password 'fish' produces the hash 'CA3F'.

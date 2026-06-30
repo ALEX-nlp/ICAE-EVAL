@@ -1,0 +1,890 @@
+{
+  "fuzzy_prd": "# Compact Token Issuance and Verification Service\n\n## Project Goal\n\nBuild a library that issues and verifies **compact, URL-safe security tokens** that carry a set of assertions (\"claims\") about a subject. The library must let a caller:\n\n- Describe and resolve **signature-algorithm metadata** by name.\n- **Serialize** an unsecured token (no signature) into the canonical compact wire format.\n- **Build** a claims set (registered + arbitrary custom claims) and round-trip it through serialization and parsing.\n- **Sign** a token with a keyed-MAC algorithm and later **verify** it, recovering header and body.\n- Optionally **compress** the body before signing and transparently decompress it on parse.\n- **Parse** an arbitrary token, recovering the declared algorithm and the body.\n- **Parse with a required shape** (signed vs. unsigned, claims vs. plaintext) and reject mismatches.\n- Enforce **required claims** and **time-based validity** (expiration / not-before).\n- **Reject malformed input and forgery attempts** with precise, language-neutral error categories.\n\nThe observable contract is a line-oriented `key=value` stdout stream produced by a thin adapter around the library. Every behavior below is specified purely as *input → output*.\n\n## Background & Problem\n\nDistributed systems need a way to pass trustworthy, self-contained assertions between parties without a shared session store. A compact token packs three dot-separated, base64url-encoded segments — a **header** (declaring the algorithm), a **body** (the payload or claims), and a **signature** — into a single ASCII string safe for use in URLs and HTTP headers.\n\nThe hard parts are not the happy paths but the guarantees around them:\n\n- The wire format must be **byte-for-byte reproducible** so independent implementations interoperate.\n- Parsing untrusted input must **fail safe**: every structurally or semantically invalid token must map to a *specific, predictable* failure category, never an ambiguous crash.\n- The verifier must **resist algorithm-substitution forgery**, where an attacker re-signs a token using a public key's bytes as a MAC secret and hopes the verifier blindly accepts it.\n- Claim-level policy (required claims, expiration, not-before) must be enforced **at parse time**, consistently.\n\nThis document specifies those behaviors as a deterministic input/output contract so that any implementation can be validated mechanically.\n\n## Architecture & Engineering Constraints\n\n- **Single process, single shot.** Each invocation reads exactly one JSON object from stdin and writes a deterministic, line-oriented `key=value` result to stdout. There is no network, no persistence, no clock-dependent output on the happy paths.\n- **Stdin schema.** The input object always carries an `op` field selecting the operation. Remaining fields are operation-specific (documented per feature).\n- **Stdout schema.** Output is zero or more `key=value` lines separated by `\\n`. Lines are emitted in the order specified per feature. Registered claims use short keys (`iss`, `sub`, `aud`, `jti`, `exp`, `nbf`, `iat`); custom claims use the `claim.<name>` prefix and are emitted in ascending key order.\n- **Keys.** Where a keyed-MAC secret is required it is provided as a base64url string and decoded to raw bytes; identical key + algorithm + body always yields an identical token.\n- **Date claims** are normalized to **integer seconds since the Unix epoch** on output.\n- **Algorithm names** are matched case-insensitively when resolving; the canonical `[a specific header constant (e.g., 'none','skip','null')]` algorithm's wire value is the lowercase string `[a specific header constant (e.g., 'none','skip','null')]`.\n- **Error model (language-neutral).** Failures are rendered as a single primary line `error=<category>` optionally followed by a discriminator line (`reason=<...>` or `claim=<name>`). No host-language exception type names, stack traces, or runtime message text ever appear in output. The categories are:\n  - `malformed` — structurally invalid token; `reason` ∈ {`period_count`, `missing_body`}.\n  - `unsupported` — well-formed but wrong shape/key relationship; `reason` ∈ {`[valid error reasons related to shape mismatch]`, `[valid error reasons related to shape mismatch]`, `[valid error reasons related to shape mismatch]`, `algorithm_key_mismatch`}.\n  - `signature_invalid` — signature verification failed or an unknown algorithm name was requested.\n  - `expired` / `premature` — time-based validity failures (no wall-clock timestamps in output).\n  - `incorrect_claim` / `missing_claim` — required-claim failures; carry a `claim=<name>` line.\n  - `illegal_state` — an internally inconsistent build request.\n  - `illegal_argument` — a null/blank input or an algorithm/key-type mismatch supplied at build time.\n- **Adapter-only test surface.** The functional library is exercised unmodified; a thin dispatcher maps JSON ops onto the public API and renders results (including native errors) into the neutral contract above.\n- **Reproducibility.** Asymmetric-key round-trips are non-deterministic by nature and are therefore only asserted via their *neutral failure category*, never via exact token bytes. All exact-token assertions use fixed MAC secrets.\n\n## Core Features\n\n### Feature 1: Signature-algorithm metadata\n\nResolve metadata for a signature algorithm by name.\n\n- `op=algorithm_info`, field `name`: emit the canonical wire `value`, a human `description`, the `family`, a `jdk_standard` flag, and the family predicates `hmac` / `rsa` / `elliptic_curve`.\n- `op=algorithm_for_name`, field `name`: case-insensitive resolution emitting `value` and `family`; an unrecognized name yields `error=signature_invalid`.\n\nExample cases:\n\n```json\n{\"op\": \"algorithm_info\", \"name\": \"HS256\"}\n```\n→\n```\nvalue=HS256\ndescription=HMAC using SHA-256\nfamily=HMAC\njdk_standard=true\nhmac=true\nrsa=false\nelliptic_curve=false\n```\n\n```json\n{\"op\": \"algorithm_info\", \"name\": \"RS256\"}\n```\n→\n```\nvalue=RS256\ndescription=RSASSA-PKCS-v1_5 using SHA-256\nfamily=RSA\njdk_standard=true\nhmac=false\nrsa=true\nelliptic_curve=false\n```\n\n```json\n{\"op\": \"algorithm_info\", \"name\": \"ES256\"}\n```\n→\n```\nvalue=ES256\ndescription=ECDSA using P-256 and SHA-256\nfamily=Elliptic Curve\njdk_standard=false\nhmac=false\nrsa=false\nelliptic_curve=true\n```\n\n```json\n{\"op\": \"algorithm_info\", \"name\": \"NONE\"}\n```\n→\n```\nvalue=[a specific header constant (e.g., 'none','skip','null')]\ndescription=No digital signature or MAC performed\nfamily=None\njdk_standard=false\nhmac=false\nrsa=false\nelliptic_curve=false\n```\n\n```json\n{\"op\": \"algorithm_for_name\", \"name\": \"hs256\"}\n```\n→\n```\nvalue=HS256\nfamily=HMAC\n```\n\n```json\n{\"op\": \"algorithm_for_name\", \"name\": \"foo\"}\n```\n→\n```\nerror=signature_invalid\n```\n\n### Feature 2: Unsecured token serialization\n\nSerialize an unsecured token (algorithm `[a specific header constant (e.g., 'none','skip','null')]`) into the canonical compact form: header, base64url body, and an empty trailing signature segment. Output must match the specification example byte-for-byte.\n\n- `op=build_plaintext`, field `payload` (string): emit `token=<compact string>`.\n\nExample cases:\n\n```json\n{\"op\": \"build_plaintext\", \"payload\": \"{\\\"iss\\\":\\\"joe\\\",\\r\\n \\\"exp\\\":1300819380,\\r\\n \\\"http://example.com/is_root\\\":true}\"}\n```\n→\n```\ntoken=eyJhbGciOiJub25lIn0.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.\n```\n\n```json\n{\"op\": \"build_plaintext\", \"payload\": \"Hello world!\"}\n```\n→\n```\ntoken=eyJhbGciOiJub25lIn0.SGVsbG8gd29ybGQh.\n```\n\n### Feature 3: Claims round-trip\n\nBuild a claims token via registered-claim setters and arbitrary custom claims, then parse it back and recover the claim set. Setting a registered claim to null removes it. Date-valued claims are stored as integer seconds.\n\n- `op=build_parse_claims`, field `claims` (object), optional `unset` (array of claim names to remove): emit recovered claims (registered first under short keys, then custom under `claim.<name>` sorted ascending).\n\nExample cases:\n\n```json\n{\"op\": \"build_parse_claims\", \"claims\": {\"iss\": \"Me\"}}\n```\n→\n```\niss=Me\n```\n\n```json\n{\"op\": \"build_parse_claims\", \"claims\": {\"iss\": \"Me\", \"sub\": \"Joe\"}, \"unset\": [\"iss\"]}\n```\n→\n```\nsub=Joe\n```\n\n```json\n{\"op\": \"build_parse_claims\", \"claims\": {\"iss\": \"Iss\", \"sub\": \"Sub\", \"aud\": \"Aud\", \"jti\": \"Id\"}}\n```\n→\n```\niss=Iss\nsub=Sub\naud=Aud\njti=Id\n```\n\n```json\n{\"op\": \"build_parse_claims\", \"claims\": {\"exp\": 9999999999000, \"nbf\": 1000000000000, \"iat\": 1000000000000}}\n```\n→\n```\nexp=9999999999\nnbf=1000000000\niat=1000000000\n```\n\n```json\n{\"op\": \"build_parse_claims\", \"claims\": {\"sub\": \"Joe\", \"role\": \"admin\", \"count\": 5}}\n```\n→\n```\nsub=Joe\nclaim.count=5\nclaim.role=admin\n```\n\n### Feature 4: Keyed-MAC signing and verification\n\nSign with an HMAC-SHA algorithm using a fixed shared secret (deterministic output), then verify and recover the header algorithm and body. Works for claims bodies and arbitrary plaintext across the 256/384/512 family.\n\n- `op=sign_verify`, fields `alg`, `key` (base64url secret), one of `claims` (object) or `payload` (string), optional `emit_token` (bool): emit optional `token=...` then `alg=<HS...>` then the recovered body/claims.\n\nExample cases:\n\n```json\n{\"op\": \"sign_verify\", \"alg\": \"HS256\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\", \"claims\": {\"sub\": \"Joe\"}, \"emit_token\": true}\n```\n→\n```\ntoken=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKb2UifQ.qs8rO_cGp7ctWsq-yGbVzJ-cjAhzdLh1jP0296AC9Ac\nalg=HS256\nsub=Joe\n```\n\n```json\n{\"op\": \"sign_verify\", \"alg\": \"HS384\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8w\", \"claims\": {\"sub\": \"Joe\"}}\n```\n→\n```\nalg=HS384\nsub=Joe\n```\n\n```json\n{\"op\": \"sign_verify\", \"alg\": \"HS512\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA\", \"payload\": \"Hello world!\"}\n```\n→\n```\nalg=HS512\nbody=Hello world!\n```\n\n### Feature 5: Payload compression\n\nCompress the body before signing and transparently decompress on parse; the header records the compression algorithm. Supports the two built-in codecs (`DEF`, `GZIP`) and a caller-supplied custom codec resolved by name during parsing.\n\n- `op=compress_roundtrip`, fields `key`, `codec` (`DEF` | `GZIP` | `CUSTOM`), one of `claims` / `payload`: emit `calg=<codec>` then the recovered body/claims.\n\nExample cases:\n\n```json\n{\"op\": \"compress_roundtrip\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\", \"codec\": \"DEF\", \"claims\": {\"sub\": \"Joe\"}}\n```\n→\n```\ncalg=DEF\nsub=Joe\n```\n\n```json\n{\"op\": \"compress_roundtrip\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\", \"codec\": \"GZIP\", \"claims\": {\"sub\": \"Joe\"}}\n```\n→\n```\ncalg=GZIP\nsub=Joe\n```\n\n```json\n{\"op\": \"compress_roundtrip\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\", \"codec\": \"CUSTOM\", \"claims\": {\"sub\": \"Joe\"}}\n```\n→\n```\ncalg=CUSTOM\nsub=Joe\n```\n\n### Feature 6: Token parsing and structural validation\n\nParse an arbitrary compact token without asserting its shape: recover the declared header algorithm and the body. Structurally invalid strings are rejected with a neutral category and a `reason`; a null input is rejected as an invalid argument.\n\n- `op=parse`, field `token` (string or null), optional `key`: emit `alg=<value>` then body/claims, or a neutral error.\n- A well-formed token has exactly two separators (wrong count → `reason=period_count`); the body segment must be non-empty (→ `reason=missing_body`).\n\nExample cases:\n\n```json\n{\"op\": \"parse\", \"token\": \"foo\"}\n```\n→\n```\nerror=malformed\nreason=period_count\n```\n\n```json\n{\"op\": \"parse\", \"token\": \".\"}\n```\n→\n```\nerror=malformed\nreason=period_count\n```\n\n```json\n{\"op\": \"parse\", \"token\": \"..\"}\n```\n→\n```\nerror=malformed\nreason=missing_body\n```\n\n```json\n{\"op\": \"parse\", \"token\": \"eyJhbGciOiJub25lIn0.SGVsbG8gd29ybGQh.\"}\n```\n→\n```\nalg=[a specific header constant (e.g., 'none','skip','null')]\nbody=Hello world!\n```\n\n```json\n{\"op\": \"parse\", \"token\": \"eyJhbGciOiJub25lIn0.eyJzdWIiOiJKb2UifQ.\"}\n```\n→\n```\nalg=[a specific header constant (e.g., 'none','skip','null')]\nsub=Joe\n```\n\n```json\n{\"op\": \"parse\", \"token\": \"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKb2UifQ.qs8rO_cGp7ctWsq-yGbVzJ-cjAhzdLh1jP0296AC9Ac\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\"}\n```\n→\n```\nalg=HS256\nsub=Joe\n```\n\n```json\n{\"op\": \"parse\", \"token\": null}\n```\n→\n```\nerror=illegal_argument\n```\n\n### Feature 7: Shape-asserting parsing\n\nParse while asserting an exact token shape (unsecured-plaintext, unsecured-claims, signed-plaintext, signed-claims). A token whose actual shape differs from the requested one is rejected with `error=unsupported` and a `reason`; a signed token verified with the wrong key is rejected as an invalid signature.\n\n- `op=parse_typed`, fields `token`, `method` (`plaintext_jwt` | `claims_jwt` | `plaintext_jws` | `claims_jws`), optional `key`: emit `kind=<method>` then (for signed forms) `alg=...` then body/claims; or a neutral error.\n\nExample cases:\n\n```json\n{\"op\": \"parse_typed\", \"token\": \"eyJhbGciOiJub25lIn0.SGVsbG8gd29ybGQh.\", \"method\": \"plaintext_jwt\"}\n```\n→\n```\nkind=plaintext_jwt\nbody=Hello world!\n```\n\n```json\n{\"op\": \"parse_typed\", \"token\": \"eyJhbGciOiJub25lIn0.eyJzdWIiOiJKb2UifQ.\", \"method\": \"claims_jwt\"}\n```\n→\n```\nkind=claims_jwt\nsub=Joe\n```\n\n```json\n{\"op\": \"parse_typed\", \"token\": \"eyJhbGciOiJIUzI1NiJ9.SGVsbG8gd29ybGQh.4Luu4D1QDg0vorxFuBy4sFq090uoZMwkkGfVFsOeqTw\", \"method\": \"plaintext_jws\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\"}\n```\n→\n```\nkind=plaintext_jws\nalg=HS256\nbody=Hello world!\n```\n\n```json\n{\"op\": \"parse_typed\", \"token\": \"eyJhbGciOiJub25lIn0.SGVsbG8gd29ybGQh.\", \"method\": \"claims_jwt\"}\n```\n→\n```\nerror=unsupported\nreason=[valid error reasons related to shape mismatch]\n```\n\n```json\n{\"op\": \"parse_typed\", \"token\": \"eyJhbGciOiJub25lIn0.eyJzdWIiOiJKb2UifQ.\", \"method\": \"plaintext_jwt\"}\n```\n→\n```\nerror=unsupported\nreason=[valid error reasons related to shape mismatch]\n```\n\n```json\n{\"op\": \"parse_typed\", \"token\": \"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKb2UifQ.qs8rO_cGp7ctWsq-yGbVzJ-cjAhzdLh1jP0296AC9Ac\", \"method\": \"claims_jws\", \"key\": \"Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbA\"}\n```\n→\n```\nerror=signature_invalid\n```\n\n### Feature 8: Required-claim enforcement\n\nAssert that a parsed token contains required claims with expected values. A matching claim verifies and recovers the claim set; a present-but-wrong value is `incorrect_claim`; a required-but-absent claim is `missing_claim`. Works for registered and custom claims.\n\n- `op=require_claim`, fields `key`, `claims` (object to sign), `require` (`{name, value}`): emit `verified=true` then claims, or a neutral error carrying `claim=<name>`.\n\nExample cases:\n\n```json\n{\"op\": \"require_claim\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\", \"claims\": {\"sub\": \"Joe\"}, \"require\": {\"name\": \"sub\", \"value\": \"Joe\"}}\n```\n→\n```\nverified=true\nsub=Joe\n```\n\n```json\n{\"op\": \"require_claim\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\", \"claims\": {\"sub\": \"Joe\"}, \"require\": {\"name\": \"sub\", \"value\": \"Wrong\"}}\n```\n→\n```\nerror=incorrect_claim\nclaim=sub\n```\n\n```json\n{\"op\": \"require_claim\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\", \"claims\": {\"sub\": \"Joe\"}, \"require\": {\"name\": \"iss\", \"value\": \"Me\"}}\n```\n→\n```\nerror=missing_claim\nclaim=iss\n```\n\n```json\n{\"op\": \"require_claim\", \"key\": \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\", \"claims\": {\"role\": \"admin\"}, \"require\": {\"name\": \"role\", \"value\": \"admin\"}}\n```\n→\n```\nverified=true\nclaim.role=admin\n```\n\n### Feature 9: Temporal validity enforcement\n\nEnforce time-based validity on parse. A token with no temporal constraints (or with currently-satisfied constraints) verifies; a past expiration is `expired`; a future not-before is `premature`. Error outcomes carry only a neutral category — no wall-clock timestamps.\n\n- `op=lifecycle`, field `sub`, optional `exp_offset_sec` / `nbf_offset_sec` (relative to now): emit `valid=true` then claims, or a neutral error.\n\nExample cases:\n\n```json\n{\"op\": \"lifecycle\", \"sub\": \"Joe\"}\n```\n→\n```\nvalid=true\nsub=Joe\n```\n\n```json\n{\"op\": \"lifecycle\", \"sub\": \"Joe\", \"exp_offset_sec\": -1000}\n```\n→\n```\nerror=expired\n```\n\n```json\n{\"op\": \"lifecycle\", \"sub\": \"Joe\", \"nbf_offset_sec\": 10000}\n```\n→\n```\nerror=premature\n```\n\n### Feature 10: Build-request validation\n\nReject internally inconsistent build requests before any token is produced.\n\n- `op=builder_validate`, field `mode`:\n  - `empty` — compacting an empty builder → `error=illegal_state`.\n  - `both_payload_and_claims` — supplying both a plaintext payload and claims → `error=illegal_state`.\n  - `bytes_without_hmac` / `base64_bytes_without_hmac` — supplying raw key bytes with a non-HMAC algorithm → `error=illegal_argument`.\n\nExample cases:\n\n```json\n{\"op\": \"builder_validate\", \"mode\": \"empty\"}\n```\n→\n```\nerror=illegal_state\n```\n\n```json\n{\"op\": \"builder_validate\", \"mode\": \"both_payload_and_claims\"}\n```\n→\n```\nerror=illegal_state\n```\n\n```json\n{\"op\": \"builder_validate\", \"mode\": \"bytes_without_hmac\"}\n```\n→\n```\nerror=illegal_argument\n```\n\n### Feature 11: Algorithm-substitution forgery resistance\n\nResist a forgery where an attacker re-signs a token with HMAC using an asymmetric public key's encoded bytes as the MAC secret. When the token is verified with the asymmetric key, the library must refuse rather than accept the forgery, surfacing a neutral category.\n\n- `op=forge_hmac_with_key`, field `key_type` (`rsa` | `ec`): always → `error=unsupported`, `reason=algorithm_key_mismatch`.\n\nExample cases:\n\n```json\n{\"op\": \"forge_hmac_with_key\", \"key_type\": \"rsa\"}\n```\n→\n```\nerror=unsupported\nreason=algorithm_key_mismatch\n```\n\n```json\n{\"op\": \"forge_hmac_with_key\", \"key_type\": \"ec\"}\n```\n→\n```\nerror=unsupported\nreason=algorithm_key_mismatch\n```\n\n## Deliverables\n\n- A library exposing the operations above through a single stdin→stdout adapter, producing the exact deterministic `key=value` output specified per feature.\n- A line-oriented, language-neutral **error contract** covering structural, semantic, signature, temporal, claim-policy, and build-time failures, with no host-language leakage.\n- A contract test suite driven by `rcb_tests/test.sh`:\n  - `rcb_tests/test_cases/featureN_*.json` — the full hidden evaluation set (one file per leaf feature).\n  - `rcb_tests/public_test_cases/featureN_*.json` — the subset embedded in this document.\n  - `rcb_tests/dispatcher/` — the adapter that maps JSON ops onto the library and renders the neutral contract.\n  - The harness reads each case's `input`, feeds it to the adapter, captures raw stdout to `rcb_tests/stdout/<cases-dir>/<stem>@<NNN>.txt`, and compares against `expected_output`, reporting per-case PASS/FAIL and a final `test_cases: N/N pass` summary.\n\n\n---\n**Implementation notes:**\n- follow the internal documentation order for standard claims\n- a sample Unix timestamp value used for testing\n",
+  "oracle_data": {
+    "task_id": "jwtk__jjwt-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "build plaintext header",
+          "header value none",
+          "plaintext header constant",
+          "build_plaintext header",
+          "what is the header value"
+        ],
+        "oracle_response": "The header value must be the literal string 'none'."
+      },
+      {
+        "constraint_id": "C021",
+        "trigger_keywords": [
+          "c021 error reasons",
+          "unsupported error list",
+          "counterfit error reasons",
+          "mismatch error values",
+          "what are the valid unsupported reasons"
+        ],
+        "oracle_response": "The valid reasons are: unsigned_plaintext_jwt, unsigned_claims_jwt, signed_claims_jws."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the internal documentation order for standard claims",
+        "actual_meaning": "The sequence iss, sub, aud, jti, exp, nbf, iat corresponds to the order of declaration in the internal `CLAIMS_STANDARD` enum or config constant within the `start` module."
+      },
+      {
+        "vague_reference": "a sample Unix timestamp value used for testing",
+        "actual_meaning": "1300819380 is a literal integer hardcoded into the unit test suite to represent a valid expiration time for the assertions."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_builder_validation.json": {
+      "description": "Reject invalid build requests. Compacting an empty builder is an illegal state; specifying both a plaintext payload and claims is an illegal state; supplying a non-HMAC algorithm with raw key bytes is an invalid argument.",
+      "cases": [
+        {
+          "input": {
+            "op": "builder_validate",
+            "mode": "empty"
+          },
+          "expected_output": "error=illegal_state"
+        },
+        {
+          "input": {
+            "op": "builder_validate",
+            "mode": "both_payload_and_claims"
+          },
+          "expected_output": "error=illegal_state"
+        },
+        {
+          "input": {
+            "op": "builder_validate",
+            "mode": "bytes_without_hmac"
+          },
+          "expected_output": "error=illegal_argument"
+        }
+      ]
+    },
+    "feature11_forgery_resistance.json": {
+      "description": "Resist an algorithm-substitution forgery: an attacker re-signs a token with HMAC using an asymmetric public key's encoded bytes as the MAC secret. When the token is verified with the asymmetric key, the library refuses rather than accepting the forgery, surfacing a neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "op": "forge_hmac_with_key",
+            "key_type": "rsa"
+          },
+          "expected_output": "error=unsupported\nreason=algorithm_key_mismatch"
+        },
+        {
+          "input": {
+            "op": "forge_hmac_with_key",
+            "key_type": "ec"
+          },
+          "expected_output": "error=unsupported\nreason=algorithm_key_mismatch"
+        }
+      ]
+    },
+    "feature1_signature_algorithm_metadata.json": {
+      "description": "Resolve signature-algorithm metadata by name: each algorithm exposes its canonical wire value, a human-readable description, an algorithm family, whether it is guaranteed by a standard platform runtime, and family predicates (HMAC / RSA / elliptic-curve). Names can also be looked up case-insensitively, and an unrecognized name is rejected.",
+      "cases": [
+        {
+          "input": {
+            "op": "algorithm_info",
+            "name": "HS256"
+          },
+          "expected_output": "value=HS256\ndescription=HMAC using SHA-256\nfamily=HMAC\njdk_standard=true\nhmac=true\nrsa=false\nelliptic_curve=false"
+        },
+        {
+          "input": {
+            "op": "algorithm_info",
+            "name": "RS256"
+          },
+          "expected_output": "value=RS256\ndescription=RSASSA-PKCS-v1_5 using SHA-256\nfamily=RSA\njdk_standard=true\nhmac=false\nrsa=true\nelliptic_curve=false"
+        },
+        {
+          "input": {
+            "op": "algorithm_info",
+            "name": "ES256"
+          },
+          "expected_output": "value=ES256\ndescription=ECDSA using P-256 and SHA-256\nfamily=Elliptic Curve\njdk_standard=false\nhmac=false\nrsa=false\nelliptic_curve=true"
+        },
+        {
+          "input": {
+            "op": "algorithm_info",
+            "name": "NONE"
+          },
+          "expected_output": "value=none\ndescription=No digital signature or MAC performed\nfamily=None\njdk_standard=false\nhmac=false\nrsa=false\nelliptic_curve=false"
+        },
+        {
+          "input": {
+            "op": "algorithm_for_name",
+            "name": "hs256"
+          },
+          "expected_output": "value=HS256\nfamily=HMAC"
+        },
+        {
+          "input": {
+            "op": "algorithm_for_name",
+            "name": "foo"
+          },
+          "expected_output": "error=signature_invalid"
+        }
+      ]
+    },
+    "feature2_unsecured_token_serialization.json": {
+      "description": "Serialize an unsecured token (no signature) into compact form. The header declares the 'none' algorithm, the payload is base64url-encoded, and an empty signature segment terminates the string. The wire output matches the canonical specification example byte-for-byte.",
+      "cases": [
+        {
+          "input": {
+            "op": "build_plaintext",
+            "payload": "{\"iss\":\"joe\",\r\n \"exp\":1300819380,\r\n \"http://example.com/is_root\":true}"
+          },
+          "expected_output": "token=eyJhbGciOiJub25lIn0.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ."
+        },
+        {
+          "input": {
+            "op": "build_plaintext",
+            "payload": "Hello world!"
+          },
+          "expected_output": "token=eyJhbGciOiJub25lIn0.SGVsbG8gd29ybGQh."
+        }
+      ]
+    },
+    "feature3_claims_roundtrip.json": {
+      "description": "Build a claims token using registered-claim convenience setters and arbitrary custom claims, then parse it back and recover the claim set. Setting a registered claim to null removes it. Date-valued claims (expiration / not-before / issued-at) are stored as integer seconds since the epoch.",
+      "cases": [
+        {
+          "input": {
+            "op": "build_parse_claims",
+            "claims": {
+              "iss": "Me"
+            }
+          },
+          "expected_output": "iss=Me"
+        },
+        {
+          "input": {
+            "op": "build_parse_claims",
+            "claims": {
+              "iss": "Me",
+              "sub": "Joe"
+            },
+            "unset": [
+              "iss"
+            ]
+          },
+          "expected_output": "sub=Joe"
+        },
+        {
+          "input": {
+            "op": "build_parse_claims",
+            "claims": {
+              "iss": "Iss",
+              "sub": "Sub",
+              "aud": "Aud",
+              "jti": "Id"
+            }
+          },
+          "expected_output": "iss=Iss\nsub=Sub\naud=Aud\njti=Id"
+        },
+        {
+          "input": {
+            "op": "build_parse_claims",
+            "claims": {
+              "exp": 9999999999000,
+              "nbf": 1000000000000,
+              "iat": 1000000000000
+            }
+          },
+          "expected_output": "exp=9999999999\nnbf=1000000000\niat=1000000000"
+        },
+        {
+          "input": {
+            "op": "build_parse_claims",
+            "claims": {
+              "sub": "Joe",
+              "role": "admin",
+              "count": 5
+            }
+          },
+          "expected_output": "sub=Joe\nclaim.count=5\nclaim.role=admin"
+        }
+      ]
+    },
+    "feature4_mac_signing.json": {
+      "description": "Sign a token with an HMAC-SHA algorithm using a fixed shared secret, producing a deterministic compact output, then verify it and recover the header algorithm and body. Works for claims bodies and arbitrary plaintext bodies across the HMAC family (256/384/512).",
+      "cases": [
+        {
+          "input": {
+            "op": "sign_verify",
+            "alg": "HS256",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "claims": {
+              "sub": "Joe"
+            },
+            "emit_token": true
+          },
+          "expected_output": "token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKb2UifQ.qs8rO_cGp7ctWsq-yGbVzJ-cjAhzdLh1jP0296AC9Ac\nalg=HS256\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "sign_verify",
+            "alg": "HS384",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8w",
+            "claims": {
+              "sub": "Joe"
+            }
+          },
+          "expected_output": "alg=HS384\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "sign_verify",
+            "alg": "HS512",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA",
+            "payload": "Hello world!"
+          },
+          "expected_output": "alg=HS512\nbody=Hello world!"
+        }
+      ]
+    },
+    "feature5_payload_compression.json": {
+      "description": "Compress the token body before signing and transparently decompress it on parse. The header records the compression algorithm. Supports the two built-in codecs (DEFLATE, GZIP) and a caller-supplied custom codec resolved by name during parsing.",
+      "cases": [
+        {
+          "input": {
+            "op": "compress_roundtrip",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "codec": "DEF",
+            "claims": {
+              "sub": "Joe"
+            }
+          },
+          "expected_output": "calg=DEF\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "compress_roundtrip",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "codec": "GZIP",
+            "claims": {
+              "sub": "Joe"
+            }
+          },
+          "expected_output": "calg=GZIP\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "compress_roundtrip",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "codec": "CUSTOM",
+            "claims": {
+              "sub": "Joe"
+            }
+          },
+          "expected_output": "calg=CUSTOM\nsub=Joe"
+        }
+      ]
+    },
+    "feature6_token_parsing.json": {
+      "description": "Parse an arbitrary compact token without asserting its shape: recover the header algorithm and the body (claims or plaintext). Structurally invalid strings are rejected with a neutral error category and a reason (wrong number of separators, missing body), and a null input is rejected as an invalid argument.",
+      "cases": [
+        {
+          "input": {
+            "op": "parse",
+            "token": "foo"
+          },
+          "expected_output": "error=malformed\nreason=period_count"
+        },
+        {
+          "input": {
+            "op": "parse",
+            "token": "."
+          },
+          "expected_output": "error=malformed\nreason=period_count"
+        },
+        {
+          "input": {
+            "op": "parse",
+            "token": ".."
+          },
+          "expected_output": "error=malformed\nreason=missing_body"
+        },
+        {
+          "input": {
+            "op": "parse",
+            "token": "eyJhbGciOiJub25lIn0.SGVsbG8gd29ybGQh."
+          },
+          "expected_output": "alg=none\nbody=Hello world!"
+        },
+        {
+          "input": {
+            "op": "parse",
+            "token": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJKb2UifQ."
+          },
+          "expected_output": "alg=none\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "parse",
+            "token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKb2UifQ.qs8rO_cGp7ctWsq-yGbVzJ-cjAhzdLh1jP0296AC9Ac",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+          },
+          "expected_output": "alg=HS256\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "parse",
+            "token": null
+          },
+          "expected_output": "error=illegal_argument"
+        }
+      ]
+    },
+    "feature7_typed_parsing.json": {
+      "description": "Parse a token while asserting its exact shape (unsecured-plaintext, unsecured-claims, signed-plaintext, signed-claims). A token whose actual shape does not match the requested shape is rejected with a neutral 'unsupported' category and a reason; a signed token verified with the wrong key is rejected as an invalid signature.",
+      "cases": [
+        {
+          "input": {
+            "op": "parse_typed",
+            "token": "eyJhbGciOiJub25lIn0.SGVsbG8gd29ybGQh.",
+            "method": "plaintext_jwt"
+          },
+          "expected_output": "kind=plaintext_jwt\nbody=Hello world!"
+        },
+        {
+          "input": {
+            "op": "parse_typed",
+            "token": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJKb2UifQ.",
+            "method": "claims_jwt"
+          },
+          "expected_output": "kind=claims_jwt\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "parse_typed",
+            "token": "eyJhbGciOiJIUzI1NiJ9.SGVsbG8gd29ybGQh.4Luu4D1QDg0vorxFuBy4sFq090uoZMwkkGfVFsOeqTw",
+            "method": "plaintext_jws",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+          },
+          "expected_output": "kind=plaintext_jws\nalg=HS256\nbody=Hello world!"
+        },
+        {
+          "input": {
+            "op": "parse_typed",
+            "token": "eyJhbGciOiJub25lIn0.SGVsbG8gd29ybGQh.",
+            "method": "claims_jwt"
+          },
+          "expected_output": "error=unsupported\nreason=unsigned_plaintext_jwt"
+        },
+        {
+          "input": {
+            "op": "parse_typed",
+            "token": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJKb2UifQ.",
+            "method": "plaintext_jwt"
+          },
+          "expected_output": "error=unsupported\nreason=unsigned_claims_jwt"
+        },
+        {
+          "input": {
+            "op": "parse_typed",
+            "token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJKb2UifQ.qs8rO_cGp7ctWsq-yGbVzJ-cjAhzdLh1jP0296AC9Ac",
+            "method": "claims_jws",
+            "key": "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbA"
+          },
+          "expected_output": "error=signature_invalid"
+        }
+      ]
+    },
+    "feature8_required_claims.json": {
+      "description": "Assert that a parsed token contains required claims with expected values. A matching claim verifies successfully and recovers the claim set; a present-but-wrong value is rejected as an incorrect claim; a required-but-absent claim is rejected as a missing claim. Works for registered claims and custom claims.",
+      "cases": [
+        {
+          "input": {
+            "op": "require_claim",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "claims": {
+              "sub": "Joe"
+            },
+            "require": {
+              "name": "sub",
+              "value": "Joe"
+            }
+          },
+          "expected_output": "verified=true\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "require_claim",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "claims": {
+              "sub": "Joe"
+            },
+            "require": {
+              "name": "sub",
+              "value": "Wrong"
+            }
+          },
+          "expected_output": "error=incorrect_claim\nclaim=sub"
+        },
+        {
+          "input": {
+            "op": "require_claim",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "claims": {
+              "sub": "Joe"
+            },
+            "require": {
+              "name": "iss",
+              "value": "Me"
+            }
+          },
+          "expected_output": "error=missing_claim\nclaim=iss"
+        },
+        {
+          "input": {
+            "op": "require_claim",
+            "key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "claims": {
+              "role": "admin"
+            },
+            "require": {
+              "name": "role",
+              "value": "admin"
+            }
+          },
+          "expected_output": "verified=true\nclaim.role=admin"
+        }
+      ]
+    },
+    "feature9_temporal_validation.json": {
+      "description": "Enforce time-based validity on parse. A token with no temporal constraints (or with constraints currently satisfied) verifies successfully; a token whose expiration is in the past is rejected as expired; a token whose not-before instant is in the future is rejected as premature. Error outcomes carry only a neutral category (no wall-clock timestamps).",
+      "cases": [
+        {
+          "input": {
+            "op": "lifecycle",
+            "sub": "Joe"
+          },
+          "expected_output": "valid=true\nsub=Joe"
+        },
+        {
+          "input": {
+            "op": "lifecycle",
+            "sub": "Joe",
+            "exp_offset_sec": -1000
+          },
+          "expected_output": "error=expired"
+        },
+        {
+          "input": {
+            "op": "lifecycle",
+            "sub": "Joe",
+            "nbf_offset_sec": 10000
+          },
+          "expected_output": "error=premature"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "start.md",
+      "input_condition": "All inputs",
+      "output_rule": "Output must be zero or more lines of key=value separated by newline.",
+      "exact_values": [
+        "key=value",
+        "\\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "start.md",
+      "input_condition": "Op: algorithm_info",
+      "output_rule": "Output lines: value, description, family, jdk_standard, hmac, rsa, elliptic_curve.",
+      "exact_values": [
+        "value=HS256",
+        "description=HMAC using SHA-256",
+        "family=HMAC",
+        "jdk_standard=true",
+        "hmac=true",
+        "rsa=false",
+        "elliptic_curve=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "start.md",
+      "input_condition": "Op: algorithm_info with name 'NONE'",
+      "output_rule": "Algorithm value must be lowercase 'none'.",
+      "exact_values": [
+        "value=none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "start.md",
+      "input_condition": "Op: algorithm_for_name",
+      "output_rule": "Name matching is case-insensitive.",
+      "exact_values": [
+        "name=hs256"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "start.md",
+      "input_condition": "Op: algorithm_for_name with unknown name",
+      "output_rule": "Output single line error.",
+      "exact_values": [
+        "error=signature_invalid"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "start.md",
+      "input_condition": "Op: build_plaintext",
+      "output_rule": "Output single line with key 'token'.",
+      "exact_values": [
+        "token=..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "start.md",
+      "input_condition": "Op: build_plaintext",
+      "output_rule": "Header value must be 'none'.",
+      "exact_values": [
+        "none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "start.md",
+      "input_condition": "Op: build_parse_claims",
+      "output_rule": "Registered claims output in order: iss, sub, aud, jti, exp, nbf, iat.",
+      "exact_values": [
+        "iss",
+        "sub",
+        "aud",
+        "jti",
+        "exp",
+        "nbf",
+        "iat"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "start.md",
+      "input_condition": "Op: build_parse_claims",
+      "output_rule": "Custom claims output prefixed with 'claim.' in ascending key order.",
+      "exact_values": [
+        "claim.count",
+        "claim.role"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "start.md",
+      "input_condition": "Op: build_parse_claims with unset",
+      "output_rule": "Claims in 'unset' array must be removed from output.",
+      "exact_values": [
+        "iss"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "start.md",
+      "input_condition": "Op: build_parse_claims",
+      "output_rule": "Date claims (exp, nbf, iat) must be integers.",
+      "exact_values": [
+        1300819380
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "start.md",
+      "input_condition": "Op: sign_verify",
+      "output_rule": "Output 'alg' in case-insensitive canonical form (e.g., HS256, HS384, HS512).",
+      "exact_values": [
+        "HS256",
+        "HS384",
+        "HS512"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "start.md",
+      "input_condition": "Op: sign_verify without emit_token",
+      "output_rule": "Do not output 'token' field; output only 'alg' and body/claims.",
+      "exact_values": [
+        "token=..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "start.md",
+      "input_condition": "Op: sign_verify",
+      "output_rule": "If body is claims, output registered claims first, then custom claims prefixed 'claim.' in ascending order.",
+      "exact_values": [
+        "claim."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "start.md",
+      "input_condition": "Op: compress_roundtrip",
+      "output_rule": "Output instantiates line 'calg=<codec>'.",
+      "exact_values": [
+        "DEF",
+        "GZIP",
+        "CUSTOM",
+        "calg=DEF"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "start.md",
+      "input_condition": "Op: parse",
+      "output_rule": "If token has wrong number of periods, output error=malformed reason=period_count.",
+      "exact_values": [
+        "error=malformed",
+        "reason=period_count"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "start.md",
+      "input_condition": "Op: parse with two or more periods",
+      "output_rule": "If body segment is empty (token ends with '.'), output error=malformed reason=missing_body.",
+      "exact_values": [
+        "error=malformed",
+        "reason=missing_body"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "start.md",
+      "input_condition": "Op: parse with signature segment present",
+      "output_rule": "Parse signature to recover alg (case-insensitive to canonical form) and body. Do not verify signature unless 'key' provided.",
+      "exact_values": [
+        "alg=HS256"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "start.md",
+      "input_condition": "Op: parse with null token",
+      "output_rule": "Output error=illegal_argument.",
+      "exact_values": [
+        "error=illegal_argument"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "start.md",
+      "input_condition": "Op: parse_typed",
+      "output_rule": "Recovers 'kind=<method>'. For signed forms, also outputs 'alg' and body.",
+      "exact_values": [
+        "kind=plaintext_jwt",
+        "kind=claims_jwt",
+        "kind=plaintext_jws",
+        "kind=claims_jws"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "start.md",
+      "input_condition": "Op: parse_typed",
+      "output_rule": "If actual shape (signed/unsigned, claims/claims) differs from method, output error=unsupported reason=<X>. Valid reasons: unsigned_plaintext_jwt, unsigned_claims_jwt, signed_claims_jws.",
+      "exact_values": [
+        "error=unsupported",
+        "unsigned_plaintext_jwt",
+        "unsigned_claims_jwt",
+        "signed_claims_jws"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "start.md",
+      "input_condition": "Op: parse_typed with signed token and wrong key",
+      "output_rule": "Output error=signature_invalid.",
+      "exact_values": [
+        "error=signature_invalid"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "start.md",
+      "input_condition": "Op: require_claim",
+      "output_rule": "If claim present but value mismatch, output error=incorrect_claim claim=<name>.",
+      "exact_values": [
+        "error=incorrect_claim",
+        "claim=sub"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "start.md",
+      "input_condition": "Op: require_claim",
+      "output_rule": "If claim missing, output error=missing_claim claim=<name>.",
+      "exact_values": [
+        "error=missing_claim",
+        "claim=iss"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "start.md",
+      "input_condition": "Op: require_claim",
+      "output_rule": "If claim value matches, output verified=true then trait lines.",
+      "exact_values": [
+        "verified=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "start.md",
+      "input_condition": "Op: lifecycle",
+      "output_rule": "If exp_offset_sec < 0, output error=expired.",
+      "exact_values": [
+        "error=expired"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "start.md",
+      "input_condition": "Op: lifecycle",
+      "output_rule": "If nbf_offset_sec > 0, output error=premature.",
+      "exact_values": [
+        "error=premature"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "start.md",
+      "input_condition": "Op: lifecycle without offsets",
+      "output_rule": "Output valid=true with claims.",
+      "exact_values": [
+        "valid=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "start.md",
+      "input_condition": "Op: builder_validate",
+      "output_rule": "If mode is 'empty', output error=illegal_state.",
+      "exact_values": [
+        "error=illegal_state"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "start.md",
+      "input_condition": "Op: builder_validate",
+      "output_rule": "If mode is 'both_payload_and_claims', output error=illegal_state.",
+      "exact_values": [
+        "error=illegal_state"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "start.md",
+      "input_condition": "Op: builder_validate",
+      "output_rule": "If mode is 'bytes_without_hmac', output error=illegal_argument.",
+      "exact_values": [
+        "error=illegal_argument"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "start.md",
+      "input_condition": "Op: forge_hmac_with_key",
+      "output_rule": "Output error=unsupported reason=algorithm_key_mismatch regardless of key_type (rsa/ec).",
+      "exact_values": [
+        "error=unsupported",
+        "reason=algorithm_key_mismatch"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific header constant (e.g., 'none','skip','null')",
+        "exact_values_to_replace": [
+          "none"
+        ],
+        "trigger_keywords": [
+          "build plaintext header",
+          "header value none",
+          "plaintext header constant",
+          "build_plaintext header",
+          "what is the header value"
+        ],
+        "oracle_response": "The header value must be the literal string 'none'."
+      },
+      {
+        "constraint_id": "C021",
+        "replacement": "valid error reasons related to shape mismatch",
+        "exact_values_to_replace": [
+          "unsigned_plaintext_jwt",
+          "unsigned_claims_jwt",
+          "signed_claims_jws"
+        ],
+        "trigger_keywords": [
+          "c021 error reasons",
+          "unsupported error list",
+          "counterfit error reasons",
+          "mismatch error values",
+          "what are the valid unsupported reasons"
+        ],
+        "oracle_response": "The valid reasons are: unsigned_plaintext_jwt, unsigned_claims_jwt, signed_claims_jws."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C008",
+        "vague_phrase": "follow the internal documentation order for standard claims",
+        "actual_meaning": "The sequence iss, sub, aud, jti, exp, nbf, iat corresponds to the order of declaration in the internal `CLAIMS_STANDARD` enum or config constant within the `start` module."
+      },
+      {
+        "constraint_id": "C011",
+        "vague_phrase": "a sample Unix timestamp value used for testing",
+        "actual_meaning": "1300819380 is a literal integer hardcoded into the unit test suite to represent a valid expiration time for the assertions."
+      }
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+## Product Requirement Document
+
+Hey team, we need to build out that slug automation library we've been talking about. Basically, devs are constantly rewriting the same boilerplate every time they add a new model — normalizing text, handling duplicates, keeping URLs from breaking when someone edits a title. It's a mess and we keep getting bug reports about broken links and weird characters showing up in URLs.
+
+The core idea: you declare how a record generates its identifier, and the system handles the rest automatically during normal save/update/delete operations. Think of it like that profile-driven approach we used in the auth module last time — same kind of declarative config pattern.
+
+A few things we know we need: it should handle accented characters gracefully, support combining fields together for the identifier, let us cap the length without cutting words in weird places, and make sure two records with the same name don't stomp on each other. Also some teams scope their content by owner/author so duplicates should be fine across different owners.
+
+We also need a way to look records up by their identifier, generate one without actually saving anything, and control what happens to the identifier when someone edits the title. Oh, and soft-deleted records — we need to decide whether those still "own" their identifier or not.
+
+Refer to the test scaffolding in the rcb_tests folder for the expected wire format. Should be a proper multi-file library, not a single script.
+
+A couple follow-ups from the questions that came in. On collisions, the first record always keeps the bare base slug, like 'a-post-title'. After that, each collision gets a numeric suffix starting at 2 and going up by 1, so 'a-post-title-2', then 'a-post-title-3'. That suffix uses the same separator the profile is already using, and there is no '-1' version — it really is base → base-2 → base-3.
+
+Also, the default separator between words is '-'. Profiles can override that to something else like '.' or '_' or even an empty string if a team wants no separator at all. The example secondary output in feature3 uses '.' and should come out like 'my.subtitle'. More generally, one record can have multiple independent slug fields at the same time, generated from different source values and even with different separators. The 'multiple_outputs' profile is the example there: the primary slug field comes from the title with '-' separator, while the secondary slug field comes from the subtitle with '.' separator. One of those fields is the primary slug key for lookups, but both values are persisted and returned.
+
+On generation behavior, we do need the generate-without-saving operation exposed as part of the library. It should compute and return the slug for a given source text and target field without persisting anything, but it still needs to look at existing stored records for uniqueness so it doesn’t hand back something that would immediately collide. If the target field name is invalid/unrecognised for the configured model, that should come back as a domain-level error rather than a generic exception.
+
+For normalization, source text gets cleaned before slugging: lowercased, accented/diacritic characters transliterated to their ASCII equivalents, unsupported punctuation removed, and leading/trailing whitespace trimmed. If the source text is empty, that should produce a null/empty slug, not an error. But scalar values that are falsy and still visible, like '0' or 'false' as text, should still produce an explicit slug string.
+
+A few more details on where the slug can come from. Sources can be multiple fields concatenated in order, for example title + subtitle joined by the separator to produce 'a-post-title-a-subtitle'. They can also include a value from an associated/related record. If that associated source record is missing, or its value just isn’t there, we should keep going with whatever source values are available and not raise an error.
+
+And on updates, default behavior for the standard profile is to preserve what’s already stored. So if someone edits the title later, that does NOT regenerate the slug automatically. Regeneration only happens in two explicit cases: either the profile has update-regeneration enabled and the source field changed, or the slug field was manually cleared/nulled before save, which forces regeneration from the current source value.
+
+Last piece is just confirming the shape of the config side: this is still the declarative slug profile/configuration system where each record kind like 'standard', 'multiple_sources', 'multiple_outputs', 'custom_separator', etc. maps to a SlugProfile object specifying source fields, separator, length limit, uniqueness scope, reserved terms, and update behavior, all defined in the core domain configuration layer.

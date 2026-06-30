@@ -1,0 +1,9 @@
+## Product Requirement Document
+
+hey team, we need to wrap up that container command builder thing we've been talking about. basically the idea is that ops people shouldn't have to hand-write all those long docker invocations every time they deploy something — it's causing too many incidents where someone forgets a flag or mis-quotes a secret and the whole routing breaks silently. we already have something similar to what we did with the login module credential handling, so let's stay consistent with that pattern for secrets.
+
+the core of it: given a config object describing a service (image, servers grouped by role, env vars including secrets pulled from the host, healthcheck stuff, logging, volumes, ssh settings), we should be able to ask for any named operation — launching a container, stopping it, reading logs, running one-off commands, querying container state — and get back the exact shell string, properly escaped, ready to run or pass over ssh.
+
+important: secrets need to be handled carefully — if a secret env var isn't present in the host environment that should be a real error, not just an empty string. also we need to be able to produce a safe/redacted version of any command for logging purposes.
+
+the whole thing should be organized cleanly across multiple files, not one giant script. different roles (web vs background workers) behave differently — web gets routing labels, others don't. ssh wrapping, proxy jump hosts, container naming with optional destination segments — all needs to work. please make sure the multi-file structure actually separates concerns properly.

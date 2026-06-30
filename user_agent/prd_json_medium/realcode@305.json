@@ -1,0 +1,671 @@
+{
+  "fuzzy_prd": "Hey team, we need to get this GrAMPS-style GraphQL composition layer wrapped up. The idea is basically what we scoped out in Q3 — one HTTP endpoint that works in both dev and prod, with the dev mode returning placeholder data and prod hitting real resolvers. We also need that interactive docs page (you know, the browser-based query explorer thing) available during development. There's also the middleware piece where we attach context and data sources per request — similar to how we handled the auth tenant stuff in the old login module, so check that for reference on how context keys get merged.\n\nOn the schema side, sources should contribute their own query fields and the built-in root ops (ping and version) should always be present. Dev sources loaded from external paths should be able to swap out local ones when the context key matches, and we should log something when that happens. For outbound calls, connectors need consistent request config (JSON mode, full response, etc.), and GETs should play nicely with Redis caching — serve cached when available, refresh in background, skip cache on errors. Mutations go out as POST or PUT with JSON body. Errors need to be normalized so clients never see raw stack traces or internal exception names, and the format should differ slightly between dev and prod (some fields hidden in prod). Make sure the model base classes blow up properly if someone tries to instantiate them directly.\n\nOne quick follow-up from the team questions: for the built-in root ops, the contract is fixed. In development/mock mode, `grampsVersion` returns `\"Hello World\"`, and `grampsPing` returns `\"GET OFF MY LAWN\"` in both mock and live modes. Those built-ins are always part of the composed schema regardless of what sources are loaded, so the root operations are `grampsVersion` (Query) returning `\"Hello World\"` and `grampsPing` (Mutation) returning `\"GET OFF MY LAWN\"`. Also, the `/graphiql` endpoint should be there for Feature 2 and return `text/html` with `containsGraphiql: true`, HTTP 200, basically the in-browser GraphQL IDE behavior we talked about.\n\nOn the middleware/context bit, Feature 3 should stay as a flat merge. Extra context keys like `tenant` sit alongside data source model keys like `Catalog` and `Inventory` in the execution context object, same general shape as the old auth tenant pattern, just merged together at the top level.\n\nA couple specifics on connector behavior too. For batch loading with `connector_load`, call each URI separately and return a `calls` array listing each URI in order, plus a `result` array with one entry per input URI in the same order, where each entry is `{ \"loaded\": true, \"uri\": \"<the uri>\" }`. For `connector_mutation`, the `request` object needs `body` as the caller-supplied body, `headers` as `{}` if none are supplied, `json: true`, `method` as POST or PUT, `resolveWithFullResponse: true`, and `uri` as baseUri + endpoint concatenated. A successful simulated write returns `result` as `{ \"accepted\": true }`.\n\nFor GET caching, on a fresh successful request with no cached value, Redis does exactly two ops in order: first a `get`, then a `setex`, and that `setex` uses TTL 300 with the response body as the value. The `redisOps` array needs to reflect that exact sequence. If the Redis lookup itself fails, the output is exactly `{ \"error\": \"cache_error\", \"value\": <the error value string> }`, where `value` is the raw error string from the Redis stub, like `\"redis unavailable\"`. In that case we stop there — no upstream request and no domain error wrapper.\n\nOn error formatting, if we wrap a domain error like from `wrap_query_error`, it should contain `code` like `\"GRAPHQL_ERROR\"`, `component` as null if not set, `description` as the original error message, `docsLink` as null if not set, `error: \"domain_error\"`, `hasGuid: true`, `message: \"An internal server error occurred\"` (fixed public message), `statusCode: 500`, and `targetEndpoint` as null if not set. Stack traces and exception class names should never show up. Then for `format_client_error`, development mode includes all of `statusCode`, `error`, `message`, `description`, `errorCode`, `graphqlModel`, `targetEndpoint`, `docsLink`, and `guid`. In production mode, `targetEndpoint` and `docsLink` are omitted from the client-facing payload. Also, `description` falls back to the `message` value if it wasn’t explicitly provided.\n\nLast thing, for the abstract base pieces, trying to directly instantiate a connector, model base, or similar abstract component should throw a normalized error, not a raw language-level exception, and it should follow that same domain error shape without leaking host-language class names or any stack trace strings. Concrete model instances created with a valid connector should keep the connector reference and return it in their output.",
+  "oracle_data": {
+    "task_id": "gramps-express-composition-adapter-001",
+    "golden_api_signature": "handleAction(input: ActionInput): Promise<string>",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "graphiql content type",
+          "docs endpoint response type",
+          "what content type does the interactive explorer return"
+        ],
+        "oracle_response": "The GraphiQL interactive documentation endpoint (`/graphiql`) must return a `Content-Type` of `text/html` with HTTP status 200. The response body must contain the GraphiQL UI marker so that `containsGraphiql` evaluates to `true`."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "how context keys are merged",
+          "extra context merging with source models",
+          "tenant context attachment in middleware"
+        ],
+        "oracle_response": "The middleware attaches each data source's model under its `context` key (e.g., `Catalog`, `Inventory`) as an object with a `name` property set to the model value. Caller-provided extra context keys (e.g., `tenant`) are merged at the same level. The composed context is flat — source model keys and extra context keys coexist at the top level of the context object."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "model value shape in context",
+          "how is modelValue stored in context",
+          "source model object structure"
+        ],
+        "oracle_response": "Each data source model is stored in the execution context as `{ name: modelValue }`. For example, a source with `context: \"Catalog\"` and `modelValue: \"catalog-model\"` produces `context.Catalog = { name: \"catalog-model\" }`."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "schema query fields naming convention",
+          "how source fields are named in schema",
+          "context to schema field name mapping"
+        ],
+        "oracle_response": "Each data source contributes a query field named `{context}Type` — the context key with `Type` appended. For example, a source with `context: \"Catalog\"` contributes a field named `CatalogType`. Built-in fields `grampsVersion` (query) and `grampsPing` (mutation) are always included. The `acceptedOptionKeys` array is empty by default."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "how many warnings when overriding sources",
+          "override warning count behavior",
+          "warning emitted per replacement or per batch"
+        ],
+        "oracle_response": "Exactly one warning is emitted per `override_sources` call regardless of how many sources are replaced. In the test case where two local sources (`Two` and `Three`) are replaced by dev sources, `warningCount` is `1`, not `2`. The warning signals that at least one override occurred, not a per-source count."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "source override ordering",
+          "where do dev sources appear after override",
+          "position of replaced sources in result list"
+        ],
+        "oracle_response": "When a local source is replaced by a dev source with a matching context key, the replacement occupies the original position of the local source in the result list. Non-matching local sources remain at their original positions. Dev sources do not get appended to the end — they take the slot of the source they replaced."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "outbound request config flags",
+          "json and full response flags",
+          "connector request option defaults"
+        ],
+        "oracle_response": "The outbound request configuration must always include `json: true` and `resolveWithFullResponse: true` in addition to the `uri` and `headers` fields. These are non-negotiable defaults for all connector GET requests and cannot be overridden by the caller."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "cache TTL value",
+          "how long are GET responses cached",
+          "redis setex ttl seconds"
+        ],
+        "oracle_response": "Successful GET responses are cached using a TTL of `300` seconds (5 minutes). The cache write operation is `setex` with this fixed TTL. The cached value is the parsed response body, not the raw HTTP response."
+      },
+      {
+        "constraint_id": "C018",
+        "trigger_keywords": [
+          "load external sources with no paths",
+          "empty source load result",
+          "what is returned when no dev source paths provided"
+        ],
+        "oracle_response": "When `load_external_sources` is called with no source paths (no input paths provided), the result is `{ \"contexts\": [], \"count\": 0, \"hasModel\": [], \"hasResolvers\": [], \"hasSchema\": [] }`. Zero sources are loaded and all arrays are empty."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid action field values",
+          "what values can action take",
+          "list all supported action values",
+          "what actions does the dispatcher handle",
+          "which action strings does the adapter support",
+          "what are the possible action inputs",
+          "tell me all the action names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'action' field. Valid values are: 'connector_load', 'connector_mutation', 'model_with_connector', 'format_client_error', 'wrap_query_error', 'graphql_http', 'graphiql_http', 'middleware_context', 'compose_schema', 'load_external_sources', 'override_sources', 'connector_request_config', 'connector_get_request_data'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature10_batch_and_get",
+        "trigger_keywords": [
+          "test cases for feature10 batch and get",
+          "show me feature10 batch and get test cases",
+          "what are the feature10 batch and get test inputs",
+          "give me the feature10_batch_and_get test file",
+          "test cases for feature 10",
+          "feature10 batch and get expected output",
+          "what does feature10 batch and get expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_batch_and_get:\n{\n  \"description\": \"Batch loading requests each URI and resource GET calls combine a base URI with an endpoint before loading.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"connector_load\",\n        \"uris\": [\n          \"https://api.example.test/a\",\n          \"https://api.example.test/b\"\n        ]\n      },\n      \"expected_output\": \"{\\n  \\\"calls\\\": [\\n    \\\"https://api.example.test/a\\\",\\n    \\\"https://api.example.test/b\\\"\\n  ],\\n  \\\"result\\\": [\\n    {\\n      \\\"loaded\\\": true,\\n      \\\"uri\\\": \\\"https://api.example.test/a\\\"\\n    },\\n    {\\n      \\\"loaded\\\": true,\\n      \\\"uri\\\": \\\"https://api.example.test/b\\\"\\n    }\\n  ]\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_mutation_requests",
+        "trigger_keywords": [
+          "test cases for feature11 mutation requests",
+          "show me feature11 mutation requests test cases",
+          "what are the feature11 mutation requests test inputs",
+          "give me the feature11_mutation_requests test file",
+          "test cases for feature 11",
+          "feature11 mutation requests expected output",
+          "what does feature11 mutation requests expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_mutation_requests:\n{\n  \"description\": \"Non-cacheable write requests send POST or PUT with the combined target URI, JSON body, and any caller-supplied request options.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"connector_mutation\",\n        \"method\": \"POST\",\n        \"baseUri\": \"https://api.example.test\",\n        \"endpoint\": \"/items\",\n        \"body\": {},\n        \"options\": {}\n      },\n      \"expected_output\": \"{\\n  \\\"request\\\": {\\n    \\\"body\\\": {},\\n    \\\"headers\\\": {},\\n    \\\"json\\\": true,\\n    \\\"method\\\": \\\"POST\\\",\\n    \\\"resolveWithFullResponse\\\": true,\\n    \\\"uri\\\": \\\"https://api.example.test/items\\\"\\n  },\\n  \\\"result\\\": {\\n    \\\"accepted\\\": true\\n  }\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature12_model_and_abstract_bases",
+        "trigger_keywords": [
+          "test cases for feature12 model and abstract bases",
+          "show me feature12 model and abstract bases test cases",
+          "what are the feature12 model and abstract bases test inputs",
+          "give me the feature12_model_and_abstract_bases test file",
+          "test cases for feature 12",
+          "feature12 model and abstract bases expected output",
+          "what does feature12 model and abstract bases expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_model_and_abstract_bases:\n{\n  \"description\": \"Concrete model instances retain the supplied connector, while abstract base components reject direct construction with normalized error output.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"model_with_connector\",\n        \"connector\": {\n          \"kind\": \"memory\",\n          \"name\": \"primary\"\n        }\n      },\n      \"expected_output\": \"{\\n  \\\"connector\\\": {\\n    \\\"kind\\\": \\\"memory\\\",\\n    \\\"name\\\": \\\"primary\\\"\\n  }\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature13_client_error_formatting",
+        "trigger_keywords": [
+          "test cases for feature13 client error formatting",
+          "show me feature13 client error formatting test cases",
+          "what are the feature13 client error formatting test inputs",
+          "give me the feature13_client_error_formatting test file",
+          "test cases for feature 13",
+          "feature13 client error formatting expected output",
+          "what does feature13 client error formatting expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature13_client_error_formatting:\n{\n  \"description\": \"Client-facing error data preserves useful fields, hides private endpoint and documentation fields in production, fills missing descriptions from messages, and normalizes quote characters.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"format_client_error\",\n        \"environment\": \"development\",\n        \"error\": {\n          \"statusCode\": 401,\n          \"error\": \"Unauthorized\",\n          \"message\": \"error message\",\n          \"description\": \"error description\",\n          \"errorCode\": \"TEST_ERROR_CODE\",\n          \"graphqlModel\": \"testGraphQLModel\",\n          \"targetEndpoint\": \"https://example.test/endpoint\",\n          \"docsLink\": \"https://example.test/docs\",\n          \"guid\": \"1234\"\n        }\n      },\n      \"expected_output\": \"{\\n  \\\"description\\\": \\\"error description\\\",\\n  \\\"docsLink\\\": \\\"https://example.test/docs\\\",\\n  \\\"error\\\": \\\"Unauthorized\\\",\\n  \\\"errorCode\\\": \\\"TEST_ERROR_CODE\\\",\\n  \\\"graphqlModel\\\": \\\"testGraphQLModel\\\",\\n  \\\"guid\\\": \\\"1234\\\",\\n  \\\"message\\\": \\\"error message\\\",\\n  \\\"statusCode\\\": 401,\\n  \\\"targetEndpoint\\\": \\\"https://example.test/endpoint\\\"\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature14_domain_error_wrapping",
+        "trigger_keywords": [
+          "test cases for feature14 domain error wrapping",
+          "show me feature14 domain error wrapping test cases",
+          "what are the feature14 domain error wrapping test inputs",
+          "give me the feature14_domain_error_wrapping test file",
+          "test cases for feature 14",
+          "feature14 domain error wrapping expected output",
+          "what does feature14 domain error wrapping expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature14_domain_error_wrapping:\n{\n  \"description\": \"GraphQL execution errors and explicitly created domain errors are converted to structured domain error payloads with HTTP status, error code, description, and endpoint metadata.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"wrap_query_error\",\n        \"message\": \"GraphQL syntax error\",\n        \"locations\": [\n          {\n            \"line\": 2,\n            \"column\": 3\n          }\n        ]\n      },\n      \"expected_output\": \"{\\n  \\\"code\\\": \\\"GRAPHQL_ERROR\\\",\\n  \\\"component\\\": null,\\n  \\\"description\\\": \\\"GraphQL syntax error\\\",\\n  \\\"docsLink\\\": null,\\n  \\\"error\\\": \\\"domain_error\\\",\\n  \\\"hasGuid\\\": true,\\n  \\\"message\\\": \\\"An internal server error occurred\\\",\\n  \\\"statusCode\\\": 500,\\n  \\\"targetEndpoint\\\": null\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_graphql_endpoint",
+        "trigger_keywords": [
+          "test cases for feature1 graphql endpoint",
+          "show me feature1 graphql endpoint test cases",
+          "what are the feature1 graphql endpoint test inputs",
+          "give me the feature1_graphql_endpoint test file",
+          "test cases for feature 1",
+          "feature1 graphql endpoint expected output",
+          "what does feature1 graphql endpoint expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_graphql_endpoint:\n{\n  \"description\": \"GraphQL HTTP endpoint returns status and response body for root query and mutation operations in mock and live runtime modes.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"graphql_http\",\n        \"environment\": \"development\",\n        \"method\": \"GET\",\n        \"path\": \"/graphql\",\n        \"graphql\": {\n          \"query\": \"query grampsVersion { grampsVersion }\",\n          \"operationName\": \"grampsVersion\",\n          \"variables\": {}\n        }\n      },\n      \"expected_output\": \"{\\n  \\\"body\\\": {\\n    \\\"data\\\": {\\n      \\\"grampsVersion\\\": \\\"Hello World\\\"\\n    }\\n  },\\n  \\\"environment\\\": \\\"development\\\",\\n  \\\"method\\\": \\\"GET\\\",\\n  \\\"path\\\": \\\"/graphql\\\",\\n  \\\"statusCode\\\": 200\\n}\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"graphql_http\",\n        \"environment\": \"production\",\n        \"method\": \"POST\",\n        \"path\": \"/graphql\",\n        \"graphql\": {\n          \"query\": \"mutation grampsPing { grampsPing }\",\n          \"operationName\": \"grampsPing\",\n          \"variables\": {}\n        }\n      },\n      \"expected_output\": \"{\\n  \\\"body\\\": {\\n    \\\"data\\\": {\\n      \\\"grampsPing\\\": \\\"GET OFF MY LAWN\\\"\\n    }\\n  },\\n  \\\"environment\\\": \\\"production\\\",\\n  \\\"method\\\": \\\"POST\\\",\\n  \\\"path\\\": \\\"/graphql\\\",\\n  \\\"statusCode\\\": 200\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_graphiql_endpoint",
+        "trigger_keywords": [
+          "test cases for feature2 graphiql endpoint",
+          "show me feature2 graphiql endpoint test cases",
+          "what are the feature2 graphiql endpoint test inputs",
+          "give me the feature2_graphiql_endpoint test file",
+          "test cases for feature 2",
+          "feature2 graphiql endpoint expected output",
+          "what does feature2 graphiql endpoint expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_graphiql_endpoint:\n{\n  \"description\": \"Interactive GraphQL documentation endpoint is exposed over HTTP and returns a successful HTML response.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"graphiql_http\",\n        \"environment\": \"development\",\n        \"path\": \"/graphiql\"\n      },\n      \"expected_output\": \"{\\n  \\\"containsGraphiql\\\": true,\\n  \\\"contentType\\\": \\\"text/html\\\",\\n  \\\"method\\\": \\\"GET\\\",\\n  \\\"path\\\": \\\"/graphiql\\\",\\n  \\\"statusCode\\\": 200\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_request_context",
+        "trigger_keywords": [
+          "test cases for feature3 request context",
+          "show me feature3 request context test cases",
+          "what are the feature3 request context test inputs",
+          "give me the feature3_request_context test file",
+          "test cases for feature 3",
+          "feature3 request context expected output",
+          "what does feature3 request context expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_request_context:\n{\n  \"description\": \"Request middleware attaches a composed execution context containing caller-provided context values and configured data-source models, then continues the request chain.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"middleware_context\",\n        \"enableMockData\": false,\n        \"extraContext\": {\n          \"tenant\": \"acme\"\n        },\n        \"sources\": [\n          {\n            \"context\": \"Catalog\",\n            \"modelValue\": \"catalog-model\"\n          },\n          {\n            \"context\": \"Inventory\",\n            \"modelValue\": \"inventory-model\"\n          }\n        ]\n      },\n      \"expected_output\": \"{\\n  \\\"context\\\": {\\n    \\\"Catalog\\\": {\\n      \\\"name\\\": \\\"catalog-model\\\"\\n    },\\n    \\\"Inventory\\\": {\\n      \\\"name\\\": \\\"inventory-model\\\"\\n    },\\n    \\\"tenant\\\": \\\"acme\\\"\\n  },\\n  \\\"hasFormatError\\\": true,\\n  \\\"hasSchema\\\": true,\\n  \\\"nextCalled\\\": true\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_schema_composition",
+        "trigger_keywords": [
+          "test cases for feature4 schema composition",
+          "show me feature4 schema composition test cases",
+          "what are the feature4 schema composition test inputs",
+          "give me the feature4_schema_composition test file",
+          "test cases for feature 4",
+          "feature4 schema composition expected output",
+          "what does feature4 schema composition expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_schema_composition:\n{\n  \"description\": \"Schema composition combines built-in root operations with query fields contributed by multiple data sources and preserves schema configuration options.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"compose_schema\",\n        \"sources\": [\n          {\n            \"context\": \"Catalog\",\n            \"id\": 1,\n            \"modelValue\": \"catalog\"\n          },\n          {\n            \"context\": \"Inventory\",\n            \"id\": 2,\n            \"modelValue\": \"inventory\"\n          }\n        ]\n      },\n      \"expected_output\": \"{\\n  \\\"acceptedOptionKeys\\\": [],\\n  \\\"mutationFields\\\": [\\n    \\\"grampsPing\\\"\\n  ],\\n  \\\"queryFields\\\": [\\n    \\\"CatalogType\\\",\\n    \\\"InventoryType\\\",\\n    \\\"grampsVersion\\\"\\n  ]\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_external_sources",
+        "trigger_keywords": [
+          "test cases for feature5 external sources",
+          "show me feature5 external sources test cases",
+          "what are the feature5 external sources test inputs",
+          "give me the feature5_external_sources test file",
+          "test cases for feature 5",
+          "feature5 external sources expected output",
+          "what does feature5 external sources expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_external_sources:\n{\n  \"description\": \"Development source loading reads zero, one, or multiple comma-separated source paths and returns only valid source definitions in the supplied order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"load_external_sources\"\n      },\n      \"expected_output\": \"{\\n  \\\"contexts\\\": [],\\n  \\\"count\\\": 0,\\n  \\\"hasModel\\\": [],\\n  \\\"hasResolvers\\\": [],\\n  \\\"hasSchema\\\": []\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_source_overrides",
+        "trigger_keywords": [
+          "test cases for feature6 source overrides",
+          "show me feature6 source overrides test cases",
+          "what are the feature6 source overrides test inputs",
+          "give me the feature6_source_overrides test file",
+          "test cases for feature 6",
+          "feature6 source overrides expected output",
+          "what does feature6 source overrides expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_source_overrides:\n{\n  \"description\": \"Development sources replace local sources with matching context keys while unrelated local sources remain in place.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"override_sources\",\n        \"sources\": [\n          {\n            \"context\": \"One\",\n            \"value\": \"local\"\n          },\n          {\n            \"context\": \"Two\",\n            \"value\": \"local\"\n          },\n          {\n            \"context\": \"Three\",\n            \"value\": \"local\"\n          }\n        ],\n        \"devSources\": [\n          {\n            \"context\": \"Two\",\n            \"value\": \"external\"\n          },\n          {\n            \"context\": \"Three\",\n            \"value\": \"external\"\n          }\n        ]\n      },\n      \"expected_output\": \"{\\n  \\\"sources\\\": [\\n    {\\n      \\\"context\\\": \\\"One\\\",\\n      \\\"value\\\": \\\"local\\\"\\n    },\\n    {\\n      \\\"context\\\": \\\"Two\\\",\\n      \\\"value\\\": \\\"external\\\"\\n    },\\n    {\\n      \\\"context\\\": \\\"Three\\\",\\n      \\\"value\\\": \\\"external\\\"\\n    }\\n  ],\\n  \\\"warningCount\\\": 1\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_request_configuration",
+        "trigger_keywords": [
+          "test cases for feature7 request configuration",
+          "show me feature7 request configuration test cases",
+          "what are the feature7 request configuration test inputs",
+          "give me the feature7_request_configuration test file",
+          "test cases for feature 7",
+          "feature7 request configuration expected output",
+          "what does feature7 request configuration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_request_configuration:\n{\n  \"description\": \"Outbound request configuration includes the target URI, JSON response parsing, full response resolution, and caller-supplied headers.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"connector_request_config\",\n        \"uri\": \"https://api.example.test/items\",\n        \"headers\": {}\n      },\n      \"expected_output\": \"{\\n  \\\"headers\\\": {},\\n  \\\"json\\\": true,\\n  \\\"resolveWithFullResponse\\\": true,\\n  \\\"uri\\\": \\\"https://api.example.test/items\\\"\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_get_request_cache",
+        "trigger_keywords": [
+          "test cases for feature8 get request cache",
+          "show me feature8 get request cache test cases",
+          "what are the feature8 get request cache test inputs",
+          "give me the feature8_get_request_cache test file",
+          "test cases for feature 8",
+          "feature8 get request cache expected output",
+          "what does feature8 get request cache expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_get_request_cache:\n{\n  \"description\": \"GET data loading returns response bodies, stores successful fresh responses in cache, serves cached responses when available while refreshing, and skips cache when disabled or unsuccessful.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"connector_get_request_data\",\n        \"uri\": \"https://api.example.test/items/1\",\n        \"statusCode\": 200,\n        \"body\": {\n          \"id\": 1,\n          \"name\": \"fresh\"\n        },\n        \"redis\": {}\n      },\n      \"expected_output\": \"{\\n  \\\"redisOps\\\": [\\n    {\\n      \\\"op\\\": \\\"get\\\"\\n    },\\n    {\\n      \\\"op\\\": \\\"setex\\\",\\n      \\\"ttl\\\": 300,\\n      \\\"value\\\": {\\n        \\\"id\\\": 1,\\n        \\\"name\\\": \\\"fresh\\\"\\n      }\\n    }\\n  ],\\n  \\\"result\\\": {\\n    \\\"id\\\": 1,\\n    \\\"name\\\": \\\"fresh\\\"\\n  }\\n}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_get_request_errors",
+        "trigger_keywords": [
+          "test cases for feature9 get request errors",
+          "show me feature9 get request errors test cases",
+          "what are the feature9 get request errors test inputs",
+          "give me the feature9_get_request_errors test file",
+          "test cases for feature 9",
+          "feature9 get request errors expected output",
+          "what does feature9 get request errors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_get_request_errors:\n{\n  \"description\": \"GET data loading reports cache lookup failures and failed outbound requests as normalized errors that include domain status and endpoint signals where available.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"connector_get_request_data\",\n        \"uri\": \"https://api.example.test/cache-error\",\n        \"statusCode\": 200,\n        \"body\": {\n          \"unused\": true\n        },\n        \"redis\": {\n          \"error\": \"redis unavailable\"\n        }\n      },\n      \"expected_output\": \"{\\n  \\\"error\\\": \\\"cache_error\\\",\\n  \\\"value\\\": \\\"redis unavailable\\\"\\n}\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "log something when that happens",
+        "actual_meaning": "When a dev source overrides a local source with a matching context key, a warning is emitted. The `warningCount` in the override result reflects this — exactly 1 warning per override operation call, not per individual source replaced. See `feature6_source_overrides.json`."
+      },
+      {
+        "vague_reference": "serve cached when available, refresh in background",
+        "actual_meaning": "Feature 8 cache behavior: when a cached value exists, it is returned immediately while a fresh upstream request is still made to refresh the cache. The `redisOps` array records both the `get` (cache read) and the subsequent `setex` (cache refresh write with TTL 300). See `feature8_get_request_cache.json`."
+      },
+      {
+        "vague_reference": "some fields hidden in prod",
+        "actual_meaning": "In production mode, `format_client_error` omits `targetEndpoint` and `docsLink` from the client payload. In development mode all fields are exposed. See `feature13_client_error_formatting.json` and the format_client_error action handler."
+      }
+    ],
+    "fallback_response": "That detail isn't something I have clear visibility into from the product side — you'd need to dig into the existing codebase or test cases for the exact contract. Check the `rcb_tests/public_test_cases/` directory for the relevant feature file, or grep the source for the behavior you're trying to confirm."
+  },
+  "public_test_cases": {
+    "feature10_batch_and_get.json": {
+      "description": "Batch loading requests each URI and resource GET calls combine a base URI with an endpoint before loading.",
+      "cases": [
+        {
+          "input": {
+            "action": "connector_load",
+            "uris": [
+              "https://api.example.test/a",
+              "https://api.example.test/b"
+            ]
+          },
+          "expected_output": "{\n  \"calls\": [\n    \"https://api.example.test/a\",\n    \"https://api.example.test/b\"\n  ],\n  \"result\": [\n    {\n      \"loaded\": true,\n      \"uri\": \"https://api.example.test/a\"\n    },\n    {\n      \"loaded\": true,\n      \"uri\": \"https://api.example.test/b\"\n    }\n  ]\n}\n"
+        }
+      ]
+    },
+    "feature11_mutation_requests.json": {
+      "description": "Non-cacheable write requests send POST or PUT with the combined target URI, JSON body, and any caller-supplied request options.",
+      "cases": [
+        {
+          "input": {
+            "action": "connector_mutation",
+            "method": "POST",
+            "baseUri": "https://api.example.test",
+            "endpoint": "/items",
+            "body": {},
+            "options": {}
+          },
+          "expected_output": "{\n  \"request\": {\n    \"body\": {},\n    \"headers\": {},\n    \"json\": true,\n    \"method\": \"POST\",\n    \"resolveWithFullResponse\": true,\n    \"uri\": \"https://api.example.test/items\"\n  },\n  \"result\": {\n    \"accepted\": true\n  }\n}\n"
+        }
+      ]
+    },
+    "feature12_model_and_abstract_bases.json": {
+      "description": "Concrete model instances retain the supplied connector, while abstract base components reject direct construction with normalized error output.",
+      "cases": [
+        {
+          "input": {
+            "action": "model_with_connector",
+            "connector": {
+              "kind": "memory",
+              "name": "primary"
+            }
+          },
+          "expected_output": "{\n  \"connector\": {\n    \"kind\": \"memory\",\n    \"name\": \"primary\"\n  }\n}\n"
+        }
+      ]
+    },
+    "feature13_client_error_formatting.json": {
+      "description": "Client-facing error data preserves useful fields, hides private endpoint and documentation fields in production, fills missing descriptions from messages, and normalizes quote characters.",
+      "cases": [
+        {
+          "input": {
+            "action": "format_client_error",
+            "environment": "development",
+            "error": {
+              "statusCode": 401,
+              "error": "Unauthorized",
+              "message": "error message",
+              "description": "error description",
+              "errorCode": "TEST_ERROR_CODE",
+              "graphqlModel": "testGraphQLModel",
+              "targetEndpoint": "https://example.test/endpoint",
+              "docsLink": "https://example.test/docs",
+              "guid": "1234"
+            }
+          },
+          "expected_output": "{\n  \"description\": \"error description\",\n  \"docsLink\": \"https://example.test/docs\",\n  \"error\": \"Unauthorized\",\n  \"errorCode\": \"TEST_ERROR_CODE\",\n  \"graphqlModel\": \"testGraphQLModel\",\n  \"guid\": \"1234\",\n  \"message\": \"error message\",\n  \"statusCode\": 401,\n  \"targetEndpoint\": \"https://example.test/endpoint\"\n}\n"
+        }
+      ]
+    },
+    "feature14_domain_error_wrapping.json": {
+      "description": "GraphQL execution errors and explicitly created domain errors are converted to structured domain error payloads with HTTP status, error code, description, and endpoint metadata.",
+      "cases": [
+        {
+          "input": {
+            "action": "wrap_query_error",
+            "message": "GraphQL syntax error",
+            "locations": [
+              {
+                "line": 2,
+                "column": 3
+              }
+            ]
+          },
+          "expected_output": "{\n  \"code\": \"GRAPHQL_ERROR\",\n  \"component\": null,\n  \"description\": \"GraphQL syntax error\",\n  \"docsLink\": null,\n  \"error\": \"domain_error\",\n  \"hasGuid\": true,\n  \"message\": \"An internal server error occurred\",\n  \"statusCode\": 500,\n  \"targetEndpoint\": null\n}\n"
+        }
+      ]
+    },
+    "feature1_graphql_endpoint.json": {
+      "description": "GraphQL HTTP endpoint returns status and response body for root query and mutation operations in mock and live runtime modes.",
+      "cases": [
+        {
+          "input": {
+            "action": "graphql_http",
+            "environment": "development",
+            "method": "GET",
+            "path": "/graphql",
+            "graphql": {
+              "query": "query grampsVersion { grampsVersion }",
+              "operationName": "grampsVersion",
+              "variables": {}
+            }
+          },
+          "expected_output": "{\n  \"body\": {\n    \"data\": {\n      \"grampsVersion\": \"Hello World\"\n    }\n  },\n  \"environment\": \"development\",\n  \"method\": \"GET\",\n  \"path\": \"/graphql\",\n  \"statusCode\": 200\n}\n"
+        },
+        {
+          "input": {
+            "action": "graphql_http",
+            "environment": "production",
+            "method": "POST",
+            "path": "/graphql",
+            "graphql": {
+              "query": "mutation grampsPing { grampsPing }",
+              "operationName": "grampsPing",
+              "variables": {}
+            }
+          },
+          "expected_output": "{\n  \"body\": {\n    \"data\": {\n      \"grampsPing\": \"GET OFF MY LAWN\"\n    }\n  },\n  \"environment\": \"production\",\n  \"method\": \"POST\",\n  \"path\": \"/graphql\",\n  \"statusCode\": 200\n}\n"
+        }
+      ]
+    },
+    "feature2_graphiql_endpoint.json": {
+      "description": "Interactive GraphQL documentation endpoint is exposed over HTTP and returns a successful HTML response.",
+      "cases": [
+        {
+          "input": {
+            "action": "graphiql_http",
+            "environment": "development",
+            "path": "/graphiql"
+          },
+          "expected_output": "{\n  \"containsGraphiql\": true,\n  \"contentType\": \"text/html\",\n  \"method\": \"GET\",\n  \"path\": \"/graphiql\",\n  \"statusCode\": 200\n}\n"
+        }
+      ]
+    },
+    "feature3_request_context.json": {
+      "description": "Request middleware attaches a composed execution context containing caller-provided context values and configured data-source models, then continues the request chain.",
+      "cases": [
+        {
+          "input": {
+            "action": "middleware_context",
+            "enableMockData": false,
+            "extraContext": {
+              "tenant": "acme"
+            },
+            "sources": [
+              {
+                "context": "Catalog",
+                "modelValue": "catalog-model"
+              },
+              {
+                "context": "Inventory",
+                "modelValue": "inventory-model"
+              }
+            ]
+          },
+          "expected_output": "{\n  \"context\": {\n    \"Catalog\": {\n      \"name\": \"catalog-model\"\n    },\n    \"Inventory\": {\n      \"name\": \"inventory-model\"\n    },\n    \"tenant\": \"acme\"\n  },\n  \"hasFormatError\": true,\n  \"hasSchema\": true,\n  \"nextCalled\": true\n}\n"
+        }
+      ]
+    },
+    "feature4_schema_composition.json": {
+      "description": "Schema composition combines built-in root operations with query fields contributed by multiple data sources and preserves schema configuration options.",
+      "cases": [
+        {
+          "input": {
+            "action": "compose_schema",
+            "sources": [
+              {
+                "context": "Catalog",
+                "id": 1,
+                "modelValue": "catalog"
+              },
+              {
+                "context": "Inventory",
+                "id": 2,
+                "modelValue": "inventory"
+              }
+            ]
+          },
+          "expected_output": "{\n  \"acceptedOptionKeys\": [],\n  \"mutationFields\": [\n    \"grampsPing\"\n  ],\n  \"queryFields\": [\n    \"CatalogType\",\n    \"InventoryType\",\n    \"grampsVersion\"\n  ]\n}\n"
+        }
+      ]
+    },
+    "feature5_external_sources.json": {
+      "description": "Development source loading reads zero, one, or multiple comma-separated source paths and returns only valid source definitions in the supplied order.",
+      "cases": [
+        {
+          "input": {
+            "action": "load_external_sources"
+          },
+          "expected_output": "{\n  \"contexts\": [],\n  \"count\": 0,\n  \"hasModel\": [],\n  \"hasResolvers\": [],\n  \"hasSchema\": []\n}\n"
+        }
+      ]
+    },
+    "feature6_source_overrides.json": {
+      "description": "Development sources replace local sources with matching context keys while unrelated local sources remain in place.",
+      "cases": [
+        {
+          "input": {
+            "action": "override_sources",
+            "sources": [
+              {
+                "context": "One",
+                "value": "local"
+              },
+              {
+                "context": "Two",
+                "value": "local"
+              },
+              {
+                "context": "Three",
+                "value": "local"
+              }
+            ],
+            "devSources": [
+              {
+                "context": "Two",
+                "value": "external"
+              },
+              {
+                "context": "Three",
+                "value": "external"
+              }
+            ]
+          },
+          "expected_output": "{\n  \"sources\": [\n    {\n      \"context\": \"One\",\n      \"value\": \"local\"\n    },\n    {\n      \"context\": \"Two\",\n      \"value\": \"external\"\n    },\n    {\n      \"context\": \"Three\",\n      \"value\": \"external\"\n    }\n  ],\n  \"warningCount\": 1\n}\n"
+        }
+      ]
+    },
+    "feature7_request_configuration.json": {
+      "description": "Outbound request configuration includes the target URI, JSON response parsing, full response resolution, and caller-supplied headers.",
+      "cases": [
+        {
+          "input": {
+            "action": "connector_request_config",
+            "uri": "https://api.example.test/items",
+            "headers": {}
+          },
+          "expected_output": "{\n  \"headers\": {},\n  \"json\": true,\n  \"resolveWithFullResponse\": true,\n  \"uri\": \"https://api.example.test/items\"\n}\n"
+        }
+      ]
+    },
+    "feature8_get_request_cache.json": {
+      "description": "GET data loading returns response bodies, stores successful fresh responses in cache, serves cached responses when available while refreshing, and skips cache when disabled or unsuccessful.",
+      "cases": [
+        {
+          "input": {
+            "action": "connector_get_request_data",
+            "uri": "https://api.example.test/items/1",
+            "statusCode": 200,
+            "body": {
+              "id": 1,
+              "name": "fresh"
+            },
+            "redis": {}
+          },
+          "expected_output": "{\n  \"redisOps\": [\n    {\n      \"op\": \"get\"\n    },\n    {\n      \"op\": \"setex\",\n      \"ttl\": 300,\n      \"value\": {\n        \"id\": 1,\n        \"name\": \"fresh\"\n      }\n    }\n  ],\n  \"result\": {\n    \"id\": 1,\n    \"name\": \"fresh\"\n  }\n}\n"
+        }
+      ]
+    },
+    "feature9_get_request_errors.json": {
+      "description": "GET data loading reports cache lookup failures and failed outbound requests as normalized errors that include domain status and endpoint signals where available.",
+      "cases": [
+        {
+          "input": {
+            "action": "connector_get_request_data",
+            "uri": "https://api.example.test/cache-error",
+            "statusCode": 200,
+            "body": {
+              "unused": true
+            },
+            "redis": {
+              "error": "redis unavailable"
+            }
+          },
+          "expected_output": "{\n  \"error\": \"cache_error\",\n  \"value\": \"redis unavailable\"\n}\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C016",
+      "C017"
+    ],
+    "kept_c": [
+      "C003",
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010",
+      "C018"
+    ],
+    "revealed_cp": 3,
+    "kept_cp": 3
+  }
+}

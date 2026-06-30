@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out the browser-side auth helper lib for the SPA. This is the thing that handles all the handshake stuff when users log in via the external identity provider — no backend involved, purely client-side. We've got about 10 distinct operations that need to work, covering everything from building the login redirect URL, handling what comes back after the redirect, dealing with the secret/challenge stuff for the secure flow, parsing the user identity token, and keeping a smart cache so we're not hammering the provider unnecessarily.
+
+One thing I want to flag — remember how we did that compatibility encoding logic in the login module before? Make sure the byte mapping and alphabet stuff is consistent with that approach. The cache piece is important too: we had a bug last quarter where users were getting tokens back that had the wrong access level because the cache lookup was too loose. That needs to be airtight.
+
+Everything should be deterministic — same inputs, same outputs, always. The adapter layer that reads commands and writes results needs to stay totally separate from the core logic. Error cases should produce clean neutral category labels rather than raw exceptions bubbling out. Please check the existing test layout under rcb_tests for the exact shapes expected.

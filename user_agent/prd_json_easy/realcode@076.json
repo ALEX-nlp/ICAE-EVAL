@@ -1,0 +1,750 @@
+{
+  "fuzzy_prd": "# Deferred HTML Rendering Toolkit - Lazy placeholders that resolve over a realtime channel\n\n## Project Goal\n\nBuild a server-side rendering toolkit that lets developers emit lightweight placeholder elements in a page and have their real content rendered later and delivered over a realtime channel, without forcing the slow or expensive parts of a page to block the initial response.\n\n---\n\n## Background & Problem\n\nWithout this toolkit, developers who want part of a page to load lazily must hand-roll an endpoint, serialize exactly which template and which data to render, sign that payload so a client cannot tamper with it, and wire up a realtime channel to push the rendered markup back. This is repetitive, easy to get wrong, and a frequent source of security mistakes (unsigned render instructions let a client render arbitrary templates or controllers).\n\nWith this toolkit, a developer marks a region with a single helper call. The helper emits a placeholder element that embeds a tamper-proof, signed description of what should eventually be rendered. A realtime channel later reads that signed description, renders the real content through the correct controller, and streams it back to replace the placeholder.\n\nThis document specifies the externally observable behavior of the toolkit's core building blocks: library configuration, controller resolution, the placeholder element builder, the out-of-band renderer, and the channel stream-name builder.\n\n---\n\n## Program / Dispatcher Contract\n\nAll features are exercised through one program that reads a single JSON command object from standard input and writes the result as raw text to standard output. Every command has an `op` field selecting the operation; the remaining fields are the operation's arguments. Unless stated otherwise, output lines are terminated by a newline and contain no test-runner metadata.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Library configuration defaults\n\n**As a developer**, I want stable, inspectable defaults for the library's top-level configuration, so I can rely on a known starting state.\n\n**Expected Behavior / Usage:**\n\nThe library's top-level namespace is exposed as a module. It also exposes a boolean configuration flag (selected here by the field name `skip_in_test`) that controls whether rendering is short-circuited in a test environment; its default value is false. The `config` operation takes a `field` selecting which fact to report: `field=\"module\"` prints `kind=Module`; `field=\"skip_in_test\"` prints `skip_in_test=false`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_library_defaults.json`\n\n```json\n{\n    \"description\": \"Reports whether the library's top-level namespace is exposed as a module and the default value of its test-skip configuration flag. Each case selects a single configuration field to inspect.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"config\", \"field\": \"module\"}, \"expected_output\": \"kind=Module\\n\"},\n        {\"input\": {\"op\": \"config\", \"field\": \"skip_in_test\"}, \"expected_output\": \"skip_in_test=false\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Configurable default controller\n\n**As a developer**, I want a configurable default controller that the toolkit uses when no specific controller is requested, so deferred rendering runs in a sensible context out of the box.\n\n**Expected Behavior / Usage:**\n\nThe toolkit keeps a configurable default controller. When nothing is configured it resolves to the application's conventional base controller (named `ApplicationController`). The `set` field assigns an override by class name (a string); the override is resolved by looking the named class up. A null `set` means no override is configured. The `default_controller` operation prints `default_controller=<resolved class name>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_default_controller.json`\n\n```json\n{\n    \"description\": \"Resolves the configurable default controller. When no override is set the resolver falls back to the framework's conventional base application controller; when an override name is assigned the resolver resolves that named class. The override is supplied as the 'set' field; a null value means no override.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"default_controller\", \"set\": null}, \"expected_output\": \"[a resolved controller class]\\n\"},\n        {\"input\": {\"op\": \"default_controller\", \"set\": \"ActionController::Base\"}, \"expected_output\": \"default_[a resolved controller class]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Controller resolution from a signed identifier\n\n**As a developer**, I want to resolve which controller renders a deferred fragment from a tamper-proof identifier, so a client cannot trick the server into rendering through an arbitrary controller.\n\n**Expected Behavior / Usage:**\n\nA controller is resolved from an optional signed identifier. When no signed identifier is supplied, the resolver returns the configured default controller (which may itself be overridden via a `default` field, otherwise the conventional base controller). When a signed identifier is supplied, the resolver verifies the signature and resolves the controller class named by the verified, trusted string. In this operation the `signed_name` field carries the plain controller name; the program signs it with the toolkit's verifier before passing it through resolution, so the round trip exercises real signing and verification. The `resolve_controller` operation prints `controller=<resolved class name>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_controller_resolution.json`\n\n```json\n{\n    \"description\": \"Resolves a controller class for deferred rendering. With no signed identifier it returns the configured default controller (optionally overridden via 'default'); with a signed identifier ('signed_name', which the harness signs before passing it through the verifier) it returns the controller class named by that verified, trusted string.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"resolve_controller\", \"signed_name\": null}, \"expected_output\": \"controller=ApplicationController\\n\"},\n        {\"input\": {\"op\": \"resolve_controller\", \"signed_name\": null, \"default\": \"ActionController::Base\"}, \"expected_output\": \"[a resolved controller class]\\n\"},\n        {\"input\": {\"op\": \"resolve_controller\", \"signed_name\": \"ActionController::Base\"}, \"expected_output\": \"[a resolved controller class]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Placeholder element builder\n\n**As a developer**, I want a single helper that emits a placeholder element carrying a tamper-proof description of what to render later, so I can defer rendering with one call and trust the embedded instructions.\n\n**Expected Behavior / Usage:**\n\nThe `futurize` operation builds one or more placeholder elements. The build inputs are: `extends` (the element shape; `\"div\"` produces a custom element tag, shown in the examples), an optional `partial` (a template identifier) with `locals` (a map of local variables), or a `collection` (a list of items) to fan out over, plus optional `html_options`, `eager`, `broadcast_each`, and a `block` selector. The toolkit signs a description of the render request and embeds it as a tamper-proof data attribute on the element.\n\nFor each element produced, the program prints a fixed block of `key=value` lines in this exact order: `tag`, `class`, `data-action`, `data-sgid`, `eager`, `broadcast_each`, `placeholder`, `params`. The literal token `_none_` is printed for any absent value. The `params` value is the signed payload after it has been verified and decoded back to its original structure, re-encoded as compact JSON with all object keys sorted alphabetically. When more than one element is produced, a line containing only `---` separates consecutive element blocks.\n\n*4.1 Signed payload round-trip and HTML option merge — a single placeholder from a template id plus locals*\n\nThe element embeds a signed payload that, once verified, reproduces exactly the supplied render description (template identifier and locals). Supplied HTML attributes are merged onto the element: a CSS class appears as the element's `class`, and arbitrary `data` attributes both appear on the element and are folded into the signed payload. The `block` selector `\"empty\"` attaches an empty placeholder block (so no automatic eager flag is added).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_signed_payload.json`\n\n```json\n{\n    \"description\": \"Builds a deferred-render custom element from a template identifier and a set of local variables, then reports the element's tag plus the cryptographically signed payload after it has been verified and decoded back to its original structure. Supplied HTML attributes (a CSS class and arbitrary data-* attributes) are merged onto the element and the data attributes are also folded into the signed payload.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"futurize\", \"extends\": \"div\", \"partial\": \"widgets/card\", \"locals\": {\"title\": \"Hello\", \"count\": 3}, \"block\": \"empty\"}, \"expected_output\": \"tag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=_none_\\nplaceholder=_none_\\nparams={\\\"locals\\\":{\\\"count\\\":3,\\\"title\\\":\\\"Hello\\\"},\\\"partial\\\":\\\"widgets/card\\\"}\\n\"},\n        {\"input\": {\"op\": \"futurize\", \"extends\": \"div\", \"partial\": \"widgets/card\", \"locals\": {\"title\": \"Hello\"}, \"html_options\": {\"class\": \"flex justify-center\", \"data\": {\"action\": \"reveal#toggle\"}}, \"block\": \"empty\"}, \"expected_output\": \"tag=futurism-element\\nclass=flex justify-center\\ndata-action=reveal#toggle\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=_none_\\nplaceholder=_none_\\nparams={\\\"data\\\":{\\\"action\\\":\\\"reveal#toggle\\\"},\\\"locals\\\":{\\\"title\\\":\\\"Hello\\\"},\\\"partial\\\":\\\"widgets/card\\\"}\\n\"}\n    ]\n}\n```\n\n*4.2 Reserved attribute protection — forged signed attributes are stripped*\n\nTwo data attributes are reserved by the toolkit: the one carrying the signed payload and the one carrying a signed record identifier. If a caller tries to supply either reserved key through `html_options.data`, it is dropped so it cannot be forged; any other supplied data attribute is preserved on the element and in the signed payload.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_attribute_protection.json`\n\n```json\n{\n    \"description\": \"Guards the reserved data attributes that carry the signed payload and the signed record identifier: if the caller tries to supply those reserved keys through the element's data attributes, they are dropped so they cannot be forged, while any other supplied data attribute is preserved on the element and inside the signed payload.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"futurize\", \"extends\": \"div\", \"partial\": \"widgets/card\", \"locals\": {\"title\": \"Hello\"}, \"html_options\": {\"data\": {\"controller\": \"reveal\", \"sgid\": \"forged\", \"signed_params\": \"forged\"}}, \"block\": \"empty\"}, \"expected_output\": \"tag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=_none_\\nplaceholder=_none_\\nparams={\\\"data\\\":{\\\"controller\\\":\\\"reveal\\\"},\\\"locals\\\":{\\\"title\\\":\\\"Hello\\\"},\\\"partial\\\":\\\"widgets/card\\\"}\\n\"}\n    ]\n}\n```\n\n*4.3 Eager-loading marker*\n\nAn eager-loading marker is emitted as a data attribute when the caller explicitly requests eager loading (`eager: true`), and it is also added automatically when the element is built without a placeholder block (because there is nothing to show while waiting). In both cases the marker value is the string `true`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_eager_flag.json`\n\n```json\n{\n    \"description\": \"Controls the eager-loading marker emitted as a data attribute on the element. The marker is present when the caller explicitly requests eager loading, and it is also added automatically when the element is built without a placeholder block (because there is nothing to show while waiting).\",\n    \"cases\": [\n        {\"input\": {\"op\": \"futurize\", \"extends\": \"div\", \"partial\": \"widgets/card\", \"locals\": {\"title\": \"Hello\"}, \"eager\": true, \"block\": \"empty\"}, \"expected_output\": \"tag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=true\\nbroadcast_each=_none_\\nplaceholder=_none_\\nparams={\\\"locals\\\":{\\\"title\\\":\\\"Hello\\\"},\\\"partial\\\":\\\"widgets/card\\\"}\\n\"},\n        {\"input\": {\"op\": \"futurize\", \"extends\": \"div\", \"partial\": \"widgets/card\", \"locals\": {\"title\": \"Hello\"}}, \"expected_output\": \"tag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=true\\nbroadcast_each=_none_\\nplaceholder=_none_\\nparams={\\\"locals\\\":{\\\"title\\\":\\\"Hello\\\"},\\\"partial\\\":\\\"widgets/card\\\"}\\n\"}\n    ]\n}\n```\n\n*4.4 Collection fan-out and indexed locals*\n\nGiven a `collection`, the builder produces one element per item. Each element's signed payload carries a pair of locals: the item itself under a name derived from the item's type, and a zero-based counter for that item under `<name>_counter`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_4_collection_locals.json`\n\n```json\n{\n    \"description\": \"Builds one element per item when given a collection. For each item the signed payload carries a pair of locals: the item itself under a name derived from the item's type, and a zero-based counter for that item under '<name>_counter'.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"futurize\", \"extends\": \"div\", \"collection\": [\"alpha\", \"beta\"], \"block\": \"empty\"}, \"expected_output\": \"tag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=_none_\\nplaceholder=_none_\\nparams={\\\"locals\\\":{\\\"string\\\":\\\"alpha\\\",\\\"string_counter\\\":0}}\\n---\\ntag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=_none_\\nplaceholder=_none_\\nparams={\\\"locals\\\":{\\\"string\\\":\\\"beta\\\",\\\"string_counter\\\":1}}\\n\"}\n    ]\n}\n```\n\n*4.5 Per-item broadcast marker*\n\nWhen a collection is rendered with the per-item broadcast option enabled (`broadcast_each: true`), every generated element carries a data attribute (value `true`) marking it for individual broadcast.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_5_broadcast_each.json`\n\n```json\n{\n    \"description\": \"When a collection is rendered with the per-item broadcast option enabled, every generated element carries a data attribute marking it for individual broadcast.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"futurize\", \"extends\": \"div\", \"collection\": [\"alpha\", \"beta\"], \"broadcast_each\": true, \"block\": \"empty\"}, \"expected_output\": \"tag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=true\\nplaceholder=_none_\\nparams={\\\"locals\\\":{\\\"string\\\":\\\"alpha\\\",\\\"string_counter\\\":0}}\\n---\\ntag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=true\\nplaceholder=_none_\\nparams={\\\"locals\\\":{\\\"string\\\":\\\"beta\\\",\\\"string_counter\\\":1}}\\n\"}\n    ]\n}\n```\n\n*4.6 Contextual placeholder block*\n\nWhen a collection is rendered with a placeholder block, the block is invoked once per item and receives the item together with its zero-based index. The text the block returns becomes the visible placeholder content of the corresponding element, while the signed payload still carries the indexed locals. The `block` selector `\"index_item\"` denotes a block that returns the one-based position followed by the item (for example, `1. alpha`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_6_collection_placeholder.json`\n\n```json\n{\n    \"description\": \"When a collection is rendered with a placeholder block, the block is invoked once per item and receives the item together with its zero-based index; the text it returns becomes the visible placeholder content of the corresponding element, while the signed payload still carries the indexed locals.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"futurize\", \"extends\": \"div\", \"collection\": [\"alpha\", \"beta\"], \"block\": \"index_item\"}, \"expected_output\": \"tag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=_none_\\nplaceholder=1. alpha\\nparams={\\\"locals\\\":{\\\"string\\\":\\\"alpha\\\",\\\"string_counter\\\":0}}\\n---\\ntag=futurism-element\\nclass=_none_\\ndata-action=_none_\\ndata-sgid=_none_\\neager=_none_\\nbroadcast_each=_none_\\nplaceholder=2. beta\\nparams={\\\"locals\\\":{\\\"string\\\":\\\"beta\\\",\\\"string_counter\\\":1}}\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Out-of-band inline renderer\n\n**As a developer**, I want to render a template outside the normal request cycle while still giving it a faithful request context, so deferred content renders exactly as it would inside a real request.\n\n**Expected Behavior / Usage:**\n\nThe `render_inline` operation configures a renderer from a target `url`, a `connection_env` (a map of environment values copied from the originating connection), and an explicit `params` map, then evaluates the supplied inline `template` through it. The `controller` field selects the rendering controller: an empty object uses the default base controller, and a `helpers` map defines named helper methods on the controller, each returning the given fixed string. The rendered template text is printed followed by a single newline.\n\n*5.1 Request context: environment, query, and explicit params*\n\nThe template can read values injected from the connection environment, query-string parameters parsed from the URL, and the explicitly supplied parameters. This holds for the default controller and for any other controller passed in.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_request_context.json`\n\n```json\n{\n    \"description\": \"Configures an out-of-band renderer from a target URL, a connection environment, and an explicit parameter hash, then evaluates an inline template through it. The template can read values injected from the connection environment, query-string parameters parsed from the URL, and the explicitly supplied parameters. The behaviour holds for the default controller and for any other controller passed in.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"render_inline\", \"controller\": {}, \"connection_env\": {\"HTTP_VAR\": \"[a literal string from connection_env]\"}, \"url\": \"http://www.example.org?someParam=1234\", \"params\": {\"SOME\": \"SOME_VALUE\"}, \"template\": \"env=<%= request.env['HTTP_VAR'] %> q=<%= params['someParam'] %> p=<%= params['SOME'] %>\"}, \"expected_output\": \"env=[a literal string from connection_env] q=1234 p=SOME_VALUE\\n\"},\n        {\"input\": {\"op\": \"render_inline\", \"controller\": {\"helpers\": {\"feature_flag\": \"on\"}}, \"connection_env\": {\"HTTP_VAR\": \"[a literal string from connection_env]\"}, \"url\": \"http://www.example.org?someParam=1234\", \"params\": {\"SOME\": \"SOME_VALUE\"}, \"template\": \"env=<%= request.env['HTTP_VAR'] %> q=<%= params['someParam'] %> p=<%= params['SOME'] %>\"}, \"expected_output\": \"env=[a literal string from connection_env] q=1234 p=SOME_VALUE\\n\"}\n    ]\n}\n```\n\n*5.2 Controller helper methods are callable from the template*\n\nHelper methods exposed by the resolving controller are callable from the inline template. The controller is configured with a named helper returning a fixed string, and the template invokes that helper by name.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_controller_helper.json`\n\n```json\n{\n    \"description\": \"Helper methods exposed by the resolving controller are callable from the inline template rendered through the out-of-band renderer. The controller is configured with a named helper returning a fixed string, and the template invokes that helper by name.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"render_inline\", \"controller\": {\"helpers\": {\"greeting\": \"FUTURISM\"}}, \"connection_env\": {\"HTTP_VAR\": \"v\"}, \"url\": \"http://www.example.org\", \"params\": {}, \"template\": \"Hi <%= greeting %>\"}, \"expected_output\": \"Hi FUTURISM\\n\"}\n    ]\n}\n```\n\n*5.3 Reconstructed request URL and tolerant routing*\n\nThe renderer reconstructs the request from the supplied URL so the template can observe the full request URL. This works for URLs whose path matches a registered route under any HTTP verb. An unmatched path still renders without raising an error; only a warning is emitted to standard error, and the reconstructed URL is still produced on standard output.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_3_request_url.json`\n\n```json\n{\n    \"description\": \"The renderer reconstructs the request from the supplied URL so that the template can observe the full request URL. This works for URLs whose path matches a registered route under any HTTP verb, and an unmatched path still renders without raising an error (a warning is emitted to standard error only).\",\n    \"cases\": [\n        {\"input\": {\"op\": \"render_inline\", \"controller\": {}, \"connection_env\": {\"HTTP_VAR\": \"v\"}, \"url\": \"[the full computed URL string]\", \"params\": {}, \"template\": \"<%= request.url %>\"}, \"expected_output\": \"[the full computed URL string]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Channel stream-name builder\n\n**As a developer**, I want a deterministic broadcast stream name derived from the subscription's channel and identity, so deferred content is delivered only to the right subscribers.\n\n**Expected Behavior / Usage:**\n\nThe stream name is computed by joining the requested channel name with the present connection identifier values. Each identifier contributes a value; an identifier object that exposes an id contributes its id. Present (non-blank) identifier values are joined by a semicolon, and the channel name is joined to that with a colon. The `stream_name` operation takes a `channel` name and an `identifiers` map (each value is either a scalar or an object with an `id`) and prints `stream_name=<value>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_stream_name.json`\n\n```json\n{\n    \"description\": \"Computes the broadcast stream name for a subscription by joining the requested channel name with the present connection identifier values. An identifier object that exposes an id contributes its id; the result is the channel name and the identifier value joined by a colon.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"stream_name\", \"channel\": \"ChatRoom\", \"identifiers\": {\"current_user\": {\"id\": 1}}}, \"expected_output\": \"stream_name=ChatRoom:1\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint, ensuring high maintainability without over-engineering. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON command from standard input and prints the result to standard output, matching the per-leaf-feature contracts above.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- check the standard fallback behavior for unresolved controllers\n- inspect the collection indexing mechanism in futurize\n",
+  "oracle_data": {
+    "task_id": "stimulusreflex__futurism-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "what is the default controller class?",
+          "resolve default_controller for ApplicationController",
+          "lookup controller for ActionController::Base",
+          "how to resolve Application Controllers",
+          "action controller resolve method"
+        ],
+        "oracle_response": "The value is explicitly set to 'ApplicationController' for the default_controller key and 'ActionController::Base' for the controller key."
+      },
+      {
+        "constraint_id": "C024",
+        "trigger_keywords": [
+          "what is the literal string value for HTTP_VAR_VALUE?",
+          "decode connection_env HTTP_VAR_VALUE",
+          "render_inline env injection result",
+          "specific value in connection_env",
+          "HTTP_VAR_VALUE literal"
+        ],
+        "oracle_response": "The exact literal string value is 'HTTP_VAR_VALUE'."
+      },
+      {
+        "constraint_id": "C028",
+        "trigger_keywords": [
+          "what is the exact URL string for request.url?",
+          "reconstruct URL for http://example.org/known/get",
+          "render_inline url reconstruction result",
+          "full url including query params",
+          "example.org known get"
+        ],
+        "oracle_response": "The precise full URL string, including query parameters, is 'http://example.org/known/get'."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "check the standard fallback behavior for unresolved controllers",
+        "actual_meaning": "Refer to the logic that defaults to 'ApplicationController' when no specific override is provided via the 'default' field or explicit configuration."
+      },
+      {
+        "vague_reference": "inspect the collection indexing mechanism in futurize",
+        "actual_meaning": "Refer to the specific implementation details in the futurize module where local variables are scoped as 'item_type' (value) and 'item_type_counter' (integer index based on iteration position i)."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_library_defaults.json": {
+      "description": "Reports whether the library's top-level namespace is exposed as a module and the default value of its test-skip configuration flag. Each case selects a single configuration field to inspect.",
+      "cases": [
+        {
+          "input": {
+            "op": "config",
+            "field": "module"
+          },
+          "expected_output": "kind=Module\n"
+        },
+        {
+          "input": {
+            "op": "config",
+            "field": "skip_in_test"
+          },
+          "expected_output": "skip_in_test=false\n"
+        }
+      ]
+    },
+    "feature2_default_controller.json": {
+      "description": "Resolves the configurable default controller. When no override is set the resolver falls back to the framework's conventional base application controller; when an override name is assigned the resolver resolves that named class. The override is supplied as the 'set' field; a null value means no override.",
+      "cases": [
+        {
+          "input": {
+            "op": "default_controller",
+            "set": null
+          },
+          "expected_output": "default_controller=ApplicationController\n"
+        },
+        {
+          "input": {
+            "op": "default_controller",
+            "set": "ActionController::Base"
+          },
+          "expected_output": "default_controller=ActionController::Base\n"
+        }
+      ]
+    },
+    "feature3_controller_resolution.json": {
+      "description": "Resolves a controller class for deferred rendering. With no signed identifier it returns the configured default controller (optionally overridden via 'default'); with a signed identifier ('signed_name', which the harness signs before passing it through the verifier) it returns the controller class named by that verified, trusted string.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve_controller",
+            "signed_name": null
+          },
+          "expected_output": "controller=ApplicationController\n"
+        },
+        {
+          "input": {
+            "op": "resolve_controller",
+            "signed_name": null,
+            "default": "ActionController::Base"
+          },
+          "expected_output": "controller=ActionController::Base\n"
+        },
+        {
+          "input": {
+            "op": "resolve_controller",
+            "signed_name": "ActionController::Base"
+          },
+          "expected_output": "controller=ActionController::Base\n"
+        }
+      ]
+    },
+    "feature4_1_signed_payload.json": {
+      "description": "Builds a deferred-render custom element from a template identifier and a set of local variables, then reports the element's tag plus the cryptographically signed payload after it has been verified and decoded back to its original structure. Supplied HTML attributes (a CSS class and arbitrary data-* attributes) are merged onto the element and the data attributes are also folded into the signed payload.",
+      "cases": [
+        {
+          "input": {
+            "op": "futurize",
+            "extends": "div",
+            "partial": "widgets/card",
+            "locals": {
+              "title": "Hello",
+              "count": 3
+            },
+            "block": "empty"
+          },
+          "expected_output": "tag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=_none_\nbroadcast_each=_none_\nplaceholder=_none_\nparams={\"locals\":{\"count\":3,\"title\":\"Hello\"},\"partial\":\"widgets/card\"}\n"
+        },
+        {
+          "input": {
+            "op": "futurize",
+            "extends": "div",
+            "partial": "widgets/card",
+            "locals": {
+              "title": "Hello"
+            },
+            "html_options": {
+              "class": "flex justify-center",
+              "data": {
+                "action": "reveal#toggle"
+              }
+            },
+            "block": "empty"
+          },
+          "expected_output": "tag=futurism-element\nclass=flex justify-center\ndata-action=reveal#toggle\ndata-sgid=_none_\neager=_none_\nbroadcast_each=_none_\nplaceholder=_none_\nparams={\"data\":{\"action\":\"reveal#toggle\"},\"locals\":{\"title\":\"Hello\"},\"partial\":\"widgets/card\"}\n"
+        }
+      ]
+    },
+    "feature4_2_attribute_protection.json": {
+      "description": "Guards the reserved data attributes that carry the signed payload and the signed record identifier: if the caller tries to supply those reserved keys through the element's data attributes, they are dropped so they cannot be forged, while any other supplied data attribute is preserved on the element and inside the signed payload.",
+      "cases": [
+        {
+          "input": {
+            "op": "futurize",
+            "extends": "div",
+            "partial": "widgets/card",
+            "locals": {
+              "title": "Hello"
+            },
+            "html_options": {
+              "data": {
+                "controller": "reveal",
+                "sgid": "forged",
+                "signed_params": "forged"
+              }
+            },
+            "block": "empty"
+          },
+          "expected_output": "tag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=_none_\nbroadcast_each=_none_\nplaceholder=_none_\nparams={\"data\":{\"controller\":\"reveal\"},\"locals\":{\"title\":\"Hello\"},\"partial\":\"widgets/card\"}\n"
+        }
+      ]
+    },
+    "feature4_3_eager_flag.json": {
+      "description": "Controls the eager-loading marker emitted as a data attribute on the element. The marker is present when the caller explicitly requests eager loading, and it is also added automatically when the element is built without a placeholder block (because there is nothing to show while waiting).",
+      "cases": [
+        {
+          "input": {
+            "op": "futurize",
+            "extends": "div",
+            "partial": "widgets/card",
+            "locals": {
+              "title": "Hello"
+            },
+            "eager": true,
+            "block": "empty"
+          },
+          "expected_output": "tag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=true\nbroadcast_each=_none_\nplaceholder=_none_\nparams={\"locals\":{\"title\":\"Hello\"},\"partial\":\"widgets/card\"}\n"
+        },
+        {
+          "input": {
+            "op": "futurize",
+            "extends": "div",
+            "partial": "widgets/card",
+            "locals": {
+              "title": "Hello"
+            }
+          },
+          "expected_output": "tag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=true\nbroadcast_each=_none_\nplaceholder=_none_\nparams={\"locals\":{\"title\":\"Hello\"},\"partial\":\"widgets/card\"}\n"
+        }
+      ]
+    },
+    "feature4_4_collection_locals.json": {
+      "description": "Builds one element per item when given a collection. For each item the signed payload carries a pair of locals: the item itself under a name derived from the item's type, and a zero-based counter for that item under '<name>_counter'.",
+      "cases": [
+        {
+          "input": {
+            "op": "futurize",
+            "extends": "div",
+            "collection": [
+              "alpha",
+              "beta"
+            ],
+            "block": "empty"
+          },
+          "expected_output": "tag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=_none_\nbroadcast_each=_none_\nplaceholder=_none_\nparams={\"locals\":{\"string\":\"alpha\",\"string_counter\":0}}\n---\ntag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=_none_\nbroadcast_each=_none_\nplaceholder=_none_\nparams={\"locals\":{\"string\":\"beta\",\"string_counter\":1}}\n"
+        }
+      ]
+    },
+    "feature4_5_broadcast_each.json": {
+      "description": "When a collection is rendered with the per-item broadcast option enabled, every generated element carries a data attribute marking it for individual broadcast.",
+      "cases": [
+        {
+          "input": {
+            "op": "futurize",
+            "extends": "div",
+            "collection": [
+              "alpha",
+              "beta"
+            ],
+            "broadcast_each": true,
+            "block": "empty"
+          },
+          "expected_output": "tag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=_none_\nbroadcast_each=true\nplaceholder=_none_\nparams={\"locals\":{\"string\":\"alpha\",\"string_counter\":0}}\n---\ntag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=_none_\nbroadcast_each=true\nplaceholder=_none_\nparams={\"locals\":{\"string\":\"beta\",\"string_counter\":1}}\n"
+        }
+      ]
+    },
+    "feature4_6_collection_placeholder.json": {
+      "description": "When a collection is rendered with a placeholder block, the block is invoked once per item and receives the item together with its zero-based index; the text it returns becomes the visible placeholder content of the corresponding element, while the signed payload still carries the indexed locals.",
+      "cases": [
+        {
+          "input": {
+            "op": "futurize",
+            "extends": "div",
+            "collection": [
+              "alpha",
+              "beta"
+            ],
+            "block": "index_item"
+          },
+          "expected_output": "tag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=_none_\nbroadcast_each=_none_\nplaceholder=1. alpha\nparams={\"locals\":{\"string\":\"alpha\",\"string_counter\":0}}\n---\ntag=futurism-element\nclass=_none_\ndata-action=_none_\ndata-sgid=_none_\neager=_none_\nbroadcast_each=_none_\nplaceholder=2. beta\nparams={\"locals\":{\"string\":\"beta\",\"string_counter\":1}}\n"
+        }
+      ]
+    },
+    "feature5_1_request_context.json": {
+      "description": "Configures an out-of-band renderer from a target URL, a connection environment, and an explicit parameter hash, then evaluates an inline template through it. The template can read values injected from the connection environment, query-string parameters parsed from the URL, and the explicitly supplied parameters. The behaviour holds for the default controller and for any other controller passed in.",
+      "cases": [
+        {
+          "input": {
+            "op": "render_inline",
+            "controller": {},
+            "connection_env": {
+              "HTTP_VAR": "HTTP_VAR_VALUE"
+            },
+            "url": "http://www.example.org?someParam=1234",
+            "params": {
+              "SOME": "SOME_VALUE"
+            },
+            "template": "env=<%= request.env['HTTP_VAR'] %> q=<%= params['someParam'] %> p=<%= params['SOME'] %>"
+          },
+          "expected_output": "env=HTTP_VAR_VALUE q=1234 p=SOME_VALUE\n"
+        },
+        {
+          "input": {
+            "op": "render_inline",
+            "controller": {
+              "helpers": {
+                "feature_flag": "on"
+              }
+            },
+            "connection_env": {
+              "HTTP_VAR": "HTTP_VAR_VALUE"
+            },
+            "url": "http://www.example.org?someParam=1234",
+            "params": {
+              "SOME": "SOME_VALUE"
+            },
+            "template": "env=<%= request.env['HTTP_VAR'] %> q=<%= params['someParam'] %> p=<%= params['SOME'] %>"
+          },
+          "expected_output": "env=HTTP_VAR_VALUE q=1234 p=SOME_VALUE\n"
+        }
+      ]
+    },
+    "feature5_2_controller_helper.json": {
+      "description": "Helper methods exposed by the resolving controller are callable from the inline template rendered through the out-of-band renderer. The controller is configured with a named helper returning a fixed string, and the template invokes that helper by name.",
+      "cases": [
+        {
+          "input": {
+            "op": "render_inline",
+            "controller": {
+              "helpers": {
+                "greeting": "FUTURISM"
+              }
+            },
+            "connection_env": {
+              "HTTP_VAR": "v"
+            },
+            "url": "http://www.example.org",
+            "params": {},
+            "template": "Hi <%= greeting %>"
+          },
+          "expected_output": "Hi FUTURISM\n"
+        }
+      ]
+    },
+    "feature5_3_request_url.json": {
+      "description": "The renderer reconstructs the request from the supplied URL so that the template can observe the full request URL. This works for URLs whose path matches a registered route under any HTTP verb, and an unmatched path still renders without raising an error (a warning is emitted to standard error only).",
+      "cases": [
+        {
+          "input": {
+            "op": "render_inline",
+            "controller": {},
+            "connection_env": {
+              "HTTP_VAR": "v"
+            },
+            "url": "http://example.org/known/get",
+            "params": {},
+            "template": "<%= request.url %>"
+          },
+          "expected_output": "http://example.org/known/get\n"
+        }
+      ]
+    },
+    "feature6_stream_name.json": {
+      "description": "Computes the broadcast stream name for a subscription by joining the requested channel name with the present connection identifier values. An identifier object that exposes an id contributes its id; the result is the channel name and the identifier value joined by a colon.",
+      "cases": [
+        {
+          "input": {
+            "op": "stream_name",
+            "channel": "ChatRoom",
+            "identifiers": {
+              "current_user": {
+                "id": 1
+              }
+            }
+          },
+          "expected_output": "stream_name=ChatRoom:1\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Command Dispatch",
+      "input_condition": "root.input.op",
+      "output_rule": "The command must match one of the defined operations to produce output; undefined ops produce no output or error.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Output Formatting",
+      "input_condition": "Any successful operation",
+      "output_rule": "Each output line must be newline-terminated and contain no test-runner metadata.",
+      "exact_values": [
+        "\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Output Formatting - Config Field",
+      "input_condition": "op=cfg, field provided",
+      "output_rule": "Output format is 'key=value' followed by newline.",
+      "exact_values": [
+        "kind=Module",
+        "skip_in_test=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Output Formatting - Controller Resolve",
+      "input_condition": "op=default_controller or op=resolve_controller",
+      "output_rule": "Output format is '<key>=<resolved value>' followed by newline.",
+      "exact_values": [
+        "default_controller=ApplicationController",
+        "controller=ActionController::Base"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Default Controller Fallback",
+      "input_condition": "op=default_controller, set=null",
+      "output_rule": "Resolve to the framework's conventional base application controller.",
+      "exact_values": [
+        "ApplicationController"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Default Controller Override",
+      "input_condition": "op=default_controller, set=<class_name>",
+      "output_rule": "Resolve to the named class provided in the 'set' field.",
+      "exact_values": [
+        "ActionController::Base"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Controller Resolution Fallback",
+      "input_condition": "op=resolve_controller, signed_name=null",
+      "output_rule": "Return the configured default controller (or the framework's default if no override via 'default' field).",
+      "exact_values": [
+        "ApplicationController"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Controller Resolution with Default Override",
+      "input_condition": "op=resolve_controller, signed_name=null, default=<class>",
+      "output_rule": "Return the class specified in the 'default' field.",
+      "exact_values": [
+        "ActionController::Base"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Controller Resolution with Signed Name",
+      "input_condition": "op=resolve_controller, signed_name=<name>",
+      "output_rule": "Verify signature of 'signed_name', then resolve to the class named by the verified string.",
+      "exact_values": [
+        "ActionController::Base"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Futureze - Attribute Merging",
+      "input_condition": "op=futurize, html_options.class provided",
+      "output_rule": "Emit the CSS class from 'html_options.class' as the 'class' field in output. Ignore explicit 'class' in 'html_options.data'.",
+      "exact_values": [
+        "flex justify-center"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Futureze - Data Attribute Merging",
+      "input_condition": "op=futurize, html_options.data provided, key not in reserved_keys",
+      "output_rule": "Emit the key-value pair from 'html_options.data' on the element and include it in the signed payload 'params'.",
+      "exact_values": [
+        "action=reveal#toggle",
+        "data={\"action\":\"reveal#toggle\"}"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Futureze - Reserved Attribute Protection (drop)",
+      "input_condition": "op=futurize, html_options.data contains 'sgid' or 'signed_params'",
+      "output_rule": "Strip 'sgid' and 'signed_params' from 'html_options.data' so they do not appear on the element or in the payload.",
+      "exact_values": [
+        "controller",
+        "data={\"controller\":\"reveal\"}"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Futureze - Default Tag",
+      "input_condition": "op=futurize",
+      "output_rule": "If 'extends' is implicit or default, tag is 'futurism-element'.",
+      "exact_values": [
+        "futurism-element"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Futureze - Explicit Extends",
+      "input_condition": "op=futurize, extends=<tag>",
+      "output_rule": "Tag becomes the value of 'extends'.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Futureze - Eager Flag Default",
+      "input_condition": "op=futurize, block is null/absent (no placeholder block)",
+      "output_rule": "Emit 'eager=true' in the output.",
+      "exact_values": [
+        "eager=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Futureze - Eager Flag Explicit",
+      "input_condition": "op=futurize, eager=true",
+      "output_rule": "Emit 'eager=true' in the output.",
+      "exact_values": [
+        "eager=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Futureze - Placeholder Default",
+      "input_condition": "op=futurize, block is null/absent",
+      "output_rule": "Emit 'placeholder=_none_' in the output.",
+      "exact_values": [
+        "placeholder=_none_"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Futureze - Collection Indexing",
+      "input_condition": "op=futurize, collection=[items], <i>th iteration",
+      "output_rule": "Local name is 'item_type', counter is '<item_type>_counter'. Local value for item_type is the item. Local value for counter is the zero-based index 'i'.",
+      "exact_values": [
+        "string",
+        "string_counter"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Futureze - Collection Eager Override",
+      "input_condition": "op=futurize, collection=..., eager=true",
+      "output_rule": "Override the automatic eager flag if present; if rendered with a block, eager is '_none_' unless explicitly set.",
+      "exact_values": [
+        "eager=_none_"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Futureze - Signed Payload Structure",
+      "input_condition": "Render executed successfully",
+      "output_rule": "The 'params' output line must be a compact, sorted JSON object representing the verified and decoded description.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Futureze - Multi-Element Separator",
+      "input_condition": "op=futurize produces >1 elements",
+      "output_rule": "Insert a line containing only '---' between consecutive element blocks.",
+      "exact_values": [
+        "---"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Stream Name - Identifiers with ID",
+      "input_condition": "op=stream_name, identifiers.<key>.id exists",
+      "output_rule": "Join channel name with identifiers.user.id using ':'.",
+      "exact_values": [
+        "ChatRoom:1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Stream Name - Identifiers without ID",
+      "input_condition": "op=stream_name, identifiers.<key>.id missing/not numeric",
+      "output_rule": "Ignore the key if it does not expose a valid ID; join channel with valid IDs only.",
+      "exact_values": [
+        "ChatRoom"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Inline Render - Env Injection",
+      "input_condition": "op=render_inline, template contains request.env[]",
+      "output_rule": "The template must evaluate to the literal string value found in connection_env.",
+      "exact_values": [
+        "HTTP_VAR_VALUE"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Inline Render - Query Param Injection",
+      "input_condition": "op=render_inline, template contains params[string_param]",
+      "output_rule": "The template must evaluate to the literal string value found in URL query params.",
+      "exact_values": [
+        "1234"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "Inline Render - Explicit Param Injection",
+      "input_condition": "op=render_inline, template contains params[event_key]",
+      "output_rule": "The template must evaluate to the literal string value found in the top-level 'params' input object.",
+      "exact_values": [
+        "SOME_VALUE"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Controller Helper Execution",
+      "input_condition": "op=render_inline, controller.helpers.<helper_name> defined",
+      "output_rule": "The template must invoke the helper via its name key and return its result.",
+      "exact_values": [
+        "FUTURISM"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Render - URL Reconstruction",
+      "input_condition": "op=render_inline, output uses request.url",
+      "output_rule": "Request.url must exactly match the 'url' input string (including query params).",
+      "exact_values": [
+        "http://example.org/known/get"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "Inline Render - Empty Debug Helper",
+      "input_condition": "controller helpers are empty",
+      "output_rule": "Helper invocations that fail or are undefined may result in errors or template rendering to null/empty (context dictated by framework, but output is deterministic in tests).",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Data Attribute Value",
+      "input_condition": "op=futurize, eager=true or block absent",
+      "output_rule": "The 'eager' field in the output block must be the string 'true' (not boolean).",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "Data Attribute _none_",
+      "input_condition": "op=futurize, eager not set/implied (false) and block present",
+      "output_rule": "The 'eager' field in the output block must be '_none_' (not boolean).",
+      "exact_values": [
+        "_none_"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "Collection Counter Value",
+      "input_condition": "op=futurize, collection=[\"a\", \"b\"]",
+      "output_rule": "The first item must have string_counter=0. The second item must have string_counter=1.",
+      "exact_values": [
+        "0",
+        "1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "Collection Block Accessibility",
+      "input_condition": "op=futurize, collection=..., block=index_item",
+      "output_rule": "The 'placeholder' field must strictly match the return value of the block function (1. alpha, 2. beta).",
+      "exact_values": [
+        "1. alpha",
+        "2. beta"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C004",
+        "replacement": "a resolved controller class",
+        "exact_values_to_replace": [
+          "default_controller=ApplicationController",
+          "controller=ActionController::Base"
+        ],
+        "trigger_keywords": [
+          "what is the default controller class?",
+          "resolve default_controller for ApplicationController",
+          "lookup controller for ActionController::Base",
+          "how to resolve Application Controllers",
+          "action controller resolve method"
+        ],
+        "oracle_response": "The value is explicitly set to 'ApplicationController' for the default_controller key and 'ActionController::Base' for the controller key."
+      },
+      {
+        "constraint_id": "C024",
+        "replacement": "a literal string from connection_env",
+        "exact_values_to_replace": [
+          "HTTP_VAR_VALUE"
+        ],
+        "trigger_keywords": [
+          "what is the literal string value for HTTP_VAR_VALUE?",
+          "decode connection_env HTTP_VAR_VALUE",
+          "render_inline env injection result",
+          "specific value in connection_env",
+          "HTTP_VAR_VALUE literal"
+        ],
+        "oracle_response": "The exact literal string value is 'HTTP_VAR_VALUE'."
+      },
+      {
+        "constraint_id": "C028",
+        "replacement": "the full computed URL string",
+        "exact_values_to_replace": [
+          "http://example.org/known/get"
+        ],
+        "trigger_keywords": [
+          "what is the exact URL string for request.url?",
+          "reconstruct URL for http://example.org/known/get",
+          "render_inline url reconstruction result",
+          "full url including query params",
+          "example.org known get"
+        ],
+        "oracle_response": "The precise full URL string, including query parameters, is 'http://example.org/known/get'."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C007",
+        "vague_phrase": "check the standard fallback behavior for unresolved controllers",
+        "actual_meaning": "Refer to the logic that defaults to 'ApplicationController' when no specific override is provided via the 'default' field or explicit configuration."
+      },
+      {
+        "constraint_id": "C018",
+        "vague_phrase": "inspect the collection indexing mechanism in futurize",
+        "actual_meaning": "Refer to the specific implementation details in the futurize module where local variables are scoped as 'item_type' (value) and 'item_type_counter' (integer index based on iteration position i)."
+      }
+    ]
+  }
+}

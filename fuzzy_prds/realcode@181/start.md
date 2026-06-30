@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from some of our geo-data partners that the shapes they send us are coming back looking weird or just wrong after we process them. Specifically stuff around how we handle the winding direction of polygon rings — apparently when someone sends us a ring that goes the 'wrong way', we're supposed to fix it automatically, but sometimes we're flipping when we shouldn't be, or not flipping when we should. Also there's something about holes inside polygons needing to wind opposite to their outer shell, which I think we already discussed in the context of that orientation-aware parsing work we did before (check how we handled that in the WKT/WKB reading path, same logic should apply here).
+
+Also separately — when people batch-query properties like dimensions across a mixed list that includes non-geography values (like plain numbers), the system should probably not just silently return garbage or crash. We need a clean, user-facing signal that makes it obvious something in the input wasn't actually a geographic shape.
+
+Finally, the multilinestring shape count behavior seems inconsistent with how multipolygons report their counts. Can someone sanity check whether the nshape value we return for multi-geometry types is actually correct and consistent across all of them? I think there's a ticket somewhere about this but I can't find it.

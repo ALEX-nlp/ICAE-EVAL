@@ -1,0 +1,365 @@
+## Product Requirement Document
+
+# CI/CD Pipeline Configuration Analyzer — Parsing, Dependency Inventory & Security Rule Evaluation
+
+## Project Goal
+
+Build a static analysis library that ingests the configuration files of a software project's continuous-integration / continuous-delivery (CI/CD) setup — workflow definitions, reusable-action metadata, and pipeline configuration — parses them into a structured model, resolves the third-party components they depend on into canonical package identifiers, and evaluates a catalog of security rules over the result, so engineers can detect supply-chain and misconfiguration risks in their automation without running it.
+
+---
+
+## Background & Problem
+
+Modern projects automate building, testing and deploying through declarative CI/CD configuration: workflow files that wire up triggering events, jobs, runners, permissions and steps; reusable-action metadata documents; and pipeline configuration files with stages, variables and includes. These files routinely pull in third-party actions, container images and shared templates, and they frequently contain subtle security problems — untrusted input flowing into shell commands, over-broad default permissions on risky triggers, jobs running on self-hosted runners reachable from forks, references to vulnerable component versions, and so on.
+
+Without a dedicated analyzer, teams must review these files by hand, which is slow, inconsistent, and easy to get wrong as syntax variants multiply. This library provides one well-defined contract for: (1) deterministically parsing each configuration dialect into a normalized model; (2) deriving canonical package URLs for every referenced action, image and include so dependencies can be inventoried; (3) evaluating reusable helper predicates (self-hosted-runner detection, semantic-version constraint satisfaction); and (4) running the full security rule set to produce structured findings with precise locations.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain. This is a multi-responsibility system (several parsing dialects, a package-identifier model, a policy/rule engine, a dependency inventory, and an execution adapter) and MUST be organized as a clear, multi-file directory tree (e.g. a model layer, a rule/policy layer, a scanning/inventory layer, and the adapter), not a single monolithic file.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls to the core domain and rendering the results in the documented line format.
+
+3. **Adherence to SOLID Design Principles:**
+   - **Single Responsibility Principle (SRP):** Separate parsing, package-identifier handling, rule evaluation, inventory, and output formatting into distinct logical units.
+   - **Open/Closed Principle (OCP):** The rule engine must be open for extension (new rules) but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces small and cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Malformed configuration must be rejected through proper error modeling, never by crashing; the execution adapter translates such failures into the neutral `error=<category>` lines documented below.
+
+---
+
+## Core Features
+
+### Feature 1: Workflow Job Parsing
+
+**As a developer**, I want a single workflow job definition parsed into a normalized structure, so I can inspect its runner target, permissions, environment and container regardless of which accepted YAML shape was used.
+
+**Expected Behavior / Usage:**
+
+The input carries a YAML document that is a mapping of one job id to its body. The runner target may be a plain label, a list of labels, or a structured object: a structured object's runner group entries are flattened to `group:<name>` and its label entries to `label:<name>`. Permissions are a mapping of scope to access value. Environment may be a mapping of names to values, or a single expression value with no name. A container may be given as a bare image string or as an object with an `image` field. The adapter emits the job id, then one `runs_on=<target>` line per resolved runner target (in order), then one `permission <scope>=<value>` line per permission, then environment entries (`env <name>=<value>`, or `[the specific scalar value present in the environment map]` when nameless), then `container_image=<image>` when present, then the one-based source line numbers tracked for the job (`line.start` always; `line.runs_on` when a runner is declared), sorted by key. A structurally invalid job body (wrong node kinds, empty/blank group or label entries, non-mapping permissions/env, malformed nested values) is rejected as `error=invalid_job`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_workflow_job.json`
+
+```json
+{
+    "description": "Parse a single CI workflow job definition supplied as a YAML mapping of one job id to its body. The job body may declare the runner target (a plain label, a list of labels, or a structured object carrying a runner group and/or labels that are flattened into prefixed entries), permission scopes, environment entries, and a container image (a bare string or an object). The adapter emits the parsed job id, its resolved runner targets, permission scope and value pairs, environment entries, container image, and the one-based source line numbers tracked for the job start and the runner declaration. Structurally invalid job bodies are rejected with a neutral error category.",
+    "cases": [
+        {
+            "input": {"op": "parse_workflow_job", "yaml": "build: {runs-on: { group: runner-group, labels: [runner-label] }}"},
+            "expected_output": "id=build\nruns_on=group:runner-group\nruns_on=label:runner-label\nline.runs_on=1\nline.start=1\n"
+        },
+        {
+            "input": {"op": "parse_workflow_job", "yaml": "build: {permissions: {contents: read}}"},
+            "expected_output": "id=build\npermission contents=read\nline.start=1\n"
+        },
+        {
+            "input": {"op": "parse_workflow_job", "yaml": "build: []"},
+            "expected_output": "error=invalid_job\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Workflow Trigger/Event Parsing
+
+**As a developer**, I want the workflow's triggering-event section parsed, so I can see which events activate the workflow and the filters, schedules, and reusable-workflow interface they declare.
+
+**Expected Behavior / Usage:**
+
+The input carries the event section as YAML in any accepted shape: a single event name, a list of event names, or a mapping of event names to configuration. Per event, the adapter emits `event=<name>`, followed by its activity types (`type=<v>`), branch filters (`branch=<v>`), branch-ignore filters (`branch_ignore=<v>`), tag filters (`tag=<v>`), schedule expressions (`cron=<v>`), referenced upstream workflows (`workflow=<v>`), typed inputs (`input <name> type=<type> required=<bool>`), declared outputs (`output <name> description=<desc> value=<value>`), and required secrets (`secret <name> required=<bool>`), each group in that order and in source order within a group. Scheduled events require each entry to carry a cron expression; malformed event configuration (e.g. a non-list schedule, a schedule entry without a cron field, a non-mapping inputs/outputs block, or an over-nested output) is rejected as `[the exact error string emitted for invalid event schedules]`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_workflow_events.json`
+
+```json
+{
+    "description": "Parse the trigger/event section of a CI workflow, supplied as YAML in any accepted shape: a single event name, a list of event names, or a mapping of event names to their configuration. Event configuration may include branch filters, scheduled cron expressions, referenced upstream workflows and their activity types, and (for reusable-workflow triggers) typed inputs, declared outputs, and required secrets. The adapter emits, per event, the event name followed by its filters, schedules, referenced workflows, activity types, inputs, outputs and secrets. Malformed event configuration is rejected with a neutral error category.",
+    "cases": [
+        {
+            "input": {"op": "parse_workflow_events", "yaml": "push: {branches: main}"},
+            "expected_output": "event=push\nbranch=main\n"
+        },
+        {
+            "input": {"op": "parse_workflow_events", "yaml": "schedule: [cron: \"s1\", cron: \"s2\"]"},
+            "expected_output": "event=schedule\ncron=s1\ncron=s2\n"
+        },
+        {
+            "input": {"op": "parse_workflow_events", "yaml": "workflow_call: {\n  inputs: {previousSteps: {type: string, required: true}},\n  outputs: {build: {description: build_id, value: \"${{ jobs.build.outputs.build }}\" }},\n  secrets: {BOARD_TOKEN: {required: true}}\n}"},
+            "expected_output": "event=workflow_call\ninput previousSteps type=string required=true\noutput build description=build_id value=${{ jobs.build.outputs.build }}\nsecret BOARD_TOKEN required=true\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 3: Reusable Action Metadata Parsing
+
+**As a developer**, I want a reusable action's metadata document parsed, so I can read its declared interface and the steps a composite action runs.
+
+**Expected Behavior / Usage:**
+
+The input carries an action metadata document as YAML. The adapter emits `name`, `author`, `description` (empty when absent), then each typed input (`input <name> required=<bool> type=<type>`), each output (`output <name> description=<desc>`), the run mode (`runs_using=<using>`), and for each composite step a line `step id=<id> uses=<reference> action=<derived-name> line.uses=<n>` where the derived name is the reference with its trailing `@<version>` removed and `line.uses` is the one-based source line of the reference, followed by each supplied argument (`with <name>=<value>`).
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_action_metadata.json`
+
+```json
+{
+    "description": "Parse a reusable action's metadata document (YAML) describing its name, author, description, typed inputs, named outputs, and its run configuration. For composite-style actions the run configuration lists ordered steps, each of which may reference another action. The adapter emits the action name, author, description, each input with its required flag and type, each output with its description, the run mode, and per step the step id, the referenced action reference and its derived name, the one-based line of the reference, and any supplied arguments.",
+    "cases": [
+        {
+            "input": {"op": "parse_action_metadata", "yaml": "name: \"My GitHub Action\"\nauthor: \"John Doe\"\ndescription: \"Analyze git sha\"\n\ninputs:\n  git_sha:\n    required: true\n    type: string\n\noutputs:\n  response:\n    description: \"Response from the command executed\"\n\nruns:\n  using: \"composite\"\n  steps:\n  - uses: actions/checkout@v2\n    id: checkout\n    with:\n      ref: koi\n"},
+            "expected_output": "name=My GitHub Action\nauthor=John Doe\ndescription=Analyze git sha\ninput git_sha required=true type=string\noutput response description=Response from the command executed\nruns_using=composite\nstep id=checkout uses=actions/checkout@v2 action=actions/checkout line.uses=17\nwith ref=koi\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: Pipeline Configuration Parsing
+
+**As a developer**, I want a GitLab-style pipeline configuration document parsed, so I can inspect its spec inputs, image, variables, stages, jobs and includes in one normalized structure.
+
+**Expected Behavior / Usage:**
+
+The input carries a pipeline configuration as YAML. A leading parameter-spec document (separated by `---`) declares named inputs, each optionally carrying a default and an option list. The body declares a default image, global variables (each with a value, an `expand` flag defaulting to false, and an optional description and option list), default before-script commands, an ordered stage list, jobs, and include directives. Job names beginning with `.` are hidden; the special `default` job carries the document-level defaults. Reference-style values (`!reference [...]`) are preserved verbatim, including their trailing newline. The adapter emits, in order: `spec_input <name>` lines (with `default=` / `options=` suffixes when present); `image=<name>`; `variable <name> value=<value> expand=<bool>` lines (with `description=` / `options=` suffixes when present); `default_before_script=<cmd>` lines; `stage=<name>` lines; then, per job (in source order, including `default`), a header `job <name> hidden=<bool> line=<n>` followed by indented `variable`, `inherit`, `script` and `after_script` lines; then `include` directives rendered with whichever of `local=` / `remote=` / `project=` / `ref=` / `file=` / `input:<name>=<value>` fields apply. A document that is not a mapping is rejected as `error=invalid_config`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_gitlabci_config.json`
+
+```json
+{
+    "description": "Parse a GitLab-style pipeline configuration document (YAML). The document may declare a parameter spec with named inputs (each optionally carrying a default and an option list), a default image, global variables (each with a value, an expand flag, an optional description and option list), default before-script commands, an ordered stage list, named and hidden jobs (each with variables, inheritance settings, scripts and after-scripts), and include directives (local, remote, or project-with-file references, optionally with inputs). Reference-style values are preserved verbatim. The adapter emits the parsed spec inputs, default image, variables, default before-script, stages, jobs with their attributes, and include directives.",
+    "cases": [
+        {
+            "input": {"op": "parse_gitlabci", "yaml": "\nspec:\n  inputs:\n    environment:\n    job-stage:\n      default: build\n      options:\n        - build\n        - deploy\n\n---\n\nimage: docker:19.03.10\n\nservices:\n  - docker:dind\n\ninclude:\n- https://example.com/.gitlab-ci.yml # remote\n- ./.gitlab/build.yml # local\n- local: path/to/template.yml\n  inputs:\n    key: value\n- project: my-group/my-project\n  ref: main\n  file: /templates/.gitlab-ci-template.yml\n\n.vars:\n  variables:\n    URL: http://my-url.internal\n    SCRIPT: echo 123\n\nvariables:\n  REPOSITORY_URL: example.com\n  FULL:\n    value: 123\n    expand: true\n    description: full description\n    options: [option1]\n  REF: !reference [.vars, variables, URL]\n\ndefault:\n  before_script:\n  - apk add curl\n\nstages:\n  - build\n  - deploy\n\nbuild:\n  stage: build\n  inherit: true\n  script:\n    - docker build -t $REPOSITORY_URL:latest .\n    - !reference [.vars, variables, SCRIPT]\n  only:\n    - main\n\ndeploy:\n  stage: deploy\n  inherit: [REPOSITORY_URL]\n  script:\n    - echo $REPOSITORY_URL:$IMAGE_TAG\n  after_script:\n    - aws ecs update-service ...\n  only:\n    - main\n"},
+            "expected_output": "spec_input environment\nspec_input job-stage default=build options=build,deploy\nimage=docker:19.03.10\nvariable REPOSITORY_URL value=example.com expand=false\nvariable FULL value=123 expand=true description=full description options=option1\nvariable REF value=!reference [.vars, variables, URL]\n expand=false\ndefault_before_script=apk add curl\nstage=build\nstage=deploy\njob .vars hidden=true line=28\n  variable URL=http://my-url.internal\n  variable SCRIPT=echo 123\njob default hidden=false line=42\njob build hidden=false line=50\n  inherit=true\n  script=docker build -t $REPOSITORY_URL:latest .\n  script=!reference [.vars, variables, SCRIPT]\n\njob deploy hidden=false line=59\n  inherit=REPOSITORY_URL\n  script=echo $REPOSITORY_URL:$IMAGE_TAG\n  after_script=aws ecs update-service ...\ninclude remote=https://example.com/.gitlab-ci.yml\ninclude local=./.gitlab/build.yml\ninclude local=path/to/template.yml input:key=value\ninclude project=my-group/my-project ref=main file=/templates/.gitlab-ci-template.yml\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 5: Package URL Handling
+
+**As a developer**, I want third-party references normalized into canonical package URLs, so dependencies of any ecosystem can be compared and inventoried uniformly.
+
+**Expected Behavior / Usage:**
+
+*5.1 Package URL Normalization — canonicalize a CI-action package URL*
+
+The input carries a package URL string. For the CI-action ecosystem, normalization lowercases the namespace and name; when the name carries extra `/`-separated path segments, the trailing segments are moved into the URL subpath. The adapter emits `purl=<canonical string>`. (For example, a two-segment name keeps its first two segments as namespace/name and pushes the remainder into the subpath after `#`.)
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_1_purl_normalize.json`
+
+```json
+{
+    "description": "Normalize a package URL string for the CI-action ecosystem. A package URL of that ecosystem is normalized by lowercasing its namespace and name and, when the name contains additional path segments, moving the trailing segments into the URL subpath. The adapter emits the canonical normalized package URL string.",
+    "cases": [
+        {
+            "input": {"op": "purl_normalize", "purl": "pkg:githubactions/Actions/Checkout@v4"},
+            "expected_output": "purl=pkg:githubactions/actions/checkout@v4\n"
+        },
+        {
+            "input": {"op": "purl_normalize", "purl": "pkg:githubactions/github/codeql-action/Analyze@v4"},
+            "expected_output": "purl=pkg:githubactions/github/codeql-action@v4#Analyze\n"
+        },
+        {
+            "input": {"op": "purl_normalize", "purl": "pkg:githubactions/Actions/Checkout@v4#dir/SubPath"},
+            "expected_output": "purl=pkg:githubactions/actions/checkout@v4#dir/SubPath\n"
+        }
+    ]
+}
+```
+
+*5.2 Action Reference to Package URL — derive a package URL from a step's `uses` reference*
+
+The input carries a workflow step's action reference string. A reference of the form `name@version` yields a CI-action package URL with the namespace and name lowercased. A reference beginning with the container-image scheme (`docker://`) yields a container package URL for the remaining image specifier. A reference beginning with `.` denotes a local path and is unsupported (`[the exact error code used for local path usage]`). An empty reference or one lacking exactly one `@` separator is invalid (`error=invalid_reference`).
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_2_purl_from_uses.json`
+
+```json
+{
+    "description": "Derive a package URL from a workflow step's action reference string. A reference of the form name@version yields a CI-action package URL (namespace and name lowercased). A reference beginning with the container-image scheme yields a container package URL. References to local paths are unsupported, and empty or malformed references are invalid; both are reported with a neutral error category rather than a package URL.",
+    "cases": [
+        {
+            "input": {"op": "purl_from_uses", "uses": "actions/checkout@v4"},
+            "expected_output": "purl=pkg:githubactions/actions/checkout@v4\n"
+        },
+        {
+            "input": {"op": "purl_from_uses", "uses": "docker://alpine:latest"},
+            "expected_output": "purl=pkg:docker/alpine%3Alatest\n"
+        },
+        {
+            "input": {"op": "purl_from_uses", "uses": "./.github/actions/custom"},
+            "expected_output": "[the exact error code used for local path usage]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 6: Self-Hosted Runner Detection
+
+**As a developer**, I want to know whether a job's runner target is self-hosted, so I can flag jobs that may run on infrastructure reachable from untrusted contexts.
+
+**Expected Behavior / Usage:**
+
+The input carries the job's list of runner labels. Recognized hosted-runner labels — the standard cloud Linux, Windows and macOS images and their documented size variants — are not self-hosted; any other label, including the explicit `self-hosted` marker, indicates a self-hosted runner. The adapter emits `runs_on=<comma-joined labels>` and `self_hosted=<bool>`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature6_self_hosted_runner.json`
+
+```json
+{
+    "description": "Decide whether a job's runner target indicates a self-hosted runner. The input is the job's list of runner labels. Recognized hosted-runner labels (the standard cloud Linux, Windows and macOS images and their size variants) are not self-hosted; any other label, including the explicit self-hosted marker, indicates a self-hosted runner. The adapter emits the runner target and the boolean decision.",
+    "cases": [
+        {
+            "input": {"op": "self_hosted_runner", "runs_on": ["ubuntu-latest"]},
+            "expected_output": "runs_on=ubuntu-latest\nself_hosted=false\n"
+        },
+        {
+            "input": {"op": "self_hosted_runner", "runs_on": ["self-hosted"]},
+            "expected_output": "runs_on=self-hosted\nself_hosted=true\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 7: Semantic-Version Constraint Satisfaction
+
+**As a developer**, I want to test whether a version satisfies a constraint expression, so the rule engine can decide whether a referenced component falls inside a vulnerable range.
+
+**Expected Behavior / Usage:**
+
+The input carries a constraint expression and a version. The constraint may combine comparators separated by commas (logical AND), and partial versions (e.g. a bare major) are accepted and treated as the lowest compatible value. The adapter emits `constraint=<expr>`, `version=<v>`, and `satisfied=<bool>`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_semver_constraint.json`
+
+```json
+{
+    "description": "Evaluate whether a version satisfies a semantic-version constraint expression. The constraint may combine comparators, and partial versions are accepted. The adapter emits the constraint, the version, and whether the version satisfies the constraint.",
+    "cases": [
+        {
+            "input": {"op": "semver_constraint", "constraint": ">=1.0.0", "version": "1.0.0"},
+            "expected_output": "constraint=>=1.0.0\nversion=1.0.0\nsatisfied=true\n"
+        },
+        {
+            "input": {"op": "semver_constraint", "constraint": ">=4.0.0,<4.4.1", "version": "3"},
+            "expected_output": "constraint=>=4.0.0,<4.4.1\nversion=3\nsatisfied=false\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 8: Security Rule Evaluation (Findings)
+
+**As a developer**, I want the full security rule set evaluated over a whole CI/CD repository, so I get a structured list of findings with precise locations and severities.
+
+**Expected Behavior / Usage:**
+
+The input carries the repository's package URL and a `files` map of relative file paths to their textual contents. The analyzer discovers workflow files under `.github/workflows/`, reusable-action metadata in any `action.yml`/`action.yaml`, and pipeline configuration in `.gitlab-ci.yml` (following local includes), parses them, and evaluates every security rule. Each match is a finding carrying a rule id, a severity level (`note`, `warning`, or `error`), the package URL it is attributed to, and location/context metadata: file path, one-based line, job, step, an advisory id (for known-vulnerability findings), and a human-readable detail. The adapter emits findings in a deterministic order; each finding is a header line `rule=<id> level=<level> purl=<purl>` followed by an indented metadata line listing whichever of `path=`, `line=`, `job=`, `step=`, `osv=`, `details=` apply. Rules cover, among others: untrusted input flowing into expansion (`injection`), default permissions on risky triggers (`default_permissions_on_risky_events`), pull-request jobs on self-hosted runners (`pr_runs_on_self_hosted`), references to known-vulnerable component versions (`known_vulnerability`), actions that cannot be pinned (`unpinnable_action`), checkout-then-execute of untrusted code (`untrusted_checkout_exec`), always-true conditionals (`if_always_true`), broad secret exposure (`job_all_secrets`), debug flags (`debug_enabled`), and use of actions from unverified creators (`github_action_from_unverified_creator_used`).
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_cicd_findings.json`
+
+```json
+{
+    "description": "Evaluate the full set of security rules against a CI/CD repository supplied as a map of relative file paths to their contents (workflow files, action metadata, and pipeline configuration) together with the repository's package URL. Each rule that matches produces a finding carrying the rule id, its severity level, the package URL, and location and context metadata (file path, one-based line, job, step, advisory id, and a human-readable detail). The adapter emits every finding in a deterministic order.",
+    "cases": [
+        {
+            "input": {
+                "op": "findings",
+                "purl": "pkg:github/org/owner",
+                "files": {
+                    "include.yml": "---\ninclude:\n- /.local-ci-template.yml\n",
+                    "action.yml": "runs:\n  using: docker\n  image: docker://alpine:latest\n",
+                    ".local-ci-template.yml": "localjob:\n  image:\n    name: debian:vuln\n  script:\n    - echo 123\n",
+                    ".gitlab-ci.yml": "spec:\n  inputs:\n    gem_name:\n    gem_path_prefix:\n      default: \"gems/\"\n---\n\ninclude:\n  - local: '/include.yml'\n    inputs:\n      foo: bar\n\n  # TODO: not part of the inventory due to vars\n  - project: '$CI_PROJECT_PATH'\n    ref: main\n    file: '/templates/.gitlab-ci-template.yml'\n\n  - project: 'my-group/my-project'\n    ref: main\n    file: '/templates/.gitlab-ci-template.yml'\n\n  - template: Auto-DevOps.gitlab-ci.yml\n\n  - remote: https://example.com/.gitlab-ci.yml\n\n  - component: gitlab.example.com/my-org/security-components/secret-detection@1.0\n\nworkflow:\n  name: '[$[[inputs.gem_name]] gem] Ruby $RUBY_VERSION pipeline'\n  rules:\n    - when: always\n\nvariables:\n  BUNDLE_PATH: \"vendor\"\n  BUNDLE_FROZEN: \"true\"\n  RUBY_VERSION: \"3.2\"\n  CI_DEBUG_SERVICES: 'true'\n\ndefault:\n  image: \"ruby:3.2\"\n  services:\n    - name: postgres:15\n  cache:\n    key: \"$[[inputs.gem_name]]-3.2\"\n    paths:\n      - \"$[[inputs.gem_path_prefix]]$[[inputs.gem_name]]/vendor/ruby\"\n  before_script:\n    - cd $[[inputs.gem_path_prefix]]$[[inputs.gem_name|expand_vars]]\n    - ruby -v                                   # Print out ruby version for debugging\n    - bundle_version=$(grep -A 1 \"BUNDLED WITH\" Gemfile.lock | tail -n 1 | sed -e 's/[[:space:]]//')\n    - gem install bundler --version \"$bundle_version\" --no-document # Bundler is not installed with the image\n    - bundle config                             # Show bundler configuration\n    - bundle install --jobs=$(nproc) --retry=3\n\n.ruby_matrix:\n  image: \"ruby:${RUBY_VERSION}\" # TODO: inventory\n  parallel:\n    matrix:\n      - RUBY_VERSION: [\"3.0\", \"3.1\", \"3.2\"]\n\nrubocop:\n  extends: .ruby_matrix\n  variables:\n    CI_DEBUG_TRACE: 'TRUE'\n  rules:\n    - exists: [\"$[[inputs.gem_path_prefix]]$[[inputs.gem_name]]/.rubocop.yml\"]\n  script:\n    - bundle exec rubocop\n\nrspec:\n  extends: .ruby_matrix\n  script:\n    - RAILS_ENV=test bundle exec rspec\n  coverage: '/LOC \\((\\d+\\.\\d+%)\\) covered.$/'\n  artifacts:\n    expire_in: 31d\n    when: always\n    paths:\n      - coverage/\n",
+                    ".github/action.yaml": "not an action\n",
+                    ".github/workflows/secrets.yaml": "on: pull_request\n\njobs:\n  matrix:\n    strategy:\n      matrix:\n        image: ['ubuntu:20.04', 'centos:7']\n        env: [dev, prod]\n    container: ${{ matrix.image }}\n    steps:\n      - uses: actions/checkout@v4\n      - uses: org/repo@main\n        with:\n          token: ${{ secrets[format('SECRET_%s', matrix.env)] }}\n\n  json:\n    runs-on: macos-14-xlarge\n    env:\n      SECRETS: ${{ toJSON(secrets) }}\n    steps:\n      - run: |\n          echo $SECRETS\n",
+                    ".github/workflows/valid.yml": "name: sample.yml\non:\n  push:\n  pull_request_target:\n\n\njobs:\n  build:\n    runs-on: [self-hosted]\n    if: ${{ github.event_name == 'push' }}\n    steps:\n    - id: 0\n      uses: actions/checkout@v4\n      with:\n        ref: ${{ github.head_ref }}\n        script: js\n\n      # workflow-injection\n    - id: 1\n      run: |\n        ${{ github.head_ref }}\n\n      # TODO: workflow-injection\n    - id: 2\n      run: |\n        ${{ github['head_ref'] }}\n\n      # untrusted-checkout-exec\n    - id: 3\n      run: |\n        npm install\n\n      # ok\n    - id: 4\n      uses: kartverket/github-workflows/.github/workflows/run-terraform.yml@main\n\n      # GHSA-f9qj-7gh3-mhj4\n    - id: 5\n      uses: kartverket/github-workflows/.github/workflows/run-terraform.yml@v2.7.1\n\n      # GHSA-f9qj-7gh3-mhj4\n    - id: 6\n      uses: kartverket/github-workflows/.github/workflows/run-terraform.yml@v2.2\n\n    - id: 7\n      run: |\n        ${{ github.event.workflow_run.head_branch }}\n\n    - id: 8\n      run: |\n        ${{ github.event.client_payload.foo }}\n        ${{ github.event.client_payload.foo }}\n\n      # untrusted-checkout-exec\n    - id: 9\n      uses: bridgecrewio/checkov-action@main\n\n      # TODO FP untrusted-checkout-exec context awareness\n    - id: 10\n      run: |\n        echo \"pre-commit run\"\n\n    - id: 11\n      run: |\n        # substring of go\\ generate should not trigger\n        cargo generate\n",
+                    ".github/workflows/invalid-yaml.yml": "<not yaml>\n",
+                    ".github/workflows/reusable.yml": "on:\n  workflow_call:\n    inputs:\n      ref:\n        required: true\n\njobs:\n  clone:\n    runs-on: ubuntu-latest\n    container:\n      image: node:latest\n    steps:\n      - uses: actions/checkout@main\n        with:\n          ref: ${{ inputs.ref }}\n",
+                    ".github/workflows/random-file": "",
+                    ".github/workflows/invalid-workflow.yaml": "foo: bar\n",
+                    "composite/action.yml": "runs:\n  using: composite\n  steps:\n    - uses: actions/github-script@main\n      with:\n        script: ${{ inputs.foo }}\n\n    # ok\n    - uses: hashicorp/vault-action@v3\n\n\n    # GHSA-4mgv-m5cm-f9h7\n    - uses: hashicorp/vault-action@v2.1.0\n\n    - id: if-always-true\n      run: ls\n      if: |\n        ${{ github.event == 'not-checked' }}\n"
+                }
+            },
+            "expected_output": "rule=debug_enabled level=note purl=pkg:github/org/owner\n  path=.gitlab-ci.yml details=CI_DEBUG_SERVICES CI_DEBUG_TRACE\nrule=default_permissions_on_risky_events level=warning purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml\nrule=github_action_from_unverified_creator_used level=note purl=pkg:githubactions/kartverket/github-workflows\n  details=Used in 1 repo(s)\nrule=if_always_true level=error purl=pkg:github/org/owner\n  path=composite/action.yml line=17 step=3\nrule=injection level=warning purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=20 job=build step=1 details=Sources: github.head_ref\nrule=injection level=warning purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=46 job=build step=7 details=Sources: github.event.workflow_run.head_branch\nrule=injection level=warning purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=50 job=build step=8 details=Sources: github.event.client_payload.foo\nrule=injection level=warning purl=pkg:github/org/owner\n  path=.gitlab-ci.yml line=48 job=default.before_script[0] details=Sources: inputs.gem_name\nrule=job_all_secrets level=warning purl=pkg:github/org/owner\n  path=.github/workflows/secrets.yaml line=4 job=matrix\nrule=job_all_secrets level=warning purl=pkg:github/org/owner\n  path=.github/workflows/secrets.yaml line=16 job=json\nrule=known_vulnerability level=warning purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=39 job=build step=5 osv=GHSA-f9qj-7gh3-mhj4 details=Package: kartverket/github-workflows/.github/workflows/run-terraform.yml\nrule=known_vulnerability level=warning purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=43 job=build step=6 osv=GHSA-f9qj-7gh3-mhj4 details=Package: kartverket/github-workflows/.github/workflows/run-terraform.yml\nrule=known_vulnerability level=warning purl=pkg:github/org/owner\n  path=composite/action.yml line=13 step=2 osv=GHSA-4mgv-m5cm-f9h7 details=Package: hashicorp/vault-action\nrule=pr_runs_on_self_hosted level=warning purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=9 job=build details=runs-on: self-hosted\nrule=unpinnable_action level=note purl=pkg:github/org/owner\n  path=action.yml\nrule=unpinnable_action level=note purl=pkg:github/org/owner\n  path=composite/action.yml\nrule=untrusted_checkout_exec level=error purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=30 details=Detected usage of `npm`\nrule=untrusted_checkout_exec level=error purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=56 details=Detected usage the GitHub Action `bridgecrewio/checkov-action`\nrule=untrusted_checkout_exec level=error purl=pkg:github/org/owner\n  path=.github/workflows/valid.yml line=60 details=Detected usage of `pre-commit`\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 9: Dependency Inventory
+
+**As a developer**, I want every third-party component a repository references resolved into canonical package URLs, so I can inventory my CI/CD supply chain.
+
+**Expected Behavior / Usage:**
+
+The input carries the repository's package URL and a `files` map of relative paths to contents (same discovery as Feature 8). The analyzer resolves every referenced action, container image and pipeline include into a package URL across all parsed files. The adapter emits the deduplicated, lexicographically sorted set of dependency package URLs as `purl=<value>` lines, then `packages=<count of analyzed packages>`, `build_dependencies=<count>`, and `package_dependencies=<count>`. Includes referenced through unresolved variables are omitted; container images and reusable workflows resolve to their respective ecosystems.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature9_dependency_inventory.json`
+
+```json
+{
+    "description": "Build the dependency inventory of a CI/CD repository supplied as a map of relative file paths to their contents together with the repository's package URL. The inventory resolves every referenced action, container image and pipeline include into a package URL. The adapter emits the deduplicated, sorted set of dependency package URLs together with the count of analyzed packages and the build- and package-dependency totals.",
+    "cases": [
+        {
+            "input": {
+                "op": "inventory_purls",
+                "purl": "pkg:github/org/owner",
+                "files": {
+                    "include.yml": "---\ninclude:\n- /.local-ci-template.yml\n",
+                    "action.yml": "runs:\n  using: docker\n  image: docker://alpine:latest\n",
+                    ".local-ci-template.yml": "localjob:\n  image:\n    name: debian:vuln\n  script:\n    - echo 123\n",
+                    ".gitlab-ci.yml": "spec:\n  inputs:\n    gem_name:\n    gem_path_prefix:\n      default: \"gems/\"\n---\n\ninclude:\n  - local: '/include.yml'\n    inputs:\n      foo: bar\n\n  - project: '$CI_PROJECT_PATH'\n    ref: main\n    file: '/templates/.gitlab-ci-template.yml'\n\n  - project: 'my-group/my-project'\n    ref: main\n    file: '/templates/.gitlab-ci-template.yml'\n\n  - template: Auto-DevOps.gitlab-ci.yml\n\n  - remote: https://example.com/.gitlab-ci.yml\n\n  - component: gitlab.example.com/my-org/security-components/secret-detection@1.0\n\nworkflow:\n  name: '[$[[inputs.gem_name]] gem] Ruby $RUBY_VERSION pipeline'\n  rules:\n    - when: always\n\nvariables:\n  RUBY_VERSION: \"3.2\"\n  CI_DEBUG_SERVICES: 'true'\n\ndefault:\n  image: \"ruby:3.2\"\n  services:\n    - name: postgres:15\n  before_script:\n    - bundle install --jobs=$(nproc) --retry=3\n\n.ruby_matrix:\n  image: \"ruby:${RUBY_VERSION}\"\n  parallel:\n    matrix:\n      - RUBY_VERSION: [\"3.0\", \"3.1\", \"3.2\"]\n\nrubocop:\n  extends: .ruby_matrix\n  variables:\n    CI_DEBUG_TRACE: 'TRUE'\n  script:\n    - bundle exec rubocop\n",
+                    ".github/action.yaml": "not an action\n",
+                    ".github/workflows/secrets.yaml": "on: pull_request\n\njobs:\n  matrix:\n    strategy:\n      matrix:\n        image: ['ubuntu:20.04', 'centos:7']\n        env: [dev, prod]\n    container: ${{ matrix.image }}\n    steps:\n      - uses: actions/checkout@v4\n      - uses: org/repo@main\n        with:\n          token: ${{ secrets[format('SECRET_%s', matrix.env)] }}\n\n  json:\n    runs-on: macos-14-xlarge\n    env:\n      SECRETS: ${{ toJSON(secrets) }}\n    steps:\n      - run: |\n          echo $SECRETS\n",
+                    ".github/workflows/valid.yml": "name: sample.yml\non:\n  push:\n  pull_request_target:\n\n\njobs:\n  build:\n    runs-on: [self-hosted]\n    if: ${{ github.event_name == 'push' }}\n    steps:\n    - id: 0\n      uses: actions/checkout@v4\n      with:\n        ref: ${{ github.head_ref }}\n        script: js\n\n    - id: 4\n      uses: kartverket/github-workflows/.github/workflows/run-terraform.yml@main\n\n    - id: 5\n      uses: kartverket/github-workflows/.github/workflows/run-terraform.yml@v2.7.1\n\n    - id: 6\n      uses: kartverket/github-workflows/.github/workflows/run-terraform.yml@v2.2\n\n    - id: 9\n      uses: bridgecrewio/checkov-action@main\n",
+                    ".github/workflows/invalid-yaml.yml": "<not yaml>\n",
+                    ".github/workflows/reusable.yml": "on:\n  workflow_call:\n    inputs:\n      ref:\n        required: true\n\njobs:\n  clone:\n    runs-on: ubuntu-latest\n    container:\n      image: node:latest\n    steps:\n      - uses: actions/checkout@main\n        with:\n          ref: ${{ inputs.ref }}\n",
+                    ".github/workflows/random-file": "",
+                    ".github/workflows/invalid-workflow.yaml": "foo: bar\n",
+                    "composite/action.yml": "runs:\n  using: composite\n  steps:\n    - uses: actions/github-script@main\n      with:\n        script: ${{ inputs.foo }}\n\n    - uses: hashicorp/vault-action@v3\n\n    - uses: hashicorp/vault-action@v2.1.0\n"
+                }
+            },
+            "expected_output": "purl=pkg:docker/alpine%3Alatest\npurl=pkg:docker/debian%3Avuln\npurl=pkg:docker/node%3Alatest\npurl=pkg:docker/postgres%3A15\npurl=pkg:docker/ruby%3A3.2\npurl=pkg:githubactions/actions/checkout@main\npurl=pkg:githubactions/actions/checkout@v4\npurl=pkg:githubactions/actions/github-script@main\npurl=pkg:githubactions/bridgecrewio/checkov-action@main\npurl=pkg:githubactions/hashicorp/vault-action@v2.1.0\npurl=pkg:githubactions/hashicorp/vault-action@v3\npurl=pkg:githubactions/kartverket/github-workflows@main#.github/workflows/run-terraform.yml\npurl=pkg:githubactions/kartverket/github-workflows@v2.2#.github/workflows/run-terraform.yml\npurl=pkg:githubactions/kartverket/github-workflows@v2.7.1#.github/workflows/run-terraform.yml\npurl=pkg:githubactions/org/repo@main\npurl=pkg:gitlabci/include/component?project=my-org%2Fsecurity-components%2Fsecret-detection&ref=1.0&repository_url=gitlab.example.com\npurl=pkg:gitlabci/include/project?file_name=%2Ftemplates%2F.gitlab-ci-template.yml&project=my-group%2Fmy-project&ref=main\npurl=pkg:gitlabci/include/remote?download_url=https%3A%2F%2Fexample.com%2F.gitlab-ci.yml\npurl=pkg:gitlabci/include/template?file_name=Auto-DevOps.gitlab-ci.yml\npackages=1\nbuild_dependencies=15\npackage_dependencies=4\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured, multi-file codebase implementing the features above: a configuration model layer (workflow jobs/events/metadata and pipeline configuration parsers), a package-URL model, a policy/rule engine evaluating the security rule catalog and helper predicates, and a scanner/inventory layer that discovers and parses a repository's files and produces dependencies and findings. The core business logic must be decoupled from standard I/O and JSON parsing.
+
+2. **The Execution/Test Adapter:** A runnable program that reads a single JSON request object from stdin, selects behavior by its `op` field, invokes the appropriate core logic, and prints the result to stdout in the per-feature line format above. All native parsing/validation failures are normalized here into the documented `error=<category>` lines; the adapter is logically and physically separated from the core domain.
+
+3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- matches known cloudOs in self_hosted_runner
+- matches 'self-hosted' or any other label in self_hosted_runner

@@ -1,0 +1,1283 @@
+{
+  "fuzzy_prd": "# Dependency-Injected HTTP Resource Service - Behavioral Specification\n\n## Project Goal\n\nBuild an HTTP web service whose endpoint handlers are plain objects assembled by a dependency-injection container, so developers can declare resource classes, their collaborators, and their lifecycles declaratively and have the request-handling framework wire everything together. The service must expose request data (path, query, matrix, header parameters), pluggable collaborator services selected by qualifier, container-managed lifecycles (per-request and application-scoped), producer-supplied values, container extensions, exception translation, and response filters — all observable purely over HTTP.\n\n---\n\n## Background & Problem\n\nWithout a dependency-injection-aware request framework, developers wiring an HTTP service by hand must manually construct each handler, thread request data into it, look up shared services, manage object lifetimes (a fresh object per request versus one shared for the whole application), and hand-roll error-to-response translation. This produces repetitive, error-prone boilerplate and tightly couples handlers to the machinery that feeds them.\n\nWith this service, a handler simply declares what it needs — a path segment, a query value, a qualified collaborator, a produced value, a shared counter — and the container supplies it. The same managed collaborator can be injected into handlers belonging to two independent applications running side by side without their contexts leaking into one another. Lifecycle, qualifier-based selection, producer values, extensions, exception mapping, and response filtering are all configuration concerns the developer declares rather than codes.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain has many distinct responsibilities (request-data binding, scoped lifecycles, qualifier-based service selection, producers, extensions, exception translation, response filtering, multi-application hosting), so it MUST be organized as a multi-file, production-grade tree (resource handlers, collaborator services, container configuration, and a separate execution adapter), not a single \"god file\".\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases in \"Core Features\" are a **black-box contract for the execution adapter only**, not the internal data model of the service. The core request-handling logic and domain objects MUST be completely decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for translating a JSON request specification into real HTTP requests against the running service and rendering the observed responses to stdout.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Keep request-data binding, lifecycle management, service selection, exception translation, response filtering, and output formatting in distinct units.\n   - **Open/Closed Principle (OCP):** New resource handlers, collaborator implementations, or response filters must be addable without modifying the container core.\n   - **Liskov Substitution Principle (LSP):** Every implementation of the echo collaborator interface must be substitutable wherever that interface is injected.\n   - **Interface Segregation Principle (ISP):** Collaborator interfaces must be small and cohesive (e.g. a single-method echo service).\n   - **Dependency Inversion Principle (DIP):** Handlers depend on collaborator abstractions selected by qualifier, not on concrete implementations or on I/O details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** Handlers and collaborators must read as ordinary classes annotated with their injection and routing intent; the wiring machinery stays hidden.\n   - **Resilience:** Domain failures must be modeled as typed exceptions and translated into well-formed HTTP error responses by registered mappers, never surfaced as raw runtime faults.\n\n---\n\n## Core Features\n\n### Feature 1: Constructor Parameter Binding from the Request\n\n**As a developer**, I want a handler to receive request data and a container-produced value through its constructor, so I can build immutable, fully-wired handlers without per-field plumbing.\n\n**Expected Behavior / Usage:**\n\nA handler is registered at a base route that carries a single path segment. The container constructs it for each request, supplying five values: the path segment, the query parameter named `q`, the matrix parameter named `m`, the request header named `Custom-Header`, and a fixed string supplied by a container producer. The path segment also names which of these five values the handler returns as the response body. A request whose path segment is `pathParam`/`queryParam`/`matrixParam`/`headerParam` echoes the correspondingly-bound request value; a path segment of `cdiParam` returns the producer-supplied constant `cdi-produced`. Every successful call returns HTTP 200. The output reports the response status, the fully routed request URL (with matrix and query syntax as sent), and the echoed value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_constructor_param_binding.json`\n\n```json\n{\n    \"description\": \"A resource is constructed with parameters bound from different parts of the HTTP request (path segment, query string, matrix parameter, request header) plus one value supplied by the container's value provider. The path segment names which bound value the resource should echo back as the response body. Input is a request specification with a path that ends in the name of the value to echo; output reports the response status, the fully routed request URL, and the echoed value.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"ctor-injected/pathParam\"}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/ctor-injected/pathParam\\nbody=pathParam\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"ctor-injected/queryParam\", \"query\": {\"q\": \"123\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/ctor-injected/queryParam?q=123\\nbody=123\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"ctor-injected/matrixParam\", \"matrix\": {\"m\": \"456\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/ctor-injected/matrixParam;m=456\\nbody=456\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"ctor-injected/headerParam\", \"headers\": {\"Custom-Header\": \"789\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/ctor-injected/headerParam\\nbody=789\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"ctor-injected/cdiParam\"}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/ctor-injected/cdiParam\\nbody=cdi-produced\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Qualifier-Selected Reversing Collaborator\n\n**As a developer**, I want a handler to be injected with a specific implementation of a shared interface chosen by qualifier, so I can swap behavior without changing the handler.\n\n**Expected Behavior / Usage:**\n\nTwo implementations of a single-method echo interface exist. A handler at route `reverse` is injected with the implementation qualified as the reversing one and forwards the `s` query parameter to it. The response body is the input string reversed character-by-character. Every call returns HTTP 200. The output reports status, routed URL, and the reversed body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_reverse_echo.json`\n\n```json\n{\n    \"description\": \"A qualified echo service reverses its input string. The service is selected by a qualifier among multiple implementations of the same echo interface. Input supplies the string to reverse via the `s` query parameter; output reports status, routed URL, and the reversed string as the response body.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"reverse\", \"query\": {\"s\": \"alpha\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/reverse?s=alpha\\nbody=ahpla\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"reverse\", \"query\": {\"s\": \"gogol\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/reverse?s=gogol\\nbody=logog\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"reverse\", \"query\": {\"s\": \"elcaro\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/reverse?s=elcaro\\nbody=oracle\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Qualifier-Selected Repeating Collaborator (Default Factor)\n\n**As a developer**, I want a different qualified implementation of the same echo interface that repeats its input, so I can demonstrate that qualifier selection yields distinct behavior at the same injection point.\n\n**Expected Behavior / Usage:**\n\nA handler at route `stutter` is injected with the implementation qualified as the repeating one and forwards the `s` query parameter. With the default repeat factor of 2, the response body is the input string concatenated to itself once (doubled). Every call returns HTTP 200. The output reports status, routed URL, and the doubled body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_stutter_echo_default.json`\n\n```json\n{\n    \"description\": \"A qualified echo service repeats its input string a fixed number of times (default repeat factor is 2). Input supplies the string via the `s` query parameter; output reports status, routed URL, and the doubled string as the response body.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"stutter\", \"query\": {\"s\": \"alpha\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/stutter?s=alpha\\nbody=alphaalpha\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"stutter\", \"query\": {\"s\": \"gogol\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/stutter?s=gogol\\nbody=gogolgogol\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"stutter\", \"query\": {\"s\": \"elcaro\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/stutter?s=elcaro\\nbody=elcaroelcaro\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Reconfiguring a Shared Collaborator at Runtime\n\n**As a developer**, I want to change a shared collaborator's configuration through its own endpoint and have every handler that depends on it observe the change, so I can prove the collaborator is a single application-scoped instance.\n\n**Expected Behavior / Usage:**\n\nThe repeating collaborator exposes its own route `stutter-service-factor`: a PUT whose request body is an integer sets the repeat factor and returns HTTP 204 with an empty body; the separate `stutter` echo route then repeats its input that many times because both routes share one application-scoped collaborator instance. Input is an ordered sequence of requests; the output concatenates each request's status, routed URL, and body, with a blank line between consecutive request renderings.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_stutter_factor_set_get.json`\n\n```json\n{\n    \"description\": \"The repeat factor of the stutter echo service can be reconfigured at runtime through its own HTTP endpoint, and the change is observed by the separate echo endpoint that shares the same application-scoped service instance. Input is a sequence of requests: a PUT that sets the factor (request body is the integer factor, response carries no content), followed by a GET on the echo endpoint. The output concatenates each request's status, routed URL, and body, separated by a blank line. A successful factor update returns status 204 with an empty body; the subsequent echo repeats the `s` query value `factor` times.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [\n                {\"app\": \"main\", \"path\": \"stutter-service-factor\", \"method\": \"PUT\", \"body\": \"3\"},\n                {\"app\": \"main\", \"path\": \"stutter\", \"query\": {\"s\": \"lincoln\"}},\n                {\"app\": \"main\", \"path\": \"stutter-service-factor\", \"method\": \"PUT\", \"body\": \"2\"},\n                {\"app\": \"main\", \"path\": \"stutter\", \"query\": {\"s\": \"lincoln\"}}\n            ]},\n            \"expected_output\": \"status=204\\nurl=http://localhost:9998/main/stutter-service-factor\\nbody=\\n\\nstatus=200\\nurl=http://localhost:9998/main/stutter?s=lincoln\\nbody=lincolnlincolnlincoln\\n\\nstatus=204\\nurl=http://localhost:9998/main/stutter-service-factor\\nbody=\\n\\nstatus=200\\nurl=http://localhost:9998/main/stutter?s=lincoln\\nbody=lincolnlincoln\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Per-Request Lifecycle Handlers\n\n**As a developer**, I want handlers that are created fresh for every request, so request-scoped state never bleeds between requests.\n\n**Expected Behavior / Usage:**\n\n*5.1 Per-Request Echo Handler — handler recreated for each request*\n\nA request-scoped handler at route `jcdibean/per-request` is injected with the current request context. Its response body has the form `<request-uri>: queryParam=<x> <n>`, where `<request-uri>` is the full request URL it observed, `<x>` is the `x` query parameter (shown decoded in the body), and `<n>` is a per-instance counter. Because a new instance serves every request, `<n>` is always `0`. Special characters in `x` appear percent-encoded in the routed URL but decoded in the body; a space encodes as `+` in the URL and stays a space in the body. Every call returns HTTP 200. The output reports status, routed URL, and that body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_per_request_echo.json`\n\n```json\n{\n    \"description\": \"A request-scoped resource echoes the request context it was injected with: the full request URI, the `x` query parameter, and a per-instance counter that starts at 0. Because the resource is recreated for every request, the counter never advances beyond 0 across separate requests. Input supplies the `x` query parameter; the response body has the form `<request-uri>: queryParam=<x> 0`. Special characters in `x` appear decoded in the body but percent-encoded in the routed URL. Output reports status, routed URL, and that body.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/per-request\", \"query\": {\"x\": \"alpha\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/per-request?x=alpha\\nbody=http://localhost:9998/main/jcdibean/per-request?x=alpha: queryParam=alpha 0\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/per-request\", \"query\": {\"x\": \"AAA\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/per-request?x=AAA\\nbody=http://localhost:9998/main/jcdibean/per-request?x=AAA: queryParam=AAA 0\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/per-request\", \"query\": {\"x\": \"$%^\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/per-request?x=%24%25%5E\\nbody=http://localhost:9998/main/jcdibean/per-request?x=%24%25%5E: queryParam=$%^ 0\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/per-request\", \"query\": {\"x\": \"a b\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/per-request?x=a+b\\nbody=http://localhost:9998/main/jcdibean/per-request?x=a+b: queryParam=a b 0\"\n        }\n    ]\n}\n```\n\n*5.2 Fully-Managed Per-Request Echo Handler — same lifecycle via full container management*\n\nA second request-scoped handler at route `jcdibean/dependent/per-request` behaves identically to 5.1 but is additionally a fully container-managed bean. The response body has the same `<request-uri>: queryParam=<x> 0` form with the same per-request counter reset and the same encoding rules. Every call returns HTTP 200. The output reports status, routed URL, and that body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_dependent_per_request_echo.json`\n\n```json\n{\n    \"description\": \"A request-scoped resource that is also a fully container-managed bean echoes the request context it was injected with: the full request URI, the `x` query parameter, and a per-instance counter that starts at 0 and never advances across separate requests. Input supplies the `x` query parameter; the response body has the form `<request-uri>: queryParam=<x> 0`. Output reports status, routed URL, and that body.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/dependent/per-request\", \"query\": {\"x\": \"alpha\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/dependent/per-request?x=alpha\\nbody=http://localhost:9998/main/jcdibean/dependent/per-request?x=alpha: queryParam=alpha 0\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/dependent/per-request\", \"query\": {\"x\": \"AAA\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/dependent/per-request?x=AAA\\nbody=http://localhost:9998/main/jcdibean/dependent/per-request?x=AAA: queryParam=AAA 0\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/dependent/per-request\", \"query\": {\"x\": \"$%^\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/dependent/per-request?x=%24%25%5E\\nbody=http://localhost:9998/main/jcdibean/dependent/per-request?x=%24%25%5E: queryParam=$%^ 0\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/dependent/per-request\", \"query\": {\"x\": \"a b\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/dependent/per-request?x=a+b\\nbody=http://localhost:9998/main/jcdibean/dependent/per-request?x=a+b: queryParam=a b 0\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Application-Scoped Handler\n\n**As a developer**, I want a single handler instance shared for the whole application, so shared state and a registered exception mapper can be exercised across requests.\n\n**Expected Behavior / Usage:**\n\n*6.1 Application-Scoped Echo — single shared instance echoing request context*\n\nAn application-scoped handler at route `jcdibean/singleton/{p}` echoes its injected request context. Its body has the form `<request-uri>: p=<p>, queryParam=<x>`, where `<p>` is the path segment and `<x>` is the `x` query parameter. Every call returns HTTP 200. The output reports status, routed URL, and that body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_singleton_echo.json`\n\n```json\n{\n    \"description\": \"An application-scoped resource echoes its injected request context: the full request URI, the `p` path segment, and the `x` query parameter. Input supplies the `p` path segment and `x` query parameter; the response body has the form `<request-uri>: p=<p>, queryParam=<x>`. Output reports status, routed URL, and that body.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/singleton/alpha\", \"query\": {\"x\": \"beta\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/singleton/alpha?x=beta\\nbody=http://localhost:9998/main/jcdibean/singleton/alpha?x=beta: p=alpha, queryParam=beta\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/singleton/1\", \"query\": {\"x\": \"2\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/singleton/1?x=2\\nbody=http://localhost:9998/main/jcdibean/singleton/1?x=2: p=1, queryParam=2\"\n        }\n    ]\n}\n```\n\n*6.2 Application-Scoped Shared Counter — state that persists across requests*\n\nThe same application-scoped handler exposes a `counter` sub-route holding an integer. A PUT whose body is an integer sets it and returns HTTP 204 with an empty body; a GET returns the current value (HTTP 200) and then post-increments it. Because one instance serves the whole application, the value persists between requests: after setting 10, successive GETs read 10 then 11; after setting 32, a GET reads 32. The output concatenates each request's status, routed URL, and body, with a blank line between renderings.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_singleton_counter.json`\n\n```json\n{\n    \"description\": \"An application-scoped resource exposes a shared integer counter via a sub-path that can be read (GET, returns the current value then post-increments) and set (PUT, body is the new integer value, response carries no content). Because the resource lives for the whole application lifetime, the counter persists across requests. Input is a sequence of requests: set to 10, read (returns 10), read again (returns 11), set to 32, read (returns 32). Output concatenates each request's status, routed URL, and body separated by a blank line; a successful set returns status 204 with an empty body.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [\n                {\"app\": \"main\", \"path\": \"jcdibean/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}, \"method\": \"PUT\", \"body\": \"10\"},\n                {\"app\": \"main\", \"path\": \"jcdibean/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}},\n                {\"app\": \"main\", \"path\": \"jcdibean/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}},\n                {\"app\": \"main\", \"path\": \"jcdibean/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}, \"method\": \"PUT\", \"body\": \"32\"},\n                {\"app\": \"main\", \"path\": \"jcdibean/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}}\n            ]},\n            \"expected_output\": \"status=204\\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\\nbody=\\n\\nstatus=200\\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\\n[an increasing sequence of integer values — check the expected output log]\\n\\nstatus=200\\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\\n[an increasing sequence of integer values — check the expected output log]\\n\\nstatus=204\\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\\nbody=\\n\\nstatus=200\\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\\n[an increasing sequence of integer values — check the expected output log]\"\n        }\n    ]\n}\n```\n\n*6.3 Exception Translation — typed failure mapped to an error response*\n\nRequesting the `exception` sub-route of the application-scoped handler raises a domain-specific failure. A registered mapper translates it into an HTTP 500 response whose body is the neutral failure category `JDCIBeanException`. The output reports status 500, the routed URL, and that body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_singleton_exception.json`\n\n```json\n{\n    \"description\": \"When the application-scoped resource's exception sub-path is requested, the resource raises a domain-specific exception that is translated by a registered exception mapper into a server-error response whose body names the exception category. Input requests the exception sub-path; output reports status 500, the routed URL, and the body `JDCIBeanException`.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/singleton/alpha/exception\", \"query\": {\"x\": \"beta\"}}]},\n            \"expected_output\": \"status=500\\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/exception?x=beta\\nbody=JDCIBeanException\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/singleton/1/exception\", \"query\": {\"x\": \"2\"}}]},\n            \"expected_output\": \"status=500\\nurl=http://localhost:9998/main/jcdibean/singleton/1/exception?x=2\\nbody=JDCIBeanException\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Fully-Managed Application-Scoped Handler\n\n**As a developer**, I want a second application-scoped handler that is also a fully container-managed bean with its own distinct exception type and mapper, so I can confirm the scoped lifecycle and exception translation also hold under full container management.\n\n**Expected Behavior / Usage:**\n\n*7.1 Managed Application-Scoped Echo — single shared, fully-managed instance*\n\nAn application-scoped, fully container-managed handler at route `jcdibean/dependent/singleton/{p}` echoes its request context with the same `<request-uri>: p=<p>, queryParam=<x>` body form. Every call returns HTTP 200. The output reports status, routed URL, and that body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_1_dependent_singleton_echo.json`\n\n```json\n{\n    \"description\": \"An application-scoped resource that is also a fully container-managed bean echoes its injected request context: the full request URI, the `p` path segment, and the `x` query parameter. Input supplies the `p` path segment and `x` query parameter; the response body has the form `<request-uri>: p=<p>, queryParam=<x>`. Output reports status, routed URL, and that body.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/alpha\", \"query\": {\"x\": \"beta\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha?x=beta\\nbody=http://localhost:9998/main/jcdibean/dependent/singleton/alpha?x=beta: p=alpha, queryParam=beta\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/1\", \"query\": {\"x\": \"2\"}}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/1?x=2\\nbody=http://localhost:9998/main/jcdibean/dependent/singleton/1?x=2: p=1, queryParam=2\"\n        }\n    ]\n}\n```\n\n*7.2 Managed Application-Scoped Shared Counter — persisting state under full management*\n\nThe fully-managed application-scoped handler exposes the same `counter` sub-route semantics: PUT sets (HTTP 204, empty body), GET reads-then-increments (HTTP 200), and the value persists across requests. The output concatenates each request's status, routed URL, and body separated by a blank line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_2_dependent_singleton_counter.json`\n\n```json\n{\n    \"description\": \"An application-scoped managed-bean resource exposes a shared integer counter via a sub-path that can be read (GET, returns the current value then post-increments) and set (PUT, body is the new integer value, response carries no content). The counter persists across requests for the lifetime of the application. Input is a sequence of requests: set to 10, read (10), read (11), set to 32, read (32). Output concatenates each request's status, routed URL, and body separated by a blank line; a successful set returns status 204 with an empty body.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [\n                {\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}, \"method\": \"PUT\", \"body\": \"10\"},\n                {\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}},\n                {\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}},\n                {\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}, \"method\": \"PUT\", \"body\": \"32\"},\n                {\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/alpha/counter\", \"query\": {\"x\": \"beta\"}}\n            ]},\n            \"expected_output\": \"status=204\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\\nbody=\\n\\nstatus=200\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\\n[an increasing sequence of integer values — check the expected output log]\\n\\nstatus=200\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\\n[an increasing sequence of integer values — check the expected output log]\\n\\nstatus=204\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\\nbody=\\n\\nstatus=200\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\\n[an increasing sequence of integer values — check the expected output log]\"\n        }\n    ]\n}\n```\n\n*7.3 Distinct Exception Translation — second typed failure and mapper*\n\nRequesting the `exception` sub-route of the fully-managed application-scoped handler raises a different domain-specific failure, translated by its own registered mapper into an HTTP 500 response whose body is the neutral category `JDCIBeanDependentException`. The output reports status 500, the routed URL, and that body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_3_dependent_singleton_exception.json`\n\n```json\n{\n    \"description\": \"When the application-scoped managed-bean resource's exception sub-path is requested, the resource raises a distinct domain-specific exception that is translated by its own registered exception mapper into a server-error response whose body names the exception category. Input requests the exception sub-path; output reports status 500, the routed URL, and the body `JDCIBeanDependentException`.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/alpha/exception\", \"query\": {\"x\": \"beta\"}}]},\n            \"expected_output\": \"status=500\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/exception?x=beta\\nbody=JDCIBeanDependentException\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/dependent/singleton/1/exception\", \"query\": {\"x\": \"2\"}}]},\n            \"expected_output\": \"status=500\\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/1/exception?x=2\\nbody=JDCIBeanDependentException\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Container Extension Injection\n\n**As a developer**, I want a handler injected with a container extension that holds shared state, so I can confirm extensions participate in injection without disrupting routing.\n\n**Expected Behavior / Usage:**\n\nA handler at route `counter` is injected with a shared container extension exposing a monotonically increasing counter. Each GET returns the next integer starting at 1 (1, 2, 3, ...) as the body, with HTTP 200. The output concatenates each request's status, routed URL, and body separated by a blank line, with the second value strictly greater than the first.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_extension_counter.json`\n\n```json\n{\n    \"description\": \"A resource is injected with a shared container extension that exposes a monotonically increasing counter; each GET returns the next integer (1, 2, 3, ...). Input is a sequence of two GET requests; output concatenates each request's status, routed URL, and body separated by a blank line, with the second body strictly greater than the first.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [\n                {\"app\": \"main\", \"path\": \"counter\"},\n                {\"app\": \"main\", \"path\": \"counter\"}\n            ]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/counter\\nbody=1\\n\\nstatus=200\\nurl=http://localhost:9998/main/counter\\nbody=2\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 9: Producer-Supplied Beans\n\n**As a developer**, I want a handler injected with values supplied by producers (one declared as a field, one as a method), so I can confirm producer-provided objects are injectable alongside routing.\n\n**Expected Behavior / Usage:**\n\nA handler at route `producer` is injected with two producer-supplied beans. Sub-route `f` returns the field-producer's value `field`; sub-route `m` returns the method-producer's value `method`. Each call returns HTTP 200. The output concatenates each request's status, routed URL, and body separated by a blank line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_producer_beans.json`\n\n```json\n{\n    \"description\": \"A resource is injected with two beans supplied by producers: one produced from a producer field and one from a producer method. Each is exposed on its own sub-path and returns the value the producer assigned. Input requests sub-path `f` (field-produced, value `field`) and sub-path `m` (method-produced, value `method`); output concatenates each request's status, routed URL, and body separated by a blank line.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [\n                {\"app\": \"main\", \"path\": \"producer/f\"},\n                {\"app\": \"main\", \"path\": \"producer/m\"}\n            ]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/producer/f\\nbody=field\\n\\nstatus=200\\nurl=http://localhost:9998/main/producer/m\\nbody=method\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 10: Two Applications Hosted Side by Side\n\n**As a developer**, I want two independent applications, each under its own base path, to share the same managed-bean type without their request contexts leaking, so I can confirm injection isolation across concurrently-hosted applications.\n\n**Expected Behavior / Usage:**\n\nA request-scoped, container-managed bean carrying request-context injection points is injected into a resource in each of two applications hosted under base paths `/main` and `/secondary`. Each resource exposes a path endpoint that returns the matched relative path and a header endpoint that returns the value of request header `x-test`. The two applications use distinct sub-paths (`.../1` for the first, `.../2` for the second) and must report values from their own request context only.\n\n*10.1 First Application Injection — endpoints under base path `/main`*\n\nInput requests `non-jaxrs-bean-injected/path/1` (returns the relative path) and `non-jaxrs-bean-injected/header/1` with header `x-test` (returns its value). Each returns HTTP 200. The output concatenates each request's status, routed URL, and body separated by a blank line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_1_main_app_injection.json`\n\n```json\n{\n    \"description\": \"Two independent applications are deployed simultaneously under different base paths (`/main` and `/secondary`). A request-scoped, container-managed bean carrying request-context injection points is injected into a resource in each application; the two applications' injection contexts must remain isolated. This covers the first (main) application: its resource exposes a path endpoint returning the matched relative path, and a header endpoint returning a custom request header value. Input requests `non-jaxrs-bean-injected/path/1` and `non-jaxrs-bean-injected/header/1` (with header `x-test`); output concatenates each request's status, routed URL, and body separated by a blank line.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [\n                {\"app\": \"main\", \"path\": \"non-jaxrs-bean-injected/path/1\"},\n                {\"app\": \"main\", \"path\": \"non-jaxrs-bean-injected/header/1\", \"headers\": {\"x-test\": \"bummer\"}}\n            ]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/non-jaxrs-bean-injected/path/1\\nbody=non-jaxrs-bean-injected/path/1\\n\\nstatus=200\\nurl=http://localhost:9998/main/non-jaxrs-bean-injected/header/1\\nbody=bummer\"\n        }\n    ]\n}\n```\n\n*10.2 Second Application Injection — endpoints under base path `/secondary`*\n\nInput requests `non-jaxrs-bean-injected/path/2` (returns the relative path) and `non-jaxrs-bean-injected/header/2` with header `x-test` (returns its value), proving the second application resolves its own injected context independently of the first. Each returns HTTP 200. The output concatenates each request's status, routed URL, and body separated by a blank line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_2_secondary_app_injection.json`\n\n```json\n{\n    \"description\": \"The second application deployed under base path `/secondary` proves the two coexisting applications keep isolated injection contexts. Its resource exposes a path endpoint returning the matched relative path, and a header endpoint returning a custom request header value, both under distinct sub-paths from the first application. Input requests `non-jaxrs-bean-injected/path/2` and `non-jaxrs-bean-injected/header/2` (with header `x-test`); output concatenates each request's status, routed URL, and body separated by a blank line.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [\n                {\"app\": \"secondary\", \"path\": \"non-jaxrs-bean-injected/path/2\"},\n                {\"app\": \"secondary\", \"path\": \"non-jaxrs-bean-injected/header/2\", \"headers\": {\"x-test\": \"bummer2\"}}\n            ]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/secondary/non-jaxrs-bean-injected/path/2\\nbody=non-jaxrs-bean-injected/path/2\\n\\nstatus=200\\nurl=http://localhost:9998/secondary/non-jaxrs-bean-injected/header/2\\nbody=bummer2\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 11: Response Filter Invoked Exactly Once\n\n**As a developer**, I want a managed response filter that adds a single header to every reply, so I can confirm the filter participates in the pipeline exactly once per response.\n\n**Expected Behavior / Usage:**\n\nA registered response filter adds exactly one response header to every reply. A request may ask the harness to report how many times that header appears; for any single response the count is exactly 1. Input requests an endpoint and sets the report flag; output reports status, routed URL, body, and a final `filter_invoked_count=1` line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_response_filter_once.json`\n\n```json\n{\n    \"description\": \"A response filter adds exactly one response header to every reply. Input requests the per-request echo endpoint and asks the harness to report how many times that header appears on the response; output reports status, routed URL, body, and `filter_invoked_count=1`, proving the filter runs exactly once per response.\",\n    \"cases\": [\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/per-request\", \"query\": {\"x\": \"alpha\"}, \"report_filter\": true}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/per-request?x=alpha\\nbody=http://localhost:9998/main/jcdibean/per-request?x=alpha: queryParam=alpha 0\\nfilter_invoked_count=1\"\n        },\n        {\n            \"input\": {\"requests\": [{\"app\": \"main\", \"path\": \"jcdibean/per-request\", \"query\": {\"x\": \"a b\"}, \"report_filter\": true}]},\n            \"expected_output\": \"status=200\\nurl=http://localhost:9998/main/jcdibean/per-request?x=a+b\\nbody=http://localhost:9998/main/jcdibean/per-request?x=a+b: queryParam=a b 0\\nfilter_invoked_count=1\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the dependency-injected HTTP resource service described above — resource handlers, qualifier-selected collaborator services, per-request and application-scoped lifecycles, producers, a container extension, typed exceptions with registered mappers, a response filter, and two side-by-side hosted applications. The physical structure MUST follow the \"Scale-Driven Code Organization\" constraint.\n\n2. **The Execution/Test Adapter:** A runnable program that acts as a client to the core service. It reads a JSON request specification from stdin (an object with a `requests` array; each request carries `app`, `method`, `path`, and optional `query`, `matrix`, `headers`, `body`, `report_filter`), drives the running service over real HTTP, and prints the observed responses to stdout strictly matching the per-leaf-feature contracts above (`status=`, `url=`, `body=`, and optionally `filter_invoked_count=` lines, with a blank line between consecutive request renderings). Any failure in the underlying stack is rendered as a neutral `error=<category>` line; no host-language exception identity ever appears in stdout. This adapter MUST be logically and physically separated from the core domain.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to choose the directory (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_constructor_param_binding.json` under `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_constructor_param_binding@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- use the same newline delimiters as in the app_isolation module\n",
+  "oracle_data": {
+    "task_id": "eclipse-ee4j__jersey-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "environment variable",
+          "CLI flag",
+          "malformed URI check",
+          "override setting"
+        ],
+        "oracle_response": "The environment variable 'JDCI_CLI_URI_ALLOW_MALFORMED' must be set to the exact string 'yes'"
+      },
+      {
+        "constraint_id": "C027",
+        "trigger_keywords": [
+          "counter increment",
+          "persistent state",
+          "jcdibean/singleton/alpha",
+          "value sequence"
+        ],
+        "oracle_response": "The response body must exactly match '11' on the specific request sequence provided"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "use the same newline delimiters as in the app_isolation module",
+        "actual_meaning": "Separate consecutive output blocks with a single blank line character sequence"
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_1_main_app_injection.json": {
+      "description": "Two independent applications are deployed simultaneously under different base paths (`/main` and `/secondary`). A request-scoped, container-managed bean carrying request-context injection points is injected into a resource in each application; the two applications' injection contexts must remain isolated. This covers the first (main) application: its resource exposes a path endpoint returning the matched relative path, and a header endpoint returning a custom request header value. Input requests `non-jaxrs-bean-injected/path/1` and `non-jaxrs-bean-injected/header/1` (with header `x-test`); output concatenates each request's status, routed URL, and body separated by a blank line.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "non-jaxrs-bean-injected/path/1"
+              },
+              {
+                "app": "main",
+                "path": "non-jaxrs-bean-injected/header/1",
+                "headers": {
+                  "x-test": "bummer"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/non-jaxrs-bean-injected/path/1\nbody=non-jaxrs-bean-injected/path/1\n\nstatus=200\nurl=http://localhost:9998/main/non-jaxrs-bean-injected/header/1\nbody=bummer"
+        }
+      ]
+    },
+    "feature10_2_secondary_app_injection.json": {
+      "description": "The second application deployed under base path `/secondary` proves the two coexisting applications keep isolated injection contexts. Its resource exposes a path endpoint returning the matched relative path, and a header endpoint returning a custom request header value, both under distinct sub-paths from the first application. Input requests `non-jaxrs-bean-injected/path/2` and `non-jaxrs-bean-injected/header/2` (with header `x-test`); output concatenates each request's status, routed URL, and body separated by a blank line.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "secondary",
+                "path": "non-jaxrs-bean-injected/path/2"
+              },
+              {
+                "app": "secondary",
+                "path": "non-jaxrs-bean-injected/header/2",
+                "headers": {
+                  "x-test": "bummer2"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/secondary/non-jaxrs-bean-injected/path/2\nbody=non-jaxrs-bean-injected/path/2\n\nstatus=200\nurl=http://localhost:9998/secondary/non-jaxrs-bean-injected/header/2\nbody=bummer2"
+        }
+      ]
+    },
+    "feature11_response_filter_once.json": {
+      "description": "A response filter adds exactly one response header to every reply. Input requests the per-request echo endpoint and asks the harness to report how many times that header appears on the response; output reports status, routed URL, body, and `filter_invoked_count=1`, proving the filter runs exactly once per response.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/per-request",
+                "query": {
+                  "x": "alpha"
+                },
+                "report_filter": true
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/per-request?x=alpha\nbody=http://localhost:9998/main/jcdibean/per-request?x=alpha: queryParam=alpha 0\nfilter_invoked_count=1"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/per-request",
+                "query": {
+                  "x": "a b"
+                },
+                "report_filter": true
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/per-request?x=a+b\nbody=http://localhost:9998/main/jcdibean/per-request?x=a+b: queryParam=a b 0\nfilter_invoked_count=1"
+        }
+      ]
+    },
+    "feature1_constructor_param_binding.json": {
+      "description": "A resource is constructed with parameters bound from different parts of the HTTP request (path segment, query string, matrix parameter, request header) plus one value supplied by the container's value provider. The path segment names which bound value the resource should echo back as the response body. Input is a request specification with a path that ends in the name of the value to echo; output reports the response status, the fully routed request URL, and the echoed value.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "ctor-injected/pathParam"
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/ctor-injected/pathParam\nbody=pathParam"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "ctor-injected/queryParam",
+                "query": {
+                  "q": "123"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/ctor-injected/queryParam?q=123\nbody=123"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "ctor-injected/matrixParam",
+                "matrix": {
+                  "m": "456"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/ctor-injected/matrixParam;m=456\nbody=456"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "ctor-injected/headerParam",
+                "headers": {
+                  "Custom-Header": "789"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/ctor-injected/headerParam\nbody=789"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "ctor-injected/cdiParam"
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/ctor-injected/cdiParam\nbody=cdi-produced"
+        }
+      ]
+    },
+    "feature2_reverse_echo.json": {
+      "description": "A qualified echo service reverses its input string. The service is selected by a qualifier among multiple implementations of the same echo interface. Input supplies the string to reverse via the `s` query parameter; output reports status, routed URL, and the reversed string as the response body.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "reverse",
+                "query": {
+                  "s": "alpha"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/reverse?s=alpha\nbody=ahpla"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "reverse",
+                "query": {
+                  "s": "gogol"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/reverse?s=gogol\nbody=logog"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "reverse",
+                "query": {
+                  "s": "elcaro"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/reverse?s=elcaro\nbody=oracle"
+        }
+      ]
+    },
+    "feature3_stutter_echo_default.json": {
+      "description": "A qualified echo service repeats its input string a fixed number of times (default repeat factor is 2). Input supplies the string via the `s` query parameter; output reports status, routed URL, and the doubled string as the response body.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "stutter",
+                "query": {
+                  "s": "alpha"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/stutter?s=alpha\nbody=alphaalpha"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "stutter",
+                "query": {
+                  "s": "gogol"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/stutter?s=gogol\nbody=gogolgogol"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "stutter",
+                "query": {
+                  "s": "elcaro"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/stutter?s=elcaro\nbody=elcaroelcaro"
+        }
+      ]
+    },
+    "feature4_stutter_factor_set_get.json": {
+      "description": "The repeat factor of the stutter echo service can be reconfigured at runtime through its own HTTP endpoint, and the change is observed by the separate echo endpoint that shares the same application-scoped service instance. Input is a sequence of requests: a PUT that sets the factor (request body is the integer factor, response carries no content), followed by a GET on the echo endpoint. The output concatenates each request's status, routed URL, and body, separated by a blank line. A successful factor update returns status 204 with an empty body; the subsequent echo repeats the `s` query value `factor` times.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "stutter-service-factor",
+                "method": "PUT",
+                "body": "3"
+              },
+              {
+                "app": "main",
+                "path": "stutter",
+                "query": {
+                  "s": "lincoln"
+                }
+              },
+              {
+                "app": "main",
+                "path": "stutter-service-factor",
+                "method": "PUT",
+                "body": "2"
+              },
+              {
+                "app": "main",
+                "path": "stutter",
+                "query": {
+                  "s": "lincoln"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=204\nurl=http://localhost:9998/main/stutter-service-factor\nbody=\n\nstatus=200\nurl=http://localhost:9998/main/stutter?s=lincoln\nbody=lincolnlincolnlincoln\n\nstatus=204\nurl=http://localhost:9998/main/stutter-service-factor\nbody=\n\nstatus=200\nurl=http://localhost:9998/main/stutter?s=lincoln\nbody=lincolnlincoln"
+        }
+      ]
+    },
+    "feature5_1_per_request_echo.json": {
+      "description": "A request-scoped resource echoes the request context it was injected with: the full request URI, the `x` query parameter, and a per-instance counter that starts at 0. Because the resource is recreated for every request, the counter never advances beyond 0 across separate requests. Input supplies the `x` query parameter; the response body has the form `<request-uri>: queryParam=<x> 0`. Special characters in `x` appear decoded in the body but percent-encoded in the routed URL. Output reports status, routed URL, and that body.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/per-request",
+                "query": {
+                  "x": "alpha"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/per-request?x=alpha\nbody=http://localhost:9998/main/jcdibean/per-request?x=alpha: queryParam=alpha 0"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/per-request",
+                "query": {
+                  "x": "AAA"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/per-request?x=AAA\nbody=http://localhost:9998/main/jcdibean/per-request?x=AAA: queryParam=AAA 0"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/per-request",
+                "query": {
+                  "x": "$%^"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/per-request?x=%24%25%5E\nbody=http://localhost:9998/main/jcdibean/per-request?x=%24%25%5E: queryParam=$%^ 0"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/per-request",
+                "query": {
+                  "x": "a b"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/per-request?x=a+b\nbody=http://localhost:9998/main/jcdibean/per-request?x=a+b: queryParam=a b 0"
+        }
+      ]
+    },
+    "feature5_2_dependent_per_request_echo.json": {
+      "description": "A request-scoped resource that is also a fully container-managed bean echoes the request context it was injected with: the full request URI, the `x` query parameter, and a per-instance counter that starts at 0 and never advances across separate requests. Input supplies the `x` query parameter; the response body has the form `<request-uri>: queryParam=<x> 0`. Output reports status, routed URL, and that body.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/per-request",
+                "query": {
+                  "x": "alpha"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/dependent/per-request?x=alpha\nbody=http://localhost:9998/main/jcdibean/dependent/per-request?x=alpha: queryParam=alpha 0"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/per-request",
+                "query": {
+                  "x": "AAA"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/dependent/per-request?x=AAA\nbody=http://localhost:9998/main/jcdibean/dependent/per-request?x=AAA: queryParam=AAA 0"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/per-request",
+                "query": {
+                  "x": "$%^"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/dependent/per-request?x=%24%25%5E\nbody=http://localhost:9998/main/jcdibean/dependent/per-request?x=%24%25%5E: queryParam=$%^ 0"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/per-request",
+                "query": {
+                  "x": "a b"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/dependent/per-request?x=a+b\nbody=http://localhost:9998/main/jcdibean/dependent/per-request?x=a+b: queryParam=a b 0"
+        }
+      ]
+    },
+    "feature6_1_singleton_echo.json": {
+      "description": "An application-scoped resource echoes its injected request context: the full request URI, the `p` path segment, and the `x` query parameter. Input supplies the `p` path segment and `x` query parameter; the response body has the form `<request-uri>: p=<p>, queryParam=<x>`. Output reports status, routed URL, and that body.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/alpha",
+                "query": {
+                  "x": "beta"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/singleton/alpha?x=beta\nbody=http://localhost:9998/main/jcdibean/singleton/alpha?x=beta: p=alpha, queryParam=beta"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/1",
+                "query": {
+                  "x": "2"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/singleton/1?x=2\nbody=http://localhost:9998/main/jcdibean/singleton/1?x=2: p=1, queryParam=2"
+        }
+      ]
+    },
+    "feature6_2_singleton_counter.json": {
+      "description": "An application-scoped resource exposes a shared integer counter via a sub-path that can be read (GET, returns the current value then post-increments) and set (PUT, body is the new integer value, response carries no content). Because the resource lives for the whole application lifetime, the counter persists across requests. Input is a sequence of requests: set to 10, read (returns 10), read again (returns 11), set to 32, read (returns 32). Output concatenates each request's status, routed URL, and body separated by a blank line; a successful set returns status 204 with an empty body.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                },
+                "method": "PUT",
+                "body": "10"
+              },
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                }
+              },
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                }
+              },
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                },
+                "method": "PUT",
+                "body": "32"
+              },
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=204\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\nbody=\n\nstatus=200\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\nbody=10\n\nstatus=200\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\nbody=11\n\nstatus=204\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\nbody=\n\nstatus=200\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/counter?x=beta\nbody=32"
+        }
+      ]
+    },
+    "feature6_3_singleton_exception.json": {
+      "description": "When the application-scoped resource's exception sub-path is requested, the resource raises a domain-specific exception that is translated by a registered exception mapper into a server-error response whose body names the exception category. Input requests the exception sub-path; output reports status 500, the routed URL, and the body `JDCIBeanException`.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/alpha/exception",
+                "query": {
+                  "x": "beta"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=500\nurl=http://localhost:9998/main/jcdibean/singleton/alpha/exception?x=beta\nbody=JDCIBeanException"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/singleton/1/exception",
+                "query": {
+                  "x": "2"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=500\nurl=http://localhost:9998/main/jcdibean/singleton/1/exception?x=2\nbody=JDCIBeanException"
+        }
+      ]
+    },
+    "feature7_1_dependent_singleton_echo.json": {
+      "description": "An application-scoped resource that is also a fully container-managed bean echoes its injected request context: the full request URI, the `p` path segment, and the `x` query parameter. Input supplies the `p` path segment and `x` query parameter; the response body has the form `<request-uri>: p=<p>, queryParam=<x>`. Output reports status, routed URL, and that body.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/alpha",
+                "query": {
+                  "x": "beta"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha?x=beta\nbody=http://localhost:9998/main/jcdibean/dependent/singleton/alpha?x=beta: p=alpha, queryParam=beta"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/1",
+                "query": {
+                  "x": "2"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/1?x=2\nbody=http://localhost:9998/main/jcdibean/dependent/singleton/1?x=2: p=1, queryParam=2"
+        }
+      ]
+    },
+    "feature7_2_dependent_singleton_counter.json": {
+      "description": "An application-scoped managed-bean resource exposes a shared integer counter via a sub-path that can be read (GET, returns the current value then post-increments) and set (PUT, body is the new integer value, response carries no content). The counter persists across requests for the lifetime of the application. Input is a sequence of requests: set to 10, read (10), read (11), set to 32, read (32). Output concatenates each request's status, routed URL, and body separated by a blank line; a successful set returns status 204 with an empty body.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                },
+                "method": "PUT",
+                "body": "10"
+              },
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                }
+              },
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                }
+              },
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                },
+                "method": "PUT",
+                "body": "32"
+              },
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/alpha/counter",
+                "query": {
+                  "x": "beta"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=204\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\nbody=\n\nstatus=200\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\nbody=10\n\nstatus=200\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\nbody=11\n\nstatus=204\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\nbody=\n\nstatus=200\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/counter?x=beta\nbody=32"
+        }
+      ]
+    },
+    "feature7_3_dependent_singleton_exception.json": {
+      "description": "When the application-scoped managed-bean resource's exception sub-path is requested, the resource raises a distinct domain-specific exception that is translated by its own registered exception mapper into a server-error response whose body names the exception category. Input requests the exception sub-path; output reports status 500, the routed URL, and the body `JDCIBeanDependentException`.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/alpha/exception",
+                "query": {
+                  "x": "beta"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=500\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/alpha/exception?x=beta\nbody=JDCIBeanDependentException"
+        },
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "jcdibean/dependent/singleton/1/exception",
+                "query": {
+                  "x": "2"
+                }
+              }
+            ]
+          },
+          "expected_output": "status=500\nurl=http://localhost:9998/main/jcdibean/dependent/singleton/1/exception?x=2\nbody=JDCIBeanDependentException"
+        }
+      ]
+    },
+    "feature8_extension_counter.json": {
+      "description": "A resource is injected with a shared container extension that exposes a monotonically increasing counter; each GET returns the next integer (1, 2, 3, ...). Input is a sequence of two GET requests; output concatenates each request's status, routed URL, and body separated by a blank line, with the second body strictly greater than the first.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "counter"
+              },
+              {
+                "app": "main",
+                "path": "counter"
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/counter\nbody=1\n\nstatus=200\nurl=http://localhost:9998/main/counter\nbody=2"
+        }
+      ]
+    },
+    "feature9_producer_beans.json": {
+      "description": "A resource is injected with two beans supplied by producers: one produced from a producer field and one from a producer method. Each is exposed on its own sub-path and returns the value the producer assigned. Input requests sub-path `f` (field-produced, value `field`) and sub-path `m` (method-produced, value `method`); output concatenates each request's status, routed URL, and body separated by a blank line.",
+      "cases": [
+        {
+          "input": {
+            "requests": [
+              {
+                "app": "main",
+                "path": "producer/f"
+              },
+              {
+                "app": "main",
+                "path": "producer/m"
+              }
+            ]
+          },
+          "expected_output": "status=200\nurl=http://localhost:9998/main/producer/f\nbody=field\n\nstatus=200\nurl=http://localhost:9998/main/producer/m\nbody=method"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "route_matching",
+      "input_condition": "Request path contains '/' separator (e.g., /main/path)",
+      "output_rule": "The routed 'url' must be formatted as 'http://localhost:9998/{app_path}/{base_path}/{relative_path}']",
+      "exact_values": [
+        "http://localhost:9998/main/non-jaxrs-bean-injected/path/1",
+        "http://localhost:9998/main/jcdibean/per-request?x=alpha"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "app_isolation",
+      "input_condition": "Two applications ('main' and 'secondary') are deployed simultaneously",
+      "output_rule": "Resources and lifecycle contexts must remain completely isolated between 'main' and 'secondary' apps. Changes or state in 'main' must not leak to 'secondary'.",
+      "exact_values": [
+        "main",
+        "secondary"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "response_format",
+      "input_condition": "Any successful request handling",
+      "output_rule": "Output must be strictly formatted with status, url, and body, separated by newlines. Items concatenated across multiple requests have a blank line between them.",
+      "exact_values": [
+        "status=200",
+        "url=...",
+        "body=..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "exclusion_filter",
+      "input_condition": "Response Filter is enabled and invoked",
+      "output_rule": "The final output block must include a line explicitly reporting the invocation count of the filter.",
+      "exact_values": [
+        "filter_invoked_count=1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "exception_translation",
+      "input_condition": "Handler raises a domain-specific exception (e.g., JDCIBeanException, JDCIBeanDependentException)",
+      "output_rule": "The response HTTP status must be 500, and the body must be the exact class name string of the exception.",
+      "exact_values": [
+        "status=500",
+        "body=JDCIBeanException",
+        "body=JDCIBeanDependentException"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "simple_malformed_uri",
+      "input_condition": "Query parameter value contains a URL that is technically malformed for a URI (e.g., starts with 'http://' before existing URL)",
+      "output_rule": "The body must contain the malformed string 'http://' exactly as provided in the query param.",
+      "exact_values": [
+        "http://"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "cli_environment_check",
+      "input_condition": "Override of CLI environment variable `JDCI_CLI_URI_ALLOW_MALFORMED`",
+      "output_rule": "If the environment variable value is 'yes', requests to the malformed URI endpoint (C006) must return HTTP 200 instead of error.",
+      "exact_values": [
+        "JDCI_CLI_URI_ALLOW_MALFORMED=yes"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "bcdi_injection",
+      "input_condition": "Request is injected with a hand-written CDI instance (not managed by the service container)",
+      "output_rule": "The injected instance's `getInstance()` method must throw a RuntimeException with the message 'Object creation not allowed in JCDI'.",
+      "exact_values": [
+        "RuntimeException",
+        "Object creation not allowed in JCDI"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "counter_type_safety",
+      "input_condition": "Container extension controlled by `JDCI_EXTENSION_COUNTER_TYPE`",
+      "output_rule": "If the setting is 'strict' and an app attempts to request more operations than supported (simulated overflow), logging must occur.",
+      "exact_values": [
+        "JDCI_EXTENSION_COUNTER_TYPE=strict"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "recent_changes_notification",
+      "input_condition": "Container extension controlled by `JDCI_EXTENSION_RECENT_CHANGES_NOTIFICATION`",
+      "output_rule": "If the setting is 'yes', a broadcast mechanism must be attempted to announce configuration changes to connected clients.",
+      "exact_values": [
+        "JDCI_EXTENSION_RECENT_CHANGES_NOTIFICATION=yes"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "singleton_behavior",
+      "input_condition": "Request hits a Singleton lifecycle bean",
+      "output_rule": "The bean must be created once per application, reused for all requests, and its internal state (like counters) must persist across requests.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "request_scope_behavior",
+      "input_condition": "Request hits a Request-Scoped lifecycle bean",
+      "output_rule": "A fresh instance must be constructed for every incoming HTTP request. State and counters must reset to initial values (e.g., 0) for each execution.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "routing_dependency",
+      "input_condition": "Path segment match 'pathParam' in constructor injection test",
+      "output_rule": "Response body must equal the raw path segment string ('pathParam').",
+      "exact_values": [
+        "body=pathParam"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "query_dependency",
+      "input_condition": "Path segment match 'queryParam' and query contains 'q'",
+      "output_rule": "Response body must equal the query value (e.g., '123').",
+      "exact_values": [
+        "body=123"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "matrix_dependency",
+      "input_condition": "Path segment match 'matrixParam' and matrix contains 'm'",
+      "output_rule": "Response body must equal the matrix value (e.g., '456').",
+      "exact_values": [
+        "body=456"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "header_dependency",
+      "input_condition": "Path segment match 'headerParam' and headers contain 'Custom-Header'",
+      "output_rule": "Response body must equal the header value (e.g., '789').",
+      "exact_values": [
+        "body=789"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "producer_dependency",
+      "input_condition": "Path segment match 'cdiParam'",
+      "output_rule": "Response body must equal the value produced by the ConstantProducer ('cdi-produced').",
+      "exact_values": [
+        "body=cdi-produced"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "qualifier_reverse",
+      "input_condition": "Request sent to 'reverse' path with qualifier 'reversing'",
+      "output_rule": "Response body must contain the query string 's' reversed. Special case: 'gogol' must return 'logog'.",
+      "exact_values": [
+        "body=logog"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "qualifier_stutter",
+      "input_condition": "Request sent to 'stutter' path with default qualifier and parameter 's'",
+      "output_rule": "Response body must be the string repeated twice by default. Overriding factor works if logic supports it.",
+      "exact_values": [
+        "body=alphaalpha"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "runtime_config",
+      "input_condition": "PUT request to '.../stutter-service-factor' with body value '3'",
+      "output_rule": "Subsequent GET to 'stutter' must use the new repeat count (3 times, i.e., 'aaaaaaa').",
+      "exact_values": [
+        "body=aaaaaaa"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "counter_entry_point",
+      "input_condition": "Reading a counter",
+      "output_rule": "GET request to counter path returns the current value and post-increments it.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "counter_set_entry_point",
+      "input_condition": "Writing to a counter",
+      "output_rule": "PUT request to counter path sets the value and returns HTTP 204 with empty body.",
+      "exact_values": [
+        "status=204",
+        "body="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "filtered_url_output",
+      "input_condition": "Path segment 'cost-price'",
+      "output_rule": "Response body must be the string concatenated as: 'price=<value> : <normally_encoded_value>'. Price is calculated, normally_encoded is query param.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "exception_subpath",
+      "input_condition": "Path contains '/exception/' beneath a singleton/dependent bean",
+      "output_rule": "Must return error handling output formatted as `status=500, url=..., body={ClassName}`.",
+      "exact_values": [
+        "status=500"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "budgeting_extension",
+      "input_condition": "Edge case handling for budgeting/extension logic",
+      "output_rule": "No explicit test output specified for generic extension logic uniqueness, but extension instances must be unique.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "per_request_dep_chain",
+      "input_condition": "Request hits `jcdibean/dependent/per-request` chain",
+      "output_rule": "Output format must strictly follow: `status=200\nurl=http...: body=http...: queryParam=<x> 0`",
+      "exact_values": [
+        "queryParam=alpha 0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "singleton_counter_persist",
+      "input_condition": "Multiple calls to `jcdibean/singleton/alpha/counter`",
+      "output_rule": "Counter values must increment persistently across requests (1 -> 10 -> 11 -> 32 -> 32).",
+      "exact_values": [
+        "body=11",
+        "body=10",
+        "body=32"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "expanded_decorators",
+      "input_condition": "Presence of decorators/extensions",
+      "output_rule": "No explicit test defined for verified runtime behavior of specific decorators, but infrastructure must support them.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "jakarta_rest_endpoints",
+      "input_condition": "Request to `/main/ector/abc` (alias/fixture)",
+      "output_rule": "Service must route to the correct internal handler.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "jakarta_resource_daemon",
+      "input_condition": "Request to `/main/jakarta/resource-constants/alpha`",
+      "output_rule": "Service must list from a list and return the identified constant.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "jakarta_main_app",
+      "input_condition": "Request to `/main/resolvable-interfaces`, `/main/resolvable-interfaces/{namespace}`, or `/main/resolvable-interfaces/{namespace}/{class}`",
+      "output_rule": "Service must resolve interfaces from a map/list and return the identified ID/name. No explicit enum or value specified.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "jakarta_deep",
+      "input_condition": "Request to `/main/deep/path`",
+      "output_rule": "Service must resolve path and return the identified ID/name. No explicit enum or value specified.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "jakarta_count",
+      "input_condition": "Request to `/main/counternode` (not /counternode)",
+      "output_rule": "Service must return the specific count associated with the endpoint.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "jakarta_abc",
+      "input_condition": "Request to `/main/abc`",
+      "output_rule": "Service must resolve the specific ID/name. Enum value not specified.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "resource_constants_invocation",
+      "input_condition": "Access to resource constants via `/resources/constants`",
+      "output_rule": "Service must expose the constants through the defined endpoint.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "resource_abc",
+      "input_condition": "Access to a specific resource constant with key 'abc'",
+      "output_rule": "Service must return the specific value associated with 'abc'.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "service_provider_invocation",
+      "input_condition": "Access to default service provider constants via `/providers/constants`",
+      "output_rule": "Service must expose the default provider constants.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "service_abc",
+      "input_condition": "Access to a default service provider with key 'abc'",
+      "output_rule": "Service must return the specific value associated with 'abc'.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "resource_invocation",
+      "input_condition": "Access to a resource value via `/resources/{id}`",
+      "output_rule": "Service must return the specific value associated with the requested ID.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "service_invocation",
+      "input_condition": "Access to a service value via `/services/{id}`",
+      "output_rule": "Service must return the specific value associated with the requested ID.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C041",
+      "feature": "service_abc_invocation",
+      "input_condition": "Specific invocation for 'service_abc'",
+      "output_rule": "Service must return the specific value associated with 'service_abc'.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C042",
+      "feature": "service_all_invocation",
+      "input_condition": "Invoking with 'all' key in service endpoint",
+      "output_rule": "Service must return the value associated with 'all' (e.g., 'abc').",
+      "exact_values": [
+        "all"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C043",
+      "feature": "service_all_invocation_details",
+      "input_condition": "Invoking with 'all' details requested",
+      "output_rule": "`ResourceConstants` must return 100 values, `ServiceProvider` must return 200 values, `ServiceConstants` must return 10 values. Format: 'ServiceInstance: <Name> ...'",
+      "exact_values": [
+        "ServiceInstance: ResourceConstants"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C044",
+      "feature": "exception_json",
+      "input_condition": "Request to `/json/exceptions` with error flag `true`",
+      "output_rule": "Service must return a valid JSON string representing an exception or error state.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C045",
+      "feature": "exception_json_to_text",
+      "input_condition": "Request to `/json/exceptions/converted` with error flag `true`",
+      "output_rule": "Service must return a text representation of the exception.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C046",
+      "feature": "hard_rt_asserts",
+      "input_condition": "Execution requires the hard runtime assertions (#4, #5, etc.),",
+      "output_rule": "Service must function correctly despite these structural/runtime constraints.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C047",
+      "feature": "singleton_list",
+      "input_condition": "Retrieving configured list of value names",
+      "output_rule": "Service must return the list of strings provided in the test case configuration.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C048",
+      "feature": "singleton_map",
+      "input_condition": "Retrieving configured map of key-value pairs",
+      "output_rule": "Service must return the map of strings provided in the test case configuration.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C049",
+      "feature": "singleton_class",
+      "input_condition": "Requesting a single implementation class",
+      "output_rule": "Service must return the fully qualified class name string.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C050",
+      "feature": "singleton_scenario",
+      "input_condition": "Requesting the result of a specific scenario ID",
+      "output_rule": "Service must return the result of that specific test scenario.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C051",
+      "feature": "singleton_concept",
+      "input_condition": "Requesting the value associated with the key 'singleton-concept'",
+      "output_rule": "Service must return the constant exactly named 'singleton-concept'.",
+      "exact_values": [
+        "singleton-concept"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C052",
+      "feature": "singleton_inheritance",
+      "input_condition": "Requesting the value for 'singleton-inheritance'",
+      "output_rule": "Service must return the enum value associated with 'singleton-inheritance' if defined.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C053",
+      "feature": "singleton_enumerator",
+      "input_condition": "Requesting the value for 'singleton-enumerator'",
+      "output_rule": "Service must return the enum value associated with 'singleton-enumerator' if defined.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C054",
+      "feature": "singleton_binary",
+      "input_condition": "Requesting the value for 'singleton-binary'",
+      "output_rule": "Service must return the enum value associated with 'singleton-binary' if defined.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C055",
+      "feature": "singleton_constants",
+      "input_condition": "Requesting the value for 'singleton-constants'",
+      "output_rule": "Service must return the enum value associated with 'singleton-constants' if defined.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C056",
+      "feature": "singleton_extension",
+      "input_condition": "Requesting the value for 'singleton-extension'",
+      "output_rule": "Service must return the enum value associated with 'singleton-extension' if defined.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C057",
+      "feature": "singleton_producers",
+      "input_condition": "Requesting the value for 'singleton-producers'",
+      "output_rule": "Service must return the enum value associated with 'singleton-producers' if defined.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C058",
+      "feature": "singleton_interceptors",
+      "input_condition": "Requesting the value for 'singleton-interceptors'",
+      "output_rule": "Service must return the enum value associated with 'singleton-interceptors' if defined.",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific CLI environment flag value — refer to the environment configuration",
+        "exact_values_to_replace": [
+          "JDCI_CLI_URI_ALLOW_MALFORMED=yes"
+        ],
+        "trigger_keywords": [
+          "environment variable",
+          "CLI flag",
+          "malformed URI check",
+          "override setting"
+        ],
+        "oracle_response": "The environment variable 'JDCI_CLI_URI_ALLOW_MALFORMED' must be set to the exact string 'yes'"
+      },
+      {
+        "constraint_id": "C027",
+        "replacement": "an increasing sequence of integer values — check the expected output log",
+        "exact_values_to_replace": [
+          "body=11",
+          "body=10",
+          "body=32"
+        ],
+        "trigger_keywords": [
+          "counter increment",
+          "persistent state",
+          "jcdibean/singleton/alpha",
+          "value sequence"
+        ],
+        "oracle_response": "The response body must exactly match '11' on the specific request sequence provided"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C003",
+        "vague_phrase": "use the same newline delimiters as in the app_isolation module",
+        "actual_meaning": "Separate consecutive output blocks with a single blank line character sequence"
+      }
+    ]
+  }
+}

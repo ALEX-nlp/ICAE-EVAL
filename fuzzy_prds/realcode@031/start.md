@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a utility that handles editable list fields inside our form system — basically the same pattern we figured out for the login module's field-registration logic, but applied to arrays. The core problem is that our devs keep writing tons of repetitive boilerplate every time they need a form with a variable-length list: they manually name each row, lose track of the indexes when rows are added or removed, and things go silently wrong in ways that are really hard to debug in production. We want something that wraps all that up cleanly.
+
+It needs to support multiple ways to plug in the row UI (we have teams that prefer different coding styles), and it should shout loudly when someone wires it up wrong instead of just doing nothing. There's also a recurring complaint that devs can't tell how many rows are in the list unless they subscribe to the whole form value, which causes unnecessary re-renders — that needs to be fixed.
+
+The list itself needs to support walking over items, transforming them, attaching a rule that checks the whole collection at once, and growing/shrinking the list. Oh, and if someone changes which list the field is pointing at, it should automatically follow the new one. Please keep the code organized sensibly — last time someone dumped everything in one file and it was a nightmare to maintain.

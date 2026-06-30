@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the interop bridge tool we've been talking about. The basic idea is that we want managed-side code to be able to talk to browser script functions and vice versa, and we want to ship a single packaged file developers can drop into their projects without hand-writing a bunch of repetitive glue code every time. Think of it like that publish pipeline we built for the config module last quarter — same kind of idea where the tool does the heavy lifting at build time.
+
+A few things that came up in last week's sync: the JSON number handling needs to be consistent on both sides of the wire (someone on the consumer team complained about mismatched values showing up), and all the different ways you can call a script function (sync, async, with or without a return value) need to route through whatever runtime is configured. Also the published output needs to support optional source maps and type declaration files, and there should be a way to clean up old files before writing new ones. If something can't be resolved during type generation, we should surface a clear error rather than silently skipping it.
+
+The script bindings inside the published file need to handle nested namespaces from assembly names, and the two different annotation types (host-callable vs script-supplied) should behave differently. Type mappings for the declarations file need to follow the same conventions we use elsewhere in the project.

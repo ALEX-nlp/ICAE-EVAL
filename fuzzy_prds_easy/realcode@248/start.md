@@ -1,0 +1,569 @@
+## Product Requirement Document
+
+# Container Deployment Definition Toolkit - Configuration and Deployment Payload Utilities
+
+## Project Goal
+Build a deployment-definition utility toolkit that allows developers to load, normalize, validate, and inspect container service deployment configuration without manually rewriting provider payloads or duplicating command-line parsing logic.
+
+---
+
+## Background & Problem
+Without this library/tool, developers are forced to hand-convert resource units, parse metadata strings, resolve environment-backed configuration files, validate identifiers, and map command-line flags into deployment options. This leads to repetitive conversion code, inconsistent payload diffs, error-prone tag handling, and late failures during deployment.
+
+With this library/tool, deployment-related inputs are accepted in developer-friendly forms and rendered into deterministic, provider-oriented outputs suitable for validation, comparison, and execution adapters.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain. 
+   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.
+   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single "god file". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository. 
+   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.
+
+3. **Adherence to SOLID Design Principles:**
+   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):
+   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.
+   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.
+
+---
+
+## Core Features
+
+### Feature 1: Duration Serialization
+
+**As a developer, I want to serialize and parse human-readable durations**, so I can keep deployment configuration timeouts stable across file formats.
+
+**Expected Behavior / Usage:**
+
+*1.1 Duration Formatting — Formatting receives an elapsed-time value in seconds and prints the canonical duration text plus the JSON and YAML scalar encodings*
+
+Formatting receives an elapsed-time value in seconds and prints the canonical duration text plus the JSON and YAML scalar encodings. The output must contain one line each for text, json, and yaml.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_1_duration_formatting.json`
+
+```json
+{
+    "description": "Formats elapsed time values as canonical duration text and as JSON/YAML scalar strings.",
+    "cases": [
+        {
+            "input": {
+                "duration_seconds": 10
+            },
+            "expected_output": "text=10s\njson=\"10s\"\nyaml=\"10s\"\n"
+        }
+    ]
+}
+```
+
+*1.2 Duration Parsing — Parsing receives a serialized scalar and its format, accepts duration strings from JSON or YAML, and prints the equivalent whole seconds and canonical duration text*
+
+Parsing receives a serialized scalar and its format, accepts duration strings from JSON or YAML, and prints the equivalent whole seconds and canonical duration text.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_2_duration_parsing.json`
+
+```json
+{
+    "description": "Parses duration scalar values from serialized input and reports the equivalent seconds and canonical text.",
+    "cases": [
+        {
+            "input": {
+                "format": "json",
+                "value": "\"10s\""
+            },
+            "expected_output": "seconds=10\ntext=10s\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Task Resource Unit Normalization
+
+**As a developer, I want user-facing CPU and memory capacity text normalized**, so I can compare and submit task definitions using provider-compatible integer strings.
+
+**Expected Behavior / Usage:**
+
+*2.1 CPU Units — CPU normalization receives a capacity string*
+
+CPU normalization receives a capacity string. Plain integer strings pass through; values expressed in vCPU are converted to CPU units where one vCPU equals 1024 units.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_1_cpu_units.json`
+
+```json
+{
+    "description": "Normalizes CPU capacity text into the integer CPU-unit string expected by container task definitions.",
+    "cases": [
+        {
+            "input": {
+                "value": "256"
+            },
+            "expected_output": "cpu=256\n"
+        }
+    ]
+}
+```
+
+*2.2 Memory Units — Memory normalization receives a capacity string*
+
+Memory normalization receives a capacity string. Plain integer strings pass through; values expressed in GB are converted to MiB where one GB equals 1024 MiB.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_2_memory_units.json`
+
+```json
+{
+    "description": "Normalizes memory capacity text into the integer MiB string expected by container task definitions.",
+    "cases": [
+        {
+            "input": {
+                "value": "512"
+            },
+            "expected_output": "[a predefined memory constant]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 3: Tag Parsing, Rendering, and Diffing
+
+**As a developer, I want deterministic tag handling**, so I can pass, display, and compare cloud resource metadata safely.
+
+**Expected Behavior / Usage:**
+
+*3.1 Tag String Parsing — Tag parsing receives comma-separated key=value text, ignores a trailing empty segment, allows empty values, and prints a JSON array of key/value records sorted by key*
+
+Tag parsing receives comma-separated key=value text, ignores a trailing empty segment, allows empty values, and prints a JSON array of key/value records sorted by key. Malformed pairs and empty keys are rendered as neutral error categories.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_1_tag_string_parsing.json`
+
+```json
+{
+    "description": "Parses comma-separated key/value tag text into ordered key/value records and reports neutral errors for malformed tag text.",
+    "cases": [
+        {
+            "input": {
+                "tags": "Foo=FOO"
+            },
+            "expected_output": "tags=[{\"key\":\"Foo\",\"value\":\"FOO\"}]\n"
+        },
+        {
+            "input": {
+                "tags": "="
+            },
+            "expected_output": "error=tag_key_required\n"
+        }
+    ]
+}
+```
+
+*3.2 Tag Map Rendering — Map rendering receives a string map and prints a comma-separated key=value list sorted lexicographically by key*
+
+Map rendering receives a string map and prints a comma-separated key=value list sorted lexicographically by key. An empty map renders as an empty value after text=.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_2_tag_map_rendering.json`
+
+```json
+{
+    "description": "Renders a string map as a stable comma-separated key=value list sorted by key.",
+    "cases": [
+        {
+            "input": {
+                "map": {
+                    "b": "2",
+                    "a": "1"
+                }
+            },
+            "expected_output": "text=a=1,b=2\n"
+        }
+    ]
+}
+```
+
+*3.3 Tag Change Sets — Tag comparison receives previous and next tag arrays and prints added, updated, and deleted arrays*
+
+Tag comparison receives previous and next tag arrays and prints added, updated, and deleted arrays. Updates contain the next value for keys whose value changed.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_3_tag_change_sets.json`
+
+```json
+{
+    "description": "Compares previous and next tag collections and reports added, updated, and deleted records.",
+    "cases": [
+        {
+            "input": {
+                "old_tags": [
+                    {
+                        "key": "key1",
+                        "value": "value1"
+                    },
+                    {
+                        "key": "key2",
+                        "value": "value2"
+                    },
+                    {
+                        "key": "key3",
+                        "value": "value3"
+                    }
+                ],
+                "new_tags": [
+                    {
+                        "key": "key1",
+                        "value": "value1_updated"
+                    },
+                    {
+                        "key": "key2",
+                        "value": "value2"
+                    },
+                    {
+                        "key": "key4",
+                        "value": "value4"
+                    }
+                ]
+            },
+            "expected_output": "added=[{\"key\":\"key4\",\"value\":\"value4\"}]\nupdated=[{\"key\":\"key1\",\"value\":\"value1_updated\"}]\ndeleted=[{\"key\":\"key3\",\"value\":\"value3\"}]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: Cloud Identifier Recognition
+
+**As a developer, I want common cloud identifiers classified and extracted**, so validation and diagnostics can use normalized signals.
+
+**Expected Behavior / Usage:**
+
+*4.1 Resource Identifier Shape — Identifier shape detection receives a container-service resource identifier and prints whether it uses the long form that includes both group and resource names*
+
+Identifier shape detection receives a container-service resource identifier and prints whether it uses the long form that includes both group and resource names.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_1_cloud_resource_arn_shape.json`
+
+```json
+{
+    "description": "Classifies container-service resource identifiers as short or long resource-name formats.",
+    "cases": [
+        {
+            "input": {
+                "arn": "arn:aws:ecs:region:aws_account_id:container-instance/container-instance-id"
+            },
+            "expected_output": "long=false\n"
+        }
+    ]
+}
+```
+
+*4.2 Role Name Extraction — Role extraction receives an identity role identifier, prints the terminal role name for valid role resources, and prints error=invalid_role_arn for non-role or malformed identifiers*
+
+Role extraction receives an identity role identifier, prints the terminal role name for valid role resources, and prints error=invalid_role_arn for non-role or malformed identifiers.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_2_role_name_extraction.json`
+
+```json
+{
+    "description": "Extracts the terminal role name from valid identity role identifiers and reports a neutral error for non-role identifiers.",
+    "cases": [
+        {
+            "input": {
+                "arn": "arn:aws:iam::123456789012:role/ecsTaskRole"
+            },
+            "expected_output": "role=ecsTaskRole\n"
+        },
+        {
+            "input": {
+                "arn": "arn:aws:iam::123456789012:foo"
+            },
+            "expected_output": "error=invalid_role_arn\n"
+        }
+    ]
+}
+```
+
+*4.3 Container Registry Detection — Image registry detection receives a container image reference and prints whether it matches the managed registry URL shape*
+
+Image registry detection receives a container image reference and prints whether it matches the managed registry URL shape.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_3_container_image_registry_detection.json`
+
+```json
+{
+    "description": "Detects whether a container image reference points to the expected managed container registry URL pattern.",
+    "cases": [
+        {
+            "input": {
+                "image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/myimage"
+            },
+            "expected_output": "ecr=true\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 5: Version Constraint Evaluation
+
+**As a developer, I want configuration files to constrain compatible tool versions**, so incompatible executions fail before deployment work begins.
+
+**Expected Behavior / Usage:**
+
+*5.1 Version Constraints — Constraint evaluation receives a required-version expression and a current version*
+
+Constraint evaluation receives a required-version expression and a current version. It prints result=satisfied when compatible, error=constraint_not_satisfied when the expression is valid but not met, and error=invalid_constraint when the expression cannot be parsed.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_1_version_constraints.json`
+
+```json
+{
+    "description": "Evaluates whether the current tool version satisfies a configured version constraint and reports neutral failure categories.",
+    "cases": [
+        {
+            "input": {
+                "required_version": ">= v1.0.0",
+                "current_version": "v1.2.1"
+            },
+            "expected_output": "result=satisfied\n"
+        },
+        {
+            "input": {
+                "required_version": "hoge",
+                "current_version": "v1.2.1"
+            },
+            "expected_output": "error=invalid_constraint\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 6: Deployment Desired Count Resolution
+
+**As a developer, I want deployment task-count overrides resolved consistently**, so service updates preserve existing counts unless an explicit meaningful override is supplied.
+
+**Expected Behavior / Usage:**
+
+*6.1 Desired Task Count — Desired-count resolution receives current service count, scheduling strategy, and optional requested count*
+
+Desired-count resolution receives current service count, scheduling strategy, and optional requested count. Daemon scheduling never sends a desired count; a missing requested count sends null; the sentinel value -1 preserves the current service count.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature6_1_desired_task_count.json`
+
+```json
+{
+    "description": "Computes the desired task count to send during deployment from service state, scheduling strategy, and an optional requested override.",
+    "cases": [
+        {
+            "input": {
+                "service_desired_count": null,
+                "requested_desired_count": null
+            },
+            "expected_output": "desired_count=null\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 7: Configuration and Definition Loading
+
+**As a developer, I want deployment configuration and definition files loaded with templates and environment values resolved**, so generated deployment payloads match the authored files.
+
+**Expected Behavior / Usage:**
+
+*7.1 Configuration Loading — Configuration loading receives a configuration path and optional environment variables, resolves defaults, and prints the service name, region, timeout, service definition path, and task definition path*
+
+Configuration loading receives a configuration path and optional environment variables, resolves defaults, and prints the service name, region, timeout, service definition path, and task definition path.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_1_configuration_loading.json`
+
+```json
+{
+    "description": "Loads deployment configuration files, applies environment defaults, and exposes key resolved paths and timing settings.",
+    "cases": [
+        {
+            "input": {
+                "config_path": "tests/ecspresso.yml",
+                "env": {
+                    "TAG": "testing",
+                    "JSON": "{\"foo\":\"bar\"}",
+                    "AWS_REGION": "ap-northeast-1"
+                }
+            },
+            "expected_output": "name=test/default\nregion=ap-northeast-1\ntimeout=10m0s\nservice_definition=tests/ecs-service-def.json\ntask_definition=tests/ecs-task-def.json\n"
+        }
+    ]
+}
+```
+
+*7.2 Service Definition Loading — Service definition loading receives a configuration path and service definition path, then prints observable service fields including desired count, launch type, scheduling strategy, target group, tag, deployment percentages, and alarm name*
+
+Service definition loading receives a configuration path and service definition path, then prints observable service fields including desired count, launch type, scheduling strategy, target group, tag, deployment percentages, and alarm name.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_2_service_definition_loading.json`
+
+```json
+{
+    "description": "Loads a service definition file and exposes the externally meaningful service, deployment, load-balancer, and tag fields.",
+    "cases": [
+        {
+            "input": {
+                "config_path": "tests/test.yaml",
+                "definition_path": "tests/sv.json"
+            },
+            "expected_output": "service=test\ndesired_count=2\nlaunch_type=EC2\nscheduling_strategy=REPLICA\ntarget_group=arn:aws:elasticloadbalancing:us-east-1:1111111111:targetgroup/test/12345678\ntag_0=cluster:default2\ndeploy_max_percent=200\ndeploy_min_healthy_percent=50\nalarm=HighResponseLatencyAlarm\n"
+        }
+    ]
+}
+```
+
+*7.3 Task Definition Loading — Task definition loading receives a configuration path and task definition path, resolves template inputs, and prints family, ephemeral storage, first container name, docker label, log group, and whether task tags are absent or present*
+
+Task definition loading receives a configuration path and task definition path, resolves template inputs, and prints family, ephemeral storage, first container name, docker label, log group, and whether task tags are absent or present.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_3_task_definition_loading.json`
+
+```json
+{
+    "description": "Loads task definition files and exposes meaningful fields resolved from templates, plain files, and definition-embedded tags.",
+    "cases": [
+        {
+            "input": {
+                "config_path": "tests/td-config.yml",
+                "definition_path": "tests/td.json"
+            },
+            "expected_output": "family=katsubushi\nephemeral_storage_gib=25\nfirst_container=katsubushi\ndocker_label_name=katsubushi\nlog_group=fargate\ntags=null\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 8: Parameter Store Lookup
+
+**As a developer, I want configuration templates to resolve parameter-store values**, so plain strings, string-list entries, and secure strings can be injected safely.
+
+**Expected Behavior / Usage:**
+
+*8.1 Parameter Lookup — Parameter lookup receives a parameter name and optional indexes*
+
+Parameter lookup receives a parameter name and optional indexes. String and secure-string parameters require no index; string-list parameters require exactly one index; argument errors are normalized without runtime exception names.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_1_parameter_lookup.json`
+
+```json
+{
+    "description": "Looks up parameter values from a parameter store adapter, including indexed list values and neutral argument errors.",
+    "cases": [
+        {
+            "input": {
+                "parameter": "/string",
+                "indexes": []
+            },
+            "expected_output": "value=string value\n"
+        },
+        {
+            "input": {
+                "parameter": "/stringlist",
+                "indexes": [
+                    0,
+                    1
+                ]
+            },
+            "expected_output": "error=too_many_arguments\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 9: Runtime Platform Normalization
+
+**As a developer, I want runtime platform settings converted to image-platform labels**, so container images can be validated against target architecture and operating system.
+
+**Expected Behavior / Usage:**
+
+*9.1 Runtime Platform — Runtime platform normalization receives optional CPU architecture, optional operating-system family, and whether the task is Fargate*
+
+Runtime platform normalization receives optional CPU architecture, optional operating-system family, and whether the task is Fargate. It prints normalized architecture and operating-system labels, defaulting to amd64/linux when unspecified.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature9_1_runtime_platform.json`
+
+```json
+{
+    "description": "Converts runtime-platform settings into normalized architecture and operating-system labels used for container image validation.",
+    "cases": [
+        {
+            "input": {
+                "runtime_platform": {},
+                "is_fargate": false
+            },
+            "expected_output": "arch=amd64\nos=linux\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 10: Command-Line Option Parsing
+
+**As a developer, I want command-line arguments translated into structured operation options**, so the execution engine can consume a stable option model.
+
+**Expected Behavior / Usage:**
+
+*10.1 CLI Option Parsing — CLI parsing receives an argument array and prints the selected subcommand plus a compact JSON representation of that subcommand’s options, including defaults*
+
+CLI parsing receives an argument array and prints the selected subcommand plus a compact JSON representation of that subcommand’s options, including defaults.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature10_1_cli_option_parsing.json`
+
+```json
+{
+    "description": "Parses command-line arguments into a selected operation and structured operation options.",
+    "cases": [
+        {
+            "input": {
+                "args": [
+                    "status"
+                ]
+            },
+            "expected_output": "subcommand=status\noptions={\"Events\":10}\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing the features described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the "Scale-Driven Code Organization" constraint, ensuring high maintainability without over-engineering.
+
+2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system. It reads a JSON command from stdin, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-leaf-feature contracts above. This adapter must be logically (and ideally physically) separated from the core domain.
+
+3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_[name].json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_[name]@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- follow the formatting logic used in network format

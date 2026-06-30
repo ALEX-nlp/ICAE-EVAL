@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that static analysis tool we've been talking about for the Angular codebase. Basically devs keep shipping components and directives with inconsistent naming, sketchy event bindings, and gnarly template logic that nobody catches in review. It's causing real pain in prod — we had that incident last sprint where a custom event shadowed a browser event and broke the checkout flow on Safari.
+
+The tool should read source code, run one of the named checks against it, and spit out a structured report so CI can fail on violations. A few of the checks also need to be able to auto-fix the source when asked — similar to how we handled the auto-correct flow in that i18n annotation pass we did a while back, just apply the same sentinel-block pattern.
+
+Input comes in over stdin as a JSON blob, output goes to stdout. Line/column positions in findings need to be consistent so golden-file diffing works. The whole thing should be modular — each check lives independently so we can add more later without touching existing ones. Need to handle bad input gracefully too, no raw stack traces leaking out. We're thinking Python but open to discussion. Can someone scope this out and get it running against the test cases in the repo? The test files lay out the exact scenarios we care about.

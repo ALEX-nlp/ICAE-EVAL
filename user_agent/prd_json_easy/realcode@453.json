@@ -1,0 +1,1240 @@
+{
+  "fuzzy_prd": "# In-Process Data Interchange & Tabular Compute Toolkit\n\n## Project Goal\n\nBuild a self-contained library that provides the low-level building blocks\nneeded to move structured data across a process boundary and to evaluate\nuser-supplied transformations over that data in-process. The toolkit must\noffer, behind a single line-oriented command interface:\n\n- value and collection equality and conversion primitives,\n- a binary wire protocol for primitive values and length-prefixed byte blocks,\n- a typeless object serializer that preserves concrete type identity across a\n  round trip,\n- a schema description parser for atomic and nested data types,\n- a microsecond-precision timestamp value type,\n- positional and by-name access into typed tabular rows,\n- composable user-defined functions (UDFs) that can be applied to a row and\n  chained together,\n- serialization of a transformation so that it can be reconstructed and\n  re-executed elsewhere,\n- value-comparable dependency-metadata records with file round-trip and\n  sortable name generation.\n\nEvery capability is exercised through one stable contract: a single JSON\ncommand object arrives on standard input, and a deterministic, line-oriented\ntext result is written to standard output.\n\n## Background & Problem\n\nSystems that distribute computation to remote workers need a small, dependable\ncore that does three things well: describe data, serialize it, and run\nuser-provided logic over it. These pieces are normally buried inside a larger\nruntime and are difficult to test in isolation because they assume a live\nbackend connection.\n\nThe problem this toolkit solves is to expose those primitives directly and\ndeterministically, so each one can be driven in isolation with a fixed input\nand verified against a fixed output. There is no network, no external service,\nand no interactive state: each invocation reads exactly one command, performs\nexactly one unit of work, and prints a stable result. This makes the behavior\nfully reproducible and independently checkable.\n\nA second concern is failure reporting. Because the same primitives may be hosted\nin different language runtimes, error results must be reported as a small set of\nneutral, stable categories rather than as runtime-specific exception identities\nor messages.\n\n## Architecture & Engineering Constraints\n\n- **Single command interface.** The program reads one complete JSON object from\n  standard input. The object always contains a string field `op` selecting the\n  operation; the remaining fields are operation-specific arguments. The program\n  writes only the result contract to standard output.\n- **Line-oriented output contract.** Output is zero or more `key=value` lines in\n  a fixed, documented order. Multi-line results are joined with a single `\\n`\n  and carry no trailing blank line. No decorative text, banners, or diagnostic\n  logging may appear on standard output.\n- **One unit of work per invocation.** The process is stateless across runs; all\n  required input is provided in the single command object.\n- **Neutral error contract.** Any rejected operation produces exactly one line\n  of the form `error=<category>`. The category vocabulary is fixed and\n  language-neutral:\n  - `error=type_mismatch` — a typed read or reconstruction was requested for a\n    target that is incompatible with the stored value.\n  - `[the exact error category constant returned for numeric out of range failures]` — a numeric argument fell outside its permitted\n    range.\n  - `error=invalid_format` — a value could not be interpreted in the requested\n    form.\n  - `error=invalid_argument` — an argument was structurally unacceptable.\n  - `error=invalid_operation` — the operation is not valid in the given state.\n  - `error=serialization_rejected` — an object was not permitted to be\n    reconstructed by the serializer.\n  - `error=failure` — any other rejection.\n  Error results never contain runtime exception class names, stack traces, or\n  localized messages.\n- **Deterministic rendering.** Booleans render as `true` / `false`. Whole numbers\n  render without a decimal point or thousands separators. Collections render in\n  input order; dictionaries render with keys in ascending order. These rules are\n  fixed so output is byte-stable across runs and hosts.\n- **No host leakage.** The contract exposes no host language, runtime, package,\n  or file-layout details.\n\n## Core Features\n\n### Feature 1: Integer-array equality\n\nCompare two integer sequences for element-by-element equality. Two sequences are\nequal only when both are absent (null) or when they have identical length and\nidentical elements in order. A present sequence is never equal to an absent one,\nand sequences of different length are never equal.\n\n- **Input:** `{ \"op\":\"array_equals\", \"left\":<int[]|null>, \"right\":<int[]|null> }`\n- **Output:** `equal=true` or `equal=false`\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"array_equals\", \"left\": [1, 2, 3], \"right\": [1, 2, 3] },\n      \"expected_output\": \"equal=true\"\n    },\n    {\n      \"input\": { \"op\": \"array_equals\", \"left\": null, \"right\": null },\n      \"expected_output\": \"equal=true\"\n    },\n    {\n      \"input\": { \"op\": \"array_equals\", \"left\": [1, 2, 3], \"right\": [1, 2, 4] },\n      \"expected_output\": \"equal=false\"\n    },\n    {\n      \"input\": { \"op\": \"array_equals\", \"left\": [1], \"right\": [1, 2] },\n      \"expected_output\": \"equal=false\"\n    },\n    {\n      \"input\": { \"op\": \"array_equals\", \"left\": [1], \"right\": null },\n      \"expected_output\": \"equal=false\"\n    }\n  ]\n}\n```\n\n### Feature 2: Value and collection conversion\n\nConvert a dynamically-typed value into a requested target shape. Scalars convert\nto the named numeric, boolean, or string target. Untyped ordered collections\nconvert into nested fixed-element arrays of the requested nesting depth, and\nuntyped keyed collections convert into nested dictionaries of the requested\ndepth. Converted collections render in a compact, canonical form: arrays in\ninput order, dictionaries with keys sorted ascending.\n\n- **Input (scalar):** `{ \"op\":\"convert_scalar\", \"target\":\"int|long|double|string|bool\", \"value\":<scalar> }`\n- **Input (array):** `{ \"op\":\"convert_array\", \"depth\":<n>, \"values\":<nested array> }`\n- **Input (dictionary):** `{ \"op\":\"convert_dictionary\", \"depth\":<n>, \"entries\":<object> }`\n- **Output:** `value=<scalar>`, `array=<canonical array>`, or `map=<canonical map>`\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"convert_scalar\", \"target\": \"long\", \"value\": 1 },\n      \"expected_output\": \"value=1\"\n    },\n    {\n      \"input\": { \"op\": \"convert_scalar\", \"target\": \"string\", \"value\": \"test\" },\n      \"expected_output\": \"value=test\"\n    },\n    {\n      \"input\": { \"op\": \"convert_array\", \"depth\": 1, \"values\": [0, 1, 2, 3] },\n      \"expected_output\": \"array=[0,1,2,3]\"\n    },\n    {\n      \"input\": { \"op\": \"convert_array\", \"depth\": 2, \"values\": [[0, 1], [2, 3]] },\n      \"expected_output\": \"array=[[0,1],[2,3]]\"\n    },\n    {\n      \"input\": { \"op\": \"convert_dictionary\", \"depth\": 1, \"entries\": { \"1\": 1, \"2\": 4, \"3\": 9 } },\n      \"expected_output\": \"map={1:1,2:4,3:9}\"\n    }\n  ]\n}\n```\n\n### Feature 3: Primitive wire serialization\n\nSerialize a primitive value to a binary stream and read it back, proving the\nwire encoding is lossless. The supported primitive types are boolean, 32-bit\ninteger, 64-bit integer, double, and string. A separate length-prefixed byte\nread recognizes a reserved sentinel length that denotes an absent block\n(reported as `[the specific sentinel value used to indicate a null read back length]`), and rejects a negative length as out of range.\n\n- **Input (primitive):** `{ \"op\":\"stream_primitives\", \"type\":\"bool|int|long|double|string\", \"value\":<v> }`\n- **Input (byte block):** `{ \"op\":\"read_bytes\", \"length\":<n> }`\n- **Output (primitive):** `type=<t>` then `value=<readback>`\n- **Output (byte block):** `length=<n|null>` or the neutral error contract\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"stream_primitives\", \"type\": \"int\", \"value\": 12345 },\n      \"expected_output\": \"type=int\\nvalue=12345\"\n    },\n    {\n      \"input\": { \"op\": \"stream_primitives\", \"type\": \"double\", \"value\": 3.14 },\n      \"expected_output\": \"type=double\\nvalue=3.14\"\n    },\n    {\n      \"input\": { \"op\": \"stream_primitives\", \"type\": \"string\", \"value\": \"hello world!\" },\n      \"expected_output\": \"type=string\\nvalue=hello world!\"\n    },\n    {\n      \"input\": { \"op\": \"read_bytes\", \"length\": -5 },\n      \"expected_output\": \"[the specific sentinel value used to indicate a null read back length]\"\n    },\n    {\n      \"input\": { \"op\": \"read_bytes\", \"length\": -1 },\n      \"expected_output\": \"[the exact error category constant returned for numeric out of range failures]\"\n    }\n  ]\n}\n```\n\n### Feature 4: Typeless object round-trip\n\nSerialize an object graph in a typeless format that embeds concrete type\nidentity, then reconstruct it. A simple record round-trips its field values. A\nderived instance referenced through its base type restores to its derived type\nand exposes the derived-only field. Requesting reconstruction as an unrelated\ntype is rejected as a type mismatch, and an object whose type is not permitted\nto be reconstructed is rejected as a serialization rejection.\n\n- **Input (round-trip):** `{ \"op\":\"object_roundtrip\", \"id\":<int>, \"name\":<string> }`\n- **Input (polymorphic):** `{ \"op\":\"object_polymorphic\", \"id\":<int>, \"name\":<string>, \"role\":<string> }`\n- **Input (mismatch):** `{ \"op\":\"object_type_mismatch\", \"id\":<int>, \"name\":<string> }`\n- **Input (disallowed):** `{ \"op\":\"object_disallowed\", \"value\":<int> }`\n- **Output:** field lines on success, or the neutral error contract\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"object_roundtrip\", \"id\": 101, \"name\": \"John Doe\" },\n      \"expected_output\": \"id=101\\nname=John Doe\"\n    },\n    {\n      \"input\": { \"op\": \"object_polymorphic\", \"id\": 1, \"name\": \"Alice\", \"role\": \"Account manager\" },\n      \"expected_output\": \"concrete=derived\\nname=Alice\\nrole=Account manager\"\n    },\n    {\n      \"input\": { \"op\": \"object_type_mismatch\", \"id\": 101, \"name\": \"John Doe\" },\n      \"expected_output\": \"error=type_mismatch\"\n    },\n    {\n      \"input\": { \"op\": \"object_disallowed\", \"value\": 123 },\n      \"expected_output\": \"error=serialization_rejected\"\n    }\n  ]\n}\n```\n\n### Feature 5: Data-type schema parsing\n\nParse a JSON schema description into a data-type model and report its observable\nshape. Atomic types report a type name and a compact signature. An array type\nadditionally reports its element type and whether it allows absent elements. A\nmap type reports key type, value type, and whether values may be absent. A\nstruct type reports its field count followed by each field's name, type, and\nnullability, in declared order.\n\n- **Input:** `{ \"op\":\"parse_type\", \"schema\":<schema-json-string> }`\n- **Output:** `type_name=...`, `simple_string=...`, plus type-specific child lines\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"parse_type\", \"schema\": \"\\\"integer\\\"\" },\n      \"expected_output\": \"type_name=integer\\nsimple_string=integer\"\n    },\n    {\n      \"input\": { \"op\": \"parse_type\", \"schema\": \"{\\\"type\\\":\\\"array\\\",\\\"elementType\\\":\\\"integer\\\",\\\"containsNull\\\":false}\" },\n      \"expected_output\": \"type_name=array\\nsimple_string=array<integer>\\nelement_type=integer\\ncontains_null=false\"\n    },\n    {\n      \"input\": { \"op\": \"parse_type\", \"schema\": \"{\\\"type\\\":\\\"map\\\",\\\"keyType\\\":\\\"integer\\\",\\\"valueType\\\":\\\"double\\\",\\\"valueContainsNull\\\":false}\" },\n      \"expected_output\": \"type_name=map\\nsimple_string=map<integer,double>\\nkey_type=integer\\nvalue_type=double\\nvalue_contains_null=false\"\n    },\n    {\n      \"input\": { \"op\": \"parse_type\", \"schema\": \"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{\\\"name\\\":\\\"age\\\",\\\"type\\\":\\\"long\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}},{\\\"name\\\":\\\"name\\\",\\\"type\\\":\\\"string\\\",\\\"nullable\\\":false,\\\"metadata\\\":{}}]}\" },\n      \"expected_output\": \"type_name=struct\\nsimple_string=struct<age:long,name:string>\\nfield_count=2\\nfield_name=age\\nfield_type=long\\nfield_nullable=true\\nfield_name=name\\nfield_type=string\\nfield_nullable=false\"\n    }\n  ]\n}\n```\n\n### Feature 6: Microsecond timestamp value\n\nConstruct a timestamp from explicit calendar and time-of-day components with\nmicrosecond precision and report each component back, plus a canonical UTC\nstring of the form `YYYY-MM-DD HH:MM:SS.ffffffZ`. The microsecond component is\nrange-checked: a value of one million or more is rejected as out of range.\n\n- **Input:** `{ \"op\":\"timestamp\", \"year\":..., \"month\":..., \"day\":..., \"hour\":..., \"minute\":..., \"second\":..., \"microsecond\":... }`\n- **Output:** component lines and `iso=<canonical string>`, or the neutral error contract\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"timestamp\", \"year\": 2020, \"month\": 1, \"day\": 2, \"hour\": 15, \"minute\": 30, \"second\": 30, \"microsecond\": 123456 },\n      \"expected_output\": \"year=2020\\nmonth=1\\nday=2\\nhour=15\\nminute=30\\nsecond=30\\nmicrosecond=123456\\niso=2020-01-02 15:30:30.123456Z\"\n    },\n    {\n      \"input\": { \"op\": \"timestamp\", \"year\": 2020, \"month\": 1, \"day\": 1, \"hour\": 8, \"minute\": 30, \"second\": 30, \"microsecond\": 123 },\n      \"expected_output\": \"year=2020\\nmonth=1\\nday=1\\nhour=8\\nminute=30\\nsecond=30\\nmicrosecond=123\\niso=2020-01-01 08:30:30.000123Z\"\n    },\n    {\n      \"input\": { \"op\": \"timestamp\", \"year\": 2020, \"month\": 1, \"day\": 2, \"hour\": 15, \"minute\": 30, \"second\": 30, \"microsecond\": 1234567 },\n      \"expected_output\": \"[the exact error category constant returned for numeric out of range failures]\"\n    }\n  ]\n}\n```\n\n### Feature 7: Typed row access\n\nBuild a tabular row from a named, typed schema and a set of values, then read\nits cells positionally and by column name. The row reports its size. A typed\nread that matches the column's declared type returns the value; a typed read\nwhose target is incompatible with the column is rejected. Reading an integer\ncolumn as a string is rejected as a type mismatch, while reading a string column\nas an integer is rejected as an invalid format.\n\n- **Input:** `{ \"op\":\"row\", \"columns\":[{\"name\":...,\"type\":\"int|string\"},...], \"values\":[...], \"access\":[{\"by\":\"index|name\", ...,\"as\":\"int|string\"},...] }`\n- **Output:** `size=<n>` then one `get=<value>` per successful access, or the neutral error contract\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"row\",\n        \"columns\": [{ \"name\": \"col1\", \"type\": \"int\" }, { \"name\": \"col2\", \"type\": \"string\" }],\n        \"values\": [1, \"abc\"],\n        \"access\": [\n          { \"by\": \"index\", \"index\": 0, \"as\": \"int\" },\n          { \"by\": \"name\", \"name\": \"col2\", \"as\": \"string\" }\n        ]\n      },\n      \"expected_output\": \"size=2\\nget=1\\nget=abc\"\n    },\n    {\n      \"input\": {\n        \"op\": \"row\",\n        \"columns\": [{ \"name\": \"col1\", \"type\": \"int\" }, { \"name\": \"col2\", \"type\": \"string\" }],\n        \"values\": [1, \"abc\"],\n        \"access\": [{ \"by\": \"index\", \"index\": 0, \"as\": \"string\" }]\n      },\n      \"expected_output\": \"error=type_mismatch\"\n    },\n    {\n      \"input\": {\n        \"op\": \"row\",\n        \"columns\": [{ \"name\": \"col1\", \"type\": \"int\" }, { \"name\": \"col2\", \"type\": \"string\" }],\n        \"values\": [1, \"abc\"],\n        \"access\": [{ \"by\": \"index\", \"index\": 1, \"as\": \"int\" }]\n      },\n      \"expected_output\": \"error=invalid_format\"\n    }\n  ]\n}\n```\n\n### Feature 8: User-defined function application and chaining\n\nApply a user-defined function to selected arguments of an input row and compose\nfunctions into a pipeline. A concatenating function of fixed arity selects its\narguments from a wider input row using an offset list, so leading columns may be\nignored. Functions can be chained so the output of one feeds the next; a valid\ntwo-stage chain reports both intermediate results, while a chain whose argument\nshapes do not line up is rejected.\n\n- **Input (apply):** `{ \"op\":\"udf_apply\", \"arity\":<n>, \"inputs\":[...], \"offsets\":[...] }`\n- **Input (chain):** `{ \"op\":\"udf_chain\", \"inputs\":[...], \"offsets\":[...], \"order\":\"valid|invalid\" }`\n- **Output:** `result=<value>`, or `level1=...` / `level2=...` for a valid chain, or the neutral error contract\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"udf_apply\", \"arity\": 1, \"inputs\": [\"arg1\"], \"offsets\": [0] },\n      \"expected_output\": \"result=arg1\"\n    },\n    {\n      \"input\": { \"op\": \"udf_apply\", \"arity\": 3, \"inputs\": [\"arg0\", \"arg1\", \"arg2\", \"arg3\"], \"offsets\": [0, 1, 2] },\n      \"expected_output\": \"result=arg0arg1arg2\"\n    },\n    {\n      \"input\": { \"op\": \"udf_chain\", \"inputs\": [100, \"name\"], \"offsets\": [0, 1], \"order\": \"valid\" },\n      \"expected_output\": \"level1=outer1:name:100\\nlevel2=outer2:outer1:name:100\"\n    },\n    {\n      \"input\": { \"op\": \"udf_chain\", \"inputs\": [100, \"name\"], \"offsets\": [0, 1], \"order\": \"invalid\" },\n      \"expected_output\": \"error=type_mismatch\"\n    }\n  ]\n}\n```\n\n### Feature 9: Transformation serialization round-trip\n\nSerialize a user-defined transformation together with its serialization modes to\nbytes, reconstruct it, and re-execute it to prove behavior survives the round\ntrip. The reconstructed transformation reports its serializer mode, deserializer\nmode, and run mode, and produces the same result it would have produced before\nserialization.\n\n- **Input:** `{ \"op\":\"command_roundtrip\", \"arg\":<string> }`\n- **Output:** `serializer_mode=...`, `deserializer_mode=...`, `run_mode=...`, `result=...`\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"command_roundtrip\", \"arg\": \"spark\" },\n      \"expected_output\": \"serializer_mode=Row\\ndeserializer_mode=Row\\nrun_mode=N\\nresult=hello spark\"\n    }\n  ]\n}\n```\n\n### Feature 10: Dependency-metadata records\n\nModel a dependency-metadata record describing assembly probe paths, native probe\npaths, and package coordinates. Records support value equality (a present record\nis never equal to an absent one, and any differing path or coordinate makes them\nunequal), a file round-trip (serialize to a file, reload, and compare for\nequality), and generation of fixed-width, zero-padded, sortable file names from\nnumbers.\n\n- **Input (equals):** `{ \"op\":\"metadata_equals\", \"left\":<metadata>, \"right\":<metadata|null> }`\n- **Input (round-trip):** `{ \"op\":\"metadata_roundtrip\", \"metadata\":<metadata> }`\n- **Input (file name):** `{ \"op\":\"metadata_filename\", \"numbers\":[...] }`\n- **Output:** `equal=true|false`, or one `filename=<name>` line per number in input order\n\nExamples:\n\n```json\n{\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"metadata_equals\",\n        \"left\": { \"assembly_paths\": [\"/assembly/probe/path\"], \"native_paths\": [\"/native/probe/path\"], \"nugets\": [{ \"file_name\": \"package.name.1.0.0.nupkg\", \"package_name\": \"package.name\", \"package_version\": \"1.0.0\" }] },\n        \"right\": { \"assembly_paths\": [\"/assembly/probe/path\"], \"native_paths\": [\"/native/probe/path\"], \"nugets\": [{ \"file_name\": \"package.name.1.0.0.nupkg\", \"package_name\": \"package.name\", \"package_version\": \"1.0.0\" }] }\n      },\n      \"expected_output\": \"equal=true\"\n    },\n    {\n      \"input\": {\n        \"op\": \"metadata_equals\",\n        \"left\": { \"assembly_paths\": [\"/assembly/probe/path\"], \"native_paths\": [\"/native/probe/path\"], \"nugets\": [{ \"file_name\": \"package.name.1.0.0.nupkg\", \"package_name\": \"package.name\", \"package_version\": \"1.0.0\" }] },\n        \"right\": null\n      },\n      \"expected_output\": \"equal=false\"\n    },\n    {\n      \"input\": {\n        \"op\": \"metadata_roundtrip\",\n        \"metadata\": { \"assembly_paths\": [\"/assembly/probe/path\"], \"native_paths\": [\"/native/probe/path\"], \"nugets\": [{ \"file_name\": \"package.name.1.0.0.nupkg\", \"package_name\": \"package.name\", \"package_version\": \"1.0.0\" }] }\n      },\n      \"expected_output\": \"equal=true\"\n    },\n    {\n      \"input\": { \"op\": \"metadata_filename\", \"numbers\": [1, 10, 100] },\n      \"expected_output\": \"filename=dependencyProviderMetadata_0000000000000000001\\nfilename=dependencyProviderMetadata_0000000000000000010\\nfilename=dependencyProviderMetadata_0000000000000000100\"\n    }\n  ]\n}\n```\n\n## Deliverables\n\n- A library implementing all ten features behind the single JSON-on-stdin,\n  lines-on-stdout command interface described above.\n- An execution adapter that reads one command object, performs the selected\n  operation, and renders the line-oriented result, including the neutral error\n  contract for every rejected operation.\n- A test harness (`rcb_tests/test.sh`) that, for a chosen case directory, feeds\n  each case's `input` to the adapter and captures only the raw program standard\n  output, then compares it to each case's `expected_output` and prints a\n  pass/fail summary.\n- A hidden evaluation set (`rcb_tests/test_cases/`) and a public mirror\n  (`rcb_tests/public_test_cases/`) whose cases match the examples embedded in\n  this document.\n\n\n---\n**Implementation notes:**\n- follow the same parenthetical expansion pattern used for scalar types in the parse_type output\n- apply the same nesting depth logic seen in C049 but include an outer level with two title parameters\n",
+  "oracle_data": {
+    "task_id": "dotnet__spark-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C029",
+        "trigger_keywords": [
+          "negative even length",
+          "cannot read bytes",
+          "null back",
+          "error sentinels"
+        ],
+        "oracle_response": "length=null"
+      },
+      {
+        "constraint_id": "C030",
+        "trigger_keywords": [
+          "negative odd length",
+          "read bytes error",
+          "range violations"
+        ],
+        "oracle_response": "error=value_out_of_range"
+      },
+      {
+        "constraint_id": "C042",
+        "trigger_keywords": [
+          "microseconds < 100000",
+          "iso padding",
+          "microsecond formatting"
+        ],
+        "oracle_response": "Zero-padded to 6 digits in iso string"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the same parenthetical expansion pattern used for scalar types in the parse_type output",
+        "actual_meaning": "The format must insert arguments between parentheses, matching the existing `type=<type>` output line termination, specifically expanding `title_s` used for long string scalars."
+      },
+      {
+        "vague_reference": "apply the same nesting depth logic seen in C049 but include an outer level with two title parameters",
+        "actual_meaning": "The `outer(n:title)` must appear first, followed by `outer(s:title)`, then the inner args, mirroring the structure pattern established in C049 but with an additional outer layer."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_dependency_metadata.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "metadata_equals",
+            "left": {
+              "assembly_paths": [
+                "/assembly/probe/path"
+              ],
+              "native_paths": [
+                "/native/probe/path"
+              ],
+              "nugets": [
+                {
+                  "file_name": "package.name.1.0.0.nupkg",
+                  "package_name": "package.name",
+                  "package_version": "1.0.0"
+                }
+              ]
+            },
+            "right": {
+              "assembly_paths": [
+                "/assembly/probe/path"
+              ],
+              "native_paths": [
+                "/native/probe/path"
+              ],
+              "nugets": [
+                {
+                  "file_name": "package.name.1.0.0.nupkg",
+                  "package_name": "package.name",
+                  "package_version": "1.0.0"
+                }
+              ]
+            }
+          },
+          "expected_output": "equal=true"
+        },
+        {
+          "input": {
+            "op": "metadata_equals",
+            "left": {
+              "assembly_paths": [
+                "/assembly/probe/path"
+              ],
+              "native_paths": [
+                "/native/probe/path"
+              ],
+              "nugets": [
+                {
+                  "file_name": "package.name.1.0.0.nupkg",
+                  "package_name": "package.name",
+                  "package_version": "1.0.0"
+                }
+              ]
+            },
+            "right": null
+          },
+          "expected_output": "equal=false"
+        },
+        {
+          "input": {
+            "op": "metadata_roundtrip",
+            "metadata": {
+              "assembly_paths": [
+                "/assembly/probe/path"
+              ],
+              "native_paths": [
+                "/native/probe/path"
+              ],
+              "nugets": [
+                {
+                  "file_name": "package.name.1.0.0.nupkg",
+                  "package_name": "package.name",
+                  "package_version": "1.0.0"
+                }
+              ]
+            }
+          },
+          "expected_output": "equal=true"
+        },
+        {
+          "input": {
+            "op": "metadata_filename",
+            "numbers": [
+              1,
+              10,
+              100
+            ]
+          },
+          "expected_output": "filename=dependencyProviderMetadata_0000000000000000001\nfilename=dependencyProviderMetadata_0000000000000000010\nfilename=dependencyProviderMetadata_0000000000000000100"
+        }
+      ]
+    },
+    "feature1_array_equals.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "array_equals",
+            "left": [
+              1,
+              2,
+              3
+            ],
+            "right": [
+              1,
+              2,
+              3
+            ]
+          },
+          "expected_output": "equal=true"
+        },
+        {
+          "input": {
+            "op": "array_equals",
+            "left": null,
+            "right": null
+          },
+          "expected_output": "equal=true"
+        },
+        {
+          "input": {
+            "op": "array_equals",
+            "left": [
+              1,
+              2,
+              3
+            ],
+            "right": [
+              1,
+              2,
+              4
+            ]
+          },
+          "expected_output": "equal=false"
+        },
+        {
+          "input": {
+            "op": "array_equals",
+            "left": [
+              1
+            ],
+            "right": [
+              1,
+              2
+            ]
+          },
+          "expected_output": "equal=false"
+        },
+        {
+          "input": {
+            "op": "array_equals",
+            "left": [
+              1
+            ],
+            "right": null
+          },
+          "expected_output": "equal=false"
+        }
+      ]
+    },
+    "feature2_type_conversion.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "convert_scalar",
+            "target": "long",
+            "value": 1
+          },
+          "expected_output": "value=1"
+        },
+        {
+          "input": {
+            "op": "convert_scalar",
+            "target": "string",
+            "value": "test"
+          },
+          "expected_output": "value=test"
+        },
+        {
+          "input": {
+            "op": "convert_array",
+            "depth": 1,
+            "values": [
+              0,
+              1,
+              2,
+              3
+            ]
+          },
+          "expected_output": "array=[0,1,2,3]"
+        },
+        {
+          "input": {
+            "op": "convert_array",
+            "depth": 2,
+            "values": [
+              [
+                0,
+                1
+              ],
+              [
+                2,
+                3
+              ]
+            ]
+          },
+          "expected_output": "array=[[0,1],[2,3]]"
+        },
+        {
+          "input": {
+            "op": "convert_dictionary",
+            "depth": 1,
+            "entries": {
+              "1": 1,
+              "2": 4,
+              "3": 9
+            }
+          },
+          "expected_output": "map={1:1,2:4,3:9}"
+        }
+      ]
+    },
+    "feature3_wire_serde.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "stream_primitives",
+            "type": "int",
+            "value": 12345
+          },
+          "expected_output": "type=int\nvalue=12345"
+        },
+        {
+          "input": {
+            "op": "stream_primitives",
+            "type": "double",
+            "value": 3.14
+          },
+          "expected_output": "type=double\nvalue=3.14"
+        },
+        {
+          "input": {
+            "op": "stream_primitives",
+            "type": "string",
+            "value": "hello world!"
+          },
+          "expected_output": "type=string\nvalue=hello world!"
+        },
+        {
+          "input": {
+            "op": "read_bytes",
+            "length": -5
+          },
+          "expected_output": "length=null"
+        },
+        {
+          "input": {
+            "op": "read_bytes",
+            "length": -1
+          },
+          "expected_output": "error=value_out_of_range"
+        }
+      ]
+    },
+    "feature4_object_serde.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "object_roundtrip",
+            "id": 101,
+            "name": "John Doe"
+          },
+          "expected_output": "id=101\nname=John Doe"
+        },
+        {
+          "input": {
+            "op": "object_polymorphic",
+            "id": 1,
+            "name": "Alice",
+            "role": "Account manager"
+          },
+          "expected_output": "concrete=derived\nname=Alice\nrole=Account manager"
+        },
+        {
+          "input": {
+            "op": "object_type_mismatch",
+            "id": 101,
+            "name": "John Doe"
+          },
+          "expected_output": "error=type_mismatch"
+        },
+        {
+          "input": {
+            "op": "object_disallowed",
+            "value": 123
+          },
+          "expected_output": "error=serialization_rejected"
+        }
+      ]
+    },
+    "feature5_schema_parsing.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "parse_type",
+            "schema": "\"integer\""
+          },
+          "expected_output": "type_name=integer\nsimple_string=integer"
+        },
+        {
+          "input": {
+            "op": "parse_type",
+            "schema": "{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":false}"
+          },
+          "expected_output": "type_name=array\nsimple_string=array<integer>\nelement_type=integer\ncontains_null=false"
+        },
+        {
+          "input": {
+            "op": "parse_type",
+            "schema": "{\"type\":\"map\",\"keyType\":\"integer\",\"valueType\":\"double\",\"valueContainsNull\":false}"
+          },
+          "expected_output": "type_name=map\nsimple_string=map<integer,double>\nkey_type=integer\nvalue_type=double\nvalue_contains_null=false"
+        },
+        {
+          "input": {
+            "op": "parse_type",
+            "schema": "{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"name\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]}"
+          },
+          "expected_output": "type_name=struct\nsimple_string=struct<age:long,name:string>\nfield_count=2\nfield_name=age\nfield_type=long\nfield_nullable=true\nfield_name=name\nfield_type=string\nfield_nullable=false"
+        }
+      ]
+    },
+    "feature6_timestamp.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "timestamp",
+            "year": 2020,
+            "month": 1,
+            "day": 2,
+            "hour": 15,
+            "minute": 30,
+            "second": 30,
+            "microsecond": 123456
+          },
+          "expected_output": "year=2020\nmonth=1\nday=2\nhour=15\nminute=30\nsecond=30\nmicrosecond=123456\niso=2020-01-02 15:30:30.123456Z"
+        },
+        {
+          "input": {
+            "op": "timestamp",
+            "year": 2020,
+            "month": 1,
+            "day": 1,
+            "hour": 8,
+            "minute": 30,
+            "second": 30,
+            "microsecond": 123
+          },
+          "expected_output": "year=2020\nmonth=1\nday=1\nhour=8\nminute=30\nsecond=30\nmicrosecond=123\niso=2020-01-01 08:30:30.000123Z"
+        },
+        {
+          "input": {
+            "op": "timestamp",
+            "year": 2020,
+            "month": 1,
+            "day": 2,
+            "hour": 15,
+            "minute": 30,
+            "second": 30,
+            "microsecond": 1234567
+          },
+          "expected_output": "error=value_out_of_range"
+        }
+      ]
+    },
+    "feature7_row_access.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "row",
+            "columns": [
+              {
+                "name": "col1",
+                "type": "int"
+              },
+              {
+                "name": "col2",
+                "type": "string"
+              }
+            ],
+            "values": [
+              1,
+              "abc"
+            ],
+            "access": [
+              {
+                "by": "index",
+                "index": 0,
+                "as": "int"
+              },
+              {
+                "by": "name",
+                "name": "col2",
+                "as": "string"
+              }
+            ]
+          },
+          "expected_output": "size=2\nget=1\nget=abc"
+        },
+        {
+          "input": {
+            "op": "row",
+            "columns": [
+              {
+                "name": "col1",
+                "type": "int"
+              },
+              {
+                "name": "col2",
+                "type": "string"
+              }
+            ],
+            "values": [
+              1,
+              "abc"
+            ],
+            "access": [
+              {
+                "by": "index",
+                "index": 0,
+                "as": "string"
+              }
+            ]
+          },
+          "expected_output": "error=type_mismatch"
+        },
+        {
+          "input": {
+            "op": "row",
+            "columns": [
+              {
+                "name": "col1",
+                "type": "int"
+              },
+              {
+                "name": "col2",
+                "type": "string"
+              }
+            ],
+            "values": [
+              1,
+              "abc"
+            ],
+            "access": [
+              {
+                "by": "index",
+                "index": 1,
+                "as": "int"
+              }
+            ]
+          },
+          "expected_output": "error=invalid_format"
+        }
+      ]
+    },
+    "feature8_udf.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "udf_apply",
+            "arity": 1,
+            "inputs": [
+              "arg1"
+            ],
+            "offsets": [
+              0
+            ]
+          },
+          "expected_output": "result=arg1"
+        },
+        {
+          "input": {
+            "op": "udf_apply",
+            "arity": 3,
+            "inputs": [
+              "arg0",
+              "arg1",
+              "arg2",
+              "arg3"
+            ],
+            "offsets": [
+              0,
+              1,
+              2
+            ]
+          },
+          "expected_output": "result=arg0arg1arg2"
+        },
+        {
+          "input": {
+            "op": "udf_chain",
+            "inputs": [
+              100,
+              "name"
+            ],
+            "offsets": [
+              0,
+              1
+            ],
+            "order": "valid"
+          },
+          "expected_output": "level1=outer1:name:100\nlevel2=outer2:outer1:name:100"
+        },
+        {
+          "input": {
+            "op": "udf_chain",
+            "inputs": [
+              100,
+              "name"
+            ],
+            "offsets": [
+              0,
+              1
+            ],
+            "order": "invalid"
+          },
+          "expected_output": "error=type_mismatch"
+        }
+      ]
+    },
+    "feature9_command_roundtrip.json": {
+      "cases": [
+        {
+          "input": {
+            "op": "command_roundtrip",
+            "arg": "spark"
+          },
+          "expected_output": "serializer_mode=Row\ndeserializer_mode=Row\nrun_mode=N\nresult=hello spark"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Command Interface",
+      "input_condition": "Input JSON always contains 'op' string field",
+      "output_rule": "Program reads one complete JSON object from stdin and writes one result contract to stdout",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Command Interface",
+      "input_condition": "No input provided",
+      "output_rule": "No output is produced by the program",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Output Format",
+      "input_condition": "Success case",
+      "output_rule": "Output is zero or more `key=value` lines in a fixed, documented order",
+      "exact_values": [
+        "key=value"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Output Format",
+      "input_condition": "Multi-line result",
+      "output_rule": "Multi-line results are joined with a single newline and carry no trailing blank line",
+      "exact_values": [
+        "\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Output Format",
+      "input_condition": "Non-error success case",
+      "output_rule": "No decorative text, banners, or diagnostic logging may appear on standard output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Deterministic Rendering",
+      "input_condition": "Boolean value",
+      "output_rule": "Booleans render as `true` or `false` (lowercase)",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Deterministic Rendering",
+      "input_condition": "Whole numbers",
+      "output_rule": "Whole numbers render without a decimal point or thousands separators",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Deterministic Rendering",
+      "input_condition": "Ordered collections",
+      "output_rule": "Collections render in input order",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Deterministic Rendering",
+      "input_condition": "Dictionaries/Maps",
+      "output_rule": "Dictionaries render with keys in ascending order",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Error Contract",
+      "input_condition": "Rejected operation",
+      "output_rule": "Produces exactly one line of the form `error=<category>`",
+      "exact_values": [
+        "error="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Neutral Error Values",
+      "input_condition": "Type mismatch",
+      "output_rule": "Category `type_mismatch`",
+      "exact_values": [
+        "type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Neutral Error Values",
+      "input_condition": "Numeric out of range",
+      "output_rule": "Category `value_out_of_range`",
+      "exact_values": [
+        "value_out_of_range"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Neutral Error Values",
+      "input_condition": "Invalid value format",
+      "output_rule": "Category `invalid_format`",
+      "exact_values": [
+        "invalid_format"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Neutral Error Values",
+      "input_condition": "Structurally unacceptable argument",
+      "output_rule": "Category `invalid_argument`",
+      "exact_values": [
+        "invalid_argument"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Neutral Error Values",
+      "input_condition": "Operation not valid in state",
+      "output_rule": "Category `invalid_operation`",
+      "exact_values": [
+        "invalid_operation"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Neutral Error Values",
+      "input_condition": "Object not permitted for reconstruction",
+      "output_rule": "Category `serialization_rejected`",
+      "exact_values": [
+        "serialization_rejected"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Neutral Error Values",
+      "input_condition": "Any other rejection",
+      "output_rule": "Category `failure`",
+      "exact_values": [
+        "failure"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Error Reporting",
+      "input_condition": "Error result",
+      "output_rule": "Error results never contain runtime exception class names, stack traces, or localized messages",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Feature 1: array_equals",
+      "input_condition": "input.op='array_equals'",
+      "output_rule": "Outputs `equal=true` if sequences are equal, `equal=false` otherwise",
+      "exact_values": [
+        "equal=true",
+        "equal=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Feature 1: array_equals",
+      "input_condition": "Array equality comparison",
+      "output_rule": "Two sequences are equal only when both are absent (null) or when they have identical length and identical elements in order",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Feature 1: array_equals",
+      "input_condition": "Array equality comparison",
+      "output_rule": "A present sequence is never equal to an absent one",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Feature 1: array_equals",
+      "input_condition": "Array equality comparison",
+      "output_rule": "Sequences of different length are never equal",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Feature 2: convert_scalar",
+      "input_condition": "input.op='convert_scalar'",
+      "output_rule": "Outputs `value=<result>`",
+      "exact_values": [
+        "value="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Feature 2: convert_array",
+      "input_condition": "input.op='convert_array'",
+      "output_rule": "Outputs `array=<canonical array>`",
+      "exact_values": [
+        "array="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Feature 2: convert_dictionary",
+      "input_condition": "input.op='convert_dictionary'",
+      "output_rule": "Outputs `map=<canonical map>`",
+      "exact_values": [
+        "map="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "Feature 2: Arrays",
+      "input_condition": "Convert array of depth>",
+      "output_rule": "Arrays render in input order",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Feature 2: Maps",
+      "input_condition": "Convert dictionary of depth>",
+      "output_rule": "Dictionaries with keys sorted ascending",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Feature 3: Primitive serialization",
+      "input_condition": "input.op='stream_primitives'",
+      "output_rule": "Outputs `type=<type>` then `value=<readback>`",
+      "exact_values": [
+        "type=",
+        "value="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "Feature 3: read_bytes (sentinel)",
+      "input_condition": "input.op='read_bytes' with negative even length",
+      "output_rule": "Outputs `length=null`",
+      "exact_values": [
+        "length=null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Feature 3: read_bytes (error)",
+      "input_condition": "input.op='read_bytes' with negative odd length",
+      "output_rule": "Outputs `error=value_out_of_range`",
+      "exact_values": [
+        "error=value_out_of_range"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "Feature 4: object_roundtrip",
+      "input_condition": "input.op='object_roundtrip'",
+      "output_rule": "Outputs field lines: `id=...`, `name=...` for record",
+      "exact_values": [
+        "id=",
+        "name="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "Feature 4: object_polymorphic",
+      "input_condition": "input.op='object_polymorphic'",
+      "output_rule": "Outputs `concrete=derived`, `name=...`, `role=...`",
+      "exact_values": [
+        "concrete=derived"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "Feature 4: object_type_mismatch",
+      "input_condition": "input.op='object_type_mismatch'",
+      "output_rule": "Outputs `error=type_mismatch`",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "Feature 4: object_disallowed",
+      "input_condition": "input.op='object_disallowed'",
+      "output_rule": "Outputs `error=serialization_rejected`",
+      "exact_values": [
+        "error=serialization_rejected"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "Feature 5: parse_type (atomic)",
+      "input_condition": "input.op='parse_type' with atomic schema",
+      "output_rule": "Outputs `type_name=...`, `simple_string=...`",
+      "exact_values": [
+        "type_name=",
+        "simple_string="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "Feature 5: parse_type (array)",
+      "input_condition": "input.op='parse_type' with array schema",
+      "output_rule": "Outputs `type_name=array`, `simple_string=array<element>`, `element_type=...`, `contains_null=...`",
+      "exact_values": [
+        "type_name=array",
+        "element_type="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "Feature 5: parse_type (map)",
+      "input_condition": "input.op='parse_type' with map schema",
+      "output_rule": "Outputs `type_name=map`, `simple_string=map<key,value>`, `key_type=...`, `value_type=...`, `value_contains_null=...`",
+      "exact_values": [
+        "type_name=map",
+        "key_type=",
+        "value_type=",
+        "value_contains_null="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "Feature 5: parse_type (struct)",
+      "input_condition": "input.op='parse_type' with struct schema",
+      "output_rule": "Outputs `type_name=struct`, `simple_string=struct<field:type,...>` then for each field: `field_name=...`, `field_type=...`, `field_nullable=...`",
+      "exact_values": [
+        "type_name=struct",
+        "field_name=",
+        "field_type=",
+        "field_nullable="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "Feature 6: timestamp",
+      "input_condition": "input.op='timestamp'",
+      "output_rule": "Outputs component lines `year=...`, `month=...`, `day=...`, `hour=...`, `minute=...`, `second=...`, `microsecond=...`, `iso=`",
+      "exact_values": [
+        "year=",
+        "month=",
+        "day=",
+        "hour=",
+        "minute=",
+        "second=",
+        "microsecond=",
+        "iso="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "Feature 6: timestamp (canonical string)",
+      "input_condition": "Valid timestamp input",
+      "output_rule": "ISO string format: `YYYY-MM-DD HH:MM:SS.ffffffZ`",
+      "exact_values": [
+        "YYYY-MM-DD",
+        "HH:MM:SS",
+        "ffffffZ"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C041",
+      "feature": "Feature 6: timestamp (range)",
+      "input_condition": "microsecond >= 1000000",
+      "output_rule": "Outputs `error=value_out_of_range`",
+      "exact_values": [
+        "error=value_out_of_range"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C042",
+      "feature": "Feature 6: microsecond default padding",
+      "input_condition": "microseconds < 100000",
+      "output_rule": "Zero-padded to 6 digits in iso string",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C043",
+      "feature": "Feature 7: row (construction)",
+      "input_condition": "input.op='row'",
+      "output_rule": "First outputs `size=<n>`",
+      "exact_values": [
+        "size="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C044",
+      "feature": "Feature 7: row (success read)",
+      "input_condition": "input.op='row' with valid access",
+      "output_rule": "Subsequent output is one `get=<value>` per successful access",
+      "exact_values": [
+        "get="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C045",
+      "feature": "Feature 7: row (type mismatch)",
+      "input_condition": "Typed read incompatible with column type (int read as string, string read as int)",
+      "output_rule": "Outputs `error=type_mismatch`",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C046",
+      "feature": "Feature 7: row (invalid format)",
+      "input_condition": "Reading integer column as string",
+      "output_rule": "Outputs `error=invalid_format`",
+      "exact_values": [
+        "error=invalid_format"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C047",
+      "feature": "Feature 8: udf_apply",
+      "input_condition": "input.op='udf_apply'",
+      "output_rule": "First outputs `result=<value>`",
+      "exact_values": [
+        "result="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C048",
+      "feature": "Feature 8: udf_chain",
+      "input_condition": "input.op='udf_chain' with valid order",
+      "output_rule": "Outputs `level1=...` then `level2=...`",
+      "exact_values": [
+        "level1=",
+        "level2="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C049",
+      "feature": "Feature 8: udf_chain (level1 format)",
+      "input_condition": "valid chain, first stage",
+      "output_rule": "Level 1 format: `outer(s:title_s):inner_args...`",
+      "exact_values": [
+        "outer"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C050",
+      "feature": "Feature 8: udf_chain (level2 format)",
+      "input_condition": "valid chain with nested chains",
+      "output_rule": "Level 2 format: `outer(n:title):outer(s:title):inner_args...`",
+      "exact_values": [
+        "outer"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C051",
+      "feature": "Feature 8: udf_chain (error)",
+      "input_condition": "input.op='udf_chain' with invalid order",
+      "output_rule": "Outputs `error=type_mismatch`",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C052",
+      "feature": "Feature 9: command_roundtrip",
+      "input_condition": "input.op='command_roundtrip'",
+      "output_rule": "Outputs `serializer_mode=Row`, `deserializer_mode=Row`, `run_mode=N`, `result=...`",
+      "exact_values": [
+        "serializer_mode=",
+        "deserializer_mode=",
+        "run_mode=",
+        "result="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C053",
+      "feature": "Feature 10: metadata_equals",
+      "input_condition": "input.op='metadata_equals'",
+      "output_rule": "Outputs `equal=true` if metadata objects are equal, `equal=false` otherwise",
+      "exact_values": [
+        "equal=true",
+        "equal=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C054",
+      "feature": "Feature 10: metadata_equals",
+      "input_condition": "Comparison against null",
+      "output_rule": "Present record is never equal to an absent (null) one",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C055",
+      "feature": "Feature 10: metadata_equals",
+      "input_condition": "Comparison of differing paths/coordinates",
+      "output_rule": "Any differing path or coordinate makes them unequal",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C056",
+      "feature": "Feature 10: metadata_roundtrip",
+      "input_condition": "input.op='metadata_roundtrip'",
+      "output_rule": "Outputs `equal=true` (assuming file I/O not detailed but implies reconstruction check)",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C057",
+      "feature": "Feature 10: metadata_filename",
+      "input_condition": "input.op='metadata_filename'",
+      "output_rule": "Outputs one `filename=...` per number in input",
+      "exact_values": [
+        "filename="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C058",
+      "feature": "Feature 10: filename format",
+      "input_condition": "Number input (e.g., 1, 10, 100)",
+      "output_rule": "Format: `dependencyProviderMetadata_<16-digit_zero_padded_number>`",
+      "exact_values": [
+        "dependencyProviderMetadata_"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C059",
+      "feature": "Feature 10: filename precision",
+      "input_condition": "Number < 0",
+      "output_rule": "Generated filename uses zero-padded representation",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C060",
+      "feature": "Feature 10: file round-trip",
+      "input_condition": "Metadata round-trip operation",
+      "output_rule": "Serialized to file, reloaded, compared for equality",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C029",
+        "replacement": "the specific sentinel value used to indicate a null read back length",
+        "exact_values_to_replace": [
+          "length=null"
+        ],
+        "trigger_keywords": [
+          "negative even length",
+          "cannot read bytes",
+          "null back",
+          "error sentinels"
+        ],
+        "oracle_response": "length=null"
+      },
+      {
+        "constraint_id": "C030",
+        "replacement": "the exact error category constant returned for numeric out of range failures",
+        "exact_values_to_replace": [
+          "error=value_out_of_range"
+        ],
+        "trigger_keywords": [
+          "negative odd length",
+          "read bytes error",
+          "range violations"
+        ],
+        "oracle_response": "error=value_out_of_range"
+      },
+      {
+        "constraint_id": "C042",
+        "replacement": "the exact literal string header for the microsecond padding rule",
+        "exact_values_to_replace": [
+          "Zero-padded to 6 digits in iso string"
+        ],
+        "trigger_keywords": [
+          "microseconds < 100000",
+          "iso padding",
+          "microsecond formatting"
+        ],
+        "oracle_response": "Zero-padded to 6 digits in iso string"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C049",
+        "vague_phrase": "follow the same parenthetical expansion pattern used for scalar types in the parse_type output",
+        "actual_meaning": "The format must insert arguments between parentheses, matching the existing `type=<type>` output line termination, specifically expanding `title_s` used for long string scalars."
+      },
+      {
+        "constraint_id": "C050",
+        "vague_phrase": "apply the same nesting depth logic seen in C049 but include an outer level with two title parameters",
+        "actual_meaning": "The `outer(n:title)` must appear first, followed by `outer(s:title)`, then the inner args, mirroring the structure pattern established in C049 but with an additional outer layer."
+      }
+    ]
+  }
+}

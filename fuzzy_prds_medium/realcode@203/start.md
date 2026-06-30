@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, following up on the proxy router project. We've had a few complaints from ops lately — mainly around deployments causing brief outages and some confusion about how traffic gets handled when backends aren't ready yet. We want to tighten this up.
+
+The big thing is: we need the router to be smarter about accepting new backends. Like, it shouldn't just blindly start sending traffic to something that isn't actually responding correctly yet. There should be some kind of window where we verify it's healthy first — similar to how we handled readiness in that gateway module a while back.
+
+Also, we've been getting reports of weird behavior when two teams accidentally register their services on the same hostname. Right now it's unclear what wins and users get inconsistent responses. We need deterministic behavior there.
+
+On the security side, some services are supposed to be HTTPS-only but plaintext requests are sneaking through. We need proper enforcement — and there's a known edge case with certain host patterns that certificate automation can't handle, so that combo should be blocked at registration time.
+
+Finally, the on-call team wants operational controls — ability to hold traffic briefly during a maintenance window, then release it, and a clean shutdown mode that doesn't just drop everything. The timeout values for these holding periods need to be configurable per operation. Let's get this scoped out properly.
+
+A couple extra details from the questions that came in. On deploys, the intent is that before a newly registered backend receives any traffic, the router probes its health endpoint. If the health endpoint does not return a success status within the configured deploy timeout window, the deployment fails with error=target_unhealthy and no routing change takes effect. The deploy_timeout_ms parameter on the deploy operation controls this window. This is the same idea we called out in Feature 4 (feature4_target_health.json): health-gated activation using a deploy_timeout_ms window that probes the backend's health endpoint before activating routing. Also on the maintenance controls, Feature 6 (feature6_pause_resume_stop.json) is the one to follow: pause_timeout_ms is a per-operation parameter on the pause step, and deploy_timeout_ms is a per-operation parameter on the deploy step.
+
+On host ownership, we should make this strict and predictable: a host may be claimed by at most one service at a time. If a different-named service attempts to register under a host already owned by another service, the deployment is rejected with error=host_in_use and the original service continues serving that host unchanged. If it's the same service name coming back under the same host, that's allowed and atomically swaps its backend. For matching, a wildcard pattern *.example.com matches any single-label subdomain (e.g. foo.example.com) but NOT the bare base domain (example.com). Exact host registrations always take precedence over overlapping wildcard registrations. A service registered with an empty host set acts as a catch-all, receiving any request not matched by another service.
+
+On the HTTPS side, the wildcard limitation should be blocked up front. Registering a TLS-enabled service under a wildcard host pattern (e.g. *.example.com) is explicitly rejected with error=automatic_tls_wildcard_unsupported because automatic certificate provisioning cannot cover wildcard hosts. This is enforced at registration time before any health check is performed.
+
+One other thing we should be clear about in the response path: the response buffering middleware switches to unbuffered pass-through when the handler's response has a content type marking it as an event stream (e.g. text/event-stream). In this case the content is streamed directly to the client regardless of the configured buffer limit. A buffered response that exceeds the maximum is replaced with an internal-server-error response.
+
+And for error pages/templates, a template source that contains no usable templates is rejected at load time with an unable-to-load error. Inner error page middleware can override outer middleware for specific status codes; statuses not defined by the inner set fall through to the outer set. When no custom template exists for a given status, a generic error page is produced.

@@ -1,0 +1,830 @@
+{
+  "fuzzy_prd": "# Asynchronous Result Toolkit — Promise Combinators, Cancellation & Streaming Primitives\n\n## Project Goal\n\nBuild a small toolkit of primitives for working with the results of operations that complete in the future, so developers can combine many concurrent operations, react to their collective outcome, cancel work cooperatively, and consume ordered streams of values — without hand-writing bespoke coordination logic for every call site.\n\n---\n\n## Background & Problem\n\nA program frequently launches several operations whose results arrive later (each modeled as a *placeholder* for a future value that will eventually be either fulfilled with a value or rejected with a failure reason). Coordinating them by hand is repetitive and error-prone: deciding whether to wait for all of them, for a threshold of them, or only for the first success; collecting partial results when some fail; cleanly aborting in-flight work; and turning a collection of items into an asynchronous stream.\n\nThis toolkit provides well-defined contracts for these recurring needs: combinators that aggregate a list of placeholders under different success policies, a single-settlement placeholder with a completion callback, a cooperative cancellation mechanism, a typo-guarded value object, and an adapter that turns any iterable into an ordered asynchronous stream. Each primitive has a precise, observable input/output contract so the same expectations hold regardless of how the internals are built.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\nEvery feature is exercised through one JSON request object on stdin and one textual result on stdout. A request carries an `op` field selecting the operation. Results are emitted as newline-terminated `key=value` lines. Collections are rendered as compact JSON: a positional collection with contiguous positions starting at zero renders as a JSON array (e.g. `[1,2,3]`); a collection with non-contiguous positions renders as a JSON object keyed by position (e.g. `{\"0\":1,\"2\":3}`). Error outcomes are reported with neutral category names, never with host-language runtime details.\n\nA list of operations is supplied under `promises` as an array of operand specs. An operand spec is one of: `{\"resolve\": <value>}` for an operation that succeeds with the given value, `{\"fail\": <message>}` for an operation that fails with the given reason message, or `{\"value\": <x>}` for a raw non-operation value used to probe input validation.\n\n### Feature 1: Aggregate — Require Every Operation To Succeed\n\n**As a developer**, I want to wait for a whole batch of operations and get all their values only if every one succeeds, so I can treat the batch as a single all-or-nothing unit.\n\n**Expected Behavior / Usage:**\n\nThe `all` operation aggregates the `promises` list. It fulfills with `values`, an ordered collection of each operation's success value at the same position as its operand. An empty list fulfills with an empty collection. If any operand is a raw non-operation value, the operation does not proceed and instead reports `status=error` with `error=invalid_operand`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_all.json`\n\n```json\n{\n    \"description\": \"Aggregate a list of asynchronous operations and require every one of them to succeed. The result is fulfilled with an ordered collection of the success values, one per input operation, in the same positions as the inputs. An empty input yields an empty collection. If any element of the input is not an asynchronous operation handle, the aggregation reports an invalid-operand error rather than proceeding.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"all\", \"promises\": [{\"resolve\": 1}, {\"resolve\": 2}, {\"resolve\": 3}]},\n            \"expected_output\": \"status=fulfilled\\nvalues=[1,2,3]\\n\"\n        },\n        {\n            \"input\": {\"op\": \"all\", \"promises\": [{\"value\": 1}]},\n            \"expected_output\": \"status=error\\nerror=invalid_operand\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Threshold Aggregate — Succeed If Enough Operations Succeed\n\n**As a developer**, I want a batch to succeed as long as at least a chosen number of operations succeed, collecting both the successes and the failures, so I can tolerate partial failure.\n\n**Expected Behavior / Usage:**\n\nThe `some` operation aggregates `promises` and accepts an optional `required` count (default `1`). It fulfills with two position-preserving collections: `errors` (failed positions mapped to their failure messages) and `values` (succeeded positions mapped to their values). If fewer than `required` operations succeed, it instead rejects with `reason=multiple_failures` and a `reasons` list of every failure message in order. A negative `required` reports `error=negative_required`; a `required` larger than the number of operations reports `error=too_few_promises`; a raw non-operation operand reports `error=invalid_operand`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_some.json`\n\n```json\n{\n    \"description\": \"Aggregate a list of asynchronous operations into a partitioned result, succeeding as long as at least a required number of operations succeed. The fulfilled result carries two collections that preserve the original positions: the failures (mapped to their failure messages) and the successes (mapped to their values). The required count defaults to one. If fewer than the required number succeed, the result is rejected with a combined multiple-failures outcome listing every failure reason in order. Supplying a negative required count, requiring more successes than there are operations, or passing a non-operation operand are each reported as a distinct invalid-input error.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"some\", \"promises\": [{\"fail\": \"boom\"}, {\"fail\": \"boom\"}, {\"resolve\": 3}]},\n            \"expected_output\": \"status=fulfilled\\nerrors=[\\\"boom\\\",\\\"boom\\\"]\\nvalues={\\\"2\\\":3}\\n\"\n        },\n        {\n            \"input\": {\"op\": \"some\", \"promises\": [{\"fail\": \"a\"}, {\"fail\": \"b\"}, {\"fail\": \"c\"}]},\n            \"expected_output\": \"status=rejected\\nreason=multiple_failures\\nreasons=[\\\"a\\\",\\\"b\\\",\\\"c\\\"]\\n\"\n        },\n        {\n            \"input\": {\"op\": \"some\", \"promises\": [], \"required\": -1},\n            \"expected_output\": \"status=error\\nerror=negative_required\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Partition Aggregate — Never Reject\n\n**As a developer**, I want to collect the outcome of every operation and always get a result, even if all of them fail, so I can inspect partial results without handling a batch-level failure.\n\n**Expected Behavior / Usage:**\n\nThe `any` operation aggregates `promises` and always fulfills with the same two position-preserving collections used by the threshold aggregate: `errors` (failed positions mapped to failure messages) and `values` (succeeded positions mapped to values). When all succeed, `errors` is empty; when all fail, `values` is empty; a mix yields both, each keyed by original position. A raw non-operation operand reports `error=invalid_operand`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_any.json`\n\n```json\n{\n    \"description\": \"Aggregate a list of asynchronous operations into a partitioned result that never rejects, regardless of how many operations fail. The fulfilled result always carries two collections preserving the original positions: the failures (mapped to their failure messages) and the successes (mapped to their values). When all operations succeed the failure collection is empty; when all fail the success collection is empty; a mix yields both, each keyed by original position. Passing a non-operation operand is reported as an invalid-operand error.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"any\", \"promises\": [{\"resolve\": 1}, {\"fail\": \"b\"}, {\"resolve\": 3}]},\n            \"expected_output\": \"status=fulfilled\\nerrors={\\\"1\\\":\\\"b\\\"}\\nvalues={\\\"0\\\":1,\\\"2\\\":3}\\n\"\n        },\n        {\n            \"input\": {\"op\": \"any\", \"promises\": [{\"fail\": \"a\"}, {\"fail\": \"b\"}, {\"fail\": \"c\"}]},\n            \"expected_output\": \"status=fulfilled\\nerrors=[\\\"a\\\",\\\"b\\\",\\\"c\\\"]\\nvalues=[]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Race — Fulfill With The First Success\n\n**As a developer**, I want the value of whichever operation succeeds first and to fail only if none succeed, so I can pick the fastest available result.\n\n**Expected Behavior / Usage:**\n\nThe `first` operation races `promises` and fulfills with `value`, the value of the first operation to succeed, disregarding later results and any earlier failures. If every operation fails, it rejects with `reason=multiple_failures` and a `reasons` list of all failure messages in order. An empty list reports `error=no_promises`; a raw non-operation operand reports `error=invalid_operand`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_first.json`\n\n```json\n{\n    \"description\": \"Race a list of asynchronous operations and fulfill with the value of the first one to succeed, ignoring later results and any failures that occurred before the first success. If every operation fails, the result is rejected with a combined multiple-failures outcome listing every failure reason in order. An empty input is reported as a no-operations error, and a non-operation operand is reported as an invalid-operand error.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"first\", \"promises\": [{\"resolve\": 1}, {\"resolve\": 2}, {\"resolve\": 3}]},\n            \"expected_output\": \"status=fulfilled\\nvalue=1\\n\"\n        },\n        {\n            \"input\": {\"op\": \"first\", \"promises\": [{\"fail\": \"a\"}, {\"fail\": \"b\"}, {\"fail\": \"c\"}]},\n            \"expected_output\": \"status=rejected\\nreason=multiple_failures\\nreasons=[\\\"a\\\",\\\"b\\\",\\\"c\\\"]\\n\"\n        },\n        {\n            \"input\": {\"op\": \"first\", \"promises\": []},\n            \"expected_output\": \"status=error\\nerror=no_promises\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Single-Settlement Placeholder\n\n**As a developer**, I want a placeholder for a future result that settles exactly once and notifies a completion callback, so I can hand a value-to-come around before it is known.\n\n**Expected Behavior / Usage:**\n\nThe `settle` operation drives a single placeholder. With `mode` of `resolve`, the placeholder is fulfilled with the provided `value` (a scalar or a structured object/array) and the result reports `status=fulfilled` with `value` rendered as compact JSON. With `mode` of `fail`, the placeholder is rejected with the provided `reason` and the result reports `status=rejected` with that reason message. The reported value/reason is the placeholder's own settlement, independent of how the placeholder was produced.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_settle.json`\n\n```json\n{\n    \"description\": \"Observe the single settlement of a placeholder for a future result. A placeholder is settled exactly once, either fulfilled with a value or rejected with a failure reason, and a registered completion callback is notified of that outcome. A fulfillment exposes the carried value (which may be a scalar or a structured object/array); a rejection exposes the failure reason message. The reported value is the placeholder's own value, independent of how the placeholder was produced.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"settle\", \"mode\": \"resolve\", \"value\": \"Resolution value\"},\n            \"expected_output\": \"status=fulfilled\\nvalue=\\\"Resolution value\\\"\\n\"\n        },\n        {\n            \"input\": {\"op\": \"settle\", \"mode\": \"fail\", \"reason\": \"failure reason\"},\n            \"expected_output\": \"status=rejected\\nreason=failure reason\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Cooperative Cancellation\n\n**As a developer**, I want to request cancellation through a token that notifies registered handlers, so in-flight work can abort cleanly and idempotently.\n\n**Expected Behavior / Usage:**\n\nThe `cancellation` operation drives a cancellation source and its token. `subscribe` lists labels of handlers registered before cancellation; `unsubscribe` lists labels removed before cancellation; `[a specific positive integer threshold for cancellation timing]` requests cancellation that many times; `subscribe_after` lists handlers registered after the first cancellation request. Each notified handler receives a neutral cancellation signal. The token reports `requested_before=false` and `requested_after=true`. Requesting cancellation more than once notifies each handler at most once. An unsubscribed handler is never notified. A handler subscribing after cancellation is notified immediately. The result reports `fired` as the ordered list of notified handler labels and `reason=cancelled` when any handler was notified (else `reason=none`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_cancellation.json`\n\n```json\n{\n    \"description\": \"Coordinate cooperative cancellation through a cancellation source and its token. Handlers subscribe to the token to be notified when cancellation is requested; each notified handler receives a neutral cancellation signal. Before any request the token reports not-requested; after a request it reports requested. Requesting cancellation more than once notifies each handler at most once. A handler that unsubscribes before the request is never notified. A handler that subscribes after cancellation has already been requested is notified immediately. The result lists, in subscription order, the labels of the handlers that were notified.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"cancellation\", \"subscribe\": [\"s1\", \"s2\"], \"unsubscribe\": [\"s1\"], \"[a specific positive integer threshold for cancellation timing]\": 1},\n            \"expected_output\": \"requested_before=false\\nrequested_after=true\\nfired=[\\\"s2\\\"]\\nreason=cancelled\\n\"\n        },\n        {\n            \"input\": {\"op\": \"cancellation\", \"subscribe\": [], \"[a specific positive integer threshold for cancellation timing]\": 1, \"subscribe_after\": [\"late\"]},\n            \"expected_output\": \"requested_before=false\\nrequested_after=true\\nfired=[\\\"late\\\"]\\nreason=cancelled\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Typo-Guarded Value Object\n\n**As a developer**, I want a value object that rejects access to misspelled properties and suggests the intended name, so configuration typos fail fast and helpfully.\n\n**Expected Behavior / Usage:**\n\nThe `struct` operation accesses a value object that has two public properties named `callback` and `_foofoofoofoofoofoofoofoobar`. With `action` of `set` or `get` on a `property` that does not exist, access fails with `error=[the exact string payload sent for unknown properties]` and echoes the offending `property`. If the offending name is sufficiently similar to an existing public property, that property name is offered as `suggestion`; otherwise `suggestion` is empty. Property names beginning with an underscore are never offered as suggestions. Reads and writes behave identically.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_struct.json`\n\n```json\n{\n    \"description\": \"Guard a value object against typos by rejecting reads or writes of properties that do not exist. Reading or writing an undefined property fails with an unknown-property error that names the offending property. When the offending name is sufficiently similar to an existing public property, a suggestion of that property name is offered; otherwise no suggestion is offered. Property names beginning with an underscore are never offered as suggestions. Both read and write access behave identically.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"struct\", \"action\": \"set\", \"property\": \"callbac\"},\n            \"expected_output\": \"error=[the exact string payload sent for unknown properties]\\nproperty=callbac\\nsuggestion=callback\\n\"\n        },\n        {\n            \"input\": {\"op\": \"struct\", \"action\": \"set\", \"property\": \"callZZZZZZZZZZZ\"},\n            \"expected_output\": \"error=[the exact string payload sent for unknown properties]\\nproperty=callZZZZZZZZZZZ\\nsuggestion=\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Iterable-To-Stream Adapter\n\n**As a developer**, I want to turn an in-memory iterable into an ordered asynchronous stream, so I can consume its elements one at a time even when some are themselves operations.\n\n**Expected Behavior / Usage:**\n\nThe `iterator` operation builds a stream from `elements`, an array of operand specs. Each element that is an operation is awaited and its resolved value is emitted; each plain `{\"value\": x}` element is emitted directly. The stream emits in order and then completes (`status=completed`). If an element fails, the stream stops there: it reports the values emitted before the failure and then `status=failed` with that element's `reason`; elements after the failure are never emitted. The result reports `emitted` as the ordered list of emitted values. Supplying a non-iterable source under `invalid` reports `status=error` with `error=[the precise technical error name for non-iterable inputs]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_iterator.json`\n\n```json\n{\n    \"description\": \"Turn an in-memory iterable into an asynchronous stream that emits each element in order. Elements that are themselves asynchronous operations are awaited and their resolved values are emitted; plain values are emitted directly. The stream completes after the last element. If an element fails, the stream stops at that point, emitting any values produced before it and then failing with that element's failure reason; elements after the failure are never emitted. The result reports the ordered list of emitted values plus whether the stream completed or failed (and, on failure, the reason). Providing a source that is not iterable is reported as an invalid-iterable error.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"iterator\", \"elements\": [{\"resolve\": 1}, {\"resolve\": 2}, {\"fail\": \"boom\"}, {\"resolve\": 4}]},\n            \"expected_output\": \"emitted=[1,2]\\nstatus=failed\\nreason=boom\\n\"\n        },\n        {\n            \"input\": {\"op\": \"iterator\", \"invalid\": \"string\"},\n            \"expected_output\": \"status=error\\nerror=[the precise technical error name for non-iterable inputs]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the primitives described above (the aggregating combinators, the single-settlement placeholder, the cancellation source/token, the typo-guarded value object, and the iterable-to-stream adapter). Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin, dispatches on the `op` field, invokes the appropriate core logic, and prints the result (or neutral error) to stdout, matching the per-feature contracts above. Outcomes are rendered as newline-terminated `key=value` lines; collections are compact JSON (array for contiguous zero-based positions, object keyed by position otherwise); all failures are reported with neutral category names rather than host-language runtime details.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- maintain the same priority ordering as the initializer module\n",
+  "oracle_data": {
+    "task_id": "amphp__amp-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C018",
+        "trigger_keywords": [
+          "how do I configure the wait time before a subscription gets fired?",
+          "what value should I use for the cancel threshold?",
+          "is this setting configurable or hardcoded?",
+          "what happens if I set the cancellation delay to 0?"
+        ],
+        "oracle_response": "cancel_times equals 100"
+      },
+      {
+        "constraint_id": "C023",
+        "trigger_keywords": [
+          "what error category is used for missing properties?",
+          "how is the property validation error typed?",
+          "what string identifies invalid access attempts?"
+        ],
+        "oracle_response": "the error type is exactly the string 'unknown_property'"
+      },
+      {
+        "constraint_id": "C028",
+        "trigger_keywords": [
+          "what error is thrown when a string is passed to the iterator?",
+          "what is the specific error code for non-array inputs?",
+          "how does the system handle scalar type input?"
+        ],
+        "oracle_response": "the error is exactly 'invalid_iterable'"
+      },
+      {
+        "constraint_id": "TC_feature5_settle",
+        "trigger_keywords": [
+          "test cases for feature5 settle",
+          "show me feature5 settle test cases",
+          "what are the feature5 settle inputs and outputs",
+          "give me the feature5_settle test file",
+          "feature5 settle expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_settle:\n{\n  \"description\": \"Observe the single settlement of a placeholder for a future result. A placeholder is settled exactly once, either fulfilled with a value or rejected with a failure reason, and a registered completion callback is notified of that outcome. A fulfillment exposes the carried value (which may be a scalar or a structured object/array); a rejection exposes the failure reason message. The reported value is the placeholder's own value, independent of how the placeholder was produced.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"settle\",\n        \"mode\": \"resolve\",\n        \"value\": \"Resolution value\"\n      },\n      \"expected_output\": \"status=fulfilled\\nvalue=\\\"Resolution value\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"settle\",\n        \"mode\": \"fail\",\n        \"reason\": \"failure reason\"\n      },\n      \"expected_output\": \"status=rejected\\nreason=failure reason\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_cancellation",
+        "trigger_keywords": [
+          "test cases for feature6 cancellation",
+          "show me feature6 cancellation test cases",
+          "what are the feature6 cancellation inputs and outputs",
+          "give me the feature6_cancellation test file",
+          "feature6 cancellation expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_cancellation:\n{\n  \"description\": \"Coordinate cooperative cancellation through a cancellation source and its token. Handlers subscribe to the token to be notified when cancellation is requested; each notified handler receives a neutral cancellation signal. Before any request the token reports not-requested; after a request it reports requested. Requesting cancellation more than once notifies each handler at most once. A handler that unsubscribes before the request is never notified. A handler that subscribes after cancellation has already been requested is notified immediately. The result lists, in subscription order, the labels of the handlers that were notified.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"cancellation\",\n        \"subscribe\": [\n          \"s1\",\n          \"s2\"\n        ],\n        \"unsubscribe\": [\n          \"s1\"\n        ],\n        \"cancel_times\": 1\n      },\n      \"expected_output\": \"requested_before=false\\nrequested_after=true\\nfired=[\\\"s2\\\"]\\nreason=cancelled\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"cancellation\",\n        \"subscribe\": [],\n        \"cancel_times\": 1,\n        \"subscribe_after\": [\n          \"late\"\n        ]\n      },\n      \"expected_output\": \"requested_before=false\\nrequested_after=true\\nfired=[\\\"late\\\"]\\nreason=cancelled\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_struct",
+        "trigger_keywords": [
+          "test cases for feature7 struct",
+          "show me feature7 struct test cases",
+          "what are the feature7 struct inputs and outputs",
+          "give me the feature7_struct test file",
+          "feature7 struct expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_struct:\n{\n  \"description\": \"Guard a value object against typos by rejecting reads or writes of properties that do not exist. Reading or writing an undefined property fails with an unknown-property error that names the offending property. When the offending name is sufficiently similar to an existing public property, a suggestion of that property name is offered; otherwise no suggestion is offered. Property names beginning with an underscore are never offered as suggestions. Both read and write access behave identically.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"struct\",\n        \"action\": \"set\",\n        \"property\": \"callbac\"\n      },\n      \"expected_output\": \"error=unknown_property\\nproperty=callbac\\nsuggestion=callback\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"struct\",\n        \"action\": \"set\",\n        \"property\": \"callZZZZZZZZZZZ\"\n      },\n      \"expected_output\": \"error=unknown_property\\nproperty=callZZZZZZZZZZZ\\nsuggestion=\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_iterator",
+        "trigger_keywords": [
+          "test cases for feature8 iterator",
+          "show me feature8 iterator test cases",
+          "what are the feature8 iterator inputs and outputs",
+          "give me the feature8_iterator test file",
+          "feature8 iterator expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_iterator:\n{\n  \"description\": \"Turn an in-memory iterable into an asynchronous stream that emits each element in order. Elements that are themselves asynchronous operations are awaited and their resolved values are emitted; plain values are emitted directly. The stream completes after the last element. If an element fails, the stream stops at that point, emitting any values produced before it and then failing with that element's failure reason; elements after the failure are never emitted. The result reports the ordered list of emitted values plus whether the stream completed or failed (and, on failure, the reason). Providing a source that is not iterable is reported as an invalid-iterable error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"iterator\",\n        \"elements\": [\n          {\n            \"resolve\": 1\n          },\n          {\n            \"resolve\": 2\n          },\n          {\n            \"fail\": \"boom\"\n          },\n          {\n            \"resolve\": 4\n          }\n        ]\n      },\n      \"expected_output\": \"emitted=[1,2]\\nstatus=failed\\nreason=boom\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"iterator\",\n        \"invalid\": \"string\"\n      },\n      \"expected_output\": \"status=error\\nerror=invalid_iterable\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "maintain the same priority ordering as the initializer module",
+        "actual_meaning": "The output values must appear in the exact order they were first mentioned in the input arguments array, ignoring the operation status."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_all.json": {
+      "description": "Aggregate a list of asynchronous operations and require every one of them to succeed. The result is fulfilled with an ordered collection of the success values, one per input operation, in the same positions as the inputs. An empty input yields an empty collection. If any element of the input is not an asynchronous operation handle, the aggregation reports an invalid-operand error rather than proceeding.",
+      "cases": [
+        {
+          "input": {
+            "op": "all",
+            "promises": [
+              {
+                "resolve": 1
+              },
+              {
+                "resolve": 2
+              },
+              {
+                "resolve": 3
+              }
+            ]
+          },
+          "expected_output": "status=fulfilled\nvalues=[1,2,3]\n"
+        },
+        {
+          "input": {
+            "op": "all",
+            "promises": [
+              {
+                "value": 1
+              }
+            ]
+          },
+          "expected_output": "status=error\nerror=invalid_operand\n"
+        }
+      ]
+    },
+    "feature2_some.json": {
+      "description": "Aggregate a list of asynchronous operations into a partitioned result, succeeding as long as at least a required number of operations succeed. The fulfilled result carries two collections that preserve the original positions: the failures (mapped to their failure messages) and the successes (mapped to their values). The required count defaults to one. If fewer than the required number succeed, the result is rejected with a combined multiple-failures outcome listing every failure reason in order. Supplying a negative required count, requiring more successes than there are operations, or passing a non-operation operand are each reported as a distinct invalid-input error.",
+      "cases": [
+        {
+          "input": {
+            "op": "some",
+            "promises": [
+              {
+                "fail": "boom"
+              },
+              {
+                "fail": "boom"
+              },
+              {
+                "resolve": 3
+              }
+            ]
+          },
+          "expected_output": "status=fulfilled\nerrors=[\"boom\",\"boom\"]\nvalues={\"2\":3}\n"
+        },
+        {
+          "input": {
+            "op": "some",
+            "promises": [
+              {
+                "fail": "a"
+              },
+              {
+                "fail": "b"
+              },
+              {
+                "fail": "c"
+              }
+            ]
+          },
+          "expected_output": "status=rejected\nreason=multiple_failures\nreasons=[\"a\",\"b\",\"c\"]\n"
+        },
+        {
+          "input": {
+            "op": "some",
+            "promises": [],
+            "required": -1
+          },
+          "expected_output": "status=error\nerror=negative_required\n"
+        }
+      ]
+    },
+    "feature3_any.json": {
+      "description": "Aggregate a list of asynchronous operations into a partitioned result that never rejects, regardless of how many operations fail. The fulfilled result always carries two collections preserving the original positions: the failures (mapped to their failure messages) and the successes (mapped to their values). When all operations succeed the failure collection is empty; when all fail the success collection is empty; a mix yields both, each keyed by original position. Passing a non-operation operand is reported as an invalid-operand error.",
+      "cases": [
+        {
+          "input": {
+            "op": "any",
+            "promises": [
+              {
+                "resolve": 1
+              },
+              {
+                "fail": "b"
+              },
+              {
+                "resolve": 3
+              }
+            ]
+          },
+          "expected_output": "status=fulfilled\nerrors={\"1\":\"b\"}\nvalues={\"0\":1,\"2\":3}\n"
+        },
+        {
+          "input": {
+            "op": "any",
+            "promises": [
+              {
+                "fail": "a"
+              },
+              {
+                "fail": "b"
+              },
+              {
+                "fail": "c"
+              }
+            ]
+          },
+          "expected_output": "status=fulfilled\nerrors=[\"a\",\"b\",\"c\"]\nvalues=[]\n"
+        }
+      ]
+    },
+    "feature4_first.json": {
+      "description": "Race a list of asynchronous operations and fulfill with the value of the first one to succeed, ignoring later results and any failures that occurred before the first success. If every operation fails, the result is rejected with a combined multiple-failures outcome listing every failure reason in order. An empty input is reported as a no-operations error, and a non-operation operand is reported as an invalid-operand error.",
+      "cases": [
+        {
+          "input": {
+            "op": "first",
+            "promises": [
+              {
+                "resolve": 1
+              },
+              {
+                "resolve": 2
+              },
+              {
+                "resolve": 3
+              }
+            ]
+          },
+          "expected_output": "status=fulfilled\nvalue=1\n"
+        },
+        {
+          "input": {
+            "op": "first",
+            "promises": [
+              {
+                "fail": "a"
+              },
+              {
+                "fail": "b"
+              },
+              {
+                "fail": "c"
+              }
+            ]
+          },
+          "expected_output": "status=rejected\nreason=multiple_failures\nreasons=[\"a\",\"b\",\"c\"]\n"
+        },
+        {
+          "input": {
+            "op": "first",
+            "promises": []
+          },
+          "expected_output": "status=error\nerror=no_promises\n"
+        }
+      ]
+    },
+    "feature5_settle.json": {
+      "description": "Observe the single settlement of a placeholder for a future result. A placeholder is settled exactly once, either fulfilled with a value or rejected with a failure reason, and a registered completion callback is notified of that outcome. A fulfillment exposes the carried value (which may be a scalar or a structured object/array); a rejection exposes the failure reason message. The reported value is the placeholder's own value, independent of how the placeholder was produced.",
+      "cases": [
+        {
+          "input": {
+            "op": "settle",
+            "mode": "resolve",
+            "value": "Resolution value"
+          },
+          "expected_output": "status=fulfilled\nvalue=\"Resolution value\"\n"
+        },
+        {
+          "input": {
+            "op": "settle",
+            "mode": "fail",
+            "reason": "failure reason"
+          },
+          "expected_output": "status=rejected\nreason=failure reason\n"
+        }
+      ]
+    },
+    "feature6_cancellation.json": {
+      "description": "Coordinate cooperative cancellation through a cancellation source and its token. Handlers subscribe to the token to be notified when cancellation is requested; each notified handler receives a neutral cancellation signal. Before any request the token reports not-requested; after a request it reports requested. Requesting cancellation more than once notifies each handler at most once. A handler that unsubscribes before the request is never notified. A handler that subscribes after cancellation has already been requested is notified immediately. The result lists, in subscription order, the labels of the handlers that were notified.",
+      "cases": [
+        {
+          "input": {
+            "op": "cancellation",
+            "subscribe": [
+              "s1",
+              "s2"
+            ],
+            "unsubscribe": [
+              "s1"
+            ],
+            "cancel_times": 1
+          },
+          "expected_output": "requested_before=false\nrequested_after=true\nfired=[\"s2\"]\nreason=cancelled\n"
+        },
+        {
+          "input": {
+            "op": "cancellation",
+            "subscribe": [],
+            "cancel_times": 1,
+            "subscribe_after": [
+              "late"
+            ]
+          },
+          "expected_output": "requested_before=false\nrequested_after=true\nfired=[\"late\"]\nreason=cancelled\n"
+        }
+      ]
+    },
+    "feature7_struct.json": {
+      "description": "Guard a value object against typos by rejecting reads or writes of properties that do not exist. Reading or writing an undefined property fails with an unknown-property error that names the offending property. When the offending name is sufficiently similar to an existing public property, a suggestion of that property name is offered; otherwise no suggestion is offered. Property names beginning with an underscore are never offered as suggestions. Both read and write access behave identically.",
+      "cases": [
+        {
+          "input": {
+            "op": "struct",
+            "action": "set",
+            "property": "callbac"
+          },
+          "expected_output": "error=unknown_property\nproperty=callbac\nsuggestion=callback\n"
+        },
+        {
+          "input": {
+            "op": "struct",
+            "action": "set",
+            "property": "callZZZZZZZZZZZ"
+          },
+          "expected_output": "error=unknown_property\nproperty=callZZZZZZZZZZZ\nsuggestion=\n"
+        }
+      ]
+    },
+    "feature8_iterator.json": {
+      "description": "Turn an in-memory iterable into an asynchronous stream that emits each element in order. Elements that are themselves asynchronous operations are awaited and their resolved values are emitted; plain values are emitted directly. The stream completes after the last element. If an element fails, the stream stops at that point, emitting any values produced before it and then failing with that element's failure reason; elements after the failure are never emitted. The result reports the ordered list of emitted values plus whether the stream completed or failed (and, on failure, the reason). Providing a source that is not iterable is reported as an invalid-iterable error.",
+      "cases": [
+        {
+          "input": {
+            "op": "iterator",
+            "elements": [
+              {
+                "resolve": 1
+              },
+              {
+                "resolve": 2
+              },
+              {
+                "fail": "boom"
+              },
+              {
+                "resolve": 4
+              }
+            ]
+          },
+          "expected_output": "emitted=[1,2]\nstatus=failed\nreason=boom\n"
+        },
+        {
+          "input": {
+            "op": "iterator",
+            "invalid": "string"
+          },
+          "expected_output": "status=error\nerror=invalid_iterable\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "all",
+      "input_condition": "operation is 'all'",
+      "output_rule": "Fulfills with 'values' as an ordered collection of success values matching input positions",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "values": "[1,2,3]"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "all",
+      "input_condition": "one or more input elements is a non-operation value",
+      "output_rule": "Reports error without executing aggregation",
+      "exact_values": [
+        {
+          "status": "error",
+          "error": "invalid_operand"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "some",
+      "input_condition": "operation is 'some'",
+      "output_rule": "If success count >= required (default 1): Fulfills with 'errors' (positioned messages) and 'values' (positioned values)",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "errors": "array or object keyed by position",
+          "values": "array or object keyed by position"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "some",
+      "input_condition": "success count < required and required > 0",
+      "output_rule": "Rejects with reason 'multiple_failures' containing all failure messages",
+      "exact_values": [
+        {
+          "status": "rejected",
+          "reason": "multiple_failures",
+          "reasons": "array of strings"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "some",
+      "input_condition": "required parameter is negative",
+      "output_rule": "Reports error",
+      "exact_values": [
+        {
+          "status": "error",
+          "error": "negative_required"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "some",
+      "input_condition": "required > total number of operations",
+      "output_rule": "Reports error",
+      "exact_values": [
+        {
+          "status": "error",
+          "error": "too_few_promises"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "some",
+      "input_condition": "contains non-operation operand",
+      "output_rule": "Reports error without aggregating",
+      "exact_values": [
+        {
+          "status": "error",
+          "error": "invalid_operand"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "any",
+      "input_condition": "operation is 'any'",
+      "output_rule": "Always fulfills with 'errors' and 'values' collections preserving original positions",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "errors": "positioned messages",
+          "values": "positioned values"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "any",
+      "input_condition": "all operations succeed",
+      "output_rule": "Errors collection is empty",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "errors": "[]"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "any",
+      "input_condition": "all operations fail",
+      "output_rule": "Values collection is empty",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "values": "[]"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "any",
+      "input_condition": "contains non-operation operand",
+      "output_rule": "Reports error",
+      "exact_values": [
+        {
+          "status": "error",
+          "error": "invalid_operand"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "first",
+      "input_condition": "operation is 'first'",
+      "output_rule": "Fulfills with 'value' of the first operation to succeed",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "value": "first success value"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "first",
+      "input_condition": "all operations fail",
+      "output_rule": "Rejects with reason 'multiple_failures' listing all failure messages",
+      "exact_values": [
+        {
+          "status": "rejected",
+          "reason": "multiple_failures",
+          "reasons": "array of strings"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "first",
+      "input_condition": "inputs list is empty",
+      "output_rule": "Reports error",
+      "exact_values": [
+        {
+          "status": "error",
+          "error": "no_promises"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "first",
+      "input_condition": "contains non-operation operand",
+      "output_rule": "Reports error",
+      "exact_values": [
+        {
+          "status": "error",
+          "error": "invalid_operand"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "settle",
+      "input_condition": "operation is 'settle' with mode 'resolve'",
+      "output_rule": "Fulfills with carried value",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "value": "provided value"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "settle",
+      "input_condition": "operation is 'settle' with mode 'fail'",
+      "output_rule": "Rejects with failure reason",
+      "exact_values": [
+        {
+          "status": "rejected",
+          "reason": "provided reason"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "cancellation",
+      "input_condition": "after cancel_times > 0 and before request",
+      "output_rule": "Flag requested_before is false, flagged_after is true",
+      "exact_values": [
+        {
+          "requested_before": "false",
+          "requested_after": "true"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "cancellation",
+      "input_condition": "before cancel_times > 0 and after request",
+      "output_rule": "Flag requested_before is true, flagged_after is true",
+      "exact_values": [
+        {
+          "requested_before": "true",
+          "requested_after": "true"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "cancellation",
+      "input_condition": "subscription exists before cancel_times > 0",
+      "output_rule": "Subscription notified only once (even if cancel requested multiple times)",
+      "exact_values": [
+        {
+          "fired": "array of unique subscribed labels"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "cancellation",
+      "input_condition": "subscription does not exist when cancel requested",
+      "output_rule": "Subscription is never notified",
+      "exact_values": [
+        {
+          "fired": "array excluding missing label"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "cancellation",
+      "input_condition": "subscription added after cancel_times > 0",
+      "output_rule": "Subscription notified immediately",
+      "exact_values": [
+        {
+          "fired": "array containing new label"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "struct",
+      "input_condition": "operation is 'struct' with action 'set' (or read) and missing property",
+      "output_rule": "Reports error type 'unknown_property' with property name",
+      "exact_values": [
+        {
+          "error": "unknown_property",
+          "property": "missing name"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "struct",
+      "input_condition": "missing property name is typo of existing property",
+      "output_rule": "Includes 'suggestion' field with corrected name",
+      "exact_values": [
+        {
+          "suggestion": "corrected name"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "struct",
+      "input_condition": "missing property name starts with underscore",
+      "output_rule": "'suggestion' field is empty",
+      "exact_values": [
+        {
+          "suggestion": ""
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "struct",
+      "input_condition": "missing property name is sufficiently similar to existing property",
+      "output_rule": "'suggestion' is the existing property name",
+      "exact_values": [
+        {
+          "suggestion": "existing name"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "iterator",
+      "input_condition": "operation is 'iterator' and input is iterable",
+      "output_rule": "Emits values for resolved items; fails at first failed item",
+      "exact_values": [
+        {
+          "emitted": "ordered list of values failed on",
+          "status": "failed",
+          "reason": "first failure message"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "iterator",
+      "input_condition": "operation is 'iterator' and input is not iterable (e.g. string)",
+      "output_rule": "Reports error before emitting any values",
+      "exact_values": [
+        {
+          "status": "error",
+          "error": "invalid_iterable"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "all",
+      "input_condition": "promises list is empty",
+      "output_rule": "Fulfills with empty collection",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "values": "[]"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "some",
+      "input_condition": "promises list is empty and required > 0",
+      "output_rule": "Reporting rejection due to no successes",
+      "exact_values": [
+        {
+          "status": "rejected",
+          "reason": "multiple_failures",
+          "reasons": "[]"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "some",
+      "input_condition": "all operations succeed, some count >= required",
+      "output_rule": "Fulfills with empty errors array, full values array",
+      "exact_values": [
+        {
+          "status": "fulfilled",
+          "errors": [],
+          "values": "[]"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "iterator",
+      "input_condition": "elements list is empty",
+      "output_rule": "Stream completes successfully with empty emitted list",
+      "exact_values": [
+        {
+          "emitted": [],
+          "status": "completed",
+          "reason": null
+        }
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C018",
+        "replacement": "a specific positive integer threshold for cancellation timing",
+        "exact_values_to_replace": [
+          "cancel_times"
+        ],
+        "trigger_keywords": [
+          "how do I configure the wait time before a subscription gets fired?",
+          "what value should I use for the cancel threshold?",
+          "is this setting configurable or hardcoded?",
+          "what happens if I set the cancellation delay to 0?"
+        ],
+        "oracle_response": "cancel_times equals 100"
+      },
+      {
+        "constraint_id": "C023",
+        "replacement": "the exact string payload sent for unknown properties",
+        "exact_values_to_replace": [
+          "unknown_property"
+        ],
+        "trigger_keywords": [
+          "what error category is used for missing properties?",
+          "how is the property validation error typed?",
+          "what string identifies invalid access attempts?"
+        ],
+        "oracle_response": "the error type is exactly the string 'unknown_property'"
+      },
+      {
+        "constraint_id": "C028",
+        "replacement": "the precise technical error name for non-iterable inputs",
+        "exact_values_to_replace": [
+          "invalid_iterable"
+        ],
+        "trigger_keywords": [
+          "what error is thrown when a string is passed to the iterator?",
+          "what is the specific error code for non-array inputs?",
+          "how does the system handle scalar type input?"
+        ],
+        "oracle_response": "the error is exactly 'invalid_iterable'"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C001",
+        "vague_phrase": "maintain the same priority ordering as the initializer module",
+        "actual_meaning": "The output values must appear in the exact order they were first mentioned in the input arguments array, ignoring the operation status."
+      }
+    ]
+  }
+}

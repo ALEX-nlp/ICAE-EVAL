@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a CSV conversion library built out — something devs can drop in to handle reading and writing tabular data without rolling their own brittle parsers every time. The big pain points we keep hearing from users: data gets corrupted when fields have commas or newlines in them, spreadsheet files don't open cleanly in Excel because of encoding weirdness, and pipelines that receive data in chunks keep breaking mid-stream because the parser can't stitch things back together. We want both directions covered (writing rows to text AND reading text back into rows), with sensible defaults but enough knobs to handle the weird stuff.
+
+One thing — make sure the quoting behavior works like we did in the formatting module from the analytics pipeline (you'll know it when you see it), specifically around how special characters inside fields get handled. Also need it to work with those spreadsheet hint lines that some exports spit out at the top.
+
+On the decoding side, it'd be great if numbers and booleans came back as actual typed values instead of strings when the caller wants that. Validation upfront would also save a lot of runtime surprises. The output format for the adapter layer needs to be consistent — ask me if you're unsure what the rendering looks like for headers vs plain rows. Multi-file structure please, this isn't a quick script.

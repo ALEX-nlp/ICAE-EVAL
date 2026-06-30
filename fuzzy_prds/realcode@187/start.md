@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that test-double library we've been talking about. Basically developers are spending way too much time hand-rolling fake implementations every time they want to isolate a unit under test — it's super repetitive and breaks constantly when interfaces change. We need something that lets you spin up a stand-in for any collaborator in one line, tell it what to return (or blow up with an error), and then afterwards confirm it was actually called the right number of times.
+
+A few things that came up in last week's sync: the library needs to handle the async stuff the same way it handles regular calls — no second-class treatment. Also remember how we handled the 'returns self' chaining pattern in the settings module of the auth service refactor? We want something like that here too for default answer strategies. And there was that discussion about the 'stub-only mode' for memory-sensitive paths — make sure that's in scope.
+
+The output format when something goes wrong needs to be completely neutral — no internal runtime class names leaking out. Errors should be categorized in plain language. Named doubles should show up properly in failure messages. Also want spy support so we can wrap real objects and only override specific bits. Please make sure the code is organized properly across multiple files — last time someone dumped everything in one god-file and it was a nightmare to maintain.

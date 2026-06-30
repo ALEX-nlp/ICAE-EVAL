@@ -1,0 +1,565 @@
+{
+  "fuzzy_prd": "# Native Function Binding Layer — Exposing Compiled Functions to a Dynamic Runtime\n\n## Project Goal\n\nBuild a binding layer that exposes statically-typed native (compiled) functions to a dynamic scripting runtime, so developers can call high-performance native code as if it were ordinary dynamic-language functions — with familiar calling conventions (defaults, keyword arguments, overloading), correct value marshalling across the boundary, and faithful error propagation — without hand-writing brittle glue code for every function.\n\n---\n\n## Background & Problem\n\nNative code is fast and strongly typed, but a dynamic runtime cannot call it directly: every argument must be converted from a dynamic object into a concrete native type, the right implementation must be chosen when several share a name, and any failure must surface as a clean runtime error rather than a crash.\n\nWithout a binding layer, developers write that conversion and dispatch glue by hand for each function — repetitive, error-prone boilerplate that silently mishandles edge cases (out-of-range integers, the wrong overload, keyword-only parameters passed positionally) and leaks low-level failure details.\n\nWith this binding layer, a native function is exposed once and then behaves like an idiomatic dynamic-language callable: arguments bind by position or by name with defaults, overloaded names dispatch by argument type, fixed-width integers are range-checked, strings and raw byte buffers round-trip correctly, keyword-only parameters are enforced, variadic arguments are captured, and native exceptions propagate as runtime errors. This PRD specifies the externally-observable contract of that calling surface.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., argument binding, type conversion, overload dispatch, error translation), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core binding logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, argument binding, type conversion, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Positional Defaults & Keyword Arguments\n\n**As a developer**, I want a bound function to accept its arguments positionally or by name and to fall back to declared defaults, so calling native code feels like calling an ordinary dynamic-language function.\n\n**Expected Behavior / Usage:**\n\nA bound binary function over two integer parameters returns the first minus the second. The first parameter has a default of 8 and the second a default of 1. A call supplies an optional `args` array (positional values) and an optional `kwargs` object (named values); anything omitted uses its default. Positional values fill the parameters left to right; named values bind to the matching parameter regardless of order; the two styles may be combined (positional first, then keywords). The output is the single resulting integer followed by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_default_keyword_args.json`\n\n```json\n{\n    \"description\": \"A bound binary function over two integer parameters returns the first minus the second. The first parameter defaults to 8 and the second to 1 when omitted. Arguments may be supplied positionally, by name, in either name order, or as a mix; omitted trailing parameters fall back to their defaults. The output is the resulting integer.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"subtract\"}, \"expected_output\": \"7\\n\"},\n        {\"input\": {\"op\": \"subtract\", \"args\": [3], \"kwargs\": {\"k\": 5}}, \"expected_output\": \"-2\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Type-Dispatched Overloading\n\n**As a developer**, I want one callable name to host several implementations selected by argument type, so the runtime automatically routes each call to the matching native function.\n\n**Expected Behavior / Usage:**\n\nA single callable name carries two overloads distinguished only by the runtime type of its one argument: one overload accepts an integer, the other accepts a real (floating-point) number. The binding layer inspects the argument's type and routes the call accordingly, returning a small integer tag that identifies which overload ran — `1` for the integer overload and `2` for the real-number overload. The distinction is by genuine value type: an integer-valued argument selects the integer overload, while a value written with a fractional part selects the real-number overload. If the argument matches no overload (for example, a text value), argument resolution fails and the adapter reports the neutral line `error=type_mismatch`. Each output ends with a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_type_overloading.json`\n\n```json\n{\n    \"description\": \"A single callable name carries two overloads distinguished only by the runtime type of its one argument: one overload accepts an integer and one accepts a real (floating-point) number. The binding layer selects the overload by argument type and returns a small integer tag identifying which overload ran (1 for the integer overload, 2 for the real-number overload). When the argument matches no overload (for example, a text value), argument resolution fails and a neutral type-mismatch error is reported.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"classify\", \"value\": 0}, \"expected_output\": \"1\\n\"},\n        {\"input\": {\"op\": \"classify\", \"value\": 0.0}, \"expected_output\": \"2\\n\"},\n        {\"input\": {\"op\": \"classify\", \"value\": \"x\"}, \"expected_output\": \"error=type_mismatch\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Variadic Positional & Keyword Capture\n\n**As a developer**, I want a bound function to accept an arbitrary number of trailing positional and keyword arguments beyond its declared parameters, so it can forward or inspect open-ended argument lists.\n\n**Expected Behavior / Usage:**\n\nA bound function declares two leading positional parameters and then captures everything else: positional arguments beyond the first two are gathered into a variadic positional pack, and any keyword arguments are gathered into a variadic keyword pack. The function reports two counts — how many extra positional arguments were captured and how many keyword arguments were captured. The first two supplied positional values fill the declared parameters and are NOT counted as extras. The output is two lines: `positional=<n>` then `keyword=<n>`, each terminated by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_variadic_capture.json`\n\n```json\n{\n    \"description\": \"A bound function declares two leading positional parameters and then captures any further arguments: extra positional arguments are gathered into a variadic positional pack, and any keyword arguments beyond the declared parameters are gathered into a variadic keyword pack. The function reports how many extra positional arguments and how many keyword arguments it received. Output lists the positional count and the keyword count, each on its own line.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"count_extras\", \"args\": [1, 2]}, \"expected_output\": \"positional=0\\nkeyword=0\\n\"},\n        {\"input\": {\"op\": \"count_extras\", \"args\": [1, 2, 3, 4], \"kwargs\": {\"c\": 5, \"d\": 6}}, \"expected_output\": \"positional=2\\nkeyword=2\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Fixed-Width Integer Range Enforcement\n\n**As a developer**, I want integer arguments converted into a specific fixed-width native integer type with range checking, so out-of-range values are rejected instead of silently truncated or wrapped.\n\n**Expected Behavior / Usage:**\n\nA family of identity functions is exposed, one per fixed-width integer type, parameterised by signedness (`signed` true/false) and bit width (`bits` of 8, 16, 32, or 64). Given a value, the matching function returns it unchanged when it fits the target type's representable range, and otherwise fails conversion. A signed N-bit type represents the inclusive range from `-2^(N-1)` to `2^(N-1)-1`; an unsigned N-bit type represents `0` to `2^N-1`. A value within range is echoed back as an integer followed by a newline; a value outside the range (too large, too small, or negative for an unsigned type) yields the neutral line `error=type_mismatch`. The full 64-bit unsigned range up to `2^64-1` must round-trip exactly.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_integer_width_range.json`\n\n```json\n{\n    \"description\": \"A family of identity functions each bound to a fixed-width integer type, parameterised by signedness (signed or unsigned) and bit width (8, 16, 32, or 64). When the supplied integer fits within the representable range of the chosen type it is returned unchanged; when it falls outside that range, argument conversion fails and a neutral type-mismatch error is reported. Signed N-bit types span -2^(N-1) .. 2^(N-1)-1; unsigned N-bit types span 0 .. 2^N-1.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"identity\", \"signed\": true, \"bits\": 8, \"value\": 127}, \"expected_output\": \"127\\n\"},\n        {\"input\": {\"op\": \"identity\", \"signed\": true, \"bits\": 8, \"value\": 128}, \"expected_output\": \"error=type_mismatch\\n\"},\n        {\"input\": {\"op\": \"identity\", \"signed\": false, \"bits\": 64, \"value\": [a very large unsigned 64-bit integer literal — ask the PM for the exact hex value]}, \"expected_output\": \"[a very large unsigned 64-bit integer literal — ask the PM for the exact hex value]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: String & Byte-Buffer Marshalling\n\n**As a developer**, I want text strings and raw byte buffers to convert correctly in both directions across the binding boundary, so binary-safe data and ordinary text both survive the round trip.\n\n**Expected Behavior / Usage:**\n\n*5.1 String Round-Trip — a text value crosses the boundary and returns unchanged*\n\nA bound function accepts a text string and returns the same text. The output is the string verbatim (including spaces, punctuation, or emptiness) followed by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_string_roundtrip.json`\n\n```json\n{\n    \"description\": \"A bound function accepts a text string and returns the same text, demonstrating round-trip marshalling of string values across the binding boundary. The output is the string unchanged, including any embedded punctuation or spaces.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"echo_string\", \"value\": \"[a default sample greeting — ask the PM for the exact string literal]\"}, \"expected_output\": \"[a default sample greeting — ask the PM for the exact string literal]\\n\"}\n    ]\n}\n```\n\n*5.2 Byte-Buffer Length — counting raw bytes including embedded zeros*\n\nA bound function receives a raw byte buffer (supplied as an array of byte values 0–255) and returns its length in bytes. The count includes every byte, so embedded zero bytes are counted like any other; a buffer of four zero bytes has length 4. The output is the integer length followed by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_byte_length.json`\n\n```json\n{\n    \"description\": \"A bound function receives a raw byte buffer and returns its length in bytes. The buffer is supplied as an array of byte values (0-255). The length counts every byte, including embedded zero bytes, so a buffer of four zero bytes has length 4. Output is the integer length.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"byte_length\", \"bytes\": [0, 0, 0, 0]}, \"expected_output\": \"4\\n\"}\n    ]\n}\n```\n\n*5.3 Truncating Byte-Buffer Construction — keep the first N bytes of a source*\n\nA bound function builds a byte buffer from a text source but keeps only the first `size` bytes. The result is the leading `size`-byte prefix of the source; a size equal to or exceeding the source length yields the whole source, and a size of 0 yields an empty result. The output is the prefix rendered as text followed by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_3_byte_prefix.json`\n\n```json\n{\n    \"description\": \"A bound function builds a byte buffer from a text source but keeps only the first N bytes, where N is supplied explicitly. The result is the leading N-byte prefix of the source text. Output is that prefix rendered as text.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"byte_prefix\", \"text\": \"[a default sample greeting — ask the PM for the exact string literal] world\", \"size\": 5}, \"expected_output\": \"[a default sample greeting — ask the PM for the exact string literal]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Keyword-Only Parameters\n\n**As a developer**, I want to mark certain parameters as keyword-only, so callers must name them explicitly and cannot accidentally bind them by position.\n\n**Expected Behavior / Usage:**\n\n*6.1 Fully Keyword-Only — every parameter must be named*\n\nA bound function declares two integer parameters that are BOTH keyword-only. Each must be supplied by name (`kwargs`), in any order, and never positionally. A valid call returns the received pair. Supplying any value positionally, or omitting a required keyword, fails argument resolution. Valid output is two lines `i=<value>` and `j=<value>`, each terminated by a newline; an invalid call yields the neutral line `error=type_mismatch`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_all_keyword_only.json`\n\n```json\n{\n    \"description\": \"A bound function declares two integer parameters that are BOTH keyword-only: each must be supplied by name, in any order, and never positionally. Supplying them by name succeeds and the function returns the pair. Passing either value positionally, or omitting a required keyword, fails argument resolution and reports a neutral type-mismatch error. Output lists the two received values, each on its own line.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"kw_only_all\", \"kwargs\": {\"i\": 1, \"j\": 2}}, \"expected_output\": \"i=1\\nj=2\\n\"},\n        {\"input\": {\"op\": \"kw_only_all\", \"args\": [1, 2]}, \"expected_output\": \"error=type_mismatch\\n\"}\n    ]\n}\n```\n\n*6.2 Mixed Positional-Then-Keyword-Only — a positional lead followed by a keyword-only tail*\n\nA bound function declares a leading parameter that may be passed positionally or by name, followed by a second parameter that is keyword-only. The leading value may arrive either way; the second must always be a keyword. A valid call returns the received pair. Passing the keyword-only value positionally, or omitting it, fails argument resolution. Valid output is two lines `i=<value>` and `j=<value>`, each terminated by a newline; an invalid call yields the neutral line `error=type_mismatch`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_mixed_keyword_only.json`\n\n```json\n{\n    \"description\": \"A bound function declares a leading parameter that may be passed positionally or by name, followed by a second parameter that is keyword-only. The first value may arrive either way; the second must always be a keyword. Mixing them validly returns the pair. Passing the keyword-only value positionally, or omitting it, fails argument resolution and reports a neutral type-mismatch error. Output lists the two received values, each on its own line.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"kw_only_mixed\", \"args\": [1], \"kwargs\": {\"j\": 2}}, \"expected_output\": \"i=1\\nj=2\\n\"},\n        {\"input\": {\"op\": \"kw_only_mixed\", \"args\": [1, 2]}, \"expected_output\": \"error=type_mismatch\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Native Exception Propagation\n\n**As a developer**, I want exceptions thrown inside native code to surface as clean runtime errors in the dynamic runtime, so failures are reported rather than crashing the process.\n\n**Expected Behavior / Usage:**\n\nA bound function whose underlying native implementation unconditionally fails by throwing an exception with a fixed diagnostic message. The binding layer catches the native exception at the boundary and propagates it as a runtime error carrying that message. The adapter renders this as two lines: the neutral category line `error=runtime_error`, then `message=<text>` where the text is the preserved diagnostic (here, `oops!`). Each line ends with a newline. The host-language identity of the exception is never exposed — only the neutral category and the domain message.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_exception_propagation.json`\n\n```json\n{\n    \"description\": \"A bound function whose underlying native implementation unconditionally raises an exception. The binding layer propagates the failure across the boundary as a runtime error carrying the original diagnostic message. The adapter renders it as a neutral runtime-error category line followed by the preserved message.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"raise_runtime\"}, \"expected_output\": \"error=runtime_error\\nmessage=oops!\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the binding behaviors described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint, ensuring high maintainability without over-engineering. The core binding logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request object from stdin and prints the result (or a neutral error) to stdout, matching the per-feature contracts above. The request's `op` field selects the behavior; `args` (array) and `kwargs` (object) supply positional and named arguments where applicable; feature-specific fields (`value`, `signed`, `bits`, `bytes`, `text`, `size`) carry the remaining inputs. Native failures are translated in this adapter layer into neutral lines: `error=type_mismatch` for argument/overload/range resolution failures and `error=runtime_error` followed by `message=<text>` for propagated runtime exceptions. The host-language identity of any native exception MUST NOT appear in the output.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- near guessed timeout\n",
+  "oracle_data": {
+    "task_id": "wjakob__nanobind-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C013",
+        "trigger_keywords": [
+          "max unsigned 64 bit",
+          "2 to the 64 minus 1",
+          "maximum ull64",
+          "2^64 - 1",
+          "max uint64"
+        ],
+        "oracle_response": "The exact integer value 18446744073709551615"
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "echo string sample",
+          "default greeting",
+          "test echo value",
+          "sample text for byte_length",
+          "literal hello"
+        ],
+        "oracle_response": "The exact string 'hello'"
+      },
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "input has args list",
+          "positionals location",
+          "trailing arguments field",
+          "varargs input key",
+          "args array presence"
+        ],
+        "oracle_response": "The field is named 'args' and must exist as a list in the input object"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "near guessed timeout",
+        "actual_meaning": "The input occurs within a specific timeout threshold where positional arguments are erroneously passed intended for keyword-only parameters"
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_default_keyword_args.json": {
+      "description": "A bound binary function over two integer parameters returns the first minus the second. The first parameter defaults to 8 and the second to 1 when omitted. Arguments may be supplied positionally, by name, in either name order, or as a mix; omitted trailing parameters fall back to their defaults. The output is the resulting integer.",
+      "cases": [
+        {
+          "input": {
+            "op": "subtract"
+          },
+          "expected_output": "7\n"
+        },
+        {
+          "input": {
+            "op": "subtract",
+            "args": [
+              3
+            ],
+            "kwargs": {
+              "k": 5
+            }
+          },
+          "expected_output": "-2\n"
+        }
+      ]
+    },
+    "feature2_type_overloading.json": {
+      "description": "A single callable name carries two overloads distinguished only by the runtime type of its one argument: one overload accepts an integer and one accepts a real (floating-point) number. The binding layer selects the overload by argument type and returns a small integer tag identifying which overload ran (1 for the integer overload, 2 for the real-number overload). When the argument matches no overload (for example, a text value), argument resolution fails and a neutral type-mismatch error is reported.",
+      "cases": [
+        {
+          "input": {
+            "op": "classify",
+            "value": 0
+          },
+          "expected_output": "1\n"
+        },
+        {
+          "input": {
+            "op": "classify",
+            "value": 0.0
+          },
+          "expected_output": "2\n"
+        },
+        {
+          "input": {
+            "op": "classify",
+            "value": "x"
+          },
+          "expected_output": "error=type_mismatch\n"
+        }
+      ]
+    },
+    "feature3_variadic_capture.json": {
+      "description": "A bound function declares two leading positional parameters and then captures any further arguments: extra positional arguments are gathered into a variadic positional pack, and any keyword arguments beyond the declared parameters are gathered into a variadic keyword pack. The function reports how many extra positional arguments and how many keyword arguments it received. Output lists the positional count and the keyword count, each on its own line.",
+      "cases": [
+        {
+          "input": {
+            "op": "count_extras",
+            "args": [
+              1,
+              2
+            ]
+          },
+          "expected_output": "positional=0\nkeyword=0\n"
+        },
+        {
+          "input": {
+            "op": "count_extras",
+            "args": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "kwargs": {
+              "c": 5,
+              "d": 6
+            }
+          },
+          "expected_output": "positional=2\nkeyword=2\n"
+        }
+      ]
+    },
+    "feature4_integer_width_range.json": {
+      "description": "A family of identity functions each bound to a fixed-width integer type, parameterised by signedness (signed or unsigned) and bit width (8, 16, 32, or 64). When the supplied integer fits within the representable range of the chosen type it is returned unchanged; when it falls outside that range, argument conversion fails and a neutral type-mismatch error is reported. Signed N-bit types span -2^(N-1) .. 2^(N-1)-1; unsigned N-bit types span 0 .. 2^N-1.",
+      "cases": [
+        {
+          "input": {
+            "op": "identity",
+            "signed": true,
+            "bits": 8,
+            "value": 127
+          },
+          "expected_output": "127\n"
+        },
+        {
+          "input": {
+            "op": "identity",
+            "signed": true,
+            "bits": 8,
+            "value": 128
+          },
+          "expected_output": "error=type_mismatch\n"
+        },
+        {
+          "input": {
+            "op": "identity",
+            "signed": false,
+            "bits": 64,
+            "value": 18446744073709551615
+          },
+          "expected_output": "18446744073709551615\n"
+        }
+      ]
+    },
+    "feature5_1_string_roundtrip.json": {
+      "description": "A bound function accepts a text string and returns the same text, demonstrating round-trip marshalling of string values across the binding boundary. The output is the string unchanged, including any embedded punctuation or spaces.",
+      "cases": [
+        {
+          "input": {
+            "op": "echo_string",
+            "value": "hello"
+          },
+          "expected_output": "hello\n"
+        }
+      ]
+    },
+    "feature5_2_byte_length.json": {
+      "description": "A bound function receives a raw byte buffer and returns its length in bytes. The buffer is supplied as an array of byte values (0-255). The length counts every byte, including embedded zero bytes, so a buffer of four zero bytes has length 4. Output is the integer length.",
+      "cases": [
+        {
+          "input": {
+            "op": "byte_length",
+            "bytes": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "expected_output": "4\n"
+        }
+      ]
+    },
+    "feature5_3_byte_prefix.json": {
+      "description": "A bound function builds a byte buffer from a text source but keeps only the first N bytes, where N is supplied explicitly. The result is the leading N-byte prefix of the source text. Output is that prefix rendered as text.",
+      "cases": [
+        {
+          "input": {
+            "op": "byte_prefix",
+            "text": "hello world",
+            "size": 5
+          },
+          "expected_output": "hello\n"
+        }
+      ]
+    },
+    "feature6_1_all_keyword_only.json": {
+      "description": "A bound function declares two integer parameters that are BOTH keyword-only: each must be supplied by name, in any order, and never positionally. Supplying them by name succeeds and the function returns the pair. Passing either value positionally, or omitting a required keyword, fails argument resolution and reports a neutral type-mismatch error. Output lists the two received values, each on its own line.",
+      "cases": [
+        {
+          "input": {
+            "op": "kw_only_all",
+            "kwargs": {
+              "i": 1,
+              "j": 2
+            }
+          },
+          "expected_output": "i=1\nj=2\n"
+        },
+        {
+          "input": {
+            "op": "kw_only_all",
+            "args": [
+              1,
+              2
+            ]
+          },
+          "expected_output": "error=type_mismatch\n"
+        }
+      ]
+    },
+    "feature6_2_mixed_keyword_only.json": {
+      "description": "A bound function declares a leading parameter that may be passed positionally or by name, followed by a second parameter that is keyword-only. The first value may arrive either way; the second must always be a keyword. Mixing them validly returns the pair. Passing the keyword-only value positionally, or omitting it, fails argument resolution and reports a neutral type-mismatch error. Output lists the two received values, each on its own line.",
+      "cases": [
+        {
+          "input": {
+            "op": "kw_only_mixed",
+            "args": [
+              1
+            ],
+            "kwargs": {
+              "j": 2
+            }
+          },
+          "expected_output": "i=1\nj=2\n"
+        },
+        {
+          "input": {
+            "op": "kw_only_mixed",
+            "args": [
+              1,
+              2
+            ]
+          },
+          "expected_output": "error=type_mismatch\n"
+        }
+      ]
+    },
+    "feature7_exception_propagation.json": {
+      "description": "A bound function whose underlying native implementation unconditionally raises an exception. The binding layer propagates the failure across the boundary as a runtime error carrying the original diagnostic message. The adapter renders it as a neutral runtime-error category line followed by the preserved message.",
+      "cases": [
+        {
+          "input": {
+            "op": "raise_runtime"
+          },
+          "expected_output": "error=runtime_error\nmessage=oops!\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Function Invocation Protocol",
+      "input_condition": "Root input object structure",
+      "output_rule": "Valid calls proceed to logic; invalid structures result in error",
+      "exact_values": [
+        "error=type_mismatch",
+        "error=runtime_error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Positional Argument Handling",
+      "input_condition": "Input contains 'args' field (list)",
+      "output_rule": "Values are consumed as trailing arguments after declared named parameters or defaults; excess values count towards variadic capture",
+      "exact_values": [
+        "array",
+        "list"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Keyword Argument Handling",
+      "input_condition": "Input contains 'kwargs' field (object/map)",
+      "output_rule": "Entries are requested by name; order in input object does not matter",
+      "exact_values": [
+        "object",
+        "map",
+        "key-value pair"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Subtract Feature - Defaults",
+      "input_condition": "op is 'subtract' and no args/kwargs provided",
+      "output_rule": "Returns result of 8 - 1",
+      "exact_values": [
+        "7"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Subtract Feature - Mixed Args",
+      "input_condition": "op is 'subtract' with partial kwargs/args",
+      "output_rule": "Positional fills left-to-right; remaining fill from kwargs or defaults",
+      "exact_values": [
+        "-2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Classify Feature - Integer Overload",
+      "input_condition": "op is 'classify' and value is an integer",
+      "output_rule": "Returns tag 1",
+      "exact_values": [
+        "1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Classify Feature - Real Overload",
+      "input_condition": "op is 'classify' and value is a float (includes 0.0)",
+      "output_rule": "Returns tag 2",
+      "exact_values": [
+        "2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Classify Feature - Type Mismatch",
+      "input_condition": "op is 'classify' and value is a string or unsupported type",
+      "output_rule": "Returns error message",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Count Extras - Empty Variadic",
+      "input_condition": "op is 'count_extras'; args/kwargs count equal to declared params",
+      "output_rule": "Reports 0 extra positional and 0 extra keyword",
+      "exact_values": [
+        "positional=0",
+        "keyword=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Count Extras - Full Variadic",
+      "input_condition": "op is 'count_extras'; args/kwargs exceed declared params",
+      "output_rule": "Reports count of arguments beyond the first 2 positional and provided keyword names",
+      "exact_values": [
+        "positional=2",
+        "keyword=2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Identity Feature - Signed 8-bit",
+      "input_condition": "op is 'identity', signed=true, bits=8, value within range [-128, 127]",
+      "output_rule": "Returns value unchanged",
+      "exact_values": [
+        "integer"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Identity Feature - Signed 8-bit Out of Range",
+      "input_condition": "op is 'identity', signed=true, bits=8, value > 127",
+      "output_rule": "Returns error message",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Identity Feature - Unsigned 64-bit Max",
+      "input_condition": "op is 'identity', signed=false, bits=64, value = 2^64 - 1",
+      "output_rule": "Returns value unchanged",
+      "exact_values": [
+        "18446744073709551615"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "String Echo Feature",
+      "input_condition": "op is 'echo_string'",
+      "output_rule": "Returns input string verbatim",
+      "exact_values": [
+        "hello"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Byte Length Feature",
+      "input_condition": "op is 'byte_length'",
+      "output_rule": "Returns length of 'bytes' array",
+      "exact_values": [
+        "4"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Byte Prefix Feature",
+      "input_condition": "op is 'byte_prefix'",
+      "output_rule": "Returns string consisting of the first 'size' bytes (N chars) of 'text'",
+      "exact_values": [
+        "hello"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Keyword Only (All) - Valid Named",
+      "input_condition": "op is 'kw_only_all'; kwargs provided, args empty/ignored",
+      "output_rule": "Returns 'i=<val>' and 'j=<val>'",
+      "exact_values": [
+        "i=1",
+        "j=2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Keyword Only (All) - Invalid Positional",
+      "input_condition": "op is 'kw_only_all'; kwargs provided, args array is non-empty",
+      "output_rule": "Returns error message",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Keyword Only (All) - Invalid Missing",
+      "input_condition": "op is 'kw_only_all'; one of i/j missing in kwargs",
+      "output_rule": "Returns error message",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Keyword Only (Mixed) - Valid Mixed",
+      "input_condition": "op is 'kw_only_mixed'; args provided for first, kwargs for second",
+      "output_rule": "Returns 'i=<val>' and 'j=<val>'",
+      "exact_values": [
+        "i=1",
+        "j=2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Keyword Only (Mixed) - Invalid Keyword Positional",
+      "input_condition": "op is 'kw_only_mixed' near guessed timeout; args array includes value intended for keyword-only param",
+      "output_rule": "Returns error message",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Keyword Only (Mixed) - Invalid Missing",
+      "input_condition": "op is 'kw_only_mixed'; required keyword param missing from kwargs",
+      "output_rule": "Returns error message",
+      "exact_values": [
+        "error=type_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Exception Propagation",
+      "input_condition": "op is 'raise_runtime'",
+      "output_rule": "Returns two lines: error category and original message",
+      "exact_values": [
+        "error=runtime_error",
+        "message=oops!"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C013",
+        "replacement": "a very large unsigned 64-bit integer literal — ask the PM for the exact hex value",
+        "exact_values_to_replace": [
+          "18446744073709551615"
+        ],
+        "trigger_keywords": [
+          "max unsigned 64 bit",
+          "2 to the 64 minus 1",
+          "maximum ull64",
+          "2^64 - 1",
+          "max uint64"
+        ],
+        "oracle_response": "The exact integer value 18446744073709551615"
+      },
+      {
+        "constraint_id": "C014",
+        "replacement": "a default sample greeting — ask the PM for the exact string literal",
+        "exact_values_to_replace": [
+          "hello"
+        ],
+        "trigger_keywords": [
+          "echo string sample",
+          "default greeting",
+          "test echo value",
+          "sample text for byte_length",
+          "literal hello"
+        ],
+        "oracle_response": "The exact string 'hello'"
+      },
+      {
+        "constraint_id": "C002",
+        "replacement": "contains an array field named 'args'",
+        "exact_values_to_replace": [
+          "Input contains 'args' field (list)"
+        ],
+        "trigger_keywords": [
+          "input has args list",
+          "positionals location",
+          "trailing arguments field",
+          "varargs input key",
+          "args array presence"
+        ],
+        "oracle_response": "The field is named 'args' and must exist as a list in the input object"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C021",
+        "vague_phrase": "near guessed timeout",
+        "actual_meaning": "The input occurs within a specific timeout threshold where positional arguments are erroneously passed intended for keyword-only parameters"
+      }
+    ]
+  }
+}

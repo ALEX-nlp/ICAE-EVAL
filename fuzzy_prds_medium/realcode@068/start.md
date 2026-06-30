@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to build out that secret mount adapter thing we talked about last sprint. The basic idea is: drivers pass in a big messy parameter map and we need to make sense of it — pull out the connection stuff, the pod identity bits, the secret descriptors (those are in that weird YAML-ish inline format, same pattern as the old CSI objects spec). We also need to validate it properly and give back clean neutral error codes, not raw exception dumps.
+
+On top of that we need to handle the actual secret fetching — normalize the paths, pick the right HTTP method, encode body args when present. There's also a value extraction step where we pull a specific key out of the response, and it needs to handle both flat and nested response shapes.
+
+The caching behavior is important too — same provider instance should reuse what it already fetched, but a fresh instance should go back to the source. We also need to wire up the connection settings resolution (env vars, flags, mount params — same precedence order we used in the auth module last time) and a version metadata endpoint.
+
+Outputs should all be key=value lines except the version one which is JSON. File permissions need to come out as decimal. Please keep the core logic totally separate from the I/O layer, we've been burned by that before.
+
+One more pass on the details the team asked about. For file permissions, per-object values come in as octal on the object itself, so if a descriptor says something like 0600 we need to convert that before rendering it back out. The example to keep in mind is octal 0600 = decimal 384, and the output key for that is secret[N].file_permission_decimal. Separately, the top-level default_file_permission already comes in as decimal, so if it’s 420 = 0644 octal we just echo 420 as-is and don’t reconvert it.
+
+On the path side, every secret_path needs to end up normalized with a /v1/ prefix. If it already starts with v1/ or /v1/, leave it alone and don’t stack another prefix on top. Also, if there’s a query string on the incoming path, split that off and render it separately as path= and query= on their own key=value lines. If the input ends with a bare ? and nothing after it, that should become an empty query string, not dropped.
+
+For request tracing, we do want every outbound call captured in the output as request[N].method=, request[N].path=, request[N].query=, request[N].body=. The index is zero-based and follows the order requests were actually issued across all runs of the same provider instance. If a later run hits cache, it should not create extra request entries. If it’s a fresh provider instance, the trace starts back at 0.
+
+A couple behavior notes on response handling too. If a secret descriptor doesn’t include secret_key, then the file contents should be the entire raw API response object serialized as compact JSON. In that case the full response envelope needs to be there: request_id, lease_id, lease_duration, renewable, data, warnings, and warnings should be null when it isn’t present. If secret_key is provided, lookup should first check for a top-level data object and, if it exists, read the key from inside that nested data object. If there’s no data wrapper, then do the lookup at the top level. String values print as plain strings, while numbers, arrays, and objects should be compact JSON.
+
+Also confirming the method/body defaults: if a descriptor doesn’t specify a method, default to GET, and render that as method=GET. If it was explicitly set then it should come through as method=POST and so on. body encoding only happens when JSON arguments are present; otherwise body= stays empty.
+
+And just to be explicit on parsing, the objects mount param is a YAML string that starts with the leading - list marker and uses indented fields for secretPath, objectName, filePermission, secretKey, method, and secretArgs. Connection settings precedence is still runtime flags > environment variables > mount parameters, and that logic lives in resolve_connection_settings.

@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to get the XML toolkit shipped. The core idea is that devs can hand us a chunk of XML text and we do the right thing with it — parse it, poke around inside it, spit it back out nicely, that kind of thing. We also need the builder side so people can construct documents in code instead of concatenating strings like animals.
+
+A few things came up in the last review that I want to make sure we nail: the serializer needs to be 'canonical' in the same way we did the JSON normalizer last quarter — you know, clean up the unnecessary fluff in tags without breaking the actual content. The pretty-printer should handle mixed content at the top level gracefully, not just nested elements. And the entity/escaping stuff needs to support at least the basic XML names plus the HTML ones people always ask about — including the case-insensitive hex thing that tripped us up before.
+
+For errors, don't just throw a generic crash — we need position info so devs can actually debug their files. The query feature should let people filter by both name and namespace, and there's a wildcard mode that has to work correctly. Finally the builder ops need to cover declarations, processing instructions, comments, CDATA, text, elements, and attributes. Attribute quote style should be preserved throughout. Please make sure you check how the old escaping module handled the double-encoding edge case — same logic should apply here.

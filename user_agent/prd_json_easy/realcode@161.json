@@ -1,0 +1,480 @@
+{
+  "fuzzy_prd": "# Time-Based One-Time-Password Engine — TOTP Code Generation, Verification & Provisioning\n\n## Project Goal\n\nBuild a reusable two-factor authentication engine that turns a single shared secret into time-based one-time-password (TOTP) codes, verifies submitted codes within a configurable tolerance, enforces single-use, exports the secret as a standard provisioning URI for authenticator apps, and manages a set of single-use recovery codes — so developers can add second-factor login to an application without hand-rolling the cryptography or the wire formats.\n\n---\n\n## Background & Problem\n\nAdding a second authentication factor means implementing the TOTP standard correctly: deriving a time-step counter from the current time, computing an HMAC over that counter with the user's secret, truncating it to a short numeric code, and checking submitted codes against a small window of neighbouring time-steps to absorb clock drift — while making sure a code cannot be replayed. On top of that, the secret must be handed to an authenticator app in the exact `otpauth://` URI shape those apps expect, and a fallback set of recovery codes must be tracked so a user who loses their device can still get in.\n\nWithout a dedicated engine, every project re-implements this fiddly, security-sensitive logic and the precise output formats, which is repetitive and error-prone. With this engine, developers get one well-defined contract: feed in a secret and the moment in time, get back a code; submit a code with a tolerance window, get back accept/reject (with replay refused); ask for the provisioning URI or the grouped secret, and manage recovery codes — all as deterministic, inspectable outputs.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Generate A Time-Based Code For A Moment\n\n**As a developer**, I want to turn a shared secret and a point in time into a short numeric code, so the user's authenticator app and my server agree on the same code at the same moment.\n\n**Expected Behavior / Usage:**\n\nThe input supplies a Base32-encoded shared secret, the hash algorithm (`sha1`, `sha256`, `sha512`), the number of output digits, and the time-step length in seconds, together with a Unix timestamp (seconds since the epoch, in UTC) and an optional integer step `offset`. The engine derives the time-step counter by integer-dividing the timestamp by the step length, computes the HMAC of that counter (encoded as an 8-byte big-endian value) under the raw secret, applies the standard dynamic-truncation rule to extract a 31-bit integer, reduces it modulo ten-to-the-`digits`, and renders the result as a decimal string left-zero-padded to exactly `digits` characters. The `offset` shifts the counter by that many whole time-steps before generating (negative = earlier step, positive = later step), which is how a verifier inspects neighbouring steps; it defaults to 0. Any two timestamps inside the same time-step yield the same code. The output is the code as `code=<digits>` followed by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_generate_code.json`\n\n```json\n{\n    \"description\": \"Generate a time-based one-time-password (TOTP) code for an explicit moment in time. The engine is given a Base32-encoded shared secret, the number of output digits, the time-step length in seconds, and the hash algorithm. From a Unix timestamp (seconds since the epoch, UTC) it derives the current time-step counter, computes the HMAC of that counter under the secret, applies the standard dynamic-truncation rule, reduces the result modulo ten-to-the-digits, and renders it as a fixed-width zero-padded decimal string. An optional integer step offset shifts the counter by that many whole time-steps (negative for earlier steps, positive for later), which is how a verifier inspects neighbouring windows. Codes are stable across any timestamp that falls inside the same time-step.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"generate_code\", \"secret\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\", \"algorithm\": \"sha1\", \"digits\": 6, \"seconds\": 30, \"timestamp\": 1577910600, \"offset\": 0},\n            \"expected_output\": \"code=716347\\n\"\n        },\n        {\n            \"input\": {\"action\": \"generate_code\", \"secret\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\", \"algorithm\": \"sha1\", \"digits\": 6, \"seconds\": 30, \"timestamp\": 1577910600, \"offset\": -1},\n            \"expected_output\": \"code=779186\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Verify A Submitted Code\n\n**As a developer**, I want to check a code a user typed in, tolerating a little clock drift but refusing reused codes, so legitimate logins succeed while replay attempts fail.\n\n**Expected Behavior / Usage:**\n\n*2.1 Backward Tolerance Window — accept the current step and a bounded number of preceding steps*\n\nThe input supplies the same TOTP parameters plus a non-negative `window`, and a list of `checks`, each with a submitted `code` and the Unix timestamp `at` which the check occurs. A code is accepted when it equals the code of the time-step containing `at`, or the code of any of the `window` time-steps immediately before it; the window only looks backward, never forward. A `window` of 0 accepts only the exact current step's code. A positive `window` keeps a code generated for one step acceptable for that many later steps, but rejects it once `at` advances beyond the window, or precedes the step that produced the code. Each check is emitted on its own line as `code=<submitted> at=<timestamp> valid=<true|false>` followed by a newline, in input order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_validate_window.json`\n\n```json\n{\n    \"description\": \"Validate a candidate code against the shared secret at a given moment, tolerating a backward verification window. The engine accepts the same TOTP parameters plus a non-negative window size. For each check it is given the submitted code and the Unix timestamp at which the check happens. A code is accepted if it equals the code of the current time-step or of any of the preceding `window` time-steps (the window only looks backward, never forward), and rejected otherwise. With a window of zero, only the exact current time-step's code is accepted. With a positive window, a code generated for one step is still accepted for that many later steps but rejected once the moment advances beyond the window or precedes the step that produced it. Each check is reported on its own line echoing the submitted code, the timestamp, and whether it was accepted.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"validate_code\", \"secret\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\", \"algorithm\": \"sha1\", \"digits\": 6, \"seconds\": 30, \"window\": 1, \"checks\": [{\"code\": \"716347\", \"at\": 1577910600}]},\n            \"expected_output\": \"code=716347 at=1577910600 valid=true\\n\"\n        },\n        {\n            \"input\": {\"action\": \"validate_code\", \"secret\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\", \"algorithm\": \"sha1\", \"digits\": 6, \"seconds\": 30, \"window\": 1, \"checks\": [{\"code\": \"716347\", \"at\": 1577910660}]},\n            \"expected_output\": \"code=716347 at=1577910660 valid=false\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Single-Use Replay Protection — a code is accepted at most once*\n\nWhen several checks are processed against the same engine in one session, the engine remembers any code it just accepted (for the lifetime of the current step plus its window). Submitting the identical code again at the same moment is rejected even though it would otherwise still be time-valid. The first submission of a valid code yields `valid=true`; an immediate re-submission of the same code yields `valid=false`. Output follows the same per-check line format as 2.1.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_validate_single_use.json`\n\n```json\n{\n    \"description\": \"A code may only be accepted once: replay must be rejected. Within a single validation session the engine remembers every code it has just accepted for the duration of the current step (plus its window), so submitting the very same code a second time at the same moment is refused even though the code is otherwise still time-valid. The checks in a case are processed in order against the same engine instance so the remembered state carries across them. The first submission of a valid code is accepted; an immediate re-submission of the identical code is rejected.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"validate_code\", \"secret\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\", \"algorithm\": \"sha1\", \"digits\": 6, \"seconds\": 30, \"window\": 0, \"checks\": [{\"code\": \"716347\", \"at\": 1577910600}, {\"code\": \"716347\", \"at\": 1577910600}]},\n            \"expected_output\": \"code=716347 at=1577910600 valid=true\\ncode=716347 at=1577910600 valid=false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Export A Provisioning URI\n\n**As a developer**, I want to hand the secret to an authenticator app in the exact URI shape it expects, so the user can set up their second factor by scanning or pasting a single string.\n\n**Expected Behavior / Usage:**\n\nThe input supplies the Base32 secret, a `label` of the form `issuer:account`, the hash algorithm and the digit count. The engine emits a URI with scheme `otpauth` and type `totp` whose path segment is the percent-encoded label, followed by a query string carrying, in this order: `issuer` (the part of the label before the first colon), `label` (the full label), `secret` (verbatim), `algorithm` (upper-cased), and `digits`. Query values are encoded per RFC 3986, so `:` becomes `%3A` and `@` becomes `%40`. The output is the URI followed by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_provisioning_uri.json`\n\n```json\n{\n    \"description\": \"Serialize the shared secret into a standard otpauth provisioning URI that authenticator apps can import. The engine is given the Base32 secret, a label of the form `issuer:account`, the hash algorithm and the digit count. It emits a URI of scheme `otpauth`, type `totp`, whose path segment is the percent-encoded label, followed by a query string carrying the issuer (the portion of the label before the first colon), the full label, the secret verbatim, the upper-cased algorithm name, and the digit count. Query values are encoded per RFC 3986 (so `:` becomes `%3A` and `@` becomes `%40`), and the query parameter order is issuer, label, secret, algorithm, digits.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"uri\", \"secret\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\", \"label\": \"quz:test@foo.com\", \"algorithm\": \"sha256\", \"digits\": 14},\n            \"expected_output\": \"[a pre-generated OTPAUTH URI string — requires checking the secret key configuration]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Present The Shared Secret As Text\n\n**As a developer**, I want both the raw secret and a human-readable grouped form, so I can store the secret and also show it to users who type it in manually.\n\n**Expected Behavior / Usage:**\n\n*4.1 Raw Secret — the secret verbatim*\n\nThe string form of the secret is exactly the Base32 secret the engine holds, unchanged, followed by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_secret_raw.json`\n\n```json\n{\n    \"description\": \"Expose the shared secret as its plain string form. The engine's string representation of the secret is exactly the Base32 secret it holds, with no separators, prefixes, or transformation.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"secret_raw\", \"secret\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\"},\n            \"expected_output\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\\n\"\n        }\n    ]\n}\n```\n\n*4.2 Grouped Secret — four-character chunks for manual entry*\n\nThe secret is split into chunks of four characters joined by a single space, with no trailing space after the last chunk, followed by a newline. Characters are otherwise unchanged.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_secret_grouped.json`\n\n```json\n{\n    \"description\": \"Render the shared secret as a human-friendly grouped string for manual entry. The secret is split into chunks of four characters separated by a single space, with no trailing space after the final chunk. The characters are otherwise unchanged.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"secret_grouped\", \"secret\": \"KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\"},\n            \"expected_output\": \"KS72 XBTN 5PEB GX2I WBMV W44L XHPA Q7L3\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Manage Recovery Codes\n\n**As a developer**, I want to issue fallback recovery codes and spend them one at a time, so a user who loses their authenticator can still log in, and each code only works once.\n\n**Expected Behavior / Usage:**\n\n*5.1 Generate A Batch — a fixed number of fresh, unused codes of a fixed length*\n\nGiven a requested `amount` and per-code `length`, the engine produces exactly `amount` codes, each exactly `length` characters long, all initially unused. The concrete code values are random and are NOT part of the contract; the deterministic, observable facts are the batch size, the (uniform) code length, and that every code starts unused. The output reports `count=<amount>`, `length=<length>` (the uniform length, or -1 if codes differ in length), and `unused=<count of unused codes>`, each on its own line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_generate_recovery.json`\n\n```json\n{\n    \"description\": \"Generate a fresh batch of single-use recovery codes. Given a requested amount and a per-code character length, the engine produces exactly that many codes, each exactly that many characters long, and all initially unused. The code values themselves are random (not part of the contract); the observable, deterministic facts are the batch size, the uniform code length, and that every code starts unused. The output reports the total count, the uniform code length, and the number of unused codes.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"generate_recovery\", \"amount\": 10, \"length\": 8},\n            \"expected_output\": \"count=10\\nlength=8\\nunused=10\\n\"\n        }\n    ]\n}\n```\n\n*5.2 Consume Codes — spend a code at most once and report what remains*\n\nThe engine holds a list of recovery entries, each with a `code` value and a `used_at` marker (`null` when still available). For each value in `consume`, the engine marks the first matching still-unused entry as used and reports `success=true`; if no matching unused entry exists (the value is unknown, or its only match is already used) it reports `success=false` and changes nothing. After all consumption attempts it reports `unused=<count of entries still unused>` and `contains_unused=<true|false>` (whether any unused entry remains). An absent (`null`) or empty set has zero unused entries. Output is one `consume=<value> success=<bool>` line per attempt (in order), then the `unused` line, then the `contains_unused` line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_recovery_codes.json`\n\n```json\n{\n    \"description\": \"Consume recovery codes from a stored set and report what remains. The engine holds a list of recovery entries, each with a code value and a used marker (null when still available). Consuming a code marks the first matching still-unused entry as used and reports success; consuming a code that does not exist, or one whose only matching entry is already used, reports failure and changes nothing. After processing all consumption attempts, the engine reports how many entries remain unused and whether any unused entry still exists. An empty or absent set has no unused entries.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"consume_recovery\", \"recovery_codes\": [{\"code\": \"AAA\", \"used_at\": null}, {\"code\": \"BBB\", \"used_at\": null}, {\"code\": \"CCC\", \"used_at\": null}], \"consume\": [\"AAA\", \"AAA\", \"ZZZ\"]},\n            \"expected_output\": \"[a deterministic consume result set based on an admin-provided recovery code list]\\nconsume=AAA success=false\\nconsume=ZZZ success=false\\n[a deterministic consume result set based on an admin-provided recovery code list]\\n[a deterministic consume result set based on an admin-provided recovery code list]\\n\"\n        },\n        {\n            \"input\": {\"action\": \"consume_recovery\", \"recovery_codes\": null, \"consume\": []},\n            \"expected_output\": \"unused=0\\ncontains_unused=false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the TOTP code generation, verification (with backward tolerance window and single-use replay protection), provisioning-URI export, secret text formatting, and recovery-code management described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint. The core logic must be decoupled from standard I/O and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON command from stdin, selects behavior by the `action` field (`generate_code`, `validate_code`, `uri`, `secret_raw`, `secret_grouped`, `generate_recovery`, `consume_recovery`), invokes the appropriate core logic, and prints the raw result to stdout, matching the per-feature contracts above. Timestamps are Unix seconds in UTC; codes are zero-padded to the requested digit count; the verification window looks only backward.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- keep using standard URI encoding rules like in REST spec versions\n",
+  "oracle_data": {
+    "task_id": "Laragear__TwoFactor-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "exact URI output",
+          "OTPAUTH URI format",
+          "complete URI string",
+          "issuer label secret format",
+          "verified OTP URI"
+        ],
+        "oracle_response": "The output is the string 'otpauth://totp/quz%3Atest%40foo.com?issuer=quz&label=quz%3Atest%40foo.com&secret=KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3&algorithm=SHA256&digits=14' followed by a newline."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "AAA consumption result",
+          "specific code AA-A success",
+          "unused count after AAA",
+          "contains unused flag state",
+          "simulate valid recovery consumption"
+        ],
+        "oracle_response": "Output lines are: 'consume=AAA success=true', a set of lines for other items, 'unused=2', and 'contains_unused=true', all followed by newlines."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "keep using standard URI encoding rules like in REST spec versions",
+        "actual_meaning": "The output should encode ':' as '%3A' and '@' as '%40' per RFC 3986, replacing only unsafe characters in the label."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_generate_code.json": {
+      "description": "Generate a time-based one-time-password (TOTP) code for an explicit moment in time. The engine is given a Base32-encoded shared secret, the number of output digits, the time-step length in seconds, and the hash algorithm. From a Unix timestamp (seconds since the epoch, UTC) it derives the current time-step counter, computes the HMAC of that counter under the secret, applies the standard dynamic-truncation rule, reduces the result modulo ten-to-the-digits, and renders it as a fixed-width zero-padded decimal string. An optional integer step offset shifts the counter by that many whole time-steps (negative for earlier steps, positive for later), which is how a verifier inspects neighbouring windows. Codes are stable across any timestamp that falls inside the same time-step.",
+      "cases": [
+        {
+          "input": {
+            "action": "generate_code",
+            "secret": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3",
+            "algorithm": "sha1",
+            "digits": 6,
+            "seconds": 30,
+            "timestamp": 1577910600,
+            "offset": 0
+          },
+          "expected_output": "code=716347\n"
+        },
+        {
+          "input": {
+            "action": "generate_code",
+            "secret": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3",
+            "algorithm": "sha1",
+            "digits": 6,
+            "seconds": 30,
+            "timestamp": 1577910600,
+            "offset": -1
+          },
+          "expected_output": "code=779186\n"
+        }
+      ]
+    },
+    "feature2_1_validate_window.json": {
+      "description": "Validate a candidate code against the shared secret at a given moment, tolerating a backward verification window. The engine accepts the same TOTP parameters plus a non-negative window size. For each check it is given the submitted code and the Unix timestamp at which the check happens. A code is accepted if it equals the code of the current time-step or of any of the preceding `window` time-steps (the window only looks backward, never forward), and rejected otherwise. With a window of zero, only the exact current time-step's code is accepted. With a positive window, a code generated for one step is still accepted for that many later steps but rejected once the moment advances beyond the window or precedes the step that produced it. Each check is reported on its own line echoing the submitted code, the timestamp, and whether it was accepted.",
+      "cases": [
+        {
+          "input": {
+            "action": "validate_code",
+            "secret": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3",
+            "algorithm": "sha1",
+            "digits": 6,
+            "seconds": 30,
+            "window": 1,
+            "checks": [
+              {
+                "code": "716347",
+                "at": 1577910600
+              }
+            ]
+          },
+          "expected_output": "code=716347 at=1577910600 valid=true\n"
+        },
+        {
+          "input": {
+            "action": "validate_code",
+            "secret": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3",
+            "algorithm": "sha1",
+            "digits": 6,
+            "seconds": 30,
+            "window": 1,
+            "checks": [
+              {
+                "code": "716347",
+                "at": 1577910660
+              }
+            ]
+          },
+          "expected_output": "code=716347 at=1577910660 valid=false\n"
+        }
+      ]
+    },
+    "feature2_2_validate_single_use.json": {
+      "description": "A code may only be accepted once: replay must be rejected. Within a single validation session the engine remembers every code it has just accepted for the duration of the current step (plus its window), so submitting the very same code a second time at the same moment is refused even though the code is otherwise still time-valid. The checks in a case are processed in order against the same engine instance so the remembered state carries across them. The first submission of a valid code is accepted; an immediate re-submission of the identical code is rejected.",
+      "cases": [
+        {
+          "input": {
+            "action": "validate_code",
+            "secret": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3",
+            "algorithm": "sha1",
+            "digits": 6,
+            "seconds": 30,
+            "window": 0,
+            "checks": [
+              {
+                "code": "716347",
+                "at": 1577910600
+              },
+              {
+                "code": "716347",
+                "at": 1577910600
+              }
+            ]
+          },
+          "expected_output": "code=716347 at=1577910600 valid=true\ncode=716347 at=1577910600 valid=false\n"
+        }
+      ]
+    },
+    "feature3_provisioning_uri.json": {
+      "description": "Serialize the shared secret into a standard otpauth provisioning URI that authenticator apps can import. The engine is given the Base32 secret, a label of the form `issuer:account`, the hash algorithm and the digit count. It emits a URI of scheme `otpauth`, type `totp`, whose path segment is the percent-encoded label, followed by a query string carrying the issuer (the portion of the label before the first colon), the full label, the secret verbatim, the upper-cased algorithm name, and the digit count. Query values are encoded per RFC 3986 (so `:` becomes `%3A` and `@` becomes `%40`), and the query parameter order is issuer, label, secret, algorithm, digits.",
+      "cases": [
+        {
+          "input": {
+            "action": "uri",
+            "secret": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3",
+            "label": "quz:test@foo.com",
+            "algorithm": "sha256",
+            "digits": 14
+          },
+          "expected_output": "otpauth://totp/quz%3Atest%40foo.com?issuer=quz&label=quz%3Atest%40foo.com&secret=KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3&algorithm=SHA256&digits=14\n"
+        }
+      ]
+    },
+    "feature4_1_secret_raw.json": {
+      "description": "Expose the shared secret as its plain string form. The engine's string representation of the secret is exactly the Base32 secret it holds, with no separators, prefixes, or transformation.",
+      "cases": [
+        {
+          "input": {
+            "action": "secret_raw",
+            "secret": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3"
+          },
+          "expected_output": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3\n"
+        }
+      ]
+    },
+    "feature4_2_secret_grouped.json": {
+      "description": "Render the shared secret as a human-friendly grouped string for manual entry. The secret is split into chunks of four characters separated by a single space, with no trailing space after the final chunk. The characters are otherwise unchanged.",
+      "cases": [
+        {
+          "input": {
+            "action": "secret_grouped",
+            "secret": "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3"
+          },
+          "expected_output": "KS72 XBTN 5PEB GX2I WBMV W44L XHPA Q7L3\n"
+        }
+      ]
+    },
+    "feature5_1_generate_recovery.json": {
+      "description": "Generate a fresh batch of single-use recovery codes. Given a requested amount and a per-code character length, the engine produces exactly that many codes, each exactly that many characters long, and all initially unused. The code values themselves are random (not part of the contract); the observable, deterministic facts are the batch size, the uniform code length, and that every code starts unused. The output reports the total count, the uniform code length, and the number of unused codes.",
+      "cases": [
+        {
+          "input": {
+            "action": "generate_recovery",
+            "amount": 10,
+            "length": 8
+          },
+          "expected_output": "count=10\nlength=8\nunused=10\n"
+        }
+      ]
+    },
+    "feature5_2_recovery_codes.json": {
+      "description": "Consume recovery codes from a stored set and report what remains. The engine holds a list of recovery entries, each with a code value and a used marker (null when still available). Consuming a code marks the first matching still-unused entry as used and reports success; consuming a code that does not exist, or one whose only matching entry is already used, reports failure and changes nothing. After processing all consumption attempts, the engine reports how many entries remain unused and whether any unused entry still exists. An empty or absent set has no unused entries.",
+      "cases": [
+        {
+          "input": {
+            "action": "consume_recovery",
+            "recovery_codes": [
+              {
+                "code": "AAA",
+                "used_at": null
+              },
+              {
+                "code": "BBB",
+                "used_at": null
+              },
+              {
+                "code": "CCC",
+                "used_at": null
+              }
+            ],
+            "consume": [
+              "AAA",
+              "AAA",
+              "ZZZ"
+            ]
+          },
+          "expected_output": "consume=AAA success=true\nconsume=AAA success=false\nconsume=ZZZ success=false\nunused=2\ncontains_unused=true\n"
+        },
+        {
+          "input": {
+            "action": "consume_recovery",
+            "recovery_codes": null,
+            "consume": []
+          },
+          "expected_output": "unused=0\ncontains_unused=false\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "action_generate_code",
+      "input_condition": "input.action == 'generate_code'",
+      "output_rule": "Output must be exactly `code=<value>` followed by newline",
+      "exact_values": [
+        "code=716347",
+        "code=779186"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "action_validate_code",
+      "input_condition": "input.action == 'validate_code'",
+      "output_rule": "Output one line per check in `checks` array: `code=<submitted_code> at=<timestamp> valid=<true|false>` followed by newline",
+      "exact_values": [
+        "valid=true",
+        "valid=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "action_validate_code",
+      "input_condition": "input.action == 'validate_code' AND checks are processed sequentially",
+      "output_rule": "Replay protection: The first use of a specific code instance within the validation session is valid; any subsequent attempt to use the exact same instance yields valid=false",
+      "exact_values": [
+        "valid=true",
+        "valid=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "action_validate_code",
+      "input_condition": "input.action == 'validate_code' AND multiple checks provided",
+      "output_rule": "Verification window: A code is valid if submitted_at falls within the current time-step OR any of the `window` preceding time-steps. The window strictly looks backward.",
+      "exact_values": [
+        "valid=true",
+        "valid=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "action_uri",
+      "input_condition": "input.action == 'uri'",
+      "output_rule": "Output the OTPAUTH URI followed by newline: `otpauth://totp/<urlencoded_label>?issuer=<issuer>&label=<urlencoded_label>&secret=<secret>&algorithm=<algorithm_upper>&digits=<digits>`",
+      "exact_values": [
+        "otpauth://totp/quz%3Atest%40foo.com?issuer=quz&label=quz%3Atest%40foo.com&secret=KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3&algorithm=SHA256&digits=14"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "action_uri",
+      "input_condition": "input.action == 'uri' AND label contains special characters",
+      "output_rule": "RFC 3986 URL encoding: `:` becomes `%3A` and `@` becomes `%40` (and all other non-safe characters)",
+      "exact_values": [
+        "%3A",
+        "%40"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "action_secret_raw",
+      "input_condition": "input.action == 'secret_raw'",
+      "output_rule": "Output the Base32 secret string exactly as provided, followed by a newline",
+      "exact_values": [
+        "KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "action_secret_grouped",
+      "input_condition": "input.action == 'secret_grouped'",
+      "output_rule": "Split secret into chunks of 4 characters. Join chunks with a single space. No trailing space after the final chunk. Followed by newline.",
+      "exact_values": [
+        "KS72 XBTN 5PEB GX2I WBMV W44L XHPA Q7L3"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "action_generate_recovery",
+      "input_condition": "input.action == 'generate_recovery'",
+      "output_rule": "Output 3 lines: `count=<amount>`, `length=<length>`, `unused=<amount>`. Codes are random/unpredictable but fixed for the request.",
+      "exact_values": [
+        "count=10",
+        "length=8",
+        "unused=10"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "action_consume_recovery",
+      "input_condition": "input.action == 'consume_recovery'",
+      "output_rule": "Line 1 for each `consume` value: `consume=<value> success=<true|false>`. Ends with `unused=<count>` and `contains_unused=<true|false>`.",
+      "exact_values": [
+        "consume=AAA success=true",
+        "unused=2",
+        "contains_unused=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "action_consume_recovery",
+      "input_condition": "input.action == 'consume_recovery' AND consuming a non-existent code",
+      "output_rule": "success is `false`. State (unused count) does not change or decrease because the entry was not found to consume.",
+      "exact_values": [
+        "consume=ZZZ success=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "action_consume_recovery",
+      "input_condition": "input.action == 'consume_recovery' AND consuming an already used code",
+      "output_rule": "success is `false`. State remains unchanged.",
+      "exact_values": [
+        "consume=AAA success=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "action_consume_recovery",
+      "input_condition": "input.recovery_codes is null or empty AND consume is empty",
+      "output_rule": "Output `unused=0` followed by `contains_unused=false`",
+      "exact_values": [
+        "unused=0",
+        "contains_unused=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "action_generate_recovery",
+      "input_condition": "input.action == 'generate_recovery' AND length is variable",
+      "output_rule": "If codes have different lengths, `length` is `-1`.",
+      "exact_values": [
+        "length=-1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "action_consume_recovery",
+      "input_condition": "input.action == 'consume_recovery' AND recovery_codes exists",
+      "output_rule": "Order of output lines must match the order of items in the `consume` array.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "action_validate_code_window",
+      "input_condition": "input.action == 'validate_code' AND multiple time-steps across lines",
+      "output_rule": "Clock drift tolerance allows accepting a code for `window` steps past the generation time, but rejects if the current attempt is for a step before the generation code was generated.",
+      "exact_values": [
+        "valid=true",
+        "valid=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "action_generate_code_offset",
+      "input_condition": "input.action == 'generate_code' AND offset != 0",
+      "output_rule": "Offset shifts the time-step counter. `offset=-1` yields the code for the previous time-step relative to `timestamp`.",
+      "exact_values": [
+        "code=779186"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "action_uri_encoding",
+      "input_condition": "label contains ':'",
+      "output_rule": "Full label (`quz:test@foo.com`) is URL encoded in the URI path segment.",
+      "exact_values": [
+        "label=quz%3Atest%40foo.com"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "action_uri_encoding",
+      "input_condition": "label contains '@'",
+      "output_rule": "Label is URL encoded in the URI path segment.",
+      "exact_values": [
+        "test%40foo.com"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "action_generate_code_hashing",
+      "input_condition": "input.algorithm is one of sha1, sha256, sha512",
+      "output_rule": "HMAC computation uses the specified algorithm. sha1, sha256, sha512 must be used exactly as provided (case-insensitive handling implied by stdlib, but output logic relies on raw bytes).",
+      "exact_values": [
+        "sha1",
+        "sha256",
+        "sha512"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C005",
+        "replacement": "a pre-generated OTPAUTH URI string — requires checking the secret key configuration",
+        "exact_values_to_replace": [
+          "otpauth://totp/quz%3Atest%40foo.com?issuer=quz&label=quz%3Atest%40foo.com&secret=KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3&algorithm=SHA256&digits=14"
+        ],
+        "trigger_keywords": [
+          "exact URI output",
+          "OTPAUTH URI format",
+          "complete URI string",
+          "issuer label secret format",
+          "verified OTP URI"
+        ],
+        "oracle_response": "The output is the string 'otpauth://totp/quz%3Atest%40foo.com?issuer=quz&label=quz%3Atest%40foo.com&secret=KS72XBTN5PEBGX2IWBMVW44LXHPAQ7L3&algorithm=SHA256&digits=14' followed by a newline."
+      },
+      {
+        "constraint_id": "C010",
+        "replacement": "a deterministic consume result set based on an admin-provided recovery code list",
+        "exact_values_to_replace": [
+          "consume=AAA success=true",
+          "unused=2",
+          "contains_unused=true"
+        ],
+        "trigger_keywords": [
+          "AAA consumption result",
+          "specific code AA-A success",
+          "unused count after AAA",
+          "contains unused flag state",
+          "simulate valid recovery consumption"
+        ],
+        "oracle_response": "Output lines are: 'consume=AAA success=true', a set of lines for other items, 'unused=2', and 'contains_unused=true', all followed by newlines."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C006",
+        "vague_phrase": "keep using standard URI encoding rules like in REST spec versions",
+        "actual_meaning": "The output should encode ':' as '%3A' and '@' as '%40' per RFC 3986, replacing only unsafe characters in the label."
+      }
+    ]
+  }
+}

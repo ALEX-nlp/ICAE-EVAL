@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+hey team, we need to get the tokenized research project registry service shipped. basically the idea is researchers can register their IP-backed projects and get a full workspace spun up automatically — like accounts, a place to store files with versioning, and a feed for updates/announcements. all through one API surface so devs don't have to wire everything together themselves.
+
+the tricky parts we keep forgetting to spec out properly: when two teams try to register the same project (or reuse a symbol someone else already claimed), we need to handle that gracefully — not just blow up. also the enable/disable flow from that lifecycle module we built before should behave the same way here (you know, the idempotency stuff and the different error messages depending on whether the project ever existed vs just currently inactive).
+
+for files, people need to upload with all the metadata — the encryption stuff, categories, tags, access levels, etc — and get proper versioning automatically. announcements need to validate that any attached files actually exist before accepting the post.
+
+the code needs to be properly structured, not one giant file. separate the API layer, domain logic, storage abstractions. think about what happens when someone queries a project that's been disabled vs one that never existed — those should feel different to the caller.
+
+check how we handled the conflict resolution and not-found vs no-history distinction in the existing login/account module for reference.
+
+one more pass on the details the team asked for. for symbol handling, the ipnftSymbol is always normalized to lowercase both for storage and for the account name derivation. so if someone submits 'VITAFAST', that means ipnftSymbol gets stored as 'vitafast' and the account name becomes 'molecule.vitafast'. the account name format is always 'molecule.' + lowercased symbol.
+
+also on createProject conflicts, this should not come back as a top-level GraphQL error. if someone tries an already-registered ipnftUid or an already-used symbol, we return a typed result inside data with __typename 'CreateProjectErrorConflict', isSuccess: false, and a message in this exact shape: 'Conflict with existing project <lowercased-symbol> (<ipnftUid>)'. in that case the catalog is left unchanged.
+
+on setup behavior, if the input includes 'create_projects_dataset: true', we provision the empty project catalog dataset before any operations run. if that flag is omitted, the catalog gets auto-created on the first createProject mutation call instead. and if somebody queries projects before any createProject on a pre-created catalog, that should just return an empty nodes array.
+
+for lifecycle behavior, the error split is intentional and needs to stay exact. disableProject on an unknown uid returns a top-level GraphQL error 'Project <uid> not found' with null data. enableProject on a uid that has never existed returns a top-level GraphQL error 'No historical entries for project <uid>' with null data. that difference matters: disable uses 'not found', enable uses 'no historical entries'. also, disabling is NOT idempotent. if you call disableProject a second time on an already-disabled project, it returns a top-level GraphQL error 'Project <uid> not found' with null data, because a disabled project is no longer visible/findable. enabling goes the other way and IS idempotent, so enabling an already-enabled project succeeds.
+
+last thing, structure still matters here. this must NOT be a single file. at minimum we want a GraphQL/API surface layer, core domain use-case modules for provisioning, lifecycle, data room, announcements, and versioned-storage abstractions. the stdin/stdout adapter is separate from the core domain. this is the same overall pattern we called out for a production-grade repository structure, and it matches the split where createProject uses the CreateProjectErrorConflict typed-result pattern while disableProject/enableProject use top-level GraphQL errors with null data for not-found and no historical entries cases.

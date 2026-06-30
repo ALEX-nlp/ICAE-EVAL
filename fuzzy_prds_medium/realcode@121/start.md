@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need to get the Dart scaffold generator wrapped up. Users keep complaining that setting up new Dart projects is super tedious — they're manually copying boilerplate, forgetting pubspec fields, mixing up package names when their folder has hyphens or dots in it, that kind of thing. The goal is a tool that takes a template choice + some basic project info and spits out a ready-to-go folder structure.
+
+We already have the template catalog defined somewhere in the codebase (similar to what we did for the package registry listing last quarter — check how we sorted and formatted that). The CLI needs to handle the usual flags, including a machine-readable mode for tooling integrations. When someone passes a bad template name, we should fail gracefully with a neutral error — no raw stack traces leaking out.
+
+One thing I keep forgetting to write down: the description fields in the generated pubspec need some kind of line-wrapping treatment so they don't blow past the readable width. There's also a placeholder system for file content templating — make sure invalid variable names are caught cleanly without exposing internals.
+
+The test harness should live under rcb_tests/ and run with a single bash command. Output files go into a stdout subdirectory. Please make sure the architecture doesn't end up as one giant file — last time we did something like this it became unmaintainable fast.
+
+One other detail to lock down on naming since folks asked: hyphens and spaces in the directory name are converted to underscores. Also, if the name contains a period, everything from the first period onward is stripped. So for example, 'foo.dart' becomes 'foo', and 'foo-bar' becomes 'foo_bar'. That same “be predictable, don’t get clever” rule applies to placeholders too: placeholder keys must contain ASCII letters only. Any key containing whitespace, digits, underscores, or symbols is considered invalid, and when that happens the adapter should output 'error=invalid_placeholder_key' followed by 'key=<offending key>' and stop there, without exposing any host-language exception details.
+
+Also confirming a couple fixed values so nobody wires them up as dynamic by accident: all generated pubspec.yaml files use version=0.0.1 and the SDK constraint '>=1.20.1 <2.0.0'. Those are stable defaults, not derived from whatever the caller passes in. And for placeholder replacement, no recursive behavior here — replacement values are substituted once and never expanded again. So if 'bar' maps to '__baz__' and 'baz' maps to 'foo', the output stays '__baz__', not 'foo'.
+
+For the description wrapping in pubspec, the YAML block text formatter wraps at a standard width of 73 characters, and each wrapped line is prefixed with two spaces for YAML block indentation. The test case everyone kept referencing is still the right mental model: 'one two three four five size seven eight nine ten eleven twelve thirteen' fits on one line at 73 chars.
+
+And on the catalog side, there are exactly 7 templates, sorted alphabetically by selector: console-full, console-simple, package-simple, server-shelf, web-angular, web-angular-simple, web-simple. Each one has a label, description, entrypoint path, and install instruction, and when install has multiple steps it uses ' | ' as the separator. In feature5_template_catalog.json, the output is the same sorted order by selector string, with template_count=7 first, then the per-template lines emitted as template=, label=, description=, entrypoint=, install=.

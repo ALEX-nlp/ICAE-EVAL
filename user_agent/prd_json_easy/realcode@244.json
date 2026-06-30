@@ -1,0 +1,1352 @@
+{
+  "fuzzy_prd": "# Secret Sidecar Injection Configuration Engine\n\n## Project Goal\n\nBuild a configuration engine that powers an admission-time \"sidecar injection\"\nworkflow for containerized workloads. Given a workload's declarative\nannotations and a small amount of cluster context, the engine must decide\nwhether a secret-delivery helper container should be attached, compute every\ndefaulted setting that container needs, render its runtime configuration\ndocument, and ultimately produce the ordered set of patch operations that an\nadmission controller applies to the workload.\n\nThe engine is exercised through a single command-line program that speaks a\nsimple **JSON-in / JSON-out** protocol:\n\n* It reads exactly one JSON object from standard input.\n* The object always carries an `op` field selecting the operation, plus\n  operation-specific fields.\n* It writes exactly one compact JSON object (keys sorted alphabetically)\n  followed by a trailing newline to standard output.\n* All error conditions are reported as **neutral, language-independent\n  category strings** inside the JSON result — never as runtime stack traces or\n  process crashes.\n\nThis program is the deliverable that the test-suite drives. Every feature below\nis one `op`.\n\n## Background & Problem\n\nIn a Kubernetes-style platform, application pods often need short-lived secrets\ndelivered to them at runtime without baking credentials into images. A common\npattern is to attach a small helper (\"agent\") container that authenticates to a\nsecrets server, fetches secrets, renders them onto a shared volume, and keeps\nthem refreshed. Wiring this up by hand for every workload is error-prone, so the\nplatform performs it automatically at admission time, driven entirely by\nannotations on the workload.\n\nThe hard part is not the attachment itself but the **large surface of\nconfiguration defaulting and validation rules** that sit behind it:\n\n* Operators supply only a handful of annotations; the engine must fill in dozens\n  of defaults (image, resource requests/limits, run-as identity, cache\n  behavior, secret mount paths, logging, etc.).\n* Many annotations interact (an inline template overrides a template file; a\n  per-secret file override changes a render destination; a \"run as same user\"\n  flag depends on the application container's declared identity).\n* Some inputs are invalid and must be rejected with a clear, stable reason\n  rather than a crash.\n* The final admission decision is an ordered list of patch operations whose\n  shape depends on which features are active.\n\nThis project isolates that decision/defaulting/rendering logic so it can be\nspecified precisely and tested deterministically, independent of any live\ncluster.\n\n## Architecture & Engineering Constraints\n\n* **Single entry program, stdin→stdout.** One request object per invocation.\n  The first thing the program inspects is the `op` string; it dispatches to the\n  matching operation and prints one JSON line.\n* **Deterministic output.** Object keys in the emitted JSON are sorted\n  alphabetically so output is byte-stable across runs. A trailing newline is\n  always emitted.\n* **Neutral error model.** Failures are surfaced as `{\"status\":\"error\", ...}`\n  (or `{\"status\":\"denied\", ...}` for the admission operation) carrying a stable\n  category string such as `missing_address`, `invalid_quantity`,\n  `unknown_log_level`, `not_allowed`, `system_namespace`,\n  `invalid_default_template`. No language/runtime exception text may appear.\n* **Annotation contract.** Workload configuration arrives as a string→string\n  map under an annotation prefix (`vault.hashicorp.com/...`). These literal keys\n  are part of the data contract and must be matched exactly.\n* **No hidden state.** Every operation is a pure function of its request object;\n  there is no filesystem, network, or clock dependency in the observable\n  contract.\n* **Defaults are fixed and observable.** Built-in defaults (e.g. default agent\n  image `vault:1.7.0`, default run-as user `100`, group `1000`, secret volume\n  path `/vault/secrets`, cache listener port `8200`, CPU/memory requests and\n  limits) must be reproduced exactly, since they appear in output.\n\n### Request envelope\n\nEvery request is a JSON object with at least `{\"op\": \"<operation>\"}`. The\nremaining fields depend on the operation, as specified per feature. The response\nis always a single JSON object; on success it contains `\"status\":\"ok\"`, on\nfailure `\"status\":\"error\"` (or `\"status\":\"denied\"`).\n\n## Core Features\n\n### Feature 1: Log-level resolution\n\nResolve a human-supplied log-level label to a canonical severity. Matching is\ncase-insensitive and surrounding whitespace is ignored. Recognized labels:\n`trace`, `debug`, `info`, `warn` (alias `warning`), `error` (alias `err`), and\n`notice` (treated as `info`). An empty or whitespace-only label defaults to\n`info`. Any unrecognized label yields the `unknown_log_level` category.\n\nRequest: `{\"op\":\"log_level\",\"level\":<string>}`\n\n```json\n[\n  {\"input\": {\"level\": \" INFO \", \"op\": \"log_level\"}, \"expected_output\": \"{\\\"level\\\":\\\"info\\\",\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"level\": \"notice\", \"op\": \"log_level\"}, \"expected_output\": \"{\\\"level\\\":\\\"info\\\",\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"level\": \"trace\", \"op\": \"log_level\"}, \"expected_output\": \"{\\\"level\\\":\\\"trace\\\",\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"level\": \"warn\", \"op\": \"log_level\"}, \"expected_output\": \"{\\\"level\\\":\\\"warn\\\",\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"level\": \"warning\", \"op\": \"log_level\"}, \"expected_output\": \"{\\\"level\\\":\\\"warn\\\",\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"level\": \"error\", \"op\": \"log_level\"}, \"expected_output\": \"{\\\"level\\\":\\\"error\\\",\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"level\": \"junk\", \"op\": \"log_level\"}, \"expected_output\": \"{\\\"error\\\":\\\"unknown_log_level\\\",\\\"status\\\":\\\"error\\\"}\\n\"}\n]\n```\n\n### Feature 2: Injection decision\n\nDecide whether a workload should have the secret-agent sidecar injected, based\non two annotations: an inject flag and an injection-status marker. Injection\nhappens only when the flag is truthy AND the status is empty or the literal\n`update`. A status of `injected` means it was already processed and injection is\nskipped regardless of the flag.\n\nRequest: `{\"op\":\"should_inject\",\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-status\": \"\", \"vault.hashicorp.com/agent-inject\": \"true\"}, \"op\": \"should_inject\"}, \"expected_output\": \"{\\\"inject\\\":true,\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-status\": \"\", \"vault.hashicorp.com/agent-inject\": \"false\"}, \"op\": \"should_inject\"}, \"expected_output\": \"{\\\"inject\\\":false,\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-status\": \"injected\", \"vault.hashicorp.com/agent-inject\": \"true\"}, \"op\": \"should_inject\"}, \"expected_output\": \"{\\\"inject\\\":false,\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-status\": \"update\", \"vault.hashicorp.com/agent-inject\": \"true\"}, \"op\": \"should_inject\"}, \"expected_output\": \"{\\\"inject\\\":true,\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 3: Agent configuration validation\n\nValidate an assembled agent configuration and report the first missing required\nfield as a neutral category, or success when complete. Validity can be satisfied\ntwo ways: a config-map based agent (namespace, service account name+path, image)\nOR a server-backed agent (the same fields plus server role, address, auth path,\nand auth type). Missing fields map to: `missing_namespace`,\n`missing_service_account`, `missing_image`, `missing_role`, `missing_address`,\n`missing_auth_path`, `missing_auth_type`.\n\nRequest: `{\"op\":\"validate\",\"agent\":<config>}`\n\n```json\n[\n  {\"input\": {\"agent\": {\"service_account_name\": \"foobar\", \"config_map_name\": \"test\", \"namespace\": \"test\", \"service_account_path\": \"foobar\", \"image_name\": \"test\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"status\\\":\\\"ok\\\",\\\"valid\\\":true}\\n\"},\n  {\"input\": {\"agent\": {\"vault_auth_type\": \"kubernetes\", \"vault_role\": \"test\", \"vault_auth_path\": \"test\", \"service_account_name\": \"foobar\", \"namespace\": \"test\", \"service_account_path\": \"foobar\", \"image_name\": \"test\", \"vault_address\": \"https://foobar.com:8200\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"status\\\":\\\"ok\\\",\\\"valid\\\":true}\\n\"},\n  {\"input\": {\"agent\": {\"service_account_name\": \"foobar\", \"config_map_name\": \"test\", \"namespace\": \"\", \"service_account_path\": \"foobar\", \"image_name\": \"test\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"reason\\\":\\\"missing_namespace\\\",\\\"status\\\":\\\"invalid\\\",\\\"valid\\\":false}\\n\"},\n  {\"input\": {\"agent\": {\"service_account_name\": \"foobar\", \"config_map_name\": \"test\", \"namespace\": \"test\", \"service_account_path\": \"\", \"image_name\": \"test\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"reason\\\":\\\"missing_service_account\\\",\\\"status\\\":\\\"invalid\\\",\\\"valid\\\":false}\\n\"},\n  {\"input\": {\"agent\": {\"service_account_name\": \"foobar\", \"config_map_name\": \"test\", \"namespace\": \"test\", \"service_account_path\": \"foobar\", \"image_name\": \"\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"reason\\\":\\\"missing_image\\\",\\\"status\\\":\\\"invalid\\\",\\\"valid\\\":false}\\n\"},\n  {\"input\": {\"agent\": {\"vault_auth_type\": \"kubernetes\", \"vault_auth_path\": \"test\", \"vault_address\": \"https://foobar.com:8200\", \"service_account_name\": \"foobar\", \"namespace\": \"test\", \"service_account_path\": \"foobar\", \"image_name\": \"test\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"reason\\\":\\\"missing_role\\\",\\\"status\\\":\\\"invalid\\\",\\\"valid\\\":false}\\n\"},\n  {\"input\": {\"agent\": {\"vault_auth_type\": \"kubernetes\", \"vault_role\": \"test\", \"vault_auth_path\": \"test\", \"service_account_name\": \"foobar\", \"namespace\": \"test\", \"service_account_path\": \"foobar\", \"image_name\": \"test\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"reason\\\":\\\"missing_address\\\",\\\"status\\\":\\\"invalid\\\",\\\"valid\\\":false}\\n\"},\n  {\"input\": {\"agent\": {\"vault_auth_type\": \"kubernetes\", \"vault_role\": \"test\", \"vault_address\": \"https://foobar.com:8200\", \"service_account_name\": \"foobar\", \"namespace\": \"test\", \"service_account_path\": \"foobar\", \"image_name\": \"test\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"reason\\\":\\\"missing_auth_path\\\",\\\"status\\\":\\\"invalid\\\",\\\"valid\\\":false}\\n\"},\n  {\"input\": {\"agent\": {\"vault_role\": \"test\", \"vault_auth_path\": \"test\", \"vault_address\": \"https://foobar.com:8200\", \"service_account_name\": \"foobar\", \"namespace\": \"test\", \"service_account_path\": \"foobar\", \"image_name\": \"test\"}, \"op\": \"validate\"}, \"expected_output\": \"{\\\"reason\\\":\\\"missing_auth_type\\\",\\\"status\\\":\\\"invalid\\\",\\\"valid\\\":false}\\n\"}\n]\n```\n\n### Feature 4: Workload initialization — defaulting\n\nInitialize a workload definition by applying defaulted configuration\nannotations. Given a partial configuration (some fields left blank) the system\nfills in every operational annotation (image, run-as user/group, auth path/type,\ncache settings, resource requests/limits, secret volume path, log settings,\netc.) and returns the full resolved annotation map. Blank image/user/group fall\nback to built-in defaults.\n\nRequest: `{\"op\":\"init\",\"config\":<partial config>}`\n\n```json\n[\n  {\"input\": {\"config\": {\"proxy_address\": \"\", \"image\": \"\", \"group_id\": \"\", \"user_id\": \"\"}, \"op\": \"init\"}, \"expected_output\": \"{\\\"annotations\\\":{\\\"vault.hashicorp.com/agent-cache-enable\\\":\\\"false\\\",\\\"vault.hashicorp.com/agent-cache-exit-on-err\\\":\\\"false\\\",\\\"vault.hashicorp.com/agent-cache-listener-port\\\":\\\"8200\\\",\\\"vault.hashicorp.com/agent-cache-use-auto-auth-token\\\":\\\"true\\\",\\\"vault.hashicorp.com/agent-image\\\":\\\"vault:1.7.0\\\",\\\"vault.hashicorp.com/agent-inject-default-template\\\":\\\"map\\\",\\\"vault.hashicorp.com/agent-limits-cpu\\\":\\\"500m\\\",\\\"vault.hashicorp.com/agent-limits-mem\\\":\\\"128Mi\\\",\\\"vault.hashicorp.com/agent-request-namespace\\\":\\\"test\\\",\\\"vault.hashicorp.com/agent-requests-cpu\\\":\\\"250m\\\",\\\"vault.hashicorp.com/agent-requests-mem\\\":\\\"64Mi\\\",\\\"vault.hashicorp.com/agent-revoke-grace\\\":\\\"5\\\",\\\"vault.hashicorp.com/agent-revoke-on-shutdown\\\":\\\"true\\\",\\\"vault.hashicorp.com/agent-run-as-group\\\":\\\"1000\\\",\\\"vault.hashicorp.com/agent-run-as-same-user\\\":\\\"false\\\",\\\"vault.hashicorp.com/agent-run-as-user\\\":\\\"100\\\",\\\"vault.hashicorp.com/agent-set-security-context\\\":\\\"true\\\",\\\"vault.hashicorp.com/auth-path\\\":\\\"test\\\",\\\"vault.hashicorp.com/auth-type\\\":\\\"kubernetes\\\",\\\"vault.hashicorp.com/log-format\\\":\\\"standard\\\",\\\"vault.hashicorp.com/log-level\\\":\\\"info\\\",\\\"vault.hashicorp.com/proxy-address\\\":\\\"\\\",\\\"vault.hashicorp.com/secret-volume-path\\\":\\\"/vault/secrets\\\",\\\"vault.hashicorp.com/service\\\":\\\"http://foobar:8200\\\"},\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 5: Workload initialization — rejection\n\nInitialization rejects incomplete or absent input. A nil/empty workload yields\n`[a specific pod-related error sentinel]`. A configuration missing the server address yields `missing_address`;\nmissing auth path yields `missing_auth_path`; missing namespace yields\n`missing_namespace`.\n\nRequest: `{\"op\":\"init\",\"pod_nil\":true}` or `{\"op\":\"init\",\"config\":<partial>}`\n\n```json\n[\n  {\"input\": {\"pod_nil\": true, \"op\": \"init\"}, \"expected_output\": \"{\\\"error\\\":\\\"[a specific pod-related error sentinel]\\\",\\\"status\\\":\\\"error\\\"}\\n\"},\n  {\"input\": {\"config\": {\"address\": \"\"}, \"op\": \"init\"}, \"expected_output\": \"{\\\"error\\\":\\\"missing_address\\\",\\\"status\\\":\\\"error\\\"}\\n\"},\n  {\"input\": {\"config\": {\"auth_path\": \"\"}, \"op\": \"init\"}, \"expected_output\": \"{\\\"error\\\":\\\"missing_auth_path\\\",\\\"status\\\":\\\"error\\\"}\\n\"},\n  {\"input\": {\"config\": {\"namespace\": \"\"}, \"op\": \"init\"}, \"expected_output\": \"{\\\"error\\\":\\\"missing_namespace\\\",\\\"status\\\":\\\"error\\\"}\\n\"}\n]\n```\n\n### Feature 6: Secret discovery — name & case\n\nDiscover secret requests from annotations of the form\n`<prefix>-secret-<name>: <path>`. The trailing `<name>` becomes the secret\nidentifier and the value becomes its source path. By default the name is\nlower-cased; when a preserve-case flag is enabled the original casing is kept.\nNames may contain dashes, underscores and dots. An empty/absent name produces no\nsecret. Each secret is reported with its `name`, `path`, `template`,\n`template_file`, `mount_path`, `command`, and `file_path_and_name` fields.\n\nRequest: `{\"op\":\"parse_secrets\",\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-secret-foobar\": \"test1\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"test1\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-secret-FOOBAR\": \"test2\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"test2\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-secret-server.crt\": \"creds/tls/somecert\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"server.crt\\\",\\\"path\\\":\\\"creds/tls/somecert\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-secret-FOOBAR\": \"test2\", \"vault.hashicorp.com/preserve-secret-case\": \"true\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"FOOBAR\\\",\\\"path\\\":\\\"test2\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 7: Secret discovery — inline template\n\nAn inline template annotation `<prefix>-template-<name>` attaches a custom render\ntemplate to the secret whose name exactly matches `<name>`. A misspelled key or a\nname that does not match any declared secret leaves the template empty.\n\nRequest: `{\"op\":\"parse_secrets\",\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/[a specific misspelled template prefix string]e-foobar\": \"foobarTemplate\", \"vault.hashicorp.com/agent-inject-secret-foobar\": \"test1\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"test1\\\",\\\"template\\\":\\\"foobarTemplate\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/[a specific misspelled template prefix string]-foobar\": \"foobarTemplate\", \"vault.hashicorp.com/agent-inject-secret-foobar\": \"test1\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"test1\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/[a specific misspelled template prefix string]e-foobar\": \"foobarTemplate\", \"vault.hashicorp.com/agent-inject-secret-foobar2\": \"test1\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar2\\\",\\\"path\\\":\\\"test1\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 8: Secret discovery — template file precedence\n\nA template-file annotation points the secret at an on-disk template. An inline\ntemplate takes precedence: when both an inline template and a template-file are\npresent the inline template wins and the template-file field stays empty; when\nthe inline template is blank the template-file path is used.\n\nRequest: `{\"op\":\"parse_secrets\",\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/[a specific misspelled template prefix string]e-foobar\": \"foobarTemplate\", \"vault.hashicorp.com/[a specific misspelled template prefix string]e-file-foobar\": \"/etc/config.tmpl\", \"vault.hashicorp.com/agent-inject-secret-foobar\": \"test1\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"test1\\\",\\\"template\\\":\\\"foobarTemplate\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/[a specific misspelled template prefix string]e-foobar\": \"\", \"vault.hashicorp.com/[a specific misspelled template prefix string]e-file-foobar\": \"/etc/config.tmpl\", \"vault.hashicorp.com/agent-inject-secret-foobar\": \"test1\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"test1\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"/etc/config.tmpl\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 9: Secret discovery — post-render command\n\nA command annotation `<prefix>-command-<name>` attaches a post-render command to\nthe matching secret. A command key whose suffix does not match any declared\nsecret name is ignored and the command stays empty.\n\nRequest: `{\"op\":\"parse_secrets\",\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-secret-foobar\": \"test1\", \"vault.hashicorp.com/agent-inject-command-foobar\": \"pkill -HUP nginx\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"test1\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"pkill -HUP nginx\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-command-foobar2\": \"pkill -HUP nginx\", \"vault.hashicorp.com/agent-inject-secret-foobar\": \"test2\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"test2\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 10: Secret discovery — file override\n\nA file annotation `<prefix>-file-<name>` overrides the on-disk filename for a\nsecret. Relative and absolute file names are both retained verbatim in the\nsecret's file field. A file key whose suffix does not match any declared secret\nname leaves the file field empty.\n\nRequest: `{\"op\":\"parse_secrets\",\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-secret-foobar\": \"vault/test1\", \"vault.hashicorp.com/agent-inject-file-foobar\": \"foobar_simple_name\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"vault/test1\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"foobar_simple_name\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-secret-foobar\": \"vault/test1\", \"vault.hashicorp.com/agent-inject-file-foobar\": \"/some/path/foobar_simple_name\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"vault/test1\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"/some/path/foobar_simple_name\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-file-notcorresponding\": \"x/y/z\", \"vault.hashicorp.com/agent-inject-secret-foobar\": \"vault/test2\"}, \"op\": \"parse_secrets\"}, \"expected_output\": \"{\\\"secrets\\\":[{\\\"name\\\":\\\"foobar\\\",\\\"path\\\":\\\"vault/test2\\\",\\\"template\\\":\\\"\\\",\\\"template_file\\\":\\\"\\\",\\\"mount_path\\\":\\\"/vault/secrets\\\",\\\"command\\\":\\\"\\\",\\\"file_path_and_name\\\":\\\"\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 11: Auth-method config collection\n\nCollect server auth-method parameters from annotations into a single\nauth-config map. A legacy role annotation maps to the `role` key and, when\npresent, takes precedence over a generic auth-config role entry. Generic\n`auth-config-<param>` annotations are copied through with dashes in the param\nname converted to underscores; values are passed through as raw strings (type\ncoercion is left to the downstream consumer).\n\nRequest: `{\"op\":\"auth_config\",\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/role\": \"backwardscompat\"}, \"op\": \"auth_config\"}, \"expected_output\": \"{\\\"auth_config\\\":{\\\"role\\\":\\\"backwardscompat\\\"},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/auth-config-role\": \"lowerprio\", \"vault.hashicorp.com/role\": \"backwardscompat\"}, \"op\": \"auth_config\"}, \"expected_output\": \"{\\\"auth_config\\\":{\\\"role\\\":\\\"backwardscompat\\\"},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/auth-config-credential_poll_interval\": \"1\", \"vault.hashicorp.com/auth-config-ca-cert\": \"bar\", \"vault.hashicorp.com/auth-config-name\": \"foo\", \"vault.hashicorp.com/auth-config-client_cert\": \"baz\", \"vault.hashicorp.com/auth-config-remove_secret_id_file_after_reading\": \"false\"}, \"op\": \"auth_config\"}, \"expected_output\": \"{\\\"auth_config\\\":{\\\"ca_cert\\\":\\\"bar\\\",\\\"client_cert\\\":\\\"baz\\\",\\\"credential_poll_interval\\\":\\\"1\\\",\\\"name\\\":\\\"foo\\\",\\\"remove_secret_id_file_after_reading\\\":\\\"false\\\"},\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 12: Default template style\n\nResolve the default secret-rendering template style from an annotation. Accepted\nvalues are `json` and `map`, case-insensitively (normalized to lower case). Any\nother value, including an empty string, is rejected as\n`invalid_default_template`.\n\nRequest: `{\"op\":\"default_template\",\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-default-template\": \"json\"}, \"op\": \"default_template\"}, \"expected_output\": \"{\\\"default_template\\\":\\\"json\\\",\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-default-template\": \"MAP\"}, \"op\": \"default_template\"}, \"expected_output\": \"{\\\"default_template\\\":\\\"map\\\",\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-default-template\": \"foobar\"}, \"op\": \"default_template\"}, \"expected_output\": \"{\\\"error\\\":\\\"invalid_default_template\\\",\\\"status\\\":\\\"error\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-inject-default-template\": \"\"}, \"op\": \"default_template\"}, \"expected_output\": \"{\\\"error\\\":\\\"invalid_default_template\\\",\\\"status\\\":\\\"error\\\"}\\n\"}\n]\n```\n\n### Feature 13: Render runtime config — caching disabled\n\nRender the full agent runtime configuration document. With no caching\nannotations the rendered document contains no proxy listeners and no cache\nstanza, while still carrying the server connection block and the auto-auth\nmethod (type, mount path and role) plus the default token sink. The\n`init_container` flag controls `exit_after_auth`.\n\nRequest: `{\"op\":\"render_config\",\"init_container\":<bool>,\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"init_container\": false, \"annotations\": {\"vault.hashicorp.com/role\": \"foobar\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":false,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[],\\\"listeners\\\":[],\\\"cache\\\":null},\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 14: Render runtime config — caching enabled\n\nWhen caching is enabled the rendered document gains a local TCP proxy listener\n(TLS disabled) and a cache stanza. The listener port defaults to 8200 and is\noverridable. The cache persists to a kubernetes-backed store at a fixed path,\noptionally exiting on persistence error, and its use-auto-auth-token mode is\nconfigurable (e.g. `force`).\n\nRequest: `{\"op\":\"render_config\",\"init_container\":<bool>,\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"init_container\": false, \"annotations\": {\"vault.hashicorp.com/agent-cache-listener-port\": \"8100\", \"vault.hashicorp.com/agent-cache-use-auto-auth-token\": \"force\", \"vault.hashicorp.com/role\": \"foobar\", \"vault.hashicorp.com/agent-cache-enable\": \"true\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":false,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[],\\\"listeners\\\":[{\\\"type\\\":\\\"tcp\\\",\\\"address\\\":\\\"127.0.0.1:8100\\\",\\\"tls_disable\\\":true}],\\\"cache\\\":{\\\"use_auto_auth_token\\\":\\\"force\\\",\\\"persist_type\\\":\\\"kubernetes\\\",\\\"persist_path\\\":\\\"/vault/agent-cache\\\",\\\"persist_exit_on_err\\\":false}},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"init_container\": false, \"annotations\": {\"vault.hashicorp.com/role\": \"foobar\", \"vault.hashicorp.com/agent-cache-enable\": \"true\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":false,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[],\\\"listeners\\\":[{\\\"type\\\":\\\"tcp\\\",\\\"address\\\":\\\"127.0.0.1:8200\\\",\\\"tls_disable\\\":true}],\\\"cache\\\":{\\\"use_auto_auth_token\\\":\\\"true\\\",\\\"persist_type\\\":\\\"kubernetes\\\",\\\"persist_path\\\":\\\"/vault/agent-cache\\\",\\\"persist_exit_on_err\\\":false}},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"init_container\": false, \"annotations\": {\"vault.hashicorp.com/agent-cache-exit-on-err\": \"true\", \"vault.hashicorp.com/role\": \"foobar\", \"vault.hashicorp.com/agent-cache-enable\": \"true\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":false,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[],\\\"listeners\\\":[{\\\"type\\\":\\\"tcp\\\",\\\"address\\\":\\\"127.0.0.1:8200\\\",\\\"tls_disable\\\":true}],\\\"cache\\\":{\\\"use_auto_auth_token\\\":\\\"true\\\",\\\"persist_type\\\":\\\"kubernetes\\\",\\\"persist_path\\\":\\\"/vault/agent-cache\\\",\\\"persist_exit_on_err\\\":true}},\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 15: Render runtime config — token sinks\n\nThe auto-auth section always emits a token-helper sink that writes the issued\ntoken to the agent home path. When token injection is enabled an additional file\nsink is emitted that writes the token under the secret volume path (overridable).\nDisabling token injection leaves only the token-helper sink.\n\nRequest: `{\"op\":\"render_config\",\"init_container\":<bool>,\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"init_container\": true, \"annotations\": {\"vault.hashicorp.com/agent-inject-token\": \"true\", \"vault.hashicorp.com/role\": \"foobar\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":true,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"},{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/vault/secrets/token\\\"}]},\\\"templates\\\":[],\\\"listeners\\\":[],\\\"cache\\\":null},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"init_container\": true, \"annotations\": {\"vault.hashicorp.com/agent-inject-token\": \"false\", \"vault.hashicorp.com/role\": \"foobar\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":true,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[],\\\"listeners\\\":[],\\\"cache\\\":null},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"init_container\": true, \"annotations\": {\"vault.hashicorp.com/agent-inject-token\": \"true\", \"vault.hashicorp.com/secret-volume-path\": \"/new/secrets\", \"vault.hashicorp.com/role\": \"foobar\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":true,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"},{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/new/secrets/token\\\"}]},\\\"templates\\\":[],\\\"listeners\\\":[],\\\"cache\\\":null},\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 16: Render runtime config — template destinations\n\nEach declared secret yields a render template whose destination path is computed\nfrom the secret name, an optional per-secret file override, and an optional\nsecret-volume-path. A bare secret renders to `<volume>/<name>`. A relative file\noverride nests under the volume; an absolute file override is appended to the\nvolume path. Overriding the global secret-volume-path relocates the destination\naccordingly.\n\nRequest: `{\"op\":\"render_config\",\"init_container\":<bool>,\"annotations\":<map>}`\n\n```json\n[\n  {\"input\": {\"init_container\": false, \"annotations\": {\"vault.hashicorp.com/role\": \"foobar\", \"vault.hashicorp.com/agent-inject-secret-foo\": \"db/creds/foo\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":false,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[{\\\"destination\\\":\\\"/vault/secrets/foo\\\",\\\"contents\\\":\\\"{{ with secret \\\\\\\"db/creds/foo\\\\\\\" }}{{ range $k, $v := .Data }}{{ $k }}: {{ $v }}\\\\n{{ end }}{{ end }}\\\",\\\"command\\\":\\\"\\\",\\\"source\\\":\\\"\\\"}],\\\"listeners\\\":[],\\\"cache\\\":null},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"init_container\": false, \"annotations\": {\"vault.hashicorp.com/agent-inject-file-foo\": \"nested/foofile\", \"vault.hashicorp.com/role\": \"foobar\", \"vault.hashicorp.com/agent-inject-secret-foo\": \"db/creds/foo\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":false,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[{\\\"destination\\\":\\\"/vault/secrets/nested/foofile\\\",\\\"contents\\\":\\\"{{ with secret \\\\\\\"db/creds/foo\\\\\\\" }}{{ range $k, $v := .Data }}{{ $k }}: {{ $v }}\\\\n{{ end }}{{ end }}\\\",\\\"command\\\":\\\"\\\",\\\"source\\\":\\\"\\\"}],\\\"listeners\\\":[],\\\"cache\\\":null},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"init_container\": false, \"annotations\": {\"vault.hashicorp.com/agent-inject-file-foo\": \"/special/volume/foofile\", \"vault.hashicorp.com/role\": \"foobar\", \"vault.hashicorp.com/agent-inject-secret-foo\": \"db/creds/foo\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":false,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[{\\\"destination\\\":\\\"/vault/secrets/special/volume/foofile\\\",\\\"contents\\\":\\\"{{ with secret \\\\\\\"db/creds/foo\\\\\\\" }}{{ range $k, $v := .Data }}{{ $k }}: {{ $v }}\\\\n{{ end }}{{ end }}\\\",\\\"command\\\":\\\"\\\",\\\"source\\\":\\\"\\\"}],\\\"listeners\\\":[],\\\"cache\\\":null},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"init_container\": false, \"annotations\": {\"vault.hashicorp.com/secret-volume-path\": \"/new/mount/path\", \"vault.hashicorp.com/agent-inject-file-foo\": \"foofile_name_is_very_very_very_long\", \"vault.hashicorp.com/role\": \"foobar\", \"vault.hashicorp.com/agent-inject-secret-foo\": \"db/creds/foo\"}, \"op\": \"render_config\"}, \"expected_output\": \"{\\\"config\\\":{\\\"exit_after_auth\\\":false,\\\"vault\\\":{\\\"address\\\":\\\"http://foobar:8200\\\",\\\"ca_cert\\\":\\\"\\\",\\\"ca_path\\\":\\\"\\\",\\\"client_cert\\\":\\\"\\\",\\\"client_key\\\":\\\"\\\",\\\"tls_skip_verify\\\":false,\\\"tls_server_name\\\":\\\"\\\"},\\\"auto_auth\\\":{\\\"type\\\":\\\"kubernetes\\\",\\\"mount_path\\\":\\\"test\\\",\\\"namespace\\\":\\\"\\\",\\\"role\\\":\\\"foobar\\\",\\\"sinks\\\":[{\\\"type\\\":\\\"file\\\",\\\"path\\\":\\\"/home/vault/.vault-token\\\"}]},\\\"templates\\\":[{\\\"destination\\\":\\\"/new/mount/path/foofile_name_is_very_very_very_long\\\",\\\"contents\\\":\\\"{{ with secret \\\\\\\"db/creds/foo\\\\\\\" }}{{ range $k, $v := .Data }}{{ $k }}: {{ $v }}\\\\n{{ end }}{{ end }}\\\",\\\"command\\\":\\\"\\\",\\\"source\\\":\\\"\\\"}],\\\"listeners\\\":[],\\\"cache\\\":null},\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 17: Resource quantity parsing\n\nParse CPU and memory request/limit quantity strings into a normalized\nresource-requirements object echoing the canonical quantity for each present\nfield. Valid SI (`M`, `G`) and binary (`Mi`, `Gi`) suffixes are accepted, as are\n`0` and blank (a blank field is simply omitted). Malformed unit notations (e.g.\nlower-case `mi`/`gi` for CPU, or `mb` for memory) are rejected as\n`invalid_quantity`.\n\nRequest: `{\"op\":\"parse_resources\",\"limits_cpu\":<s>,\"limits_mem\":<s>,\"requests_cpu\":<s>,\"requests_mem\":<s>}`\n\n```json\n[\n  {\"input\": {\"limits_mem\": \"128Mi\", \"limits_cpu\": \"500Mi\", \"requests_cpu\": \"250Mi\", \"requests_mem\": \"64Mi\", \"op\": \"parse_resources\"}, \"expected_output\": \"{\\\"limits\\\":{\\\"cpu\\\":\\\"500Mi\\\",\\\"memory\\\":\\\"128Mi\\\"},\\\"requests\\\":{\\\"cpu\\\":\\\"250Mi\\\",\\\"memory\\\":\\\"64Mi\\\"},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"limits_mem\": \"\", \"limits_cpu\": \"\", \"requests_cpu\": \"\", \"requests_mem\": \"\", \"op\": \"parse_resources\"}, \"expected_output\": \"{\\\"limits\\\":{},\\\"requests\\\":{},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"limits_mem\": \"0\", \"limits_cpu\": \"0\", \"requests_cpu\": \"0\", \"requests_mem\": \"0\", \"op\": \"parse_resources\"}, \"expected_output\": \"{\\\"limits\\\":{\\\"cpu\\\":\\\"0\\\",\\\"memory\\\":\\\"0\\\"},\\\"requests\\\":{\\\"cpu\\\":\\\"0\\\",\\\"memory\\\":\\\"0\\\"},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"limits_mem\": \"128m\", \"limits_cpu\": \"500mi\", \"requests_cpu\": \"250mi\", \"requests_mem\": \"64m\", \"op\": \"parse_resources\"}, \"expected_output\": \"{\\\"error\\\":\\\"invalid_quantity\\\",\\\"status\\\":\\\"error\\\"}\\n\"},\n  {\"input\": {\"limits_mem\": \"128mb\", \"limits_cpu\": \"500Mi\", \"requests_cpu\": \"250Mi\", \"requests_mem\": \"64mb\", \"op\": \"parse_resources\"}, \"expected_output\": \"{\\\"error\\\":\\\"invalid_quantity\\\",\\\"status\\\":\\\"error\\\"}\\n\"}\n]\n```\n\n### Feature 18: Container environment variables\n\nCompute the set of environment-variable names the agent container exposes given\nits settings. By default a single config variable is present. Setting a client\nmax-retries value adds a retries variable; a client timeout adds a timeout\nvariable; a log level adds a log-level variable; a proxy address adds an HTTPS\nproxy variable. Providing an external config-map name suppresses the inline\nconfig variable. The returned names are sorted.\n\nRequest: `{\"op\":\"container_env\",\"config_map_name\":<s>,\"client_max_retries\":<s>,\"client_timeout\":<s>,\"env_log_level\":<s>,\"proxy_address\":<s>}`\n\n```json\n[\n  {\"input\": {\"env_log_level\": \"\", \"config_map_name\": \"\", \"client_max_retries\": \"\", \"proxy_address\": \"\", \"op\": \"container_env\", \"client_timeout\": \"\"}, \"expected_output\": \"{\\\"envs\\\":[\\\"VAULT_CONFIG\\\"],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"env_log_level\": \"\", \"config_map_name\": \"foobar\", \"client_max_retries\": \"\", \"proxy_address\": \"\", \"op\": \"container_env\", \"client_timeout\": \"\"}, \"expected_output\": \"{\\\"envs\\\":[],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"env_log_level\": \"\", \"config_map_name\": \"\", \"client_max_retries\": \"0\", \"proxy_address\": \"\", \"op\": \"container_env\", \"client_timeout\": \"5s\"}, \"expected_output\": \"{\\\"envs\\\":[\\\"VAULT_CLIENT_TIMEOUT\\\",\\\"VAULT_CONFIG\\\",\\\"VAULT_MAX_RETRIES\\\"],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"env_log_level\": \"info\", \"config_map_name\": \"foobar\", \"client_max_retries\": \"0\", \"proxy_address\": \"http://proxy:3128\", \"op\": \"container_env\", \"client_timeout\": \"5s\"}, \"expected_output\": \"{\\\"envs\\\":[\\\"HTTPS_PROXY\\\",\\\"VAULT_CLIENT_TIMEOUT\\\",\\\"VAULT_LOG_LEVEL\\\",\\\"VAULT_MAX_RETRIES\\\"],\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 19: Run-as-same-id resolution\n\nDecide whether the agent container should run as the same user id as the\napplication container. The decision is driven by a run-as-same-user flag and the\napplication's declared run-as user id. When the flag is true and the app declares\na non-root id, the agent adopts that id (result true). When the flag is false or\nunset, the agent keeps its default id (result false). When the flag is true but\nthe app declares no id, or declares root (0), or when the flag value is not a\nvalid boolean, it is reported as the error category `not_allowed` with the agent\nid left at its default (100).\n\nRequest: `{\"op\":\"run_as_same_id\",\"run_as_same_user\":<s>,\"app_run_as_user\":<int?>}`\n\n```json\n[\n  {\"input\": {\"run_as_same_user\": \"false\", \"op\": \"run_as_same_id\"}, \"expected_output\": \"{\\\"result\\\":false,\\\"run_as_user\\\":100,\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"app_run_as_user\": 123456, \"run_as_same_user\": \"true\", \"op\": \"run_as_same_id\"}, \"expected_output\": \"{\\\"result\\\":true,\\\"run_as_user\\\":123456,\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"run_as_same_user\": \"true\", \"op\": \"run_as_same_id\"}, \"expected_output\": \"{\\\"error\\\":\\\"not_allowed\\\",\\\"result\\\":false,\\\"run_as_user\\\":100,\\\"status\\\":\\\"error\\\"}\\n\"},\n  {\"input\": {\"run_as_same_user\": \"rooooooot\", \"op\": \"run_as_same_id\"}, \"expected_output\": \"{\\\"error\\\":\\\"not_allowed\\\",\\\"result\\\":false,\\\"run_as_user\\\":100,\\\"status\\\":\\\"error\\\"}\\n\"},\n  {\"input\": {\"app_run_as_user\": 0, \"run_as_same_user\": \"true\", \"op\": \"run_as_same_id\"}, \"expected_output\": \"{\\\"error\\\":\\\"not_allowed\\\",\\\"result\\\":false,\\\"run_as_user\\\":100,\\\"status\\\":\\\"error\\\"}\\n\"}\n]\n```\n\n### Feature 20: Security context derivation\n\nDerive the agent container's security context from configuration and\nannotations. By default it pins a non-root run-as user (100) and group (1000),\nmarks the filesystem read-only, drops all capabilities and forbids privilege\nescalation. Run-as user/group are overridable by annotation; setting either to 0\nflips the non-root flag to false. Disabling the set-security-context flag yields\nno security context at all. In same-user mode the agent adopts the application\ncontainer's declared user id.\n\nRequest: `{\"op\":\"security_context\",\"annotations\":<map?>,\"set_security_context\":<bool?>,\"same_id\":<bool?>,\"app_run_as_user\":<int?>}`\n\n```json\n[\n  {\"input\": {\"annotations\": {}, \"op\": \"security_context\"}, \"expected_output\": \"{\\\"security_context\\\":{\\\"run_as_user\\\":100,\\\"run_as_group\\\":1000,\\\"run_as_non_root\\\":true,\\\"read_only_root_filesystem\\\":true,\\\"allow_privilege_escalation\\\":false,\\\"capabilities_drop\\\":[\\\"ALL\\\"]},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-run-as-group\": \"1001\", \"vault.hashicorp.com/agent-run-as-user\": \"1001\"}, \"op\": \"security_context\"}, \"expected_output\": \"{\\\"security_context\\\":{\\\"run_as_user\\\":1001,\\\"run_as_group\\\":1001,\\\"run_as_non_root\\\":true,\\\"read_only_root_filesystem\\\":true,\\\"allow_privilege_escalation\\\":false,\\\"capabilities_drop\\\":[\\\"ALL\\\"]},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"annotations\": {\"vault.hashicorp.com/agent-run-as-group\": \"0\", \"vault.hashicorp.com/agent-run-as-user\": \"0\"}, \"op\": \"security_context\"}, \"expected_output\": \"{\\\"security_context\\\":{\\\"run_as_user\\\":0,\\\"run_as_group\\\":0,\\\"run_as_non_root\\\":false,\\\"read_only_root_filesystem\\\":true,\\\"allow_privilege_escalation\\\":false,\\\"capabilities_drop\\\":[\\\"ALL\\\"]},\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"set_security_context\": false, \"op\": \"security_context\"}, \"expected_output\": \"{\\\"security_context\\\":null,\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"app_run_as_user\": 123456, \"same_id\": true, \"op\": \"security_context\"}, \"expected_output\": \"{\\\"security_context\\\":{\\\"run_as_user\\\":123456,\\\"run_as_group\\\":1000,\\\"run_as_non_root\\\":true,\\\"read_only_root_filesystem\\\":true,\\\"allow_privilege_escalation\\\":false,\\\"capabilities_drop\\\":[\\\"ALL\\\"]},\\\"status\\\":\\\"ok\\\"}\\n\"}\n]\n```\n\n### Feature 21: Admission decision (end-to-end)\n\nProcess an admission request for a workload and return either an allow decision\nwith an ordered list of JSON-patch operations (each an operation verb and a\ntarget path) or a deny decision with a neutral error category. Injection into\nprotected system namespaces is denied (`system_namespace`). An invalid\ndefault-template annotation is denied (`invalid_default_template`). Requests that\ndo not call for injection are allowed with no patches. When injection applies,\nthe patch list adds the agent volumes, copies volume mounts, inserts the init\nand sidecar containers, and stamps the injection-status annotation; enabling\ninit-first changes the ordering of the init-container patches.\n\nThe workload under test has a single init container and a single app container,\neach with one volume mount. Setting `with_mounts` adds an extra mount to the\ninit container so the copy-volume-mounts behavior can be observed.\n\nRequest: `{\"op\":\"mutate\",\"namespace\":<s>,\"annotations\":<map>,\"with_mounts\":<bool?>}`\n\n```json\n[\n  {\"input\": {\"namespace\": \"kube-system\", \"annotations\": {\"vault.hashicorp.com/role\": \"demo\", \"vault.hashicorp.com/agent-inject\": \"true\"}, \"op\": \"mutate\"}, \"expected_output\": \"{\\\"allowed\\\":false,\\\"error\\\":\\\"system_namespace\\\",\\\"status\\\":\\\"denied\\\"}\\n\"},\n  {\"input\": {\"namespace\": \"test\", \"annotations\": {}, \"op\": \"mutate\"}, \"expected_output\": \"{\\\"allowed\\\":true,\\\"patches\\\":[],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"namespace\": \"test\", \"annotations\": {\"vault.hashicorp.com/role\": \"demo\", \"vault.hashicorp.com/agent-inject\": \"true\"}, \"op\": \"mutate\"}, \"expected_output\": \"{\\\"allowed\\\":true,\\\"patches\\\":[{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/volumes\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/volumes/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/volumes\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/containers/0/volumeMounts/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/initContainers/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/initContainers/0/volumeMounts/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/containers/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/metadata/annotations/vault.hashicorp.com~1agent-inject-status\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"namespace\": \"test\", \"annotations\": {\"vault.hashicorp.com/agent-init-first\": \"true\", \"vault.hashicorp.com/role\": \"demo\", \"vault.hashicorp.com/agent-inject\": \"true\"}, \"op\": \"mutate\"}, \"expected_output\": \"{\\\"allowed\\\":true,\\\"patches\\\":[{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/volumes\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/volumes/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/volumes\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/containers/0/volumeMounts/-\\\"},{\\\"op\\\":\\\"remove\\\",\\\"path\\\":\\\"/spec/initContainers\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/initContainers\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/initContainers/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/initContainers/1/volumeMounts/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/spec/containers/-\\\"},{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/metadata/annotations/vault.hashicorp.com~1agent-inject-status\\\"}],\\\"status\\\":\\\"ok\\\"}\\n\"},\n  {\"input\": {\"namespace\": \"foo\", \"annotations\": {\"vault.hashicorp.com/agent-inject-default-template\": \"foobar\", \"vault.hashicorp.com/role\": \"demo\", \"vault.hashicorp.com/agent-inject\": \"true\"}, \"op\": \"mutate\"}, \"expected_output\": \"{\\\"allowed\\\":false,\\\"error\\\":\\\"invalid_default_template\\\",\\\"status\\\":\\\"denied\\\"}\\n\"}\n]\n```\n\n## Deliverables\n\n1. **A single command-line program** implementing the JSON-in/JSON-out protocol\n   described above, dispatching on the `op` field and covering all 21 features.\n   Output must be a single compact JSON object per request with alphabetically\n   sorted keys and a trailing newline.\n\n2. **Stable error categories.** Every invalid input must produce the exact\n   neutral category strings used in the examples (`missing_*`, `invalid_*`,\n   `unknown_log_level`, `not_allowed`, `system_namespace`, `[a specific pod-related error sentinel]`, etc.).\n   No runtime traces.\n\n3. **A test harness** (`rcb_tests/`) consisting of:\n   * `test.sh` — single entry point accepting `--cases-dir <subdir>` (default\n     `test_cases`); builds the program and runs every recorded case.\n   * `test_cases/` — the full evaluation set, one JSON file per feature, each\n     `{\"description\": ..., \"cases\": [{\"input\": ..., \"expected_output\": ...}]}`.\n   * `public_test_cases/` — the public mirror of the cases embedded in this\n     document.\n   * Raw program stdout for each case is written to\n     `rcb_tests/stdout/<cases-dir>/<stem>@<NNN>.txt`.\n\n4. **Determinism.** Running the harness against a correct implementation must\n   reproduce every `expected_output` byte-for-byte.\n\n\n---\n**Implementation notes:**\n- current_env namespace example\n- canonical severity string list\n",
+  "oracle_data": {
+    "task_id": "hashicorp__vault-k8s-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "error category empty_pod",
+          "workload_init error",
+          "pod initialization failure",
+          "Nil pod error code",
+          "init operation return value"
+        ],
+        "oracle_response": "The exact error category string is 'empty_pod'."
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "template annotation misspelled",
+          "secret booking error key",
+          "incorrect template prefix",
+          "agent-inject-templat error",
+          "template name mismatch"
+        ],
+        "oracle_response": "The exact string that triggers this behavior is 'agent-inject-templat'."
+      },
+      {
+        "constraint_id": "C024",
+        "trigger_keywords": [
+          "security context null output",
+          "null security_context value",
+          "disabled security context",
+          "annotation set_security_context False",
+          "null object in response"
+        ],
+        "oracle_response": "The exact value is null."
+      },
+      {
+        "constraint_id": "TC_feature12_security_context",
+        "trigger_keywords": [
+          "test cases for feature12 security context",
+          "show me feature12 security context test cases",
+          "what are the feature12 security context inputs and outputs",
+          "give me the feature12_security_context test file",
+          "feature12 security context expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_security_context:\n{\n  \"cases\": [\n    {\n      \"input\": {\n        \"annotations\": {},\n        \"op\": \"security_context\"\n      },\n      \"expected_output\": \"{\\\"security_context\\\":{\\\"run_as_user\\\":100,\\\"run_as_group\\\":1000,\\\"run_as_non_root\\\":true,\\\"read_only_root_filesystem\\\":true,\\\"allow_privilege_escalation\\\":false,\\\"capabilities_drop\\\":[\\\"ALL\\\"]},\\\"status\\\":\\\"ok\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"annotations\": {\n          \"vault.hashicorp.com/agent-run-as-group\": \"1001\",\n          \"vault.hashicorp.com/agent-run-as-user\": \"1001\"\n        },\n        \"op\": \"security_context\"\n      },\n      \"expected_output\": \"{\\\"security_context\\\":{\\\"run_as_user\\\":1001,\\\"run_as_group\\\":1001,\\\"run_as_non_root\\\":true,\\\"read_only_root_filesystem\\\":true,\\\"allow_privilege_escalation\\\":false,\\\"capabilities_drop\\\":[\\\"ALL\\\"]},\\\"status\\\":\\\"ok\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"annotations\": {\n          \"vault.hashicorp.com/agent-run-as-group\": \"0\",\n          \"vault.hashicorp.com/agent-run-as-user\": \"0\"\n        },\n        \"op\": \"security_context\"\n      },\n      \"expected_output\": \"{\\\"security_context\\\":{\\\"run_as_user\\\":0,\\\"run_as_group\\\":0,\\\"run_as_non_root\\\":false,\\\"read_only_root_filesystem\\\":true,\\\"allow_privilege_escalation\\\":false,\\\"capabilities_drop\\\":[\\\"ALL\\\"]},\\\"status\\\":\\\"ok\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"set_security_context\": false,\n        \"op\": \"security_context\"\n      },\n      \"expected_output\": \"{\\\"security_context\\\":null,\\\"status\\\":\\\"ok\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"app_run_as_user\": 123456,\n        \"same_id\": true,\n        \"op\": \"security_context\"\n      },\n      \"expected_output\": \"{\\\"security_context\\\":{\\\"run_as_user\\\":123456,\\\"run_as_group\\\":1000,\\\"run_as_non_root\\\":true,\\\"read_only_root_filesystem\\\":true,\\\"allow_privilege_escalation\\\":false,\\\"capabilities_drop\\\":[\\\"ALL\\\"]},\\\"status\\\":\\\"ok\\\"}\\n\"\n    }\n  ],\n  \"description\": \"Derive the agent container's security context from configuration and annotations. By default it pins a non-root run-as user and group, marks the filesystem read-only, drops all capabilities and forbids privilege escalation. Run-as user/group are overridable by annotation; setting either to 0 flips the non-root flag to false. Disabling the set-security-context flag yields no security context at all. In same-user mode the agent adopts the application container's declared user id.\"\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "current_env namespace example",
+        "actual_meaning": "Requires searching the codebase to find the specific namespace string matching the pattern of the current deployment environment, such as 'kube-system'."
+      },
+      {
+        "vague_reference": "canonical severity string list",
+        "actual_meaning": "Refers to the literal set of strings {trace, debug, info, warn, warning, error} found in the logging module's severity mapping dictionary."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_container_env.json": {
+      "cases": [
+        {
+          "input": {
+            "env_log_level": "",
+            "config_map_name": "",
+            "client_max_retries": "",
+            "proxy_address": "",
+            "op": "container_env",
+            "client_timeout": ""
+          },
+          "expected_output": "{\"envs\":[\"VAULT_CONFIG\"],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "env_log_level": "",
+            "config_map_name": "foobar",
+            "client_max_retries": "",
+            "proxy_address": "",
+            "op": "container_env",
+            "client_timeout": ""
+          },
+          "expected_output": "{\"envs\":[],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "env_log_level": "",
+            "config_map_name": "",
+            "client_max_retries": "0",
+            "proxy_address": "",
+            "op": "container_env",
+            "client_timeout": "5s"
+          },
+          "expected_output": "{\"envs\":[\"VAULT_CLIENT_TIMEOUT\",\"VAULT_CONFIG\",\"VAULT_MAX_RETRIES\"],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "env_log_level": "info",
+            "config_map_name": "foobar",
+            "client_max_retries": "0",
+            "proxy_address": "http://proxy:3128",
+            "op": "container_env",
+            "client_timeout": "5s"
+          },
+          "expected_output": "{\"envs\":[\"HTTPS_PROXY\",\"VAULT_CLIENT_TIMEOUT\",\"VAULT_LOG_LEVEL\",\"VAULT_MAX_RETRIES\"],\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "Compute the set of environment-variable names the agent container exposes given its settings. By default a single config variable is present. Setting a client max-retries value adds a retries variable; a client timeout adds a timeout variable; a log level adds a log-level variable; a proxy address adds an HTTPS proxy variable. Providing an external config-map name suppresses the inline config variable."
+    },
+    "feature11_run_as_same_id.json": {
+      "cases": [
+        {
+          "input": {
+            "run_as_same_user": "false",
+            "op": "run_as_same_id"
+          },
+          "expected_output": "{\"result\":false,\"run_as_user\":100,\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "app_run_as_user": 123456,
+            "run_as_same_user": "true",
+            "op": "run_as_same_id"
+          },
+          "expected_output": "{\"result\":true,\"run_as_user\":123456,\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "run_as_same_user": "true",
+            "op": "run_as_same_id"
+          },
+          "expected_output": "{\"error\":\"not_allowed\",\"result\":false,\"run_as_user\":100,\"status\":\"error\"}\n"
+        },
+        {
+          "input": {
+            "run_as_same_user": "rooooooot",
+            "op": "run_as_same_id"
+          },
+          "expected_output": "{\"error\":\"not_allowed\",\"result\":false,\"run_as_user\":100,\"status\":\"error\"}\n"
+        },
+        {
+          "input": {
+            "app_run_as_user": 0,
+            "run_as_same_user": "true",
+            "op": "run_as_same_id"
+          },
+          "expected_output": "{\"error\":\"not_allowed\",\"result\":false,\"run_as_user\":100,\"status\":\"error\"}\n"
+        }
+      ],
+      "description": "Decide whether the agent container should run as the same user id as the application container. The decision is driven by a run-as-same-user flag and the application's declared run-as user id. When the flag is true and the app declares a non-root id, the agent adopts that id (result true). When the flag is false or unset, the agent keeps its default id (result false). When the flag is true but the app declares no id, or declares root (0), or when the flag value is not a valid boolean, it is reported as the error category not_allowed with the agent id left at its default."
+    },
+    "feature12_security_context.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {},
+            "op": "security_context"
+          },
+          "expected_output": "{\"security_context\":{\"run_as_user\":100,\"run_as_group\":1000,\"run_as_non_root\":true,\"read_only_root_filesystem\":true,\"allow_privilege_escalation\":false,\"capabilities_drop\":[\"ALL\"]},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-run-as-group": "1001",
+              "vault.hashicorp.com/agent-run-as-user": "1001"
+            },
+            "op": "security_context"
+          },
+          "expected_output": "{\"security_context\":{\"run_as_user\":1001,\"run_as_group\":1001,\"run_as_non_root\":true,\"read_only_root_filesystem\":true,\"allow_privilege_escalation\":false,\"capabilities_drop\":[\"ALL\"]},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-run-as-group": "0",
+              "vault.hashicorp.com/agent-run-as-user": "0"
+            },
+            "op": "security_context"
+          },
+          "expected_output": "{\"security_context\":{\"run_as_user\":0,\"run_as_group\":0,\"run_as_non_root\":false,\"read_only_root_filesystem\":true,\"allow_privilege_escalation\":false,\"capabilities_drop\":[\"ALL\"]},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "set_security_context": false,
+            "op": "security_context"
+          },
+          "expected_output": "{\"security_context\":null,\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "app_run_as_user": 123456,
+            "same_id": true,
+            "op": "security_context"
+          },
+          "expected_output": "{\"security_context\":{\"run_as_user\":123456,\"run_as_group\":1000,\"run_as_non_root\":true,\"read_only_root_filesystem\":true,\"allow_privilege_escalation\":false,\"capabilities_drop\":[\"ALL\"]},\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "Derive the agent container's security context from configuration and annotations. By default it pins a non-root run-as user and group, marks the filesystem read-only, drops all capabilities and forbids privilege escalation. Run-as user/group are overridable by annotation; setting either to 0 flips the non-root flag to false. Disabling the set-security-context flag yields no security context at all. In same-user mode the agent adopts the application container's declared user id."
+    },
+    "feature13_webhook_mutate.json": {
+      "cases": [
+        {
+          "input": {
+            "namespace": "kube-system",
+            "annotations": {
+              "vault.hashicorp.com/role": "demo",
+              "vault.hashicorp.com/agent-inject": "true"
+            },
+            "op": "mutate"
+          },
+          "expected_output": "{\"allowed\":false,\"error\":\"system_namespace\",\"status\":\"denied\"}\n"
+        },
+        {
+          "input": {
+            "namespace": "test",
+            "annotations": {},
+            "op": "mutate"
+          },
+          "expected_output": "{\"allowed\":true,\"patches\":[],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "namespace": "test",
+            "annotations": {
+              "vault.hashicorp.com/role": "demo",
+              "vault.hashicorp.com/agent-inject": "true"
+            },
+            "op": "mutate"
+          },
+          "expected_output": "{\"allowed\":true,\"patches\":[{\"op\":\"add\",\"path\":\"/spec/volumes\"},{\"op\":\"add\",\"path\":\"/spec/volumes/-\"},{\"op\":\"add\",\"path\":\"/spec/volumes\"},{\"op\":\"add\",\"path\":\"/spec/containers/0/volumeMounts/-\"},{\"op\":\"add\",\"path\":\"/spec/initContainers/-\"},{\"op\":\"add\",\"path\":\"/spec/initContainers/0/volumeMounts/-\"},{\"op\":\"add\",\"path\":\"/spec/containers/-\"},{\"op\":\"add\",\"path\":\"/metadata/annotations/vault.hashicorp.com~1agent-inject-status\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "namespace": "test",
+            "annotations": {
+              "vault.hashicorp.com/agent-init-first": "true",
+              "vault.hashicorp.com/role": "demo",
+              "vault.hashicorp.com/agent-inject": "true"
+            },
+            "op": "mutate"
+          },
+          "expected_output": "{\"allowed\":true,\"patches\":[{\"op\":\"add\",\"path\":\"/spec/volumes\"},{\"op\":\"add\",\"path\":\"/spec/volumes/-\"},{\"op\":\"add\",\"path\":\"/spec/volumes\"},{\"op\":\"add\",\"path\":\"/spec/containers/0/volumeMounts/-\"},{\"op\":\"remove\",\"path\":\"/spec/initContainers\"},{\"op\":\"add\",\"path\":\"/spec/initContainers\"},{\"op\":\"add\",\"path\":\"/spec/initContainers/-\"},{\"op\":\"add\",\"path\":\"/spec/initContainers/1/volumeMounts/-\"},{\"op\":\"add\",\"path\":\"/spec/containers/-\"},{\"op\":\"add\",\"path\":\"/metadata/annotations/vault.hashicorp.com~1agent-inject-status\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "namespace": "foo",
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-default-template": "foobar",
+              "vault.hashicorp.com/role": "demo",
+              "vault.hashicorp.com/agent-inject": "true"
+            },
+            "op": "mutate"
+          },
+          "expected_output": "{\"allowed\":false,\"error\":\"invalid_default_template\",\"status\":\"denied\"}\n"
+        }
+      ],
+      "description": "Process an admission request for a workload and return either an allow decision with an ordered list of JSON-patch operations (each an operation verb and a target path) or a deny decision with a neutral error category. Injection into protected system namespaces is denied (system_namespace). An invalid default-template annotation is denied (invalid_default_template). Requests that do not call for injection are allowed with no patches. When injection applies, the patch list adds the agent volumes, copies volume mounts, inserts the init and sidecar containers, and stamps the injection-status annotation; enabling init-first, an external config map, a TLS secret, or copy-volume-mounts changes which patches are produced."
+    },
+    "feature1_log_level.json": {
+      "cases": [
+        {
+          "input": {
+            "level": " INFO ",
+            "op": "log_level"
+          },
+          "expected_output": "{\"level\":\"info\",\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "level": "notice",
+            "op": "log_level"
+          },
+          "expected_output": "{\"level\":\"info\",\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "level": "trace",
+            "op": "log_level"
+          },
+          "expected_output": "{\"level\":\"trace\",\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "level": "warn",
+            "op": "log_level"
+          },
+          "expected_output": "{\"level\":\"warn\",\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "level": "warning",
+            "op": "log_level"
+          },
+          "expected_output": "{\"level\":\"warn\",\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "level": "error",
+            "op": "log_level"
+          },
+          "expected_output": "{\"level\":\"error\",\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "level": "junk",
+            "op": "log_level"
+          },
+          "expected_output": "{\"error\":\"unknown_log_level\",\"status\":\"error\"}\n"
+        }
+      ],
+      "description": "Resolve a human-supplied log-level label to a canonical severity. Matching is case-insensitive and surrounding whitespace is ignored. Recognized labels include trace, debug, info, warn (alias warning), error (alias err) and notice (treated as info). An empty or whitespace-only label defaults to info. Any unrecognized label is reported as an error category."
+    },
+    "feature2_should_inject.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-status": "",
+              "vault.hashicorp.com/agent-inject": "true"
+            },
+            "op": "should_inject"
+          },
+          "expected_output": "{\"inject\":true,\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-status": "",
+              "vault.hashicorp.com/agent-inject": "false"
+            },
+            "op": "should_inject"
+          },
+          "expected_output": "{\"inject\":false,\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-status": "injected",
+              "vault.hashicorp.com/agent-inject": "true"
+            },
+            "op": "should_inject"
+          },
+          "expected_output": "{\"inject\":false,\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-status": "update",
+              "vault.hashicorp.com/agent-inject": "true"
+            },
+            "op": "should_inject"
+          },
+          "expected_output": "{\"inject\":true,\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "Decide whether a workload should have the secret-agent sidecar injected, based on two annotations: an inject flag and an injection-status marker. Injection happens only when the flag is truthy AND the status is empty or the literal 'update'. A status of 'injected' means it was already processed and injection is skipped regardless of the flag."
+    },
+    "feature3_validate.json": {
+      "cases": [
+        {
+          "input": {
+            "agent": {
+              "service_account_name": "foobar",
+              "config_map_name": "test",
+              "namespace": "test",
+              "service_account_path": "foobar",
+              "image_name": "test"
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"status\":\"ok\",\"valid\":true}\n"
+        },
+        {
+          "input": {
+            "agent": {
+              "vault_auth_type": "kubernetes",
+              "vault_role": "test",
+              "vault_auth_path": "test",
+              "service_account_name": "foobar",
+              "namespace": "test",
+              "service_account_path": "foobar",
+              "image_name": "test",
+              "vault_address": "https://foobar.com:8200"
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"status\":\"ok\",\"valid\":true}\n"
+        },
+        {
+          "input": {
+            "agent": {
+              "service_account_name": "foobar",
+              "config_map_name": "test",
+              "namespace": "",
+              "service_account_path": "foobar",
+              "image_name": "test"
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"reason\":\"missing_namespace\",\"status\":\"invalid\",\"valid\":false}\n"
+        },
+        {
+          "input": {
+            "agent": {
+              "service_account_name": "foobar",
+              "config_map_name": "test",
+              "namespace": "test",
+              "service_account_path": "",
+              "image_name": "test"
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"reason\":\"missing_service_account\",\"status\":\"invalid\",\"valid\":false}\n"
+        },
+        {
+          "input": {
+            "agent": {
+              "service_account_name": "foobar",
+              "config_map_name": "test",
+              "namespace": "test",
+              "service_account_path": "foobar",
+              "image_name": ""
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"reason\":\"missing_image\",\"status\":\"invalid\",\"valid\":false}\n"
+        },
+        {
+          "input": {
+            "agent": {
+              "vault_auth_type": "kubernetes",
+              "vault_auth_path": "test",
+              "vault_address": "https://foobar.com:8200",
+              "service_account_name": "foobar",
+              "namespace": "test",
+              "service_account_path": "foobar",
+              "image_name": "test"
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"reason\":\"missing_role\",\"status\":\"invalid\",\"valid\":false}\n"
+        },
+        {
+          "input": {
+            "agent": {
+              "vault_auth_type": "kubernetes",
+              "vault_role": "test",
+              "vault_auth_path": "test",
+              "service_account_name": "foobar",
+              "namespace": "test",
+              "service_account_path": "foobar",
+              "image_name": "test"
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"reason\":\"missing_address\",\"status\":\"invalid\",\"valid\":false}\n"
+        },
+        {
+          "input": {
+            "agent": {
+              "vault_auth_type": "kubernetes",
+              "vault_role": "test",
+              "vault_address": "https://foobar.com:8200",
+              "service_account_name": "foobar",
+              "namespace": "test",
+              "service_account_path": "foobar",
+              "image_name": "test"
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"reason\":\"missing_auth_path\",\"status\":\"invalid\",\"valid\":false}\n"
+        },
+        {
+          "input": {
+            "agent": {
+              "vault_role": "test",
+              "vault_auth_path": "test",
+              "vault_address": "https://foobar.com:8200",
+              "service_account_name": "foobar",
+              "namespace": "test",
+              "service_account_path": "foobar",
+              "image_name": "test"
+            },
+            "op": "validate"
+          },
+          "expected_output": "{\"reason\":\"missing_auth_type\",\"status\":\"invalid\",\"valid\":false}\n"
+        }
+      ],
+      "description": "Validate an assembled agent configuration and report the first missing required field as a neutral category, or success when complete. Validity can be satisfied two ways: a config-map based agent (namespace, service account name+path, image) OR a server-backed agent (namespace, service account name+path, image, plus server role, address, auth path and auth type). Missing fields map to: missing_namespace, missing_service_account, missing_image, missing_role, missing_address, missing_auth_path, missing_auth_type."
+    },
+    "feature4_1_init_defaults.json": {
+      "cases": [
+        {
+          "input": {
+            "config": {
+              "proxy_address": "",
+              "image": "",
+              "group_id": "",
+              "user_id": ""
+            },
+            "op": "init"
+          },
+          "expected_output": "{\"annotations\":{\"vault.hashicorp.com/agent-cache-enable\":\"false\",\"vault.hashicorp.com/agent-cache-exit-on-err\":\"false\",\"vault.hashicorp.com/agent-cache-listener-port\":\"8200\",\"vault.hashicorp.com/agent-cache-use-auto-auth-token\":\"true\",\"vault.hashicorp.com/agent-image\":\"vault:1.7.0\",\"vault.hashicorp.com/agent-inject-default-template\":\"map\",\"vault.hashicorp.com/agent-limits-cpu\":\"500m\",\"vault.hashicorp.com/agent-limits-mem\":\"128Mi\",\"vault.hashicorp.com/agent-request-namespace\":\"test\",\"vault.hashicorp.com/agent-requests-cpu\":\"250m\",\"vault.hashicorp.com/agent-requests-mem\":\"64Mi\",\"vault.hashicorp.com/agent-revoke-grace\":\"5\",\"vault.hashicorp.com/agent-revoke-on-shutdown\":\"true\",\"vault.hashicorp.com/agent-run-as-group\":\"1000\",\"vault.hashicorp.com/agent-run-as-same-user\":\"false\",\"vault.hashicorp.com/agent-run-as-user\":\"100\",\"vault.hashicorp.com/agent-set-security-context\":\"true\",\"vault.hashicorp.com/auth-path\":\"test\",\"vault.hashicorp.com/auth-type\":\"kubernetes\",\"vault.hashicorp.com/log-format\":\"standard\",\"vault.hashicorp.com/log-level\":\"info\",\"vault.hashicorp.com/proxy-address\":\"\",\"vault.hashicorp.com/secret-volume-path\":\"/vault/secrets\",\"vault.hashicorp.com/service\":\"http://foobar:8200\"},\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "Initialize a workload definition by applying defaulted configuration annotations. Given a partial configuration (some fields left blank) the system fills in every operational annotation (image, run-as user/group, auth path/type, cache settings, resource requests/limits, secret volume path, log settings, etc.) and returns the full resolved annotation map. Blank image/user/group fall back to built-in defaults."
+    },
+    "feature4_2_init_errors.json": {
+      "cases": [
+        {
+          "input": {
+            "pod_nil": true,
+            "op": "init"
+          },
+          "expected_output": "{\"error\":\"empty_pod\",\"status\":\"error\"}\n"
+        },
+        {
+          "input": {
+            "config": {
+              "address": ""
+            },
+            "op": "init"
+          },
+          "expected_output": "{\"error\":\"missing_address\",\"status\":\"error\"}\n"
+        },
+        {
+          "input": {
+            "config": {
+              "auth_path": ""
+            },
+            "op": "init"
+          },
+          "expected_output": "{\"error\":\"missing_auth_path\",\"status\":\"error\"}\n"
+        },
+        {
+          "input": {
+            "config": {
+              "namespace": ""
+            },
+            "op": "init"
+          },
+          "expected_output": "{\"error\":\"missing_namespace\",\"status\":\"error\"}\n"
+        }
+      ],
+      "description": "Initialization rejects incomplete or absent input. A nil/empty workload yields empty_pod. A configuration missing the server address yields missing_address; missing auth path yields missing_auth_path; missing namespace yields missing_namespace."
+    },
+    "feature5_1_secret_name.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-secret-foobar": "test1"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"test1\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-secret-FOOBAR": "test2"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"test2\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-secret-server.crt": "creds/tls/somecert"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"server.crt\",\"path\":\"creds/tls/somecert\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-secret-FOOBAR": "test2",
+              "vault.hashicorp.com/preserve-secret-case": "true"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"FOOBAR\",\"path\":\"test2\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "Discover secret requests from annotations of the form '<prefix>-secret-<name>: <path>'. The trailing <name> becomes the secret identifier and the value becomes its source path. By default the name is lower-cased; when a preserve-case flag is enabled the original casing is kept. Names may contain dashes, underscores and dots. An empty or absent name produces no secret."
+    },
+    "feature5_2_secret_template.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-template-foobar": "foobarTemplate",
+              "vault.hashicorp.com/agent-inject-secret-foobar": "test1"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"test1\",\"template\":\"foobarTemplate\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-templat-foobar": "foobarTemplate",
+              "vault.hashicorp.com/agent-inject-secret-foobar": "test1"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"test1\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-template-foobar": "foobarTemplate",
+              "vault.hashicorp.com/agent-inject-secret-foobar2": "test1"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar2\",\"path\":\"test1\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "An inline template annotation '<prefix>-template-<name>' attaches a custom render template to the secret whose name exactly matches <name>. A misspelled key or a name that does not match any declared secret leaves the template empty."
+    },
+    "feature5_3_secret_template_file.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-template-foobar": "foobarTemplate",
+              "vault.hashicorp.com/agent-inject-template-file-foobar": "/etc/config.tmpl",
+              "vault.hashicorp.com/agent-inject-secret-foobar": "test1"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"test1\",\"template\":\"foobarTemplate\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-template-foobar": "",
+              "vault.hashicorp.com/agent-inject-template-file-foobar": "/etc/config.tmpl",
+              "vault.hashicorp.com/agent-inject-secret-foobar": "test1"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"test1\",\"template\":\"\",\"template_file\":\"/etc/config.tmpl\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "A template-file annotation points the secret at an on-disk template. An inline template takes precedence: when both an inline template and a template-file are present the inline template wins and the template-file field stays empty; when the inline template is blank the template-file path is used."
+    },
+    "feature5_4_secret_command.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-secret-foobar": "test1",
+              "vault.hashicorp.com/agent-inject-command-foobar": "pkill -HUP nginx"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"test1\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"pkill -HUP nginx\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-command-foobar2": "pkill -HUP nginx",
+              "vault.hashicorp.com/agent-inject-secret-foobar": "test2"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"test2\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "A command annotation '<prefix>-command-<name>' attaches a post-render command to the matching secret. A command key whose suffix does not match any declared secret name is ignored and the command stays empty."
+    },
+    "feature5_5_secret_file.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-secret-foobar": "vault/test1",
+              "vault.hashicorp.com/agent-inject-file-foobar": "foobar_simple_name"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"vault/test1\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"foobar_simple_name\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-secret-foobar": "vault/test1",
+              "vault.hashicorp.com/agent-inject-file-foobar": "/some/path/foobar_simple_name"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"vault/test1\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"/some/path/foobar_simple_name\"}],\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-file-notcorresponding": "x/y/z",
+              "vault.hashicorp.com/agent-inject-secret-foobar": "vault/test2"
+            },
+            "op": "parse_secrets"
+          },
+          "expected_output": "{\"secrets\":[{\"name\":\"foobar\",\"path\":\"vault/test2\",\"template\":\"\",\"template_file\":\"\",\"mount_path\":\"/vault/secrets\",\"command\":\"\",\"file_path_and_name\":\"\"}],\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "A file annotation '<prefix>-file-<name>' overrides the on-disk filename for a secret. Relative and absolute file names are both retained verbatim in the secret's file field. A file key whose suffix does not match any declared secret name leaves the file field empty."
+    },
+    "feature6_auth_config.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/role": "backwardscompat"
+            },
+            "op": "auth_config"
+          },
+          "expected_output": "{\"auth_config\":{\"role\":\"backwardscompat\"},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/auth-config-role": "lowerprio",
+              "vault.hashicorp.com/role": "backwardscompat"
+            },
+            "op": "auth_config"
+          },
+          "expected_output": "{\"auth_config\":{\"role\":\"backwardscompat\"},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/auth-config-credential_poll_interval": "1",
+              "vault.hashicorp.com/auth-config-ca-cert": "bar",
+              "vault.hashicorp.com/auth-config-name": "foo",
+              "vault.hashicorp.com/auth-config-client_cert": "baz",
+              "vault.hashicorp.com/auth-config-remove_secret_id_file_after_reading": "false"
+            },
+            "op": "auth_config"
+          },
+          "expected_output": "{\"auth_config\":{\"ca_cert\":\"bar\",\"client_cert\":\"baz\",\"credential_poll_interval\":\"1\",\"name\":\"foo\",\"remove_secret_id_file_after_reading\":\"false\"},\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "Collect server auth-method parameters from annotations into a single auth-config map. A legacy role annotation maps to the 'role' key and, when present, takes precedence over a generic auth-config role entry. Generic 'auth-config-<param>' annotations are copied through with dashes in the param name converted to underscores; values are passed through as raw strings (type coercion is left to the downstream consumer)."
+    },
+    "feature7_default_template.json": {
+      "cases": [
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-default-template": "json"
+            },
+            "op": "default_template"
+          },
+          "expected_output": "{\"default_template\":\"json\",\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-default-template": "MAP"
+            },
+            "op": "default_template"
+          },
+          "expected_output": "{\"default_template\":\"map\",\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-default-template": "foobar"
+            },
+            "op": "default_template"
+          },
+          "expected_output": "{\"error\":\"invalid_default_template\",\"status\":\"error\"}\n"
+        },
+        {
+          "input": {
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-default-template": ""
+            },
+            "op": "default_template"
+          },
+          "expected_output": "{\"error\":\"invalid_default_template\",\"status\":\"error\"}\n"
+        }
+      ],
+      "description": "Resolve the default secret-rendering template style from an annotation. Accepted values are 'json' and 'map', case-insensitively (normalized to lower case). Any other value, including an empty string, is rejected as invalid_default_template."
+    },
+    "feature8_1_render_cache_default.json": {
+      "cases": [
+        {
+          "input": {
+            "init_container": false,
+            "annotations": {
+              "vault.hashicorp.com/role": "foobar"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":false,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[],\"listeners\":[],\"cache\":null},\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "Render the full agent runtime configuration document. With no caching annotations the rendered document contains no proxy listeners and no cache stanza, while still carrying the server connection block and the auto-auth method (type, mount path and role) plus the default token sink."
+    },
+    "feature8_2_render_cache_enabled.json": {
+      "cases": [
+        {
+          "input": {
+            "init_container": false,
+            "annotations": {
+              "vault.hashicorp.com/agent-cache-listener-port": "8100",
+              "vault.hashicorp.com/agent-cache-use-auto-auth-token": "force",
+              "vault.hashicorp.com/role": "foobar",
+              "vault.hashicorp.com/agent-cache-enable": "true"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":false,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[],\"listeners\":[{\"type\":\"tcp\",\"address\":\"127.0.0.1:8100\",\"tls_disable\":true}],\"cache\":{\"use_auto_auth_token\":\"force\",\"persist_type\":\"kubernetes\",\"persist_path\":\"/vault/agent-cache\",\"persist_exit_on_err\":false}},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "init_container": false,
+            "annotations": {
+              "vault.hashicorp.com/role": "foobar",
+              "vault.hashicorp.com/agent-cache-enable": "true"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":false,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[],\"listeners\":[{\"type\":\"tcp\",\"address\":\"127.0.0.1:8200\",\"tls_disable\":true}],\"cache\":{\"use_auto_auth_token\":\"true\",\"persist_type\":\"kubernetes\",\"persist_path\":\"/vault/agent-cache\",\"persist_exit_on_err\":false}},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "init_container": false,
+            "annotations": {
+              "vault.hashicorp.com/agent-cache-exit-on-err": "true",
+              "vault.hashicorp.com/role": "foobar",
+              "vault.hashicorp.com/agent-cache-enable": "true"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":false,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[],\"listeners\":[{\"type\":\"tcp\",\"address\":\"127.0.0.1:8200\",\"tls_disable\":true}],\"cache\":{\"use_auto_auth_token\":\"true\",\"persist_type\":\"kubernetes\",\"persist_path\":\"/vault/agent-cache\",\"persist_exit_on_err\":true}},\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "When caching is enabled the rendered document gains a local TCP proxy listener (TLS disabled) and a cache stanza. The listener port defaults to 8200 and is overridable. The cache may persist to a kubernetes-backed store at a fixed path, optionally exiting on persistence error, and its use-auto-auth-token mode is configurable (e.g. 'force')."
+    },
+    "feature8_3_render_token_sinks.json": {
+      "cases": [
+        {
+          "input": {
+            "init_container": true,
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-token": "true",
+              "vault.hashicorp.com/role": "foobar"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":true,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"},{\"type\":\"file\",\"path\":\"/vault/secrets/token\"}]},\"templates\":[],\"listeners\":[],\"cache\":null},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "init_container": true,
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-token": "false",
+              "vault.hashicorp.com/role": "foobar"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":true,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[],\"listeners\":[],\"cache\":null},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "init_container": true,
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-token": "true",
+              "vault.hashicorp.com/secret-volume-path": "/new/secrets",
+              "vault.hashicorp.com/role": "foobar"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":true,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"},{\"type\":\"file\",\"path\":\"/new/secrets/token\"}]},\"templates\":[],\"listeners\":[],\"cache\":null},\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "The auto-auth section always emits a token-helper sink that writes the issued token to the agent home path. When token injection is enabled an additional file sink is emitted that writes the token under the secret volume path (overridable). Disabling token injection leaves only the token-helper sink."
+    },
+    "feature8_4_render_templates.json": {
+      "cases": [
+        {
+          "input": {
+            "init_container": false,
+            "annotations": {
+              "vault.hashicorp.com/role": "foobar",
+              "vault.hashicorp.com/agent-inject-secret-foo": "db/creds/foo"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":false,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[{\"destination\":\"/vault/secrets/foo\",\"contents\":\"{{ with secret \\\"db/creds/foo\\\" }}{{ range $k, $v := .Data }}{{ $k }}: {{ $v }}\\n{{ end }}{{ end }}\",\"command\":\"\",\"source\":\"\"}],\"listeners\":[],\"cache\":null},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "init_container": false,
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-file-foo": "nested/foofile",
+              "vault.hashicorp.com/role": "foobar",
+              "vault.hashicorp.com/agent-inject-secret-foo": "db/creds/foo"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":false,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[{\"destination\":\"/vault/secrets/nested/foofile\",\"contents\":\"{{ with secret \\\"db/creds/foo\\\" }}{{ range $k, $v := .Data }}{{ $k }}: {{ $v }}\\n{{ end }}{{ end }}\",\"command\":\"\",\"source\":\"\"}],\"listeners\":[],\"cache\":null},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "init_container": false,
+            "annotations": {
+              "vault.hashicorp.com/agent-inject-file-foo": "/special/volume/foofile",
+              "vault.hashicorp.com/role": "foobar",
+              "vault.hashicorp.com/agent-inject-secret-foo": "db/creds/foo"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":false,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[{\"destination\":\"/vault/secrets/special/volume/foofile\",\"contents\":\"{{ with secret \\\"db/creds/foo\\\" }}{{ range $k, $v := .Data }}{{ $k }}: {{ $v }}\\n{{ end }}{{ end }}\",\"command\":\"\",\"source\":\"\"}],\"listeners\":[],\"cache\":null},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "init_container": false,
+            "annotations": {
+              "vault.hashicorp.com/secret-volume-path": "/new/mount/path",
+              "vault.hashicorp.com/agent-inject-file-foo": "foofile_name_is_very_very_very_long",
+              "vault.hashicorp.com/role": "foobar",
+              "vault.hashicorp.com/agent-inject-secret-foo": "db/creds/foo"
+            },
+            "op": "render_config"
+          },
+          "expected_output": "{\"config\":{\"exit_after_auth\":false,\"vault\":{\"address\":\"http://foobar:8200\",\"ca_cert\":\"\",\"ca_path\":\"\",\"client_cert\":\"\",\"client_key\":\"\",\"tls_skip_verify\":false,\"tls_server_name\":\"\"},\"auto_auth\":{\"type\":\"kubernetes\",\"mount_path\":\"test\",\"namespace\":\"\",\"role\":\"foobar\",\"sinks\":[{\"type\":\"file\",\"path\":\"/home/vault/.vault-token\"}]},\"templates\":[{\"destination\":\"/new/mount/path/foofile_name_is_very_very_very_long\",\"contents\":\"{{ with secret \\\"db/creds/foo\\\" }}{{ range $k, $v := .Data }}{{ $k }}: {{ $v }}\\n{{ end }}{{ end }}\",\"command\":\"\",\"source\":\"\"}],\"listeners\":[],\"cache\":null},\"status\":\"ok\"}\n"
+        }
+      ],
+      "description": "Each declared secret yields a render template whose destination path is computed from the secret name, an optional per-secret file override, and an optional secret-volume-path. A bare secret renders to '<volume>/<name>'. A relative file override nests under the volume; an absolute file override is appended to the volume path. Overriding the global secret-volume-path relocates the destination accordingly."
+    },
+    "feature9_parse_resources.json": {
+      "cases": [
+        {
+          "input": {
+            "limits_mem": "128Mi",
+            "limits_cpu": "500Mi",
+            "requests_cpu": "250Mi",
+            "requests_mem": "64Mi",
+            "op": "parse_resources"
+          },
+          "expected_output": "{\"limits\":{\"cpu\":\"500Mi\",\"memory\":\"128Mi\"},\"requests\":{\"cpu\":\"250Mi\",\"memory\":\"64Mi\"},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "limits_mem": "",
+            "limits_cpu": "",
+            "requests_cpu": "",
+            "requests_mem": "",
+            "op": "parse_resources"
+          },
+          "expected_output": "{\"limits\":{},\"requests\":{},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "limits_mem": "0",
+            "limits_cpu": "0",
+            "requests_cpu": "0",
+            "requests_mem": "0",
+            "op": "parse_resources"
+          },
+          "expected_output": "{\"limits\":{\"cpu\":\"0\",\"memory\":\"0\"},\"requests\":{\"cpu\":\"0\",\"memory\":\"0\"},\"status\":\"ok\"}\n"
+        },
+        {
+          "input": {
+            "limits_mem": "128m",
+            "limits_cpu": "500mi",
+            "requests_cpu": "250mi",
+            "requests_mem": "64m",
+            "op": "parse_resources"
+          },
+          "expected_output": "{\"error\":\"invalid_quantity\",\"status\":\"error\"}\n"
+        },
+        {
+          "input": {
+            "limits_mem": "128mb",
+            "limits_cpu": "500Mi",
+            "requests_cpu": "250Mi",
+            "requests_mem": "64mb",
+            "op": "parse_resources"
+          },
+          "expected_output": "{\"error\":\"invalid_quantity\",\"status\":\"error\"}\n"
+        }
+      ],
+      "description": "Parse CPU and memory request/limit quantity strings into a normalized resource-requirements object echoing the canonical quantity for each present field. Valid SI ('M','G') and binary ('Mi','Gi') suffixes are accepted, as are '0' and blank (a blank field is simply omitted). Malformed unit notations (e.g. lower-case 'mi'/'gi' for CPU, or 'mb'/'g' for memory) are rejected as invalid_quantity."
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "input_protocol",
+      "input_condition": "Program initialization",
+      "output_rule": "Must be a single JSON object containing exactly one top-level 'op' field. All remaining fields depend on the operation.",
+      "exact_values": [
+        "Binary"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "log_level",
+      "input_condition": "op=login, level field present",
+      "output_rule": "Return canonical severity string. Empty/whitespace input defaults to 'info'.",
+      "exact_values": [
+        "trace",
+        "debug",
+        "info",
+        "warn",
+        "warning",
+        "error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "log_level",
+      "input_condition": "op=login, level field present, recognized_str not in {trace,debug,info,warn,warning,error,notice}",
+      "output_rule": "Return error with category 'unknown_log_level'.",
+      "exact_values": [
+        "unknown_log_level"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "log_level",
+      "input_condition": "op=login, level=notice",
+      "output_rule": "Map 'notice' to canonical 'info'.",
+      "exact_values": [
+        "notice"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "injection_decision",
+      "input_condition": "op=should_inject, annotations.contains(agent-inject-status)",
+      "output_rule": "If status is 'injected', inject=false. If status is empty, inject=true (if flag true). If status is 'update', inject=true (if flag true).",
+      "exact_values": [
+        "injected",
+        "",
+        "update"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "agent_validation",
+      "input_condition": "op=validate, agent config missing required_config_map_field",
+      "output_rule": "Report missing field reason. Precedence: namespace > service_account_name > image_name > vault_role > vault_address > vault_auth_path > vault_auth_type.",
+      "exact_values": [
+        "missing_namespace",
+        "missing_service_account",
+        "missing_image",
+        "missing_role",
+        "missing_address",
+        "missing_auth_path",
+        "missing_auth_type"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "workload_init",
+      "input_condition": "op=init, pod_nil=true",
+      "output_rule": "Return error with category 'empty_pod'.",
+      "exact_values": [
+        "empty_pod"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "workload_init",
+      "input_condition": "op=init, config.address empty",
+      "output_rule": "Return error with category 'missing_address'.",
+      "exact_values": [
+        "missing_address"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "workload_init",
+      "input_condition": "op=init, config.auth_path empty",
+      "output_rule": "Return error with category 'missing_auth_path'.",
+      "exact_values": [
+        "missing_auth_path"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "workload_init",
+      "input_condition": "op=init, config.namespace empty",
+      "output_rule": "Return error with category 'missing_namespace'.",
+      "exact_values": [
+        "missing_namespace"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "secret_discovery",
+      "input_condition": "op=parse_secrets, annotation matches <prefix>-secret-<name>:<path>",
+      "output_rule": "Extract secret name (lowercased unless preserve-case=true) and path.",
+      "exact_values": [
+        "lower-cased"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "secret_discovery",
+      "input_condition": "op=parse_secrets, preserve-secret-case annotation=true",
+      "output_rule": "Secret name retains original casing from annotation key suffix.",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "secret_booking",
+      "input_condition": "op=parse_secrets, annotation-key matches <prefix>-template-<secret-name>",
+      "output_rule": "Attach template string to corresponding secret if name matches exactly.",
+      "exact_values": [
+        "agent-inject-template"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "secret_booking",
+      "input_condition": "annotation-key for template is misspelled OR secret name does not match",
+      "output_rule": "Template remains empty string.",
+      "exact_values": [
+        "agent-inject-templat"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "secret_templating",
+      "input_condition": "op=parse_secrets, both <prefix>-template-<name> and <prefix>-template-file-<name> present",
+      "output_rule": "Inline template wins. template_file field remains empty.",
+      "exact_values": [
+        ""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "secret_templating",
+      "input_condition": "op=parse_secrets, inline template empty AND template-file exists",
+      "output_rule": "Use template-file path as source. template_file field contains path.",
+      "exact_values": [
+        "template_file"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "env_vars",
+      "input_condition": "op=container_env, client_max_retries string not empty/non-zero",
+      "output_rule": "Include 'VAULT_MAX_RETRIES' in envs list.",
+      "exact_values": [
+        "VAULT_MAX_RETRIES"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "env_vars",
+      "input_condition": "op=container_env, client_timeout string not empty",
+      "output_rule": "Include 'VAULT_CLIENT_TIMEOUT' in envs list.",
+      "exact_values": [
+        "VAULT_CLIENT_TIMEOUT"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "env_vars",
+      "input_condition": "op=container_env, env_log_level string not empty",
+      "output_rule": "Include 'VAULT_LOG_LEVEL' in envs list.",
+      "exact_values": [
+        "VAULT_LOG_LEVEL"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "env_vars",
+      "input_condition": "op=container_env, proxy_address string not empty",
+      "output_rule": "Include 'HTTPS_PROXY' in envs list.",
+      "exact_values": [
+        "HTTPS_PROXY"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "env_vars",
+      "input_condition": "op=container_env, config_map_name string not empty",
+      "output_rule": "Do NOT include 'VAULT_CONFIG' in envs list (suppressed).",
+      "exact_values": [
+        "config_map_name"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "run_as_same_id",
+      "input_condition": "op=run_as_same_id, same_id annotation=same_value",
+      "output_rule": "If valid boolean true AND app_user is set to non-root: result=true. Otherwise (invalid flag/bool, app_user missing/root): report error 'not_allowed'.",
+      "exact_values": [
+        "not_allowed",
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "run_as_same_id",
+      "input_condition": "op=run_as_same_id, app_user=0",
+      "output_rule": "Return error 'not_allowed' even if flag is true.",
+      "exact_values": [
+        "not_allowed"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "security_context",
+      "input_condition": "op=security_context, set_security_context annotation=False",
+      "output_rule": "Return security_context as null.",
+      "exact_values": [
+        null
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "security_context",
+      "input_condition": "op=security_context, run_as_user annotation=0",
+      "output_rule": "Set run_as_non_root to false. Others remain true/standard.",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "mutate",
+      "input_condition": "op=mutate, namespace=current_env (e.g. kube-system)",
+      "output_rule": "Return allowed=false, error='system_namespace'.",
+      "exact_values": [
+        "system_namespace"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "mutate",
+      "output_rule": "Output object keys must be sorted alphabetically. Followed by a single newline.",
+      "exact_values": [
+        "sorted"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "mutate",
+      "output_rule": "If allowed=true, output includes 'patches' array. If allowed=false, output excludes 'patches' array, includes 'error' and 'status' only.",
+      "exact_values": [
+        "patches"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific pod-related error sentinel",
+        "exact_values_to_replace": [
+          "empty_pod"
+        ],
+        "trigger_keywords": [
+          "error category empty_pod",
+          "workload_init error",
+          "pod initialization failure",
+          "Nil pod error code",
+          "init operation return value"
+        ],
+        "oracle_response": "The exact error category string is 'empty_pod'."
+      },
+      {
+        "constraint_id": "C014",
+        "replacement": "a specific misspelled template prefix string",
+        "exact_values_to_replace": [
+          "agent-inject-templat"
+        ],
+        "trigger_keywords": [
+          "template annotation misspelled",
+          "secret booking error key",
+          "incorrect template prefix",
+          "agent-inject-templat error",
+          "template name mismatch"
+        ],
+        "oracle_response": "The exact string that triggers this behavior is 'agent-inject-templat'."
+      },
+      {
+        "constraint_id": "C024",
+        "replacement": "the exact sentinel value for disabled security context",
+        "exact_values_to_replace": [
+          null
+        ],
+        "trigger_keywords": [
+          "security context null output",
+          "null security_context value",
+          "disabled security context",
+          "annotation set_security_context False",
+          "null object in response"
+        ],
+        "oracle_response": "The exact value is null."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C026",
+        "vague_phrase": "current_env namespace example",
+        "actual_meaning": "Requires searching the codebase to find the specific namespace string matching the pattern of the current deployment environment, such as 'kube-system'."
+      },
+      {
+        "constraint_id": "C002",
+        "vague_phrase": "canonical severity string list",
+        "actual_meaning": "Refers to the literal set of strings {trace, debug, info, warn, warning, error} found in the logging module's severity mapping dictionary."
+      }
+    ]
+  }
+}

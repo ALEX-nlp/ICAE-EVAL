@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to ship the ordered list positioning engine we've been talking about. The core idea is that any record type should be able to 'join' an ordered list and have all the bookkeeping done automatically — no more manual position juggling when things get inserted, moved around, or deleted. We've had bugs in the past where gaps never closed after deletions, or positions collided when someone inserted in the middle, and that's exactly what this should fix.
+
+A few things I know we need: records should default to going to the end of the list when created, but we need a way to flip that so new stuff shows up at the top instead. There should also be a way to completely opt out of auto-placement. We talked about supporting sub-lists (like, the same table can have multiple independent ordered lists based on some grouping field). Oh, and remember that constraint thing we ran into on the login module — same deal applies here, the shifting logic needs to handle that edge case gracefully.
+
+Also, someone on the data team asked about zero-based ordering for one of their exports, so that config knob needs to be in there. And we definitely need timestamp behavior to be controllable — sometimes you don't want a reorder to look like a content edit. There's also a bulk-operation mode where you want to pause the auto-maintenance temporarily. Error handling should be clean and categorized, no raw exceptions leaking out.

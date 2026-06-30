@@ -1,0 +1,713 @@
+{
+  "fuzzy_prd": "# Executable Behavior Specification Runner - Data-driven behavior cases with reliable execution semantics\n\n## Project Goal\n\nBuild a behavior-specification runner that allows developers to describe an executable test as an ordered sequence of named setup, action, assertion, and cleanup steps — optionally driven by example data rows — so they can express intent as readable prose-like steps without duplicating boilerplate for each data row or resource-lifecycle concern.\n\n---\n\n## Background & Problem\n\nWithout this runner, developers are forced to hand-write a separate test method per data row, manually bind example values to parameters, manually re-run shared setup before a destructive assertion, and hand-code cleanup ordering and resource disposal. This leads to duplicated code, fragile resource handling, unclear skip/error reporting, and brittle behaviour when the same step sequence is registered from more than one thread.\n\nWith this runner, a developer expresses behaviour as a list of ordered steps, attaches one or more example rows, optionally marks individual steps (or a whole case) as skipped, isolates a destructive assertion so it gets its own replayed context, enforces a per-step time limit, and registers cleanup callbacks or disposable resources. The runner then executes the steps and emits one structured result per executed step, including pass/error/skip status, rendered step display text, and reliable cleanup ordering.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\nThe runner exposes a single conceptual operation: *run a behavior definition and report one result per executed step*. Every result carries a status that is one of completed (the step ran and passed), error (the step or its surrounding machinery failed), or skipped (the step was intentionally not executed). Throughout this document the standard result summary lines are: `result_count` (total results emitted), `completed_count`, `error_count`, and `skipped_count`. Each leaf feature below accepts a single JSON command object on stdin and prints only the stdout lines shown in its cases.\n\n### Feature 1: Input Value Representation\n\n**As a developer**, I want declared inputs to a behavior case to be represented consistently, so I can distinguish a value the caller actually supplied from a value the runner had to generate on the caller's behalf.\n\n**Expected Behavior / Usage:**\n\nAn input value can be created two ways: from a concrete value the caller provides, or from only a type when no value is available. The runner must record which of the two happened (a `generated_default` flag) and the resulting value. This feature is split into two independent leaf contracts.\n\n*1.1 Explicit supplied value — A caller-supplied value is preserved verbatim and flagged as not generated*\n\nWhen an input is created from a concrete runtime value, the runner must keep that exact value and report `generated_default=false`. The command names this behavior and carries the value to wrap; stdout reports the generated flag followed by the rendered value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_specific_argument_value.json`\n\n```json\n{\n    \"description\": \"A supplied runtime value is wrapped as an explicit argument rather than as a generated default.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"specific_argument_value\",\n                \"value\": \"sample\"\n            },\n            \"expected_output\": \"generated_default=false\\nvalue=sample\\n\"\n        }\n    ]\n}\n```\n\n*1.2 Generated default value — A value requested by type only is filled with that type's default and flagged as generated*\n\nWhen an input is created from a type with no supplied value, the runner must produce the type's natural default (zero for an integer-like type, absent/null for a reference-like type) and report `generated_default=true`. The command names a neutral value type; stdout reports the generated flag followed by the rendered default value, using `null` for an absent reference default.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_2_generated_default_argument.json`\n\n```json\n{\n    \"description\": \"A requested argument type is converted to its generated default value and marked as generated.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"generated_default_argument\",\n                \"value_type\": \"integer\"\n            },\n            \"expected_output\": \"generated_default=true\\nvalue=0\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"generated_default_argument\",\n                \"value_type\": \"object\"\n            },\n            \"expected_output\": \"generated_default=true\\nvalue=null\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Example-Driven Behavior Cases\n\n**As a developer**, I want one behavior definition to run against multiple data rows with readable step text, so I can cover related examples without copy-pasting the behavior body.\n\n**Expected Behavior / Usage:**\n\nA behavior body can declare typed parameters and be paired with zero or more example rows. The runner executes the body once per example row, binding the row's values to the parameters; rows shorter than the parameter list have their trailing parameters filled with generated defaults; a parameterized body with no rows still runs once using generated defaults. Step display text may contain positional placeholders that are substituted with the bound values. Rows that cannot bind to the declared parameters must surface as error results rather than crashing the run.\n\n*2.1 Complete example rows — Each row runs the body once with exactly that row's values*\n\nEvery example row whose value count matches the parameter list runs the body once, binding each value in order. Stdout reports the result summary followed by one `arguments=` line per run listing the bound values; argument lines are emitted in a stable sorted order so the contract is independent of run scheduling.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_examples_supply_arguments.json`\n\n```json\n{\n    \"description\": \"Each tabular example runs the scenario once with the values from that example.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"examples_supply_all_arguments\"\n            },\n            \"expected_output\": \"result_count=3\\ncompleted_count=3\\nerror_count=0\\nskipped_count=0\\narguments=1,2,3\\narguments=3,4,5\\narguments=5,6,7\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Short example rows — Missing trailing values are filled with generated defaults*\n\nWhen a row supplies fewer values than the body declares, the runner binds the supplied values to the leading parameters and fills each remaining trailing parameter with its generated default. Stdout reports the successful result summary followed by one completed `arguments=` line per row, including the filled defaults.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_examples_fill_missing_arguments.json`\n\n```json\n{\n    \"description\": \"When examples provide fewer values than the scenario declares, the missing trailing values are generated defaults.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"examples_fill_missing_arguments\"\n            },\n            \"expected_output\": \"result_count=3\\ncompleted_count=3\\nerror_count=0\\nskipped_count=0\\narguments=1,2,0,0\\narguments=3,4,0,0\\narguments=5,6,0,0\\n\"\n        }\n    ]\n}\n```\n\n*2.3 Parameters with no example rows — The body runs once with all generated defaults*\n\nA parameterized body that has no example rows must still execute exactly once, binding every parameter to its generated default. Stdout reports a single successful run and the generated argument tuple.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_3_parameters_without_examples.json`\n\n```json\n{\n    \"description\": \"A parameterized scenario without explicit examples runs with generated default parameter values.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"scenario_parameters_without_examples\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=1\\nerror_count=0\\nskipped_count=0\\narguments=0,0,0,0\\n\"\n        }\n    ]\n}\n```\n\n*2.4 Step display text formatting — Placeholders are substituted with bound values, nulls render as `null`, out-of-range placeholders are left intact*\n\nA step's display text may contain positional placeholders `{0}`, `{1}`, … . The runner substitutes each placeholder with the corresponding bound value, renders an absent value as the literal `null`, and — crucially — leaves any placeholder whose index exceeds the available values untouched without failing the run. The command selects which formatting case to exercise (`valid_values`, `null_values`, or any other value for the out-of-range case); stdout reports the result summary and a `display_suffix=` line holding the rendered step text.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_4_formatted_step_names.json`\n\n```json\n{\n    \"description\": \"Step display names render supplied example values when the text contains matching placeholders, including null values, and leave out-of-range placeholders unchanged.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"formatted_step_names\",\n                \"format_case\": \"valid_values\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=1\\nerror_count=0\\nskipped_count=0\\n[a specific sentinel value — ask the PM for the exact string]\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"formatted_step_names\",\n                \"format_case\": \"null_values\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=1\\nerror_count=0\\nskipped_count=0\\ndisplay_suffix=Given null, null and null\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"formatted_step_names\",\n                \"format_case\": \"out_of_range_placeholders\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=1\\nerror_count=0\\nskipped_count=0\\ndisplay_suffix=Given {3}, {4} and {5}\\n\"\n        }\n    ]\n}\n```\n\n*2.5 Unbindable example rows — Rows that cannot bind become error results, not crashes*\n\nIf an example row's values cannot be bound to the declared parameters (wrong count or incompatible type), the runner must turn each such row into an error result instead of letting the failure escape discovery or execution. Stdout reports the result summary in which every runnable case is an error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_5_invalid_examples.json`\n\n```json\n{\n    \"description\": \"Examples that cannot be bound to the declared scenario parameters are reported as error results instead of crashing discovery or execution.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"invalid_examples\"\n            },\n            \"expected_output\": \"result_count=2\\ncompleted_count=0\\nerror_count=2\\nskipped_count=0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Step Execution Semantics\n\n**As a developer**, I want a behavior case's setup, skips, errors, isolation, and time limits to behave predictably, so I can trust that each emitted result faithfully reflects the flow of the steps.\n\n**Expected Behavior / Usage:**\n\nA behavior case is a sequence of steps, each producing one result. Shared background steps run before each case; a whole case or individual steps can be skipped; a step failure blocks the dependent steps that follow it; definition/construction errors are captured as results; a destructive assertion can be isolated to its own replayed context; and a step may declare a time limit. The leaves below cover each of these guarantees.\n\n*3.1 Shared background steps — Background steps run before each case and are distinguishable in results*\n\nBackground steps declared for a feature must execute before the steps of each case in that feature, and their results must be distinguishable from ordinary case-step results. Stdout reports the result summary, an `execution=` trace listing whether each executed step was a `background` or `scenario` step in order, and the counts of background versus case results.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_background_steps.json`\n\n```json\n{\n    \"description\": \"Background steps are executed before each scenario and are identified separately from scenario steps in result names.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"background_steps\"\n            },\n            \"expected_output\": \"result_count=10\\ncompleted_count=10\\nerror_count=0\\nskipped_count=0\\nexecution=background,background,background,scenario,scenario,background,background,background,scenario,scenario\\nbackground_result_count=6\\nscenario_result_count=4\\n\"\n        }\n    ]\n}\n```\n\n*3.2 Whole-case skip — A skipped case yields one skipped result and runs no steps*\n\nWhen an entire behavior case is marked skipped with a reason, the runner must emit exactly one skipped result, execute none of its steps, and preserve the reason. Stdout reports the result summary, the executed step count (zero), and the skip reason.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_skipped_scenario.json`\n\n```json\n{\n    \"description\": \"A skipped whole scenario produces one skipped result and does not execute its steps.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"skipped_scenario\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=0\\nerror_count=0\\nskipped_count=1\\nsteps_executed=0\\nskip_reason=Test\\n\"\n        }\n    ]\n}\n```\n\n*3.3 Individual skipped steps — Skipped steps do not run, do not fail the case, and keep their reason*\n\nA step marked skipped must not execute its action and must not fail the surrounding case; its reason must be preserved. Non-skipped steps in the same case still run and complete normally. Stdout reports the result summary (completed plus skipped, no errors) and one `skip_reason=` line per skipped step.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_skipped_steps.json`\n\n```json\n{\n    \"description\": \"Skipped individual steps are not executed, do not fail the scenario, and report the supplied skip reason.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"skipped_steps\"\n            },\n            \"expected_output\": \"result_count=4\\ncompleted_count=2\\nerror_count=0\\nskipped_count=2\\nskip_reason=the feature is unfinished\\nskip_reason=the feature is unfinished\\n\"\n        }\n    ]\n}\n```\n\n*3.4 Failure propagation — A failed step blocks the dependent steps after it*\n\nWhen a step fails, the runner must not execute the dependent steps that follow it; each such following step is reported as an error that is explicitly blocked by the failed preceding step. Stdout reports the result summary, the executed step count (only the failing step ran), and one `blocked_by=` line per blocked following step identifying the failed preceding step.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_4_failing_step_stops_following_steps.json`\n\n```json\n{\n    \"description\": \"After a step fails, later dependent steps are not executed and are reported as blocked by the failed preceding step.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"failing_step_stops_following_steps\"\n            },\n            \"expected_output\": \"result_count=3\\ncompleted_count=0\\nerror_count=3\\nskipped_count=0\\nsteps_executed=1\\n[a specific blocking string — ask the PM for the exact cause]\\n[a specific blocking string — ask the PM for the exact cause]\\n\"\n        }\n    ]\n}\n```\n\n*3.5 Definition and construction errors — Errors while building a case become error results*\n\nIf an error is raised while defining a behavior body (for example the body itself throws) or while constructing the instance that hosts the body (for example no usable constructor), the runner must capture it as an error result rather than letting it escape. The command selects which failure to exercise; stdout reports a result summary containing exactly one error result.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_5_definition_errors.json`\n\n```json\n{\n    \"description\": \"Errors while constructing or defining a scenario are converted into error results rather than escaping the runner.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"scenario_body_error\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=0\\nerror_count=1\\nskipped_count=0\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"unconstructable_feature\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=0\\nerror_count=1\\nskipped_count=0\\n\"\n        }\n    ]\n}\n```\n\n*3.6 Isolated assertions — A destructive assertion gets its own replayed context*\n\nA step can be marked as isolated. The runner must give each isolated step its own fresh replay of the preceding context, so that a destructive check (one that consumes or mutates shared state) does not break the steps that follow it. The expansion of replayed contexts plus ordinary steps must all complete. Stdout reports a result summary in which every emitted result is completed.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_6_isolated_steps.json`\n\n```json\n{\n    \"description\": \"An isolated assertion receives its own replayed context so destructive checks do not affect later steps.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"isolated_steps\"\n            },\n            \"expected_output\": \"result_count=10\\ncompleted_count=10\\nerror_count=0\\nskipped_count=0\\n\"\n        }\n    ]\n}\n```\n\n*3.7 Per-step time limit — A step within its limit completes; a step over its limit fails with a neutral timeout signal*\n\nA step may declare a maximum duration. A step that finishes within its limit completes normally. A step that exceeds its limit must fail, and the failure must be reported as a language-neutral timeout category carrying the configured limit (no host-runtime exception identity). The command selects a fast or slow step; for the slow case stdout reports the result summary plus `error=timeout` and `limit_ms=`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_7_timeout.json`\n\n```json\n{\n    \"description\": \"A step that finishes before its limit passes, while a step exceeding its limit fails with a normalized timeout signal.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"timeout\",\n                \"step_duration\": \"within_limit\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=1\\nerror_count=0\\nskipped_count=0\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"timeout\",\n                \"step_duration\": \"exceeds_1ms_limit\"\n            },\n            \"expected_output\": \"result_count=1\\ncompleted_count=0\\nerror_count=1\\nskipped_count=0\\nerror=timeout\\nlimit_ms=1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Cleanup and Resource Lifetime\n\n**As a developer**, I want cleanup callbacks and disposable resources to run reliably after a behavior case, so I can be sure resources are released even when a step or a cleanup action itself fails.\n\n**Expected Behavior / Usage:**\n\nA step can register cleanup callbacks and disposable resources. After the case finishes (whether it passed or failed), the runner runs every registered cleanup callback exactly once in reverse registration order, and disposes every registered resource exactly once in reverse creation order; resources remain usable while the steps run. A throwing cleanup callback or a throwing disposal must not prevent the remaining cleanups/disposals, and the failure is surfaced as an error result. The leaves below cover ordering and the failure variants.\n\n*4.1 Cleanup callback ordering — Callbacks run once, in reverse order, including for failing cases*\n\nRegistered cleanup callbacks must each run exactly once after the case in reverse registration order. This holds even when the case contains a failing step: cleanup still runs in reverse. The command selects the registration shape; stdout reports the result summary and a `teardown_order=` line listing the callback identifiers in the order they ran.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_teardown_order.json`\n\n```json\n{\n    \"description\": \"Registered cleanup callbacks execute once after scenario execution in reverse registration order, including failing scenarios.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"teardown_order\",\n                \"teardown_case\": \"single_step\"\n            },\n            \"expected_output\": \"result_count=2\\ncompleted_count=2\\nerror_count=0\\nskipped_count=0\\n[a specific sequence string — ask the PM for the exact teardown order]\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"teardown_order\",\n                \"teardown_case\": \"many_steps\"\n            },\n            \"expected_output\": \"result_count=3\\ncompleted_count=3\\nerror_count=0\\nskipped_count=0\\nteardown_order=6,5,4,3,2,1\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"teardown_order\",\n                \"teardown_case\": \"failing_step\"\n            },\n            \"expected_output\": \"result_count=6\\ncompleted_count=5\\nerror_count=1\\nskipped_count=0\\n[a specific sequence string — ask the PM for the exact teardown order]\\n\"\n        }\n    ]\n}\n```\n\n*4.2 Throwing cleanup callbacks — Cleanup still completes in reverse order and the failure is reported*\n\nIf cleanup callbacks throw while running, the runner must still execute all of them in reverse order and surface the cleanup failure as an error result emitted after the successful step results. Stdout reports the result summary (one error from the failing cleanup) and the full reverse `teardown_order=`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_teardown_failures.json`\n\n```json\n{\n    \"description\": \"Cleanup callbacks still execute in reverse order when they throw, and their cleanup failures are reported after successful step results.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"teardown_order\",\n                \"teardown_case\": \"throwing_teardowns\"\n            },\n            \"expected_output\": \"result_count=2\\ncompleted_count=1\\nerror_count=1\\nskipped_count=0\\n[a specific sequence string — ask the PM for the exact teardown order]\\n\"\n        }\n    ]\n}\n```\n\n*4.3 Disposable resource lifetime — Resources stay usable during the case and are disposed once in reverse creation order*\n\nResources registered for disposal must remain usable throughout the case's steps and then be disposed exactly once afterward in reverse creation order. This holds whether registration happened in one step or across several steps, and even when a later step fails. The command selects the registration shape; stdout reports the result summary and a `lifetime=` line listing creation and disposal events in order (creations ascending, disposals in reverse).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_disposable_lifetime.json`\n\n```json\n{\n    \"description\": \"Registered disposable resources remain usable during scenario steps and are disposed once afterward in reverse creation order.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"disposable_lifetime\",\n                \"disposal_case\": \"single_step\"\n            },\n            \"expected_output\": \"result_count=3\\ncompleted_count=3\\nerror_count=0\\nskipped_count=0\\nlifetime=create1,create2,create3,dispose3,dispose2,dispose1\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"disposable_lifetime\",\n                \"disposal_case\": \"many_steps\"\n            },\n            \"expected_output\": \"result_count=5\\ncompleted_count=5\\nerror_count=0\\nskipped_count=0\\nlifetime=create1,create2,create3,dispose3,dispose2,dispose1\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"disposable_lifetime\",\n                \"disposal_case\": \"failing_step\"\n            },\n            \"expected_output\": \"result_count=6\\ncompleted_count=5\\nerror_count=1\\nskipped_count=0\\nlifetime=create1,create2,create3,dispose3,dispose2,dispose1\\n\"\n        }\n    ]\n}\n```\n\n*4.4 Throwing disposal — All resources are still disposed and the disposal failure is reported*\n\nIf registered resources throw while being disposed, the runner must still dispose every resource it registered and surface the disposal failure as an error result. Stdout reports the result summary (one error from the failing disposal) and the full reverse `lifetime=` sequence showing every resource was disposed.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_4_dispose_failures.json`\n\n```json\n{\n    \"description\": \"If registered resources throw while being disposed, all resources are still disposed and disposal failures are surfaced as error results.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"disposable_lifetime\",\n                \"disposal_case\": \"throwing_dispose\"\n            },\n            \"expected_output\": \"result_count=3\\ncompleted_count=2\\nerror_count=1\\nskipped_count=0\\nlifetime=create1,create2,create3,dispose3,dispose2,dispose1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Concurrent Step Registration\n\n**As a developer**, I want step-registration state to be isolated per thread, so I can register behavior definitions from multiple threads at once without one thread's registration corrupting another's.\n\n**Expected Behavior / Usage:**\n\nThe step-registration buffer that accumulates a case's steps must be per-thread, so two threads building the same kind of step sequence at the same time never interfere. The command names which registration shape both threads perform — a full setup/action/assertion sequence, a single action step, an isolated assertion, a plain observation, or a skipped step. The runner starts two physical threads that each perform the named registration, joins them, and reports the thread count and a neutral error status (`none` when no cross-thread error occurred).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_concurrent_registration.json`\n\n```json\n{\n    \"description\": \"Step registration state is isolated per thread so two threads can register the same kind of step sequence concurrently without cross-thread errors.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"behavior\": \"concurrent_registration\",\n                \"operation\": \"full_sequence\"\n            },\n            \"expected_output\": \"threads=2\\nerror=none\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"concurrent_registration\",\n                \"operation\": \"action_step\"\n            },\n            \"expected_output\": \"threads=2\\nerror=none\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"concurrent_registration\",\n                \"operation\": \"isolated_assertion\"\n            },\n            \"expected_output\": \"threads=2\\nerror=none\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"concurrent_registration\",\n                \"operation\": \"observation\"\n            },\n            \"expected_output\": \"threads=2\\nerror=none\\n\"\n        },\n        {\n            \"input\": {\n                \"behavior\": \"concurrent_registration\",\n                \"operation\": \"skipped_step\"\n            },\n            \"expected_output\": \"threads=2\\nerror=none\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint, ensuring high maintainability without over-engineering.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system. It reads a JSON command from stdin, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-leaf-feature contracts above. This adapter must be logically (and ideally physically) separated from the core domain.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_1_specific_argument_value.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_1_specific_argument_value@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the same numbering convention as the setup order\n- match the lifecycle pattern defined in the disposable module\n",
+  "oracle_data": {
+    "task_id": "adamralph__xbehave.net-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what does 'Given' substitute to",
+          "value 1 format",
+          "formatted output sample",
+          "display suffix value"
+        ],
+        "oracle_response": "display_suffix=Given 1, 2 and 3"
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "what blocks step 2",
+          "blocking string value",
+          "step stopped by",
+          "error message for step 2"
+        ],
+        "oracle_response": "blocked_by=[01.01] Given something"
+      },
+      {
+        "constraint_id": "C019",
+        "trigger_keywords": [
+          "teardown order",
+          "reverse order values",
+          "callback sequence",
+          "teardown sequence"
+        ],
+        "oracle_response": "teardown_order=3,2,1"
+      },
+      {
+        "constraint_id": "TC_feature3_4_failing_step_stops_following_steps",
+        "trigger_keywords": [
+          "test cases for feature3 4 failing step stops following steps",
+          "show me feature3 4 failing step stops following steps test cases",
+          "what are the feature3 4 failing step stops following steps inputs and outputs",
+          "give me the feature3_4_failing_step_stops_following_steps test file",
+          "feature3 4 failing step stops following steps expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_4_failing_step_stops_following_steps:\n{\n  \"description\": \"After a step fails, later dependent steps are not executed and are reported as blocked by the failed preceding step.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"behavior\": \"failing_step_stops_following_steps\"\n      },\n      \"expected_output\": \"result_count=3\\ncompleted_count=0\\nerror_count=3\\nskipped_count=0\\nsteps_executed=1\\nblocked_by=[01.01] Given something\\nblocked_by=[01.01] Given something\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_teardown_failures",
+        "trigger_keywords": [
+          "test cases for feature4 2 teardown failures",
+          "show me feature4 2 teardown failures test cases",
+          "what are the feature4 2 teardown failures inputs and outputs",
+          "give me the feature4_2_teardown_failures test file",
+          "feature4 2 teardown failures expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_2_teardown_failures:\n{\n  \"description\": \"Cleanup callbacks still execute in reverse order when they throw, and their cleanup failures are reported after successful step results.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"behavior\": \"teardown_order\",\n        \"teardown_case\": \"throwing_teardowns\"\n      },\n      \"expected_output\": \"result_count=2\\ncompleted_count=1\\nerror_count=1\\nskipped_count=0\\nteardown_order=3,2,1\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the same numbering convention as the setup order",
+        "actual_meaning": "The teardown callbacks must execute in descending order of their registration index (highest first)."
+      },
+      {
+        "vague_reference": "match the lifecycle pattern defined in the disposable module",
+        "actual_meaning": "Resources must be disposed in the exact reverse order of their creation."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_specific_argument_value.json": {
+      "description": "A supplied runtime value is wrapped as an explicit argument rather than as a generated default.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "specific_argument_value",
+            "value": "sample"
+          },
+          "expected_output": "generated_default=false\nvalue=sample\n"
+        }
+      ]
+    },
+    "feature1_2_generated_default_argument.json": {
+      "description": "A requested argument type is converted to its generated default value and marked as generated.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "generated_default_argument",
+            "value_type": "integer"
+          },
+          "expected_output": "generated_default=true\nvalue=0\n"
+        },
+        {
+          "input": {
+            "behavior": "generated_default_argument",
+            "value_type": "object"
+          },
+          "expected_output": "generated_default=true\nvalue=null\n"
+        }
+      ]
+    },
+    "feature2_1_examples_supply_arguments.json": {
+      "description": "Each tabular example runs the scenario once with the values from that example.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "examples_supply_all_arguments"
+          },
+          "expected_output": "result_count=3\ncompleted_count=3\nerror_count=0\nskipped_count=0\narguments=1,2,3\narguments=3,4,5\narguments=5,6,7\n"
+        }
+      ]
+    },
+    "feature2_2_examples_fill_missing_arguments.json": {
+      "description": "When examples provide fewer values than the scenario declares, the missing trailing values are generated defaults.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "examples_fill_missing_arguments"
+          },
+          "expected_output": "result_count=3\ncompleted_count=3\nerror_count=0\nskipped_count=0\narguments=1,2,0,0\narguments=3,4,0,0\narguments=5,6,0,0\n"
+        }
+      ]
+    },
+    "feature2_3_parameters_without_examples.json": {
+      "description": "A parameterized scenario without explicit examples runs with generated default parameter values.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "scenario_parameters_without_examples"
+          },
+          "expected_output": "result_count=1\ncompleted_count=1\nerror_count=0\nskipped_count=0\narguments=0,0,0,0\n"
+        }
+      ]
+    },
+    "feature2_4_formatted_step_names.json": {
+      "description": "Step display names render supplied example values when the text contains matching placeholders, including null values, and leave out-of-range placeholders unchanged.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "formatted_step_names",
+            "format_case": "valid_values"
+          },
+          "expected_output": "result_count=1\ncompleted_count=1\nerror_count=0\nskipped_count=0\ndisplay_suffix=Given 1, 2 and 3\n"
+        },
+        {
+          "input": {
+            "behavior": "formatted_step_names",
+            "format_case": "null_values"
+          },
+          "expected_output": "result_count=1\ncompleted_count=1\nerror_count=0\nskipped_count=0\ndisplay_suffix=Given null, null and null\n"
+        },
+        {
+          "input": {
+            "behavior": "formatted_step_names",
+            "format_case": "out_of_range_placeholders"
+          },
+          "expected_output": "result_count=1\ncompleted_count=1\nerror_count=0\nskipped_count=0\ndisplay_suffix=Given {3}, {4} and {5}\n"
+        }
+      ]
+    },
+    "feature2_5_invalid_examples.json": {
+      "description": "Examples that cannot be bound to the declared scenario parameters are reported as error results instead of crashing discovery or execution.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "invalid_examples"
+          },
+          "expected_output": "result_count=2\ncompleted_count=0\nerror_count=2\nskipped_count=0\n"
+        }
+      ]
+    },
+    "feature3_1_background_steps.json": {
+      "description": "Background steps are executed before each scenario and are identified separately from scenario steps in result names.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "background_steps"
+          },
+          "expected_output": "result_count=10\ncompleted_count=10\nerror_count=0\nskipped_count=0\nexecution=background,background,background,scenario,scenario,background,background,background,scenario,scenario\nbackground_result_count=6\nscenario_result_count=4\n"
+        }
+      ]
+    },
+    "feature3_2_skipped_scenario.json": {
+      "description": "A skipped whole scenario produces one skipped result and does not execute its steps.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "skipped_scenario"
+          },
+          "expected_output": "result_count=1\ncompleted_count=0\nerror_count=0\nskipped_count=1\nsteps_executed=0\nskip_reason=Test\n"
+        }
+      ]
+    },
+    "feature3_3_skipped_steps.json": {
+      "description": "Skipped individual steps are not executed, do not fail the scenario, and report the supplied skip reason.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "skipped_steps"
+          },
+          "expected_output": "result_count=4\ncompleted_count=2\nerror_count=0\nskipped_count=2\nskip_reason=the feature is unfinished\nskip_reason=the feature is unfinished\n"
+        }
+      ]
+    },
+    "feature3_4_failing_step_stops_following_steps.json": {
+      "description": "After a step fails, later dependent steps are not executed and are reported as blocked by the failed preceding step.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "failing_step_stops_following_steps"
+          },
+          "expected_output": "result_count=3\ncompleted_count=0\nerror_count=3\nskipped_count=0\nsteps_executed=1\nblocked_by=[01.01] Given something\nblocked_by=[01.01] Given something\n"
+        }
+      ]
+    },
+    "feature3_5_definition_errors.json": {
+      "description": "Errors while constructing or defining a scenario are converted into error results rather than escaping the runner.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "scenario_body_error"
+          },
+          "expected_output": "result_count=1\ncompleted_count=0\nerror_count=1\nskipped_count=0\n"
+        },
+        {
+          "input": {
+            "behavior": "unconstructable_feature"
+          },
+          "expected_output": "result_count=1\ncompleted_count=0\nerror_count=1\nskipped_count=0\n"
+        }
+      ]
+    },
+    "feature3_6_isolated_steps.json": {
+      "description": "An isolated assertion receives its own replayed context so destructive checks do not affect later steps.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "isolated_steps"
+          },
+          "expected_output": "result_count=10\ncompleted_count=10\nerror_count=0\nskipped_count=0\n"
+        }
+      ]
+    },
+    "feature3_7_timeout.json": {
+      "description": "A step that finishes before its limit passes, while a step exceeding its limit fails with a normalized timeout signal.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "timeout",
+            "step_duration": "within_limit"
+          },
+          "expected_output": "result_count=1\ncompleted_count=1\nerror_count=0\nskipped_count=0\n"
+        },
+        {
+          "input": {
+            "behavior": "timeout",
+            "step_duration": "exceeds_1ms_limit"
+          },
+          "expected_output": "result_count=1\ncompleted_count=0\nerror_count=1\nskipped_count=0\nerror=timeout\nlimit_ms=1\n"
+        }
+      ]
+    },
+    "feature4_1_teardown_order.json": {
+      "description": "Registered cleanup callbacks execute once after scenario execution in reverse registration order, including failing scenarios.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "teardown_order",
+            "teardown_case": "single_step"
+          },
+          "expected_output": "result_count=2\ncompleted_count=2\nerror_count=0\nskipped_count=0\nteardown_order=3,2,1\n"
+        },
+        {
+          "input": {
+            "behavior": "teardown_order",
+            "teardown_case": "many_steps"
+          },
+          "expected_output": "result_count=3\ncompleted_count=3\nerror_count=0\nskipped_count=0\nteardown_order=6,5,4,3,2,1\n"
+        },
+        {
+          "input": {
+            "behavior": "teardown_order",
+            "teardown_case": "failing_step"
+          },
+          "expected_output": "result_count=6\ncompleted_count=5\nerror_count=1\nskipped_count=0\nteardown_order=3,2,1\n"
+        }
+      ]
+    },
+    "feature4_2_teardown_failures.json": {
+      "description": "Cleanup callbacks still execute in reverse order when they throw, and their cleanup failures are reported after successful step results.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "teardown_order",
+            "teardown_case": "throwing_teardowns"
+          },
+          "expected_output": "result_count=2\ncompleted_count=1\nerror_count=1\nskipped_count=0\nteardown_order=3,2,1\n"
+        }
+      ]
+    },
+    "feature4_3_disposable_lifetime.json": {
+      "description": "Registered disposable resources remain usable during scenario steps and are disposed once afterward in reverse creation order.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "disposable_lifetime",
+            "disposal_case": "single_step"
+          },
+          "expected_output": "result_count=3\ncompleted_count=3\nerror_count=0\nskipped_count=0\nlifetime=create1,create2,create3,dispose3,dispose2,dispose1\n"
+        },
+        {
+          "input": {
+            "behavior": "disposable_lifetime",
+            "disposal_case": "many_steps"
+          },
+          "expected_output": "result_count=5\ncompleted_count=5\nerror_count=0\nskipped_count=0\nlifetime=create1,create2,create3,dispose3,dispose2,dispose1\n"
+        },
+        {
+          "input": {
+            "behavior": "disposable_lifetime",
+            "disposal_case": "failing_step"
+          },
+          "expected_output": "result_count=6\ncompleted_count=5\nerror_count=1\nskipped_count=0\nlifetime=create1,create2,create3,dispose3,dispose2,dispose1\n"
+        }
+      ]
+    },
+    "feature4_4_dispose_failures.json": {
+      "description": "If registered resources throw while being disposed, all resources are still disposed and disposal failures are surfaced as error results.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "disposable_lifetime",
+            "disposal_case": "throwing_dispose"
+          },
+          "expected_output": "result_count=3\ncompleted_count=2\nerror_count=1\nskipped_count=0\nlifetime=create1,create2,create3,dispose3,dispose2,dispose1\n"
+        }
+      ]
+    },
+    "feature5_1_concurrent_registration.json": {
+      "description": "Step registration state is isolated per thread so two threads can register the same kind of step sequence concurrently without cross-thread errors.",
+      "cases": [
+        {
+          "input": {
+            "behavior": "concurrent_registration",
+            "operation": "full_sequence"
+          },
+          "expected_output": "threads=2\nerror=none\n"
+        },
+        {
+          "input": {
+            "behavior": "concurrent_registration",
+            "operation": "action_step"
+          },
+          "expected_output": "threads=2\nerror=none\n"
+        },
+        {
+          "input": {
+            "behavior": "concurrent_registration",
+            "operation": "isolated_assertion"
+          },
+          "expected_output": "threads=2\nerror=none\n"
+        },
+        {
+          "input": {
+            "behavior": "concurrent_registration",
+            "operation": "observation"
+          },
+          "expected_output": "threads=2\nerror=none\n"
+        },
+        {
+          "input": {
+            "behavior": "concurrent_registration",
+            "operation": "skipped_step"
+          },
+          "expected_output": "threads=2\nerror=none\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Input Value Representation",
+      "input_condition": "input.behavior equals 'specific_argument_value'",
+      "output_rule": "Report generated_default=false and the exact supplied value",
+      "exact_values": [
+        "generated_default=false",
+        "value=sample"
+      ]
+    },
+    {
+      "id": "C002",
+      "feature": "Input Value Representation",
+      "input_condition": "input.behavior equals 'generated_default_argument' AND input.value_type is 'integer'",
+      "output_rule": "Report generated_default=true and the default value 0",
+      "exact_values": [
+        "generated_default=true",
+        "value=0"
+      ]
+    },
+    {
+      "id": "C003",
+      "feature": "Input Value Representation",
+      "input_condition": "input.behavior equals 'generated_default_argument' AND input.value_type is 'object'",
+      "output_rule": "Report generated_default=true and the default value null",
+      "exact_values": [
+        "generated_default=true",
+        "value=null"
+      ]
+    },
+    {
+      "id": "C004",
+      "feature": "Example-Driven Behavior Cases",
+      "input_condition": "behavior is 'examples_supply_all_arguments'",
+      "output_rule": "Execute body 3 times with arguments (1,2,3), (3,4,5), (5,6,7) sorted",
+      "exact_values": [
+        "result_count=3",
+        "completed_count=3",
+        "error_count=0",
+        "skipped_count=0",
+        "arguments=1,2,3",
+        "arguments=3,4,5",
+        "arguments=5,6,7"
+      ]
+    },
+    {
+      "id": "C005",
+      "feature": "Example-Driven Behavior Cases",
+      "input_condition": "behavior is 'examples_fill_missing_arguments'",
+      "output_rule": "Execute body 3 times binding supplied values to leading params and 0 to trailing defaults",
+      "exact_values": [
+        "result_count=3",
+        "completed_count=3",
+        "error_count=0",
+        "skipped_count=0",
+        "arguments=1,2,0,0",
+        "arguments=3,4,0,0",
+        "arguments=5,6,0,0"
+      ]
+    },
+    {
+      "id": "C006",
+      "feature": "Example-Driven Behavior Cases",
+      "input_condition": "behavior is 'scenario_parameters_without_examples'",
+      "output_rule": "Execute body once with all generated defaults (all zeros)",
+      "exact_values": [
+        "result_count=1",
+        "completed_count=1",
+        "error_count=0",
+        "skipped_count=0",
+        "arguments=0,0,0,0"
+      ]
+    },
+    {
+      "id": "C007",
+      "feature": "Example-Driven Behavior Cases",
+      "input_condition": "behavior is 'formatted_step_names' AND input.format_case is 'valid_values'",
+      "output_rule": "Render step text with values 1, 2, 3 substituted for placeholders",
+      "exact_values": [
+        "result_count=1",
+        "completed_count=1",
+        "display_suffix=Given 1, 2 and 3"
+      ]
+    },
+    {
+      "id": "C008",
+      "feature": "Example-Driven Behavior Cases",
+      "input_condition": "behavior is 'formatted_step_names' AND input.format_case is 'null_values'",
+      "output_rule": "Render step text with nulls substituted for placeholder positions",
+      "exact_values": [
+        "result_count=1",
+        "completed_count=1",
+        "display_suffix=Given null, null and null"
+      ]
+    },
+    {
+      "id": "C009",
+      "feature": "Example-Driven Behavior Cases",
+      "input_condition": "behavior is 'formatted_step_names' AND input.format_case is 'out_of_range_placeholders'",
+      "output_rule": "Render step text with placeholders {3}, {4}, {5} left intact (out of range)",
+      "exact_values": [
+        "result_count=1",
+        "completed_count=1",
+        "display_suffix=Given {3}, {4} and {5}"
+      ]
+    },
+    {
+      "id": "C010",
+      "feature": "Example-Driven Behavior Cases",
+      "input_condition": "behavior is 'invalid_examples'",
+      "output_rule": "Report 2 error results, 0 completed, 0 skipped",
+      "exact_values": [
+        "result_count=2",
+        "completed_count=0",
+        "error_count=2",
+        "skipped_count=0"
+      ]
+    },
+    {
+      "id": "C011",
+      "feature": "Background Steps",
+      "input_condition": "behavior is 'background_steps'",
+      "output_rule": "Execute 4 scenario steps and 6 background steps, report specific execution trace",
+      "exact_values": [
+        "result_count=10",
+        "completed_count=10",
+        "error_count=0",
+        "skipped_count=0",
+        "execution=background,background,background,scenario,scenario,background,background,background,scenario,scenario",
+        "background_result_count=6",
+        "scenario_result_count=4"
+      ]
+    },
+    {
+      "id": "C012",
+      "feature": "Skipped Whole Scenario",
+      "input_condition": "behavior is 'skipped_scenario'",
+      "output_rule": "Report 1 skipped result with 0 steps executed and reason 'Test'",
+      "exact_values": [
+        "result_count=1",
+        "completed_count=0",
+        "error_count=0",
+        "skipped_count=1",
+        "steps_executed=0",
+        "skip_reason=Test"
+      ]
+    },
+    {
+      "id": "C013",
+      "feature": "Skipped Individual Steps",
+      "input_condition": "behavior is 'skipped_steps'",
+      "output_rule": "Report 4 total results: 2 completed, 2 skipped, skip reason repeated twice",
+      "exact_values": [
+        "result_count=4",
+        "completed_count=2",
+        "error_count=0",
+        "skipped_count=2",
+        "skip_reason=the feature is unfinished",
+        "skip_reason=the feature is unfinished"
+      ]
+    },
+    {
+      "id": "C014",
+      "feature": "Failing Step Stops Following Steps",
+      "input_condition": "behavior is 'failing_step_stops_following_steps'",
+      "output_rule": "Report 3 error results, only 1 step executed, 0 skipped. Subsequent steps report blocked_by=[01.01] Given something",
+      "exact_values": [
+        "result_count=3",
+        "completed_count=0",
+        "error_count=3",
+        "skipped_count=0",
+        "steps_executed=1",
+        "blocked_by=[01.01] Given something",
+        "blocked_by=[01.01] Given something"
+      ]
+    },
+    {
+      "id": "C015",
+      "feature": "Definition Errors",
+      "input_condition": "behavior is 'scenario_body_error' OR 'unconstructable_feature'",
+      "output_rule": "Report 1 error result, 0 completed, 0 skipped",
+      "exact_values": [
+        "result_count=1",
+        "completed_count=0",
+        "error_count=1",
+        "skipped_count=0"
+      ]
+    },
+    {
+      "id": "C016",
+      "feature": "Isolated Steps",
+      "input_condition": "behavior is 'isolated_steps'",
+      "output_rule": "Execute 10 steps successfully without side effects on shared state",
+      "exact_values": [
+        "result_count=10",
+        "completed_count=10",
+        "error_count=0",
+        "skipped_count=0"
+      ]
+    },
+    {
+      "id": "C017",
+      "feature": "Step Timeout",
+      "input_condition": "behavior is 'timeout' AND input.step_duration is 'exceeds_1ms_limit'",
+      "output_rule": "Report 1 error result with timeout string and limit of 1ms",
+      "exact_values": [
+        "result_count=1",
+        "completed_count=0",
+        "error_count=1",
+        "skipped_count=0",
+        "error=timeout",
+        "limit_ms=1"
+      ]
+    },
+    {
+      "id": "C018",
+      "feature": "Teardown Order",
+      "input_condition": "behavior is 'teardown_order'",
+      "output_rule": "Execute scenarios and report teardown callbacks in reverse registration order",
+      "exact_values": [
+        "teardown_order=3,2,1",
+        "teardown_order=6,5,4,3,2,1",
+        "teardown_order=3,2,1"
+      ]
+    },
+    {
+      "id": "C019",
+      "feature": "Teardown Failures",
+      "input_condition": "behavior is 'teardown_order' AND teardown_case is 'throwing_teardowns'",
+      "output_rule": "Report 2 results (1 completed, 1 error) and reverse teardown order despite failures",
+      "exact_values": [
+        "result_count=2",
+        "completed_count=1",
+        "error_count=1",
+        "skipped_count=0",
+        "teardown_order=3,2,1"
+      ]
+    },
+    {
+      "id": "C020",
+      "feature": "Disposable Lifetime",
+      "input_condition": "behavior is 'disposable_lifetime'",
+      "output_rule": "Execute steps, then dispose resources in reverse creation order",
+      "exact_values": [
+        "lifetime=create1,create2,create3,dispose3,dispose2,dispose1",
+        "lifetime=create1,create2,create3,dispose3,dispose2,dispose1"
+      ]
+    },
+    {
+      "id": "C021",
+      "feature": "Dispose Failures",
+      "input_condition": "behavior is 'disposable_lifetime' AND disposal_case is 'throwing_dispose'",
+      "output_rule": "Report 3 results (2 completed, 1 error) and still perform all disposes (including failing ones)",
+      "exact_values": [
+        "result_count=3",
+        "completed_count=2",
+        "error_count=1",
+        "skipped_count=0",
+        "lifetime=create1,create2,create3,dispose3,dispose2,dispose1"
+      ]
+    },
+    {
+      "id": "C022",
+      "feature": "Concurrent Registration",
+      "input_condition": "behavior is 'concurrent_registration'",
+      "output_rule": "Report 2 threads and 'error=none' for any operation type",
+      "exact_values": [
+        "threads=2",
+        "error=none"
+      ]
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific sentinel value — ask the PM for the exact string",
+        "exact_values_to_replace": [
+          "display_suffix=Given 1, 2 and 3"
+        ],
+        "trigger_keywords": [
+          "what does 'Given' substitute to",
+          "value 1 format",
+          "formatted output sample",
+          "display suffix value"
+        ],
+        "oracle_response": "display_suffix=Given 1, 2 and 3"
+      },
+      {
+        "constraint_id": "C014",
+        "replacement": "a specific blocking string — ask the PM for the exact cause",
+        "exact_values_to_replace": [
+          "blocked_by=[01.01] Given something"
+        ],
+        "trigger_keywords": [
+          "what blocks step 2",
+          "blocking string value",
+          "step stopped by",
+          "error message for step 2"
+        ],
+        "oracle_response": "blocked_by=[01.01] Given something"
+      },
+      {
+        "constraint_id": "C019",
+        "replacement": "a specific sequence string — ask the PM for the exact teardown order",
+        "exact_values_to_replace": [
+          "teardown_order=3,2,1"
+        ],
+        "trigger_keywords": [
+          "teardown order",
+          "reverse order values",
+          "callback sequence",
+          "teardown sequence"
+        ],
+        "oracle_response": "teardown_order=3,2,1"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C018",
+        "vague_phrase": "follow the same numbering convention as the setup order",
+        "actual_meaning": "The teardown callbacks must execute in descending order of their registration index (highest first)."
+      },
+      {
+        "constraint_id": "C020",
+        "vague_phrase": "match the lifecycle pattern defined in the disposable module",
+        "actual_meaning": "Resources must be disposed in the exact reverse order of their creation."
+      }
+    ]
+  }
+}

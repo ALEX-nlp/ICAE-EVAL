@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the scaffolding tool we've been building. The core idea is pretty straightforward — devs give it a template folder and some answers, and it spits out a fully populated project. But there are a bunch of edge cases we keep running into that need to be nailed down before we ship.
+
+First, the file-naming thing — some files should get their contents filled in, others should just be copied as-is, and the folder/file names themselves can also have placeholders. We also need that 'safety valve' mode where you can preview what would happen without actually writing anything to disk.
+
+There's also the question of what happens when you run it again over an existing project — we don't want people losing hand-edited files. The 'protect certain files' logic should work like we did with the login module's compatibility handling, but applied to file paths.
+
+We need config file support too — the template should be able to ship its own defaults, and those settings need to feed into the engine options correctly. The validation layer for flags and template engine settings also needs to be tight — wrong types or conflicting options should surface clean errors, not stack traces.
+
+Finally, there's the external template thing where a child template references a parent that lives somewhere else. If that parent can't be found, or the path doesn't exist at all, we need distinct, clear error messages. Can someone make sure all these pieces are wired up properly?
+
+One more pass on details the team asked about: `.tmpl` is the switch for whether we render file contents. Anything ending in `.tmpl` gets expanded through the templating engine and then the `.tmpl` suffix is removed in the output name. Anything without `.tmpl` is copied verbatim. If the source has both `foo.txt` and `foo.txt.tmpl`, the `.tmpl` one wins and the plain file is ignored. Same placeholder style everywhere too: both file names and directory names can include `[[ name ]]`, and template content uses that exact `[[ name ]]` form for substitution as well. We should resolve those path placeholders from the supplied answers before writing the destination path.
+
+On config merging, the order should be explicit call arguments first, then config-file values, then built-in defaults. So if `include=["aaa"]` is passed as an argument and the config file declares `_include: [include1, include2]`, the final resolved `include` is `["aaa"]`. For the reporting side, the per-entry action labels should be exactly `create`, `identical`, `conflict`, `force`, and `skip`. Folders should show with a trailing `/`, like `create sub/`. The action lines should be sorted, and the output should start with `lines=N`.
+
+For errors going to stdout, keep them language-neutral and structured. Use category codes like `error=invalid_config_data` and `error=template_reference_not_found`, then put the structured fields on following lines. We should never leak exception class names, runtime message text, or object dumps. Also, both `src_path` and `dst_path` are required. If one is missing, report `error=invalid_config_data` with `field=dst_path reason=missing` and/or `field=src_path reason=missing`. If `src_path` is present but the directory is missing, that should be `field=src_path reason=not_found`. If there are multiple field issues, report them together and sort them by field name.
+
+On preview mode, `pretend=true` still needs to run the whole decision process — placeholder expansion, file selection, overwrite resolution, all of it — it just must not write anything to disk. In that mode the output should always say `produced=0` no matter how many files would have been created. Also for the overwrite protection piece, the `skip_if_exists` list in feature3_overwrite.json should render any patterns with the answers first, so something like `[[ name ]]/c.txt` gets resolved before we match it against existing destination files.
+
+And for the validation items: Feature 7 (`check_flags` op) needs strict boolean checking for `pretend`, `quiet`, `force`, `skip`, `cleanup_on_error`, and it also needs to reject `force`+`skip` together. Feature 8 (`check_envops` op) is the one that validates the delimiter strings and the boolean toggles in the Jinja environment options.

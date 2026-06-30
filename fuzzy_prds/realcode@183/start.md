@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that reactive stream processing library we talked about in the last planning session. Basically developers are tired of hand-wiring callbacks and managing subscriptions by hand every time they need to react to a sequence of values — whether those values come from a static list, a single item, or something that just keeps pushing data in over time. The core idea is that a stream is a first-class thing you can pass around and compose, not a pile of ad-hoc glue code.
+
+We need the usual source factories (you know, the ones we sketched on the whiteboard — static collections, single values, the empty/silent cases), plus a solid set of operators for transforming, filtering, combining, and windowing. There's also the multicast hub thing we discussed — similar to what the notifications team built for their pub-sub module, where consumers can join and leave independently. And we need that promise-style consumer for one-shot last-value resolution.
+
+One thing that keeps coming up in feedback: people get confused when streams cut off early or when a consumer leaves mid-flight — the behavior needs to be consistent and predictable. Also the delay/timing operator has been requested a few times. We want the whole thing to be composable so you can chain operators freely. Please model the output format after what the infra team standardized for the event log renderer — prefixed lines per consumer, value lines, and completion markers.

@@ -1,0 +1,474 @@
+{
+  "fuzzy_prd": "hey team, we need to build out that logging engine thing we talked about last sprint. basically the idea is devs should be able to fire off a log entry with some context attached and have it show up in one or more places without them having to do a bunch of wiring themselves. there's a bunch of stuff we need to handle — like, sometimes the message bytes are garbage and we don't want the whole thing to blow up, so we need to quietly fix that before it hits storage. also we talked about the thread thing, like how last time on the jobs service one noisy thread was drowning everything out — we need to be able to turn down the noise on just that thread without touching the rest. we also want the same entry to go to multiple destinations at once, kind of like how we set up the audit trail fan-out in the payments module. oh and there's a mode where you want the entry to go downstream but NOT get written to the main store — that needs to still fan out properly. entries should be able to carry extra context (stack info, environment stuff) without us manually passing it everywhere. the adapter layer should read commands from stdin as JSON and write results to stdout, same pattern as the notification dispatcher we built. deferred message producing should also be supported. check the existing test cases for the exact output format, i don't have time to spell it all out here.\n\none more pass on this since a few details came up. for the encoding cleanup part, we’re treating everything as UTF-8, and if a message has byte runs that aren’t valid in that encoding, each bad run gets replaced with U+FFFD before we record it. the important bit is the repaired version is what gets stored, and `valid_encoding=true` should reflect the stored message being valid after cleanup, not whether the original bytes were clean. we’re not surfacing the original invalidity anywhere beyond that flag behavior. the exact byte-level example is bytes [97, 32, 228, 32, 116, 101, 115, 116], where 0xE4 (228) is not a valid standalone UTF-8 byte, and that should come out as `message=a � test` with `valid_encoding=true`.\n\non the thread noise control, each thread can have its own override threshold. so if we set `thread_threshold: 2`, only entries from that thread whose numeric level is >= that threshold get recorded. other threads with no override still use the default behavior, which accepts all levels, basically threshold of 0 / no threshold. if we set `thread_threshold: null`, that clears the override and puts that thread back to accepting everything. in the adapter JSON protocol, the `thread_threshold` action applies to the 'main' thread, and log actions can include an optional `thread` field for which thread emitted the entry.\n\nalso wanted to be really explicit about the skip-store behavior in the fan-out case. when `skip_store` is active, the primary sink must NOT record the entry, so its count does not move, but any attached downstream loggers still need to receive that entry. and while forwarding it, the `skip_store` flag has to go along too, so the downstream sees `skip_store=true` on that forwarded call. the exact output there is `chain_probe skip_store=true message=testing` followed by `primary total=0`. that `primary total=0` line still shows up in stdout even though nothing got written to the primary sink.\n\nfor rendering, each entry the primary sink records is one line exactly like `primary level=<L> source=<tag> message=<text> backtrace=<bt> env=<json> valid_encoding=<flag>`. if a field is absent or empty, it still renders with nothing after the `=`, like `source=`. `env` is a compact JSON object string when present, otherwise empty. after all entries, there’s a trailing line `primary total=<n>` with the recorded count. for a chained recording sink the prefix is `chained` instead of `primary`. for the standard chain it is `chain_standard severity=<letter> message=<text>`. For the probe chain it is `chain_probe skip_store=<bool> message=<text>`. each sink/downstream type keeps its own count.\n\nand just to close the loop on the fan-out setup itself, the downstream loggers get attached via a `chain` action, and then every accepted entry gets broadcast to all of them before reaching the primary sink.",
+  "oracle_data": {
+    "task_id": "discourse__logster",
+    "golden_api_signature": "emit(level, message=nil, source=nil, metadata=nil, block=nil, skip_store=false, thread_id=nil)",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "what happens when message is null or missing",
+          "empty message behavior",
+          "no message provided to log call"
+        ],
+        "oracle_response": "There are two distinct cases. (1) If a deferred block/producer is provided instead of a message, the engine calls the producer to obtain the message text when the entry passes the severity gate — it is NOT called for dropped entries. (2) If neither a message nor a block is provided, the entry is still recorded but with an empty message. Crucially, when the message is empty (nil/absent, no block), the `valid_encoding` field must also render as empty (i.e. `valid_encoding=`) — there is no text to validate. When message is explicitly `null` in the JSON input but a source is present, the source is used as the message text for the standard chain formatter. See feature4_1_block_and_default_message.json and feature5_1_chain_standard.json."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "how does fan-out to multiple sinks work",
+          "chaining downstream loggers",
+          "attaching additional loggers"
+        ],
+        "oracle_response": "The engine supports attaching one or more downstream loggers via a `chain` mechanism. When an entry is accepted (passes the severity gate), it is forwarded to each downstream logger BEFORE being recorded by the primary sink. There are three downstream logger types in the adapter: `recording` (same-kind sink, full payload, uses `chained` prefix), `standard` (foreign logger, single-letter severity indicator derived from level, uses `chain_standard` prefix), and `probe` (observes skip_store flag, uses `chain_probe` prefix). A failure in one downstream logger must not prevent delivery to others or to the primary sink. The severity letter mapping is: level 0→D, 1→I, 2→W, 3→E, 4→F (or similar — W for level 2 is confirmed by feature5_1). Downstream output appears before primary output in stdout."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "where should JSON parsing live",
+          "should the core engine know about stdin or JSON",
+          "separation between adapter and engine"
+        ],
+        "oracle_response": "The core engine must have zero knowledge of JSON, stdin, or stdout. It exposes an in-process API only. A separate execution adapter layer is solely responsible for reading JSON commands from stdin, calling the core engine API, and writing rendered output to stdout. The JSON action types are: `log` (emit an entry), `thread_threshold` (set/clear per-thread threshold for 'main' thread), `chain` (attach a downstream logger), and `skip_store` (toggle suppression). Malformed adapter input must produce a normalized error line rather than a raw exception stack trace. This is a hard architectural constraint — see the NFR section of the PRD ('The core engine MUST NOT know about stdin/stdout or JSON')."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "how is metadata passed through",
+          "backtrace and env fields",
+          "structured context on a log entry"
+        ],
+        "oracle_response": "An entry may carry a `metadata` object containing a `backtrace` string and an `env` map of arbitrary key-value pairs. Both are preserved verbatim all the way to the sink — the engine must not interpret, reshape, or filter them. In the output, `backtrace=<text>` and `env=<json-object>` appear as labelled segments. The env map is serialized as a compact JSON object (no extra spaces). If metadata is absent, both fields render as empty (`backtrace=` and `env=`). See feature3_metadata_passthrough.json."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_threshold_override",
+        "trigger_keywords": [
+          "test cases for feature1 threshold override",
+          "show me feature1 threshold override test cases",
+          "what are the feature1 threshold override test inputs",
+          "give me the feature1_threshold_override test file",
+          "test cases for feature 1",
+          "feature1 threshold override expected output",
+          "what does feature1 threshold override expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_threshold_override:\n{\n  \"description\": \"A per-thread severity threshold filters log entries: an entry whose numeric level is below the active threshold for the thread that emits it is dropped, while an entry at or above the threshold is recorded. A threshold override applies only to the thread that set it; entries emitted on other threads are unaffected, and clearing the override on a thread restores its default acceptance of all levels. Each recorded entry is rendered with its level, source tag, message, attached metadata, and an encoding-validity flag, followed by a count of how many entries were recorded.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"actions\": [\n          {\n            \"thread_threshold\": 2\n          },\n          {\n            \"log\": {\n              \"level\": 0,\n              \"message\": \"test\",\n              \"source\": \"prog\",\n              \"metadata\": {\n                \"backtrace\": \"backtrace\",\n                \"env\": {\n                  \"a\": \"x\"\n                }\n              },\n              \"thread\": \"main\"\n            }\n          },\n          {\n            \"log\": {\n              \"level\": 0,\n              \"message\": \"test\",\n              \"source\": \"prog\",\n              \"metadata\": {\n                \"backtrace\": \"backtrace\",\n                \"env\": {\n                  \"a\": \"x\"\n                }\n              },\n              \"thread\": \"other\"\n            }\n          },\n          {\n            \"thread_threshold\": null\n          },\n          {\n            \"log\": {\n              \"level\": 0,\n              \"message\": \"test\",\n              \"source\": \"prog\",\n              \"metadata\": {\n                \"backtrace\": \"backtrace\",\n                \"env\": {\n                  \"a\": \"x\"\n                }\n              },\n              \"thread\": \"main\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"primary level=0 source=prog message=test backtrace=backtrace env={\\\"a\\\":\\\"x\\\"} valid_encoding=true\\nprimary level=0 source=prog message=test backtrace=backtrace env={\\\"a\\\":\\\"x\\\"} valid_encoding=true\\nprimary total=2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_encoding_scrub",
+        "trigger_keywords": [
+          "test cases for feature2 encoding scrub",
+          "show me feature2 encoding scrub test cases",
+          "what are the feature2 encoding scrub test inputs",
+          "give me the feature2_encoding_scrub test file",
+          "test cases for feature 2",
+          "feature2 encoding scrub expected output",
+          "what does feature2 encoding scrub expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_encoding_scrub:\n{\n  \"description\": \"When a message carries a byte sequence that is not valid text in the declared encoding, the logger repairs the message before recording it by replacing each invalid byte run with the standard replacement character, so the stored message is always valid text. The output shows the repaired message and an encoding-validity flag confirming the stored message is now valid.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"actions\": [\n          {\n            \"log\": {\n              \"level\": 4,\n              \"message\": {\n                \"bytes\": [\n                  97,\n                  32,\n                  228,\n                  32,\n                  116,\n                  101,\n                  115,\n                  116\n                ]\n              },\n              \"source\": \"prog\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"primary level=4 source=prog message=a � test backtrace= env= valid_encoding=true\\nprimary total=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_metadata_passthrough",
+        "trigger_keywords": [
+          "test cases for feature3 metadata passthrough",
+          "show me feature3 metadata passthrough test cases",
+          "what are the feature3 metadata passthrough test inputs",
+          "give me the feature3_metadata_passthrough test file",
+          "test cases for feature 3",
+          "feature3 metadata passthrough expected output",
+          "what does feature3 metadata passthrough expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_metadata_passthrough:\n{\n  \"description\": \"Structured metadata attached to a log entry — a captured backtrace and an arbitrary environment map — is carried through unchanged to the recorded entry alongside the level, source tag, and message. The output renders each metadata field as its own labelled segment so callers can confirm the backtrace text and the environment map survived intact.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"actions\": [\n          {\n            \"log\": {\n              \"level\": 0,\n              \"message\": \"test\",\n              \"source\": \"prog\",\n              \"metadata\": {\n                \"backtrace\": \"backtrace\",\n                \"env\": {\n                  \"a\": \"x\"\n                }\n              }\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"primary level=0 source=prog message=test backtrace=backtrace env={\\\"a\\\":\\\"x\\\"} valid_encoding=true\\nprimary total=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_block_and_default_message",
+        "trigger_keywords": [
+          "test cases for feature4 1 block and default message",
+          "show me feature4 1 block and default message test cases",
+          "what are the feature4 1 block and default message test inputs",
+          "give me the feature4_1_block_and_default_message test file",
+          "test cases for feature 4",
+          "feature4 1 block and default message expected output",
+          "what does feature4 1 block and default message expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_block_and_default_message:\n{\n  \"description\": \"When an entry is logged without an explicit message but with a deferred message producer, the message is obtained from that producer and recorded. When an entry is logged with neither an explicit message nor a producer, it is still recorded but with an empty message. The output lists each recorded entry in order and a count, demonstrating that both forms are accepted and that the deferred producer's value is captured.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"actions\": [\n          {\n            \"log\": {\n              \"level\": 2,\n              \"block\": \"test\"\n            }\n          },\n          {\n            \"log\": {\n              \"level\": 2\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"primary level=2 source= message=test backtrace= env= valid_encoding=true\\nprimary level=2 source= message= backtrace= env= valid_encoding=\\nprimary total=2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_default_source",
+        "trigger_keywords": [
+          "test cases for feature4 2 default source",
+          "show me feature4 2 default source test cases",
+          "what are the feature4 2 default source test inputs",
+          "give me the feature4_2_default_source test file",
+          "test cases for feature 4",
+          "feature4 2 default source expected output",
+          "what does feature4 2 default source expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_2_default_source:\n{\n  \"description\": \"When an entry is logged with only a level and a message and no source tag is supplied, the recorded entry's source tag defaults to empty rather than being inferred from the message or any other field. The output shows the entry with an empty source segment, confirming the default.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"actions\": [\n          {\n            \"log\": {\n              \"level\": 0,\n              \"message\": \"test\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"primary level=0 source= message=test backtrace= env= valid_encoding=true\\nprimary total=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_chain_standard",
+        "trigger_keywords": [
+          "test cases for feature5 1 chain standard",
+          "show me feature5 1 chain standard test cases",
+          "what are the feature5 1 chain standard test inputs",
+          "give me the feature5_1_chain_standard test file",
+          "test cases for feature 5",
+          "feature5 1 chain standard expected output",
+          "what does feature5 1 chain standard expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_chain_standard:\n{\n  \"description\": \"When a foreign downstream logger is attached, each accepted entry is forwarded to it through the standard logging interface. The downstream logger formats the entry independently, exposing a single-letter severity indicator and the message text. The output shows the forwarded entry as observed at the downstream logger, plus the entry recorded by the primary sink, confirming the entry travelled through the real downstream formatting path rather than being short-circuited.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"actions\": [\n          {\n            \"chain\": \"standard\"\n          },\n          {\n            \"log\": {\n              \"level\": 2,\n              \"message\": null,\n              \"source\": \"boom\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"chain_standard severity=W message=boom\\nprimary level=2 source= message=boom backtrace= env= valid_encoding=true\\nprimary total=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_chain_recording",
+        "trigger_keywords": [
+          "test cases for feature5 2 chain recording",
+          "show me feature5 2 chain recording test cases",
+          "what are the feature5 2 chain recording test inputs",
+          "give me the feature5_2_chain_recording test file",
+          "test cases for feature 5",
+          "feature5 2 chain recording expected output",
+          "what does feature5 2 chain recording expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_chain_recording:\n{\n  \"description\": \"When another sink of the same kind is attached downstream, each accepted entry is forwarded to it with the full payload — level, source tag, message, and all attached metadata (backtrace and environment map) — preserved identically to what the primary sink records. The output shows the forwarded entry as recorded by the downstream sink followed by the entry recorded by the primary sink, each with its own count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"actions\": [\n          {\n            \"chain\": \"recording\"\n          },\n          {\n            \"log\": {\n              \"level\": 0,\n              \"message\": \"test\",\n              \"source\": \"prog\",\n              \"metadata\": {\n                \"backtrace\": \"backtrace\",\n                \"env\": {\n                  \"a\": \"x\"\n                }\n              }\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"chained level=0 source=prog message=test backtrace=backtrace env={\\\"a\\\":\\\"x\\\"} valid_encoding=true\\nchained total=1\\nprimary level=0 source=prog message=test backtrace=backtrace env={\\\"a\\\":\\\"x\\\"} valid_encoding=true\\nprimary total=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_3_skip_store_propagation",
+        "trigger_keywords": [
+          "test cases for feature5 3 skip store propagation",
+          "show me feature5 3 skip store propagation test cases",
+          "what are the feature5 3 skip store propagation test inputs",
+          "give me the feature5_3_skip_store_propagation test file",
+          "test cases for feature 5",
+          "feature5 3 skip store propagation expected output",
+          "what does feature5 3 skip store propagation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_skip_store_propagation:\n{\n  \"description\": \"A suppression flag prevents the primary sink from recording an entry, yet the entry is still forwarded to any attached downstream logger, and the suppression flag itself is propagated to that downstream logger for the duration of the forwarded call. The output shows the downstream logger observing the entry with the suppression flag active, while the primary sink records nothing.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"actions\": [\n          {\n            \"chain\": \"probe\"\n          },\n          {\n            \"skip_store\": true\n          },\n          {\n            \"log\": {\n              \"level\": 2,\n              \"message\": null,\n              \"source\": \"testing\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"chain_probe skip_store=true message=testing\\nprimary total=0\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the adapter layer should read commands from stdin as JSON and write results to stdout, same pattern as the notification dispatcher we built",
+        "actual_meaning": "The execution adapter module that parses JSON action arrays from stdin and writes rendered log lines to stdout. This is architecturally separate from the core engine, which only exposes an in-process API. See NFR constraint #2 in start.md ('The core engine MUST NOT know about stdin/stdout or JSON')."
+      },
+      {
+        "vague_reference": "like how last time on the jobs service one noisy thread was drowning everything out",
+        "actual_meaning": "The per-thread severity threshold override described in Feature 1. A `thread_threshold` action sets a minimum numeric level for the 'main' thread; entries from other threads are unaffected. See feature1_threshold_override.json."
+      }
+    ],
+    "fallback_response": "That detail isn't something I can clarify from the ticket — you'll need to look at the existing test case files in rcb_tests/public_test_cases/ and cross-reference the PRD in start.md to work out the exact expected behavior. The test cases are the ground truth for output formatting."
+  },
+  "public_test_cases": {
+    "feature1_threshold_override.json": {
+      "description": "A per-thread severity threshold filters log entries: an entry whose numeric level is below the active threshold for the thread that emits it is dropped, while an entry at or above the threshold is recorded. A threshold override applies only to the thread that set it; entries emitted on other threads are unaffected, and clearing the override on a thread restores its default acceptance of all levels. Each recorded entry is rendered with its level, source tag, message, attached metadata, and an encoding-validity flag, followed by a count of how many entries were recorded.",
+      "cases": [
+        {
+          "input": {
+            "actions": [
+              {
+                "thread_threshold": 2
+              },
+              {
+                "log": {
+                  "level": 0,
+                  "message": "test",
+                  "source": "prog",
+                  "metadata": {
+                    "backtrace": "backtrace",
+                    "env": {
+                      "a": "x"
+                    }
+                  },
+                  "thread": "main"
+                }
+              },
+              {
+                "log": {
+                  "level": 0,
+                  "message": "test",
+                  "source": "prog",
+                  "metadata": {
+                    "backtrace": "backtrace",
+                    "env": {
+                      "a": "x"
+                    }
+                  },
+                  "thread": "other"
+                }
+              },
+              {
+                "thread_threshold": null
+              },
+              {
+                "log": {
+                  "level": 0,
+                  "message": "test",
+                  "source": "prog",
+                  "metadata": {
+                    "backtrace": "backtrace",
+                    "env": {
+                      "a": "x"
+                    }
+                  },
+                  "thread": "main"
+                }
+              }
+            ]
+          },
+          "expected_output": "primary level=0 source=prog message=test backtrace=backtrace env={\"a\":\"x\"} valid_encoding=true\nprimary level=0 source=prog message=test backtrace=backtrace env={\"a\":\"x\"} valid_encoding=true\nprimary total=2\n"
+        }
+      ]
+    },
+    "feature2_encoding_scrub.json": {
+      "description": "When a message carries a byte sequence that is not valid text in the declared encoding, the logger repairs the message before recording it by replacing each invalid byte run with the standard replacement character, so the stored message is always valid text. The output shows the repaired message and an encoding-validity flag confirming the stored message is now valid.",
+      "cases": [
+        {
+          "input": {
+            "actions": [
+              {
+                "log": {
+                  "level": 4,
+                  "message": {
+                    "bytes": [
+                      97,
+                      32,
+                      228,
+                      32,
+                      116,
+                      101,
+                      115,
+                      116
+                    ]
+                  },
+                  "source": "prog"
+                }
+              }
+            ]
+          },
+          "expected_output": "primary level=4 source=prog message=a � test backtrace= env= valid_encoding=true\nprimary total=1\n"
+        }
+      ]
+    },
+    "feature3_metadata_passthrough.json": {
+      "description": "Structured metadata attached to a log entry — a captured backtrace and an arbitrary environment map — is carried through unchanged to the recorded entry alongside the level, source tag, and message. The output renders each metadata field as its own labelled segment so callers can confirm the backtrace text and the environment map survived intact.",
+      "cases": [
+        {
+          "input": {
+            "actions": [
+              {
+                "log": {
+                  "level": 0,
+                  "message": "test",
+                  "source": "prog",
+                  "metadata": {
+                    "backtrace": "backtrace",
+                    "env": {
+                      "a": "x"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "expected_output": "primary level=0 source=prog message=test backtrace=backtrace env={\"a\":\"x\"} valid_encoding=true\nprimary total=1\n"
+        }
+      ]
+    },
+    "feature4_1_block_and_default_message.json": {
+      "description": "When an entry is logged without an explicit message but with a deferred message producer, the message is obtained from that producer and recorded. When an entry is logged with neither an explicit message nor a producer, it is still recorded but with an empty message. The output lists each recorded entry in order and a count, demonstrating that both forms are accepted and that the deferred producer's value is captured.",
+      "cases": [
+        {
+          "input": {
+            "actions": [
+              {
+                "log": {
+                  "level": 2,
+                  "block": "test"
+                }
+              },
+              {
+                "log": {
+                  "level": 2
+                }
+              }
+            ]
+          },
+          "expected_output": "primary level=2 source= message=test backtrace= env= valid_encoding=true\nprimary level=2 source= message= backtrace= env= valid_encoding=\nprimary total=2\n"
+        }
+      ]
+    },
+    "feature4_2_default_source.json": {
+      "description": "When an entry is logged with only a level and a message and no source tag is supplied, the recorded entry's source tag defaults to empty rather than being inferred from the message or any other field. The output shows the entry with an empty source segment, confirming the default.",
+      "cases": [
+        {
+          "input": {
+            "actions": [
+              {
+                "log": {
+                  "level": 0,
+                  "message": "test"
+                }
+              }
+            ]
+          },
+          "expected_output": "primary level=0 source= message=test backtrace= env= valid_encoding=true\nprimary total=1\n"
+        }
+      ]
+    },
+    "feature5_1_chain_standard.json": {
+      "description": "When a foreign downstream logger is attached, each accepted entry is forwarded to it through the standard logging interface. The downstream logger formats the entry independently, exposing a single-letter severity indicator and the message text. The output shows the forwarded entry as observed at the downstream logger, plus the entry recorded by the primary sink, confirming the entry travelled through the real downstream formatting path rather than being short-circuited.",
+      "cases": [
+        {
+          "input": {
+            "actions": [
+              {
+                "chain": "standard"
+              },
+              {
+                "log": {
+                  "level": 2,
+                  "message": null,
+                  "source": "boom"
+                }
+              }
+            ]
+          },
+          "expected_output": "chain_standard severity=W message=boom\nprimary level=2 source= message=boom backtrace= env= valid_encoding=true\nprimary total=1\n"
+        }
+      ]
+    },
+    "feature5_2_chain_recording.json": {
+      "description": "When another sink of the same kind is attached downstream, each accepted entry is forwarded to it with the full payload — level, source tag, message, and all attached metadata (backtrace and environment map) — preserved identically to what the primary sink records. The output shows the forwarded entry as recorded by the downstream sink followed by the entry recorded by the primary sink, each with its own count.",
+      "cases": [
+        {
+          "input": {
+            "actions": [
+              {
+                "chain": "recording"
+              },
+              {
+                "log": {
+                  "level": 0,
+                  "message": "test",
+                  "source": "prog",
+                  "metadata": {
+                    "backtrace": "backtrace",
+                    "env": {
+                      "a": "x"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "expected_output": "chained level=0 source=prog message=test backtrace=backtrace env={\"a\":\"x\"} valid_encoding=true\nchained total=1\nprimary level=0 source=prog message=test backtrace=backtrace env={\"a\":\"x\"} valid_encoding=true\nprimary total=1\n"
+        }
+      ]
+    },
+    "feature5_3_skip_store_propagation.json": {
+      "description": "A suppression flag prevents the primary sink from recording an entry, yet the entry is still forwarded to any attached downstream logger, and the suppression flag itself is propagated to that downstream logger for the duration of the forwarded call. The output shows the downstream logger observing the entry with the suppression flag active, while the primary sink records nothing.",
+      "cases": [
+        {
+          "input": {
+            "actions": [
+              {
+                "chain": "probe"
+              },
+              {
+                "skip_store": true
+              },
+              {
+                "log": {
+                  "level": 2,
+                  "message": null,
+                  "source": "testing"
+                }
+              }
+            ]
+          },
+          "expected_output": "chain_probe skip_store=true message=testing\nprimary total=0\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C003",
+      "C004"
+    ],
+    "kept_c": [
+      "C005",
+      "C006",
+      "C007",
+      "C008"
+    ],
+    "revealed_cp": 1,
+    "kept_cp": 2
+  }
+}

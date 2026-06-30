@@ -1,0 +1,230 @@
+{
+  "fuzzy_prd": "# Cluster Specification Normalizer — Defaulting, Validation, Resource Naming & Label Composition\n\n## Project Goal\n\nBuild a small library that turns a partially-filled cluster deployment specification into a fully-resolved, validated one, so operators can declare only the fields they care about and rely on the library to fill in safe defaults, reject malformed input, derive the canonical names of the resources that will be created, and compose the label sets attached to those resources.\n\n---\n\n## Background & Problem\n\nA cluster deployment is described by a specification that names two cooperating component groups: a primary data component and a monitor component. Each group declares a container image and a desired replica count; the primary group additionally declares a metrics-exporter image and an optional pinned name for its shutdown configuration object, and the monitor group declares a list of free-form configuration directives. Almost every field is optional, so a real specification arrives sparsely populated.\n\nWithout a normalizer, every consumer of such a specification has to re-implement the same chores: substitute defaults for omitted fields, reject names that are too long to be used as resource identifiers, compute the deterministic names of the resources to be created, and stitch together the label maps that get stamped onto those resources. Doing this ad hoc leads to inconsistent defaults and subtly different naming across tools.\n\nThis library centralizes those rules: defaulting and validation of the specification, deterministic resource-name derivation from a single base name, resolution of an optionally-overridden configuration-object name, and ordered merging of label maps.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Specification Defaulting & Name Validation\n\n**As a developer**, I want a sparsely-filled cluster specification to be validated and then completed with built-in defaults, so I can declare only the non-default fields and trust the rest to be filled consistently.\n\n**Expected Behavior / Usage:**\n\nThe input is a request with an action of `validate`, a `name` (the cluster's base name), and optional `redis` and `sentinel` blocks. The `redis` block may carry `image`, `replicas`, and `exporter_image`; the `sentinel` block may carry `image`, `replicas`, and `custom_config` (a list of directive strings). Validation happens first: if `name` is longer than the maximum permitted length of 48 characters, the request is rejected and the output is exactly the two lines `error=name_too_long` and `max_length=48`, with no defaulting performed. Otherwise each absent or non-positive field is filled with its default and the fully-resolved values are reported, one `key=value` line each in this fixed order: `redis_image`, `redis_replicas`, `redis_exporter_image`, `sentinel_image`, `sentinel_replicas`, `sentinel_custom_config`. An empty image becomes `redis:5.0-alpine`; an empty redis exporter image becomes `oliver006/redis_exporter:v0.33.0`; a replica count that is zero or negative becomes `3`; an empty monitor `custom_config` list becomes the two default directives `down-after-milliseconds 5000` and `failover-timeout 10000`. The resolved `sentinel_custom_config` value is the directive list joined by the `|` character. Any value explicitly supplied (a non-empty image, a positive replica count, a non-empty directive list) is preserved verbatim.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_spec_defaulting.json`\n\n```json\n{\n    \"description\": \"Apply defaulting and validation to a deployment specification. The spec describes two component groups (a primary data component and a monitor component), each with a container image and a desired replica count; the primary component also carries a metrics-exporter image and the monitor component carries a list of free-form configuration directives. Missing or non-positive values are filled with built-in defaults: an empty image becomes the default image, a replica count that is zero or negative becomes the default count, an empty exporter image becomes the default exporter image, and an empty configuration list for the monitor becomes the default directive list. Values that are explicitly provided are preserved untouched. The resource name is validated first: a name longer than the maximum permitted length is rejected and no defaulting is reported.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"validate\", \"name\": \"mycluster\"},\n            \"expected_output\": \"redis_image=redis:5.0-alpine\\nredis_replicas=3\\nredis_exporter_image=oliver006/redis_exporter:v0.33.0\\nsentinel_image=redis:5.0-alpine\\nsentinel_replicas=3\\nsentinel_custom_config=down-after-milliseconds 5000|failover-timeout 10000\\n\"\n        },\n        {\n            \"input\": {\"action\": \"validate\", \"name\": \"this-name-is-definitely-way-too-long-to-be-accepted-here\"},\n            \"expected_output\": \"error=name_too_long\\nmax_length=48\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Resource Name Derivation\n\n**As a developer**, I want the names of the resources a cluster will create derived deterministically from its base name, so independent tools agree on exactly what each resource is called.\n\n**Expected Behavior / Usage:**\n\n*2.1 Component Resource Names — derive the three standard names from a base name*\n\nThe input is a request with an action of `names` and a `name` (the base name). Three names are produced, each on its own `key=value` line in the order `redis`, `sentinel`, `redis_shutdown`. Every name is the concatenation of a fixed product prefix `rf`, a fixed per-component token, a dash, and the base name. The primary data component uses token `r` (e.g. `rfr-<name[a specific sentinel value — ask the PM for the exact string]`), the monitor component uses token `s` (e.g. `rfs-<name[a specific sentinel value — ask the PM for the exact string]`), and the primary component's shutdown helper uses token `r-s` (e.g. `rfr-s-<name[a specific sentinel value — ask the PM for the exact string]`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_resource_names.json`\n\n```json\n{\n    \"description\": \"Derive the deterministic resource names for a cluster from its base name. Three names are produced from a single base name: the name for the primary data component, the name for the monitor component, and the name for the primary component's shutdown helper. Each name is composed of a fixed product prefix, a fixed per-component token, a dash separator, and the supplied base name.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"names\", \"name\": \"test\"},\n            \"expected_output\": \"redis=rfr-test\\nsentinel=rfs-test\\nredis_shutdown=rfr-s-test\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Shutdown Configuration Object Name — honor an explicit override, else fall back*\n\nThe input is a request with an action of `shutdown_configmap`, a `name` (base name), and an optional `redis.shutdown_configmap` value. When that value is present and non-empty it is used verbatim as the result. When it is absent or empty, the result is the deterministically generated shutdown-helper name (`rf` + token `r-s` + dash + base name, i.e. `rfr-s-<name[a specific sentinel value — ask the PM for the exact string]`). The output is the single line `shutdown_configmap=<resolved name[a specific sentinel value — ask the PM for the exact string]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_shutdown_configmap_name.json`\n\n```json\n{\n    \"description\": \"Resolve the name of the shutdown configuration object for the primary data component. The caller may explicitly pin a configuration-object name in the spec; when that value is non-empty it is used verbatim. When it is empty, the name falls back to the deterministically generated shutdown-helper name derived from the cluster's base name (fixed product prefix, fixed shutdown token, dash, base name).\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"shutdown_configmap\", \"name\": \"test\", \"redis\": {\"shutdown_configmap\": \"my-custom-cm\"}},\n            \"expected_output\": \"shutdown_configmap=my-custom-cm\\n\"\n        },\n        {\n            \"input\": {\"action\": \"shutdown_configmap\", \"name\": \"test\"},\n            \"expected_output\": \"shutdown_configmap=rfr-s-test\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Label Map Composition\n\n**As a developer**, I want to merge several label maps into one with a well-defined precedence, so I can layer base labels, dynamic labels and user labels without ambiguity.\n\n**Expected Behavior / Usage:**\n\nThe input is a request with an action of `merge_labels` and a `label_maps` list. The maps are merged left to right into a single map; when the same key appears in more than one map, the value from the later map overrides the earlier one. A `[a specific sentinel value — ask the PM for the exact string]` entry in the list (an absent map) is skipped and contributes nothing. The merged result is emitted as one `key=value` line per entry, ordered lexicographically by key. An empty or all-`[a specific sentinel value — ask the PM for the exact string]` list produces no output.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_merge_labels.json`\n\n```json\n{\n    \"description\": \"Merge an ordered list of label maps into a single label map. Maps are combined left to right; when the same key appears in more than one map, the value from the later map wins. Entries that are [a specific sentinel value — ask the PM for the exact string] (absent maps) are skipped without error. The merged result is reported as one key=value line per entry, ordered by key.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"merge_labels\", \"label_maps\": [{\"app\": \"web\", \"tier\": \"frontend\"}, {\"tier\": \"backend\", \"env\": \"prod\"}]},\n            \"expected_output\": \"app=web\\nenv=prod\\ntier=backend\\n\"\n        },\n        {\n            \"input\": {\"action\": \"merge_labels\", \"label_maps\": [{\"a\": \"1\"}, [a specific sentinel value — ask the PM for the exact string], {\"b\": \"2\"}]},\n            \"expected_output\": \"a=1\\nb=2\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint, ensuring high maintainability without over-engineering. The core business logic (defaulting/validation, name derivation, label merging) must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin and prints the resulting `key=value` lines (or a neutral `error=<category[a specific sentinel value — ask the PM for the exact string]` block) to stdout, matching the per-feature contracts above. The request's `action` selects behavior: `validate` validates and defaults a specification; `names` derives the three component resource names; `shutdown_configmap` resolves the shutdown configuration-object name; `merge_labels` merges an ordered list of label maps. Native validation failures are surfaced as neutral category lines (e.g. `error=name_too_long`) with supporting fields on their own lines, never as host-language runtime artifacts.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir[a specific sentinel value — ask the PM for the exact string]` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir[a specific sentinel value — ask the PM for the exact string]/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir[a specific sentinel value — ask the PM for the exact string]` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the same resolution order as the [MERGE_FUNCTION]\n",
+  "oracle_data": {
+    "task_id": "spotahome__redis-operator-001",
+    "golden_api_signature": "main(stdin: JSON object routed by action) -> stdout exactly matching public_test_cases expected_output",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C023",
+        "trigger_keywords": [
+          "> used when?",
+          "detect null labels?",
+          "what is the failure character?",
+          "handle missing map entry?",
+          "output logic for missing keys?"
+        ],
+        "oracle_response": "The value '>' is inserted into the label string if a key is present in one map but missing in others."
+      },
+      {
+        "constraint_id": "FULL_SCOPE",
+        "trigger_keywords": [
+          "full task scope",
+          "all public features",
+          "semantic equivalence"
+        ],
+        "oracle_response": "This generated package must cover the full detailed-PRD behavior represented by all authoritative public test case files, not just a subset mentioned in the fuzzy PRD. Public feature files: feature1_spec_defaulting, feature2_1_resource_names, feature2_2_shutdown_configmap_name, feature3_merge_labels. Feature descriptions include: Apply defaulting and validation to a deployment specification. The spec describes two component groups (a primary data component and a monitor component), each with a container image and a desired replica count; the primary component also carries a metrics-exporter image and the monitor component carries a list of free-form configuration directives. Missing or non-positive values are filled with built-in defaults: an empty image becomes the default image, a replica count that is zero or negative becomes the default count, an empty exporter image becomes the default exporter image, and an empty configuration list for the monitor becomes the default directive list. Values that are explicitly provided are preserved untouched. The resource name is validated first: a name longer than the maximum permitted length is rejected and no defaulting is reported.; Derive the deterministic resource names for a cluster from its base name. Three names are produced from a single base name: the name for the primary data component, the name for the monitor component, and the name for the primary component's shutdown helper. Each name is composed of a fixed product prefix, a fixed per-component token, a dash separator, and the supplied base name.; Resolve the name of the shutdown configuration object for the primary data component. The caller may explicitly pin a configuration-object name in the spec; when that value is non-empty it is used verbatim. When it is empty, the name falls back to the deterministically generated shutdown-helper name derived from the cluster's base name (fixed product prefix, fixed shutdown token, dash, base name).; Merge an ordered list of label maps into a single label map. Maps are combined left to right; when the same key appears in more than one map, the value from the later map wins. Entries that are null (absent maps) are skipped without error. The merged result is reported as one key=value line per entry, ordered by key."
+      },
+      {
+        "constraint_id": "EXECUTION_CONTRACT",
+        "trigger_keywords": [
+          "dispatcher contract",
+          "same tests",
+          "input fields",
+          "stdout expected_output"
+        ],
+        "oracle_response": "The execution adapter must accept exactly the input shapes used by public_test_cases and emit stdout exactly equal to each expected_output. Observed top-level input fields/values include: action=['merge_labels', 'names', 'shutdown_configmap', 'validate'], name=['mycluster', 'test', 'this-name-is-definitely-way-too-long-to-be-accepted-here'], redis=['{dict}'], label_maps=['[list]']. Do not require a different discriminator field, different action names, JSON output where line output is expected, or extra PASS/FAIL metadata."
+      },
+      {
+        "constraint_id": "PUBLIC_TEST_CASES_AUTHORITY",
+        "trigger_keywords": [
+          "exact outputs",
+          "public tests authoritative",
+          "expected_output"
+        ],
+        "oracle_response": "The embedded public_test_cases are part of oracle_data and are authoritative for exact input shapes, action/operation names, stdout line order, whitespace, error categories, numeric formatting, and deterministic serialization. If prose, fuzzy_prd, context pointers, or older hidden constraints are vague or conflict with expected_output, the public_test_cases expected_output is the pass-critical contract."
+      },
+      {
+        "constraint_id": "NO_CROSS_TASK_INFERENCE",
+        "trigger_keywords": [
+          "ignore unrelated analogies",
+          "cross task contamination"
+        ],
+        "oracle_response": "Ignore any vague analogy or context pointer that names an unrelated module, pipeline, login flow, audit generator, or previous project. Such wording is non-normative; only this repo’s detailed PRD, FULL_SCOPE, EXECUTION_CONTRACT, and public_test_cases define the task."
+      },
+      {
+        "constraint_id": "TC_feature3_merge_labels",
+        "trigger_keywords": [
+          "feature3_merge_labels",
+          "feature3_merge_labels.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature3_merge_labels:\n{\n  \"description\": \"Merge an ordered list of label maps into a single label map. Maps are combined left to right; when the same key appears in more than one map, the value from the later map wins. Entries that are null (absent maps) are skipped without error. The merged result is reported as one key=value line per entry, ordered by key.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"merge_labels\",\n        \"label_maps\": [\n          {\n            \"app\": \"web\",\n            \"tier\": \"frontend\"\n          },\n          {\n            \"tier\": \"backend\",\n            \"env\": \"prod\"\n          }\n        ]\n      },\n      \"expected_output\": \"app=web\\nenv=prod\\ntier=backend\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"merge_labels\",\n        \"label_maps\": [\n          {\n            \"a\": \"1\"\n          },\n          null,\n          {\n            \"b\": \"2\"\n          }\n        ]\n      },\n      \"expected_output\": \"a=1\\nb=2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_shutdown_configmap_name",
+        "trigger_keywords": [
+          "feature2_2_shutdown_configmap_name",
+          "feature2_2_shutdown_configmap_name.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_2_shutdown_configmap_name:\n{\n  \"description\": \"Resolve the name of the shutdown configuration object for the primary data component. The caller may explicitly pin a configuration-object name in the spec; when that value is non-empty it is used verbatim. When it is empty, the name falls back to the deterministically generated shutdown-helper name derived from the cluster's base name (fixed product prefix, fixed shutdown token, dash, base name).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"shutdown_configmap\",\n        \"name\": \"test\",\n        \"redis\": {\n          \"shutdown_configmap\": \"my-custom-cm\"\n        }\n      },\n      \"expected_output\": \"shutdown_configmap=my-custom-cm\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"shutdown_configmap\",\n        \"name\": \"test\"\n      },\n      \"expected_output\": \"shutdown_configmap=rfr-s-test\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_resource_names",
+        "trigger_keywords": [
+          "feature2_1_resource_names",
+          "feature2_1_resource_names.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_1_resource_names:\n{\n  \"description\": \"Derive the deterministic resource names for a cluster from its base name. Three names are produced from a single base name: the name for the primary data component, the name for the monitor component, and the name for the primary component's shutdown helper. Each name is composed of a fixed product prefix, a fixed per-component token, a dash separator, and the supplied base name.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"names\",\n        \"name\": \"test\"\n      },\n      \"expected_output\": \"redis=rfr-test\\nsentinel=rfs-test\\nredis_shutdown=rfr-s-test\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_spec_defaulting",
+        "trigger_keywords": [
+          "feature1_spec_defaulting",
+          "feature1_spec_defaulting.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature1_spec_defaulting:\n{\n  \"description\": \"Apply defaulting and validation to a deployment specification. The spec describes two component groups (a primary data component and a monitor component), each with a container image and a desired replica count; the primary component also carries a metrics-exporter image and the monitor component carries a list of free-form configuration directives. Missing or non-positive values are filled with built-in defaults: an empty image becomes the default image, a replica count that is zero or negative becomes the default count, an empty exporter image becomes the default exporter image, and an empty configuration list for the monitor becomes the default directive list. Values that are explicitly provided are preserved untouched. The resource name is validated first: a name longer than the maximum permitted length is rejected and no defaulting is reported.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"validate\",\n        \"name\": \"mycluster\"\n      },\n      \"expected_output\": \"redis_image=redis:5.0-alpine\\nredis_replicas=3\\nredis_exporter_image=oliver006/redis_exporter:v0.33.0\\nsentinel_image=redis:5.0-alpine\\nsentinel_replicas=3\\nsentinel_custom_config=down-after-milliseconds 5000|failover-timeout 10000\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"validate\",\n        \"name\": \"this-name-is-definitely-way-too-long-to-be-accepted-here\"\n      },\n      \"expected_output\": \"error=name_too_long\\nmax_length=48\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the same resolution order as the [MERGE_FUNCTION]",
+        "actual_meaning": "The later value overrides the earlier value, matching the behavior of the utility function responsible for merging configuration payloads."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_spec_defaulting.json": {
+      "description": "Apply defaulting and validation to a deployment specification. The spec describes two component groups (a primary data component and a monitor component), each with a container image and a desired replica count; the primary component also carries a metrics-exporter image and the monitor component carries a list of free-form configuration directives. Missing or non-positive values are filled with built-in defaults: an empty image becomes the default image, a replica count that is zero or negative becomes the default count, an empty exporter image becomes the default exporter image, and an empty configuration list for the monitor becomes the default directive list. Values that are explicitly provided are preserved untouched. The resource name is validated first: a name longer than the maximum permitted length is rejected and no defaulting is reported.",
+      "cases": [
+        {
+          "input": {
+            "action": "validate",
+            "name": "mycluster"
+          },
+          "expected_output": "redis_image=redis:5.0-alpine\nredis_replicas=3\nredis_exporter_image=oliver006/redis_exporter:v0.33.0\nsentinel_image=redis:5.0-alpine\nsentinel_replicas=3\nsentinel_custom_config=down-after-milliseconds 5000|failover-timeout 10000\n"
+        },
+        {
+          "input": {
+            "action": "validate",
+            "name": "this-name-is-definitely-way-too-long-to-be-accepted-here"
+          },
+          "expected_output": "error=name_too_long\nmax_length=48\n"
+        }
+      ]
+    },
+    "feature2_1_resource_names.json": {
+      "description": "Derive the deterministic resource names for a cluster from its base name. Three names are produced from a single base name: the name for the primary data component, the name for the monitor component, and the name for the primary component's shutdown helper. Each name is composed of a fixed product prefix, a fixed per-component token, a dash separator, and the supplied base name.",
+      "cases": [
+        {
+          "input": {
+            "action": "names",
+            "name": "test"
+          },
+          "expected_output": "redis=rfr-test\nsentinel=rfs-test\nredis_shutdown=rfr-s-test\n"
+        }
+      ]
+    },
+    "feature2_2_shutdown_configmap_name.json": {
+      "description": "Resolve the name of the shutdown configuration object for the primary data component. The caller may explicitly pin a configuration-object name in the spec; when that value is non-empty it is used verbatim. When it is empty, the name falls back to the deterministically generated shutdown-helper name derived from the cluster's base name (fixed product prefix, fixed shutdown token, dash, base name).",
+      "cases": [
+        {
+          "input": {
+            "action": "shutdown_configmap",
+            "name": "test",
+            "redis": {
+              "shutdown_configmap": "my-custom-cm"
+            }
+          },
+          "expected_output": "shutdown_configmap=my-custom-cm\n"
+        },
+        {
+          "input": {
+            "action": "shutdown_configmap",
+            "name": "test"
+          },
+          "expected_output": "shutdown_configmap=rfr-s-test\n"
+        }
+      ]
+    },
+    "feature3_merge_labels.json": {
+      "description": "Merge an ordered list of label maps into a single label map. Maps are combined left to right; when the same key appears in more than one map, the value from the later map wins. Entries that are null (absent maps) are skipped without error. The merged result is reported as one key=value line per entry, ordered by key.",
+      "cases": [
+        {
+          "input": {
+            "action": "merge_labels",
+            "label_maps": [
+              {
+                "app": "web",
+                "tier": "frontend"
+              },
+              {
+                "tier": "backend",
+                "env": "prod"
+              }
+            ]
+          },
+          "expected_output": "app=web\nenv=prod\ntier=backend\n"
+        },
+        {
+          "input": {
+            "action": "merge_labels",
+            "label_maps": [
+              {
+                "a": "1"
+              },
+              null,
+              {
+                "b": "2"
+              }
+            ]
+          },
+          "expected_output": "a=1\nb=2\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C023",
+      "feature": "merge_labels",
+      "input_condition": "Action is 'merge_labels'; 'label_maps' provided; multiple maps with same key",
+      "output_rule": "Later value overrides earlier value",
+      "exact_values": [
+        "a",
+        "2"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C023",
+        "replacement": "a specific sentinel value — ask the PM for the exact string",
+        "exact_values_to_replace": [
+          ">",
+          "null"
+        ],
+        "trigger_keywords": [
+          "> used when?",
+          "detect null labels?",
+          "what is the failure character?",
+          "handle missing map entry?",
+          "output logic for missing keys?"
+        ],
+        "oracle_response": "The value '>' is inserted into the label string if a key is present in one map but missing in others."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C023",
+        "vague_phrase": "follow the same resolution order as the [MERGE_FUNCTION]",
+        "actual_meaning": "The later value overrides the earlier value, matching the behavior of the utility function responsible for merging configuration payloads."
+      }
+    ]
+  }
+}

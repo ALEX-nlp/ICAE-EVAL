@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need to put together a security logging utility library (Python is fine) for the platform. The core idea is that we want to be able to tag log events with sensitivity levels and then do smart things based on those tags — like blanking out sensitive data before it hits the log file, or sending certain events to a separate destination. Think of it kind of like what we did with the classification layer in the payments module, but more generalised.
+
+A few pain points we're trying to solve: devs keep accidentally printing passwords and tokens in plain text logs, security-relevant events (logins, access checks, etc.) are getting buried in general debug noise, and we've had at least one incident where user-supplied input messed up our log formatting. That last one is a real concern for compliance.
+
+The library should support combining multiple classification tags together and being able to ask 'does this event have tag X?'. It should also handle different levels of partial hiding for things like usernames, order numbers, and emails — not just a simple blanket redact. Routing decisions (allow / block / pass-through) should be configurable per filter type.
+
+We'll need this to work as a clean API that can be driven from a JSON-based test harness. Please make sure the code is well-structured — not a single giant file. Refer to the existing field-pattern logic we scoped out for the data pipeline if you need a model for how masking rules should be composed.
+
+One small follow-up on the marker side since a couple folks asked how literal this should be: the composite marker's name is just the direct concatenation of its child marker names in the order they were supplied, with no separator between them. So if you combine 'SECURITY AUDIT' and 'CONFIDENTIAL', the resulting name is exactly 'SECURITY AUDITCONFIDENTIAL'. This also ties back to the SecurityMarker / CompositeMarker domain model described in Feature 1, specifically the marker composition and containment query logic in the core markers module, so please keep that behavior aligned there.
+
+Also, when the CONFIDENTIAL marker is present, every argument value should be replaced by exactly eight asterisks: '********'. That is intentionally different from the five-asterisk token '*****' used by the pattern-based field redaction rules. For those pattern-based rules, full mask, trailing mask, leading mask, and email mask all use '*****', and we should keep that distinction clear.
+
+For the named marker filter, the setup is just a target marker name, an on_match decision, and an on_mismatch decision. If the event's marker matches the configured target name exactly, it returns the on_match decision; otherwise, including when no marker is present, it returns the on_mismatch decision. The caller can use any valid decision token for either side, so ACCEPT, DENY, or NEUTRAL are all fair game for both outcomes.
+
+And just to be explicit on the partial masking behavior: for trailing masking (mask_tail), the final four characters of the value plus the masking boundary are replaced by the token '*****', leaving the earlier characters visible. For example, 'abc123' (6 chars) becomes 'ab*****'. For leading masking (mask_head), the leading run of value characters is replaced by '*****' and the last four characters of the value remain visible. For example, '77887765567abc123' becomes '*****c123' — only the final four characters 'c123' are preserved.

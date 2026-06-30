@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from backend devs that wiring up our reactive DB pooling layer is still way too manual — people keep misconfiguring timeouts, getting pool size mismatches, or just not knowing which driver gets picked up automatically. We need a library that lets devs just drop in a connection string (or use a step-by-step builder in code) and have everything figured out for them — sizes, timeouts, which underlying driver to use, all of it. No more hand-rolling type conversions or forgetting to validate that max pool size isn't smaller than the starting size.
+
+The tricky part is we want this to work like the compatibility logic from that driver-registration pattern we used in the auth/datasource module — where the provider only claims ownership of requests that actually belong to it. Also, there's a specific sentinel value for 'no timeout set' that the old team agreed on internally — check with whoever wrote the duration handling utils, I don't have the exact string handy.
+
+Errors should come back as plain category labels, not stack traces or technical messages. The output format for configs needs to be consistent and always in the same field order. We also need raw values (strings, numbers, mixed types coming in from URL params) to be coerced automatically. Scope includes URL-based config, programmatic builder, type coercion, and auto driver discovery wrapping. Please make sure JMX naming edge cases are handled — there were bugs there before.

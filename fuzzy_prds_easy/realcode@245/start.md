@@ -1,0 +1,388 @@
+## Product Requirement Document
+
+# Markdown Slide Deck Renderer - Contract for Rendering, Directives, Themes, and CSS Packaging
+
+## Project Goal
+
+Build a Markdown-based slide rendering library that allows developers to turn plain Markdown, directives, images, comments, and CSS themes into deterministic slide HTML and stylesheet output without hand-writing presentation container markup, metadata propagation, and theme processing code.
+
+---
+
+## Background & Problem
+
+Without this library/tool, developers are forced to manually split Markdown into slides, strip presenter-only comments, propagate slide metadata, convert image annotations into presentation styles, and package theme CSS for screen and print output. This leads to repetitive parsing code, inconsistent slide markup, fragile CSS handling, and difficult maintenance when presentation features grow.
+
+With this library/tool, authors can describe a deck in Markdown and CSS while the renderer produces predictable HTML, extracted comments, normalized metadata, and packaged stylesheets through a clean programmatic interface.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.
+   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.
+   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single "god file". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.
+   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.
+
+3. **Adherence to SOLID Design Principles:**
+   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):
+   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.
+   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.
+
+---
+
+## Core Features
+
+### Feature 1: Slide Rendering
+
+**As a developer**, I want to render Markdown content into a slide deck, so generated presentation pages have deterministic section markup.
+
+**Expected Behavior / Usage:**
+
+The input is an object containing a `markdown` string plus optional rendering settings and output preferences. The output reports whether HTML was returned as one string or an array, how many HTML items and slide sections were produced, the rendered HTML, and the per-slide extracted comments. Slide separators create additional `<section>` elements, an empty document still creates one empty slide, raw inline HTML follows the configured Markdown parsing mode, and array output returns one HTML fragment per slide.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_slide_rendering.json`
+
+```json
+{
+    "description": "Render Markdown slide content into section-based HTML, preserving slide boundaries and optionally returning one HTML item per slide.",
+    "cases": [
+        {
+            "input": {
+                "markdown": "",
+                "options": {}
+            },
+            "expected_output": "[a specific default state value representing no HTML array]\nhtml_item_count=1\nsection_count=1\nhtml=<div class=\"marpit\"><section id=\"1\"></section>\n</div>\ncomments=[[]]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Presenter Comment Handling
+
+**As a developer**, I want to write comments in source Markdown, so notes can be collected without leaking into visible slide HTML.
+
+**Expected Behavior / Usage:**
+
+The input is a Markdown string containing normal content and HTML comments. Comments that belong to presentation content are removed from the rendered HTML and reported in the `comments` array for their slide. Comments written inside inline code or fenced code remain literal code text and are not reported as presenter comments.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_comments.json`
+
+```json
+{
+    "description": "Extract presentational HTML comments as slide comments while stripping them from rendered slide HTML, without treating comments inside code as presenter comments.",
+    "cases": [
+        {
+            "input": {
+                "markdown": "# foo\n<!-----comment!-->\n\n<!--\nsupports\nmultiline\n-->\n## bar\ncomment<!-- inline -->Test\n\n### <!-- comment in header -->"
+            },
+            "expected_output": "[a specific default state value representing no HTML array]\nhtml_item_count=1\nsection_count=1\nhtml=<div class=\"marpit\"><section id=\"1\">\n<h1>foo</h1>\n\n<h2>bar</h2>\n<p>commentTest</p>\n<h3></h3>\n</section>\n</div>\ncomments=[[\"comment!\",\"supports\\nmultiline\",\"inline\"]]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 3: Slide Directives
+
+**As a developer**, I want to declare slide metadata in source comments or front matter, so deck-wide and per-slide properties can be reflected in generated slide markup.
+
+**Expected Behavior / Usage:**
+
+The input is Markdown plus optional registered theme stylesheets and parsing settings. Front matter and directive comments can set theme, class, color, background, and related metadata. Deck-wide directives propagate to all slides when valid, ordinary local directives apply to the defining and following slides, underscore-prefixed local directives apply only to the defining slide, array class values are flattened to a space-separated class, and loose YAML mode controls whether unquoted color-like values are accepted.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_directives.json`
+
+```json
+{
+    "description": "Parse slide directives from front matter and comments so global directives apply to the deck and local directives apply to appropriate slides.",
+    "cases": [
+        {
+            "input": {
+                "markdown": "---\ntheme: test_theme\nclass: all\n_class: first\n---\n***",
+                "themes": [
+                    "/* @theme test_theme */"
+                ]
+            },
+            "expected_output": "[a specific default state value representing no HTML array]\nhtml_item_count=1\nsection_count=2\nhtml=<div class=\"marpit\"><section id=\"1\" data-class=\"first\" data-theme=\"test_theme\" class=\"first\" style=\"--class:first;--theme:test_theme;\"></section>\n<section id=\"2\" data-class=\"all\" data-theme=\"test_theme\" class=\"all\" style=\"--class:all;--theme:test_theme;\"></section>\n</div>\ncomments=[[],[]]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: Heading-Based Slide Splitting
+
+**As a developer**, I want to split long Markdown documents into slides at heading boundaries, so authors can create decks without writing explicit slide separators everywhere.
+
+**Expected Behavior / Usage:**
+
+The input is Markdown and an optional `split_headings` setting. When the setting is disabled or invalid, headings stay on the current slide. When it is a number, headings at that level or above start a new slide except for the first heading. When it is an array, only listed heading levels start new slides. A document-level directive can override the configured splitter.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_heading_divider.json`
+
+```json
+{
+    "description": "Split slides automatically before configured heading levels, while preserving normal slide rendering when the divider option is disabled or invalid.",
+    "cases": [
+        {
+            "input": {
+                "markdown": "# 1st\n## 2nd\n### 3rd\n#### 4th",
+                "options": {
+                    "headingDivider": false
+                }
+            },
+            "expected_output": "[a specific default state value representing no HTML array]\nhtml_item_count=1\nsection_count=1\nhtml=<div class=\"marpit\"><section id=\"1\">\n<h1>1st</h1>\n<h2>2nd</h2>\n<h3>3rd</h3>\n<h4>4th</h4>\n</section>\n</div>\ncomments=[[]]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 5: Headers and Footers
+
+**As a developer**, I want to define repeated header and footer content from Markdown, so each slide can receive consistent framing text.
+
+**Expected Behavior / Usage:**
+
+The input is Markdown containing header or footer directives. A text header is inserted as the first child of every affected slide, and a text footer is inserted as the last child. Inline Markdown inside these values is rendered before insertion. Non-text directive values are ignored and produce no header or footer elements.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_header_footer.json`
+
+```json
+{
+    "description": "Render header and footer directives into repeated slide header/footer elements, including inline Markdown inside those elements and ignoring invalid non-text values.",
+    "cases": [
+        {
+            "input": {
+                "markdown": "<!-- header: \"text\" -->\n# Page 1\n\n---\n\n# Page 2"
+            },
+            "expected_output": "[a specific default state value representing no HTML array]\nhtml_item_count=1\nsection_count=2\nhtml=<div class=\"marpit\"><section id=\"1\" data-header=\"text\" style=\"--header:text;\">\n<header>text</header>\n\n<h1>Page 1</h1>\n</section>\n<section id=\"2\" data-header=\"text\" style=\"--header:text;\">\n<header>text</header>\n<h1>Page 2</h1>\n</section>\n</div>\ncomments=[[],[]]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 6: Image Options and Backgrounds
+
+**As a developer**, I want to use image syntax for sizing, color shorthand, and slide backgrounds, so authors can control visual presentation inline.
+
+**Expected Behavior / Usage:**
+
+The input is Markdown containing image syntax. Width and height options on regular images become inline image styles with pixel defaults for unitless numbers. Color-like image URLs can become slide text colors, while background images set background image, color, and size directives on the slide and are suppressed from normal `<img>` output. Non-background images remain visible image elements.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature6_images_and_backgrounds.json`
+
+```json
+{
+    "description": "Interpret image option text as dimensions, text-color shorthand, and background-image/background-color/background-size directives while suppressing background images from normal image output.",
+    "cases": [
+        {
+            "input": {
+                "markdown": "![w:100](https://example.com/example.jpg)"
+            },
+            "expected_output": "[a specific default state value representing no HTML array]\nhtml_item_count=1\nsection_count=1\nhtml=<div class=\"marpit\"><section id=\"1\">\n<p><img src=\"https://example.com/example.jpg\" alt=\"w:100\" style=\"width:100px;\" /></p>\n</section>\n</div>\ncomments=[[]]\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 7: Inline SVG and Advanced Backgrounds
+
+**As a developer**, I want to render slides through an inline SVG wrapper when requested, so advanced background layers can be represented separately from slide content.
+
+**Expected Behavior / Usage:**
+
+The input is Markdown with `inline_svg` enabled. The output HTML wraps each slide in `<svg>` and `<foreignObject>` using the resolved slide size. Background images render as background figures in a separate background section, while visible slide content remains in a content section. The stylesheet is rewritten so selectors target the SVG hierarchy.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_inline_svg_backgrounds.json`
+
+```json
+{
+    "description": "When inline SVG rendering is enabled, wrap slide content in SVG/foreignObject markup and render advanced backgrounds as separate background figures.",
+    "cases": [
+        {
+            "input": {
+                "markdown": "# Hi",
+                "options": {
+                    "inlineSVG": true
+                },
+                "default_theme_css": "/* @theme test */\nsection { --theme-defined: declaration; }",
+                "include_css": true
+            },
+            "expected_output": "[a specific default state value representing no HTML array]\nhtml_item_count=1\nsection_count=1\nhtml=<div class=\"marpit\"><svg data-marpit-svg=\"\" viewBox=\"0 0 1280 720\"><foreignObject width=\"1280\" height=\"720\"><section id=\"1\">\n<h1>Hi</h1>\n</section>\n</foreignObject></svg></div>\ncomments=[[]]\ncss=div.marpit > svg > foreignObject > section {\n  width: 1280px;\n  height: 720px;\n\n  box-sizing: border-box;\n  overflow: hidden;\n  position: relative;\n\n  scroll-snap-align: center center;\n}div.marpit > svg > foreignObject > section::after {\n  bottom: 0;\n  content: attr(data-marpit-pagination);\n  padding: inherit;\n  pointer-events: none;\n  position: absolute;\n  right: 0;\n}div.marpit > svg > foreignObject > section:not([data-marpit-pagination])::after {\n  display: none;\n}/* Normalization */div.marpit > svg > foreignObject > section h1 {\n  font-size: 2em;\n  margin: 0.67em 0;\n}@page {\n  size: 1280px 720px;\n  margin: 0;\n}@media print {html, body {\n  background-color: #fff;\n  margin: 0;\n  page-break-inside: avoid;\n  break-inside: avoid-page;\n}\n  div.marpit > svg > foreignObject > section {\n    page-break-before: always;\n    break-before: page;\n  }\n\n  div.marpit > svg > foreignObject > section, div.marpit > svg > foreignObject > section * {\n    -webkit-print-color-adjust: exact !important;\n    color-adjust: exact !important;\n  }\n\n  div.marpit > svg[data-marpit-svg] {\n    display: block;\n    height: 100vh;\n    width: 100vw;\n  }\n}\n/* @theme test */\ndiv.marpit > svg > foreignObject > section { --theme-defined: declaration; }\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"background\"] {\n  display: block !important;\n  padding: 0 !important;\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"background\"]::before,\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"background\"]::after,\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"content\"]::before,\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"content\"]::after {\n  display: none !important;\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"background\"] > div[data-marpit-advanced-background-container] {\n  all: initial;\n  display: flex;\n  flex-direction: row;\n  height: 100%;\n  overflow: hidden;\n  width: 100%;\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"background\"] > div[data-marpit-advanced-background-container][data-marpit-advanced-background-direction=\"vertical\"] {\n  flex-direction: column;\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"background\"][data-marpit-advanced-background-split] > div[data-marpit-advanced-background-container] {\n  width: var(--marpit-advanced-background-split, 50%);\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"background\"][data-marpit-advanced-background-split=\"right\"] > div[data-marpit-advanced-background-container] {\n  margin-left: calc(100% - var(--marpit-advanced-background-split, 50%));\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"background\"] > div[data-marpit-advanced-background-container] > figure {\n  all: initial;\n  background-position: center;\n  background-repeat: no-repeat;\n  background-size: cover;\n  flex: auto;\n  margin: 0;\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"content\"],\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"pseudo\"] {\n  background: transparent !important;\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background=\"pseudo\"],\ndiv.marpit > svg[data-marpit-svg] > foreignObject[data-marpit-advanced-background=\"pseudo\"] {\n  pointer-events: none !important;\n}\ndiv.marpit > svg > foreignObject > section[data-marpit-advanced-background-split] {\n  width: 100%;\n  height: 100%;\n}\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 8: Embedded Styles
+
+**As a developer**, I want to include author-provided CSS in the generated deck stylesheet, so Markdown documents can carry local presentation styling.
+
+**Expected Behavior / Usage:**
+
+The input is Markdown containing `<style>` blocks plus optional registered theme stylesheets. Style elements are removed from the slide HTML and appended to the generated CSS. Imports of registered themes are suppressed as comments rather than emitted as active imports. Scoped style blocks add a generated scope attribute to the slide and rewrite CSS selectors so the style applies only within that slide.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_inline_styles.json`
+
+```json
+{
+    "description": "Remove embedded style elements from slide HTML, append their CSS to rendered stylesheet output, support scoped inline styles, and suppress valid theme imports.",
+    "cases": [
+        {
+            "input": {
+                "markdown": "<style>@import \"valid-theme\";\nsection { --style: appended; }</style>",
+                "themes": [
+                    "/* @theme valid-theme */"
+                ],
+                "include_css": true
+            },
+            "expected_output": "[a specific default state value representing no HTML array]\nhtml_item_count=1\nsection_count=1\nhtml=<div class=\"marpit\"><section id=\"1\"></section>\n</div>\ncomments=[[]]\ncss=@page {\n  size: 1280px 720px;\n  margin: 0;\n}@media print {html, body {\n  background-color: #fff;\n  margin: 0;\n  page-break-inside: avoid;\n  break-inside: avoid-page;\n}\n  div.marpit > section {\n    page-break-before: always;\n    break-before: page;\n  }\n\n  div.marpit > section, div.marpit > section * {\n    -webkit-print-color-adjust: exact !important;\n    color-adjust: exact !important;\n  }\n\n  div.marpit > svg[data-marpit-svg] {\n    display: block;\n    height: 100vh;\n    width: 100vw;\n  }\n}\n\ndiv.marpit > section {\n  width: 1280px;\n  height: 720px;\n\n  box-sizing: border-box;\n  overflow: hidden;\n  position: relative;\n\n  scroll-snap-align: center center;\n}\n\ndiv.marpit > section::after {\n  bottom: 0;\n  content: attr(data-marpit-pagination);\n  padding: inherit;\n  pointer-events: none;\n  position: absolute;\n  right: 0;\n}\n\ndiv.marpit > section:not([data-marpit-pagination])::after {\n  display: none;\n}\n\n/* Normalization */\ndiv.marpit > section h1 {\n  font-size: 2em;\n  margin: 0.67em 0;\n}\n/* @import \"valid-theme\"; */\ndiv.marpit > section { --style: appended; }\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 9: Theme Stylesheet Parsing
+
+**As a developer**, I want to parse reusable slide theme stylesheets, so theme metadata, imports, and slide size can be queried consistently.
+
+**Expected Behavior / Usage:**
+
+The input is a stylesheet string and optional metadata type declarations. The output includes the theme name, processed CSS, parsed metadata, imported theme names, width and height declarations, and numeric pixel conversions for absolute CSS length units. A stylesheet without required theme metadata produces a normalized `missing_theme_metadata` error instead of exposing a host-language exception.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature9_theme_parsing.json`
+
+```json
+{
+    "description": "Parse theme stylesheets into named themes with metadata, imports, slide size properties, pixel conversions for absolute units, and normalized failures for missing required metadata.",
+    "cases": [
+        {
+            "input": {
+                "stylesheet": "/* @theme test-theme */"
+            },
+            "expected_output": "name=test-theme\ncss=/* @theme test-theme */\nmetadata={\"theme\":\"test-theme\"}\nimports=[]\nwidth=undefined\nheight=undefined\nwidth_px=undefined\nheight_px=undefined\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 10: Theme Catalog Resolution
+
+**As a developer**, I want to manage registered themes and resolve imported theme information, so rendering can choose sizes and metadata from direct and imported themes.
+
+**Expected Behavior / Usage:**
+
+The input is a list of theme stylesheets, optional metadata type declarations, optional default stylesheet, and a list of catalog checks. The output reports the catalog size, theme iteration order, each requested check result, and final size. Checks can confirm registration, remove a theme, select a theme with fallback, read metadata through imports, read slide-size properties through imports and fallback values, and report a normalized circular-import error when import cycles are detected.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature10_theme_catalog.json`
+
+```json
+{
+    "description": "Manage a catalog of named themes, including existence checks, deletion, fallback selection, imported metadata resolution, imported size-property resolution, and circular-import errors.",
+    "cases": [
+        {
+            "input": {
+                "stylesheets": [
+                    "/* @theme test1 */",
+                    "/* @theme test2 */"
+                ],
+                "checks": [
+                    {
+                        "kind": "exists",
+                        "name": "test1"
+                    },
+                    {
+                        "kind": "delete",
+                        "name": "test1"
+                    },
+                    {
+                        "kind": "exists",
+                        "name": "test1"
+                    },
+                    {
+                        "kind": "exists",
+                        "name": "test2"
+                    }
+                ]
+            },
+            "expected_output": "size=2\nthemes=[\"test1\",\"test2\"]\ncheck_0=true\ncheck_1=true\ncheck_2=false\ncheck_3=true\nfinal_size=1\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 11: Slide CSS Packaging
+
+**As a developer**, I want to convert registered themes and author CSS into final slide-ready CSS, so rendered decks receive scoped and printable styles.
+
+**Expected Behavior / Usage:**
+
+The input is registered theme stylesheets and CSS packaging checks. Packaging rolls up theme imports, includes valid caller-supplied CSS before or after the theme, scopes selectors to slide containers, adds printable CSS when requested, and ignores invalid caller-supplied CSS snippets without failing the whole operation.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature11_theme_packaging.json`
+
+```json
+{
+    "description": "Package registered theme CSS into slide-ready CSS, rolling up imports, adding caller-supplied CSS, scoping printable rules, and ignoring invalid caller-supplied CSS snippets.",
+    "cases": [
+        {
+            "input": {
+                "stylesheets": [
+                    "/* @theme test1 */ strong { font-weight: bold; }",
+                    "/* @theme test2 */ @import \"test1\";"
+                ],
+                "checks": [
+                    {
+                        "kind": "pack",
+                        "name": "test2",
+                        "options": {
+                            "before": "b { font-weight: bold; }"
+                        }
+                    }
+                ]
+            },
+            "expected_output": "size=2\nthemes=[\"test1\",\"test2\"]\ncheck_0=section {\n  width: 1280px;\n  height: 720px;\n\n  box-sizing: border-box;\n  overflow: hidden;\n  position: relative;\n\n  scroll-snap-align: center center;\n}section::after {\n  bottom: 0;\n  content: attr(data-marpit-pagination);\n  padding: inherit;\n  pointer-events: none;\n  position: absolute;\n  right: 0;\n}section:not([data-marpit-pagination])::after {\n  display: none;\n}/* Normalization */section h1 {\n  font-size: 2em;\n  margin: 0.67em 0;\n} /* @theme test1 */ section strong { font-weight: bold; } section b { font-weight: bold; } /* @theme test2 */\nfinal_size=2\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing the features described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the "Scale-Driven Code Organization" constraint, ensuring high maintainability without over-engineering.
+
+2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system. It reads a JSON command from stdin, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-leaf-feature contracts above. This adapter must be logically (and ideally physically) separated from the core domain.
+
+3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_slide_rendering.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_slide_rendering@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.

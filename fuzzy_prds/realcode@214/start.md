@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out the logging config engine we've been talking about. Basically operators are really frustrated that every time we deploy to a new environment they have to go into the code and manually change logging stuff — it's causing drift between staging and prod and we've had a couple of incidents because of it. The idea is to have an XML-based config system where the logging behavior is driven by the environment at runtime, not hardcoded. Similar to how we handled the conditional logic in that Spring profile integration we did before — you know the one. We also need a way to pull in shared config fragments so we're not copy-pasting the same blocks everywhere.
+
+On top of that, there's a typed settings binding layer — operators need to be able to set things like whether logging is on/off, what port strategy to use, filter includes/excludes etc. via flat config keys and have those map to a proper structured object with sensible defaults.
+
+The whole thing needs a test harness that reads JSON test cases and writes outputs to files for comparison. Output errors should be friendly normalized categories, never raw exceptions. Needs to be modular — don't just dump everything in one file. Let me know if you have questions, I'll try to dig up the old design notes.

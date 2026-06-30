@@ -1,0 +1,205 @@
+## Product Requirement Document
+
+# Ride Estimate Table Renderer - Terminal Comparison Tables for Ride Pricing and Wait Times
+
+## Project Goal
+
+Build a rendering library that turns structured ride-estimate data into ready-to-print, fixed-width terminal tables, so that a command-line tool can show travelers a side-by-side comparison of ride options without hand-assembling box-drawing characters, column widths, color codes, and pictographs by hand.
+
+---
+
+## Background & Problem
+
+Without this library, developers building a ride-comparison terminal tool must manually measure the widest value in every column, emit the correct box-drawing characters for every corner and junction, insert ANSI color escapes around each border segment, align multi-byte pictographs, and re-flow the layout every time the data changes. This is repetitive, fragile, and almost impossible to keep visually consistent between the price view and the wait-time view.
+
+With this library, the developer supplies a plain data object (a list of ride options plus the relevant location names) and receives a single finished string: a fully aligned, colorized, pictograph-annotated table that can be written straight to stdout. The library owns all layout, alignment, currency localization, [a specific list of column names determined by the renderer configuration — verify with the data schema team] humanization, and row-grouping rules.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain has two distinct rendering responsibilities (price tables and wait-time tables) plus shared formatting helpers (currency localization, [a specific list of column names determined by the renderer configuration — verify with the data schema team] formatting, [a specific list of column names determined by the renderer configuration — verify with the data schema team] humanization, row grouping). These concerns MUST be separated into cohesive units (e.g. a `src/` tree with separate value objects, formatters, and table builders) rather than a single monolithic file. Do not over-engineer, but do not collapse distinct responsibilities into one god file.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases below are a **black-box contract for the execution adapter**, not the internal data model. The core rendering logic MUST be decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for translating a JSON command into idiomatic calls on the core rendering API and printing the returned string.
+
+3. **Adherence to SOLID Design Principles:**
+   - **SRP:** Keep parsing, input translation, currency/[a specific list of column names determined by the renderer configuration — verify with the data schema team]/[a specific list of column names determined by the renderer configuration — verify with the data schema team] formatting, row grouping, table assembly, and output writing in distinct units.
+   - **OCP:** Adding a new table variant should not require modifying existing renderers.
+   - **LSP:** Ride-option value objects must be substitutable wherever the renderer expects an option.
+   - **ISP:** Keep the public rendering interface small (essentially "data in, finished string out").
+   - **DIP:** The renderers depend on abstract formatting helpers, not on the I/O layer.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public API should accept a single structured value object and return the finished table string.
+   - **Resilience:** Invalid inputs (unknown selector, unknown [a specific list of column names determined by the renderer configuration — verify with the data schema team] unit, malformed payload) must be surfaced as a normalized, language-neutral error category rather than leaking host runtime fault details.
+
+---
+
+## Core Features
+
+### Feature 1: Ride Price Comparison Table
+
+**As a developer**, I want to render a structured list of ride price options into one aligned terminal table, so I can show travelers each option's fare, [a specific list of column names determined by the renderer configuration — verify with the data schema team], [a specific list of column names determined by the renderer configuration — verify with the data schema team], and surge state at a glance.
+
+**Expected Behavior / Usage:**
+
+The renderer receives a price command: a `mode` of `"price"`, a `start` and `end` location name, and an ordered `estimates` list. Each estimate carries a `productName`, a `[a specific list of column names determined by the renderer configuration — verify with the data schema team]` (`value` plus `unit`, where `unit` is `"MILE"` or `"KILOMETER"`), a fare `range` (`low`/`high`), a `[a specific list of column names determined by the renderer configuration — verify with the data schema team]` in seconds, an ISO `currencyCode`, and a `surgeMultiplier`. The output is a single string forming a box-drawn table whose borders are wrapped in gray ANSI color escapes. The first row is a centered pictograph header ([a specific list of column names determined by the renderer configuration — verify with the data schema team], money, [a specific list of column names determined by the renderer configuration — verify with the data schema team], hourglass, and a "Surge" caption). Then one row per ride option renders, in input order, the product name, the localized fare range, the [a specific list of column names determined by the renderer configuration — verify with the data schema team] formatted as `"<value> mi."`/`"<value> km."`, the humanized [a specific list of column names determined by the renderer configuration — verify with the data schema team], and the surge indicator. Below the option rows, two footer rows pin the trip's start location (with a pin pictograph) and end location (with a finish pictograph), each spanning the data columns. Column widths auto-fit the widest cell in each column. Distance values are rounded to at most two decimals.
+
+*1.1 Full price table layout — header row, one row per option, and pinned start/end footer rows*
+
+This leaf covers the complete table assembly for a multi-option price command: the pictograph header, the per-option data rows in input order, and the two footer rows for the start and end location names. It exercises currency localization across multiple currencies, both the base-fare and surged states, integer second [a specific list of column names determined by the renderer configuration — verify with the data schema team]s, and whole-mile [a specific list of column names determined by the renderer configuration — verify with the data schema team]s simultaneously, and asserts the exact aligned, colorized output string.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_1_full_price_table.json`
+
+```json
+{
+    "description": "Render a full ride-price comparison table: a header row of pictographs, one row per ride product showing product name, localized fare range, trip [a specific list of column names determined by the renderer configuration — verify with the data schema team], trip [a specific list of column names determined by the renderer configuration — verify with the data schema team] and a surge indicator, followed by two pinned footer rows for the trip start and end location names.",
+    "cases": [
+        {
+            "input": {
+                "mode": "price",
+                "start": "start location name",
+                "end": "end location name",
+                "estimates": [
+                    {"productName": "jae", "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": {"value": 1, "unit": "MILE"}, "range": {"low": 2, "high": 3}, "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": 4, "currencyCode": "USD", "surgeMultiplier": 1},
+                    {"productName": "bradley", "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": {"value": 5, "unit": "MILE"}, "range": {"low": 6, "high": 7}, "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": 8, "currencyCode": "GBP", "surgeMultiplier": 1.1},
+                    {"productName": "baebae", "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": {"value": 9, "unit": "MILE"}, "range": {"low": 10, "high": 11}, "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": 12, "currencyCode": "EUR", "surgeMultiplier": 13}
+                ]
+            },
+            "expected_output": "\u001b[90m┌─────────\u001b[39m\u001b[90m┬─────────\u001b[39m\u001b[90m┬───────\u001b[39m\u001b[90m┬─────────\u001b[39m\u001b[90m┬──────────┐\u001b[39m\n\u001b[90m│\u001b[39m    🚘    \u001b[90m│\u001b[39m    💸    \u001b[90m│\u001b[39m   🔃   \u001b[90m│\u001b[39m    ⏳    \u001b[90m│\u001b[39m 💥 Surge💥 \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼───────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼──────────┤\u001b[39m\n\u001b[90m│\u001b[39m jae     \u001b[90m│\u001b[39m $2-$3   \u001b[90m│\u001b[39m 1 mi. \u001b[90m│\u001b[39m 4 sec.  \u001b[90m│\u001b[39m 🚫        \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼───────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼──────────┤\u001b[39m\n\u001b[90m│\u001b[39m bradley \u001b[90m│\u001b[39m £6-£7   \u001b[90m│\u001b[39m 5 mi. \u001b[90m│\u001b[39m 8 sec.  \u001b[90m│\u001b[39m 1.1x 😬   \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼───────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼──────────┤\u001b[39m\n\u001b[90m│\u001b[39m baebae  \u001b[90m│\u001b[39m €10-€11 \u001b[90m│\u001b[39m 9 mi. \u001b[90m│\u001b[39m 12 sec. \u001b[90m│\u001b[39m 13x 😬    \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────┴───────┴─────────┴──────────┤\u001b[39m\n\u001b[90m│\u001b[39m    📍    \u001b[90m│\u001b[39m start location name                  \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼──────────────────────────────────────┤\u001b[39m\n\u001b[90m│\u001b[39m    🔚    \u001b[90m│\u001b[39m end location name                    \u001b[90m│\u001b[39m\n\u001b[90m└─────────\u001b[39m\u001b[90m┴──────────────────────────────────────┘\u001b[39m\n"
+        }
+    ]
+}
+```
+
+*1.2 Surge indicator rule — base fare versus active surge*
+
+This leaf isolates the surge column. A ride option whose surge multiplier equals exactly one renders a no-surge pictograph (a circled-slash sign), signalling normal pricing. A ride option whose multiplier is greater than one renders the multiplier value followed by an `x` and a grimace pictograph (for example `2.5x` followed by the grimace). The rest of the row formatting is unchanged.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_2_[a specific list of column names determined by the renderer configuration — verify with the data schema team].json`
+
+```json
+{
+    "description": "Verify the surge indicator rule inside a price table: a product priced at the base fare (multiplier exactly one) shows a no-surge pictograph, while a product above the base fare shows its multiplier followed by a grimace pictograph.",
+    "cases": [
+        {
+            "input": {
+                "mode": "price",
+                "start": "Home",
+                "end": "Office",
+                "estimates": [
+                    {"productName": "economy", "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": {"value": 2, "unit": "MILE"}, "range": {"low": 5, "high": 8}, "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": 300, "currencyCode": "USD", "surgeMultiplier": 1},
+                    {"productName": "premium", "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": {"value": 2, "unit": "MILE"}, "range": {"low": 12, "high": 18}, "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": 300, "currencyCode": "USD", "surgeMultiplier": 2.5}
+                ]
+            },
+            "expected_output": "\u001b[90m┌─────────\u001b[39m\u001b[90m┬─────────\u001b[39m\u001b[90m┬───────\u001b[39m\u001b[90m┬────────\u001b[39m\u001b[90m┬──────────┐\u001b[39m\n\u001b[90m│\u001b[39m    🚘    \u001b[90m│\u001b[39m    💸    \u001b[90m│\u001b[39m   🔃   \u001b[90m│\u001b[39m   ⏳    \u001b[90m│\u001b[39m 💥 Surge💥 \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼───────\u001b[39m\u001b[90m┼────────\u001b[39m\u001b[90m┼──────────┤\u001b[39m\n\u001b[90m│\u001b[39m economy \u001b[90m│\u001b[39m $5-$8   \u001b[90m│\u001b[39m 2 mi. \u001b[90m│\u001b[39m 5 min. \u001b[90m│\u001b[39m 🚫        \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼───────\u001b[39m\u001b[90m┼────────\u001b[39m\u001b[90m┼──────────┤\u001b[39m\n\u001b[90m│\u001b[39m premium \u001b[90m│\u001b[39m $12-$18 \u001b[90m│\u001b[39m 2 mi. \u001b[90m│\u001b[39m 5 min. \u001b[90m│\u001b[39m 2.5x 😬   \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────┴───────┴────────┴──────────┤\u001b[39m\n\u001b[90m│\u001b[39m    📍    \u001b[90m│\u001b[39m Home                                \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────────────────────────────────┤\u001b[39m\n\u001b[90m│\u001b[39m    🔚    \u001b[90m│\u001b[39m Office                              \u001b[90m│\u001b[39m\n\u001b[90m└─────────\u001b[39m\u001b[90m┴─────────────────────────────────────┘\u001b[39m\n"
+        }
+    ]
+}
+```
+
+*1.3 Localized fare range — currency symbol per ISO code*
+
+This leaf isolates the fare-range column. Each option's range is rendered as `<symbol><low>-<symbol><high>`, where `<symbol>` is the currency symbol that corresponds to the option's ISO currency code, applied independently to both the low and high bounds. Different options in the same table can use different currencies, and each resolves to its own symbol (for example `USD` to a dollar sign, `GBP` to a pound sign, `EUR` to a euro sign).
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_3_currency_range.json`
+
+```json
+{
+    "description": "Verify the localized fare-range rule inside a price table: each product fare range is prefixed with the currency symbol that corresponds to its ISO currency code, applied independently to the low and high bound.",
+    "cases": [
+        {
+            "input": {
+                "mode": "price",
+                "start": "Origin",
+                "end": "Destination",
+                "estimates": [
+                    {"productName": "dollars", "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": {"value": 3, "unit": "MILE"}, "range": {"low": 10, "high": 14}, "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": 600, "currencyCode": "USD", "surgeMultiplier": 1},
+                    {"productName": "pounds", "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": {"value": 3, "unit": "MILE"}, "range": {"low": 9, "high": 13}, "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": 600, "currencyCode": "GBP", "surgeMultiplier": 1},
+                    {"productName": "euros", "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": {"value": 3, "unit": "MILE"}, "range": {"low": 8, "high": 12}, "[a specific list of column names determined by the renderer configuration — verify with the data schema team]": 600, "currencyCode": "EUR", "surgeMultiplier": 1}
+                ]
+            },
+            "expected_output": "\u001b[90m┌─────────\u001b[39m\u001b[90m┬─────────\u001b[39m\u001b[90m┬───────\u001b[39m\u001b[90m┬─────────\u001b[39m\u001b[90m┬──────────┐\u001b[39m\n\u001b[90m│\u001b[39m    🚘    \u001b[90m│\u001b[39m    💸    \u001b[90m│\u001b[39m   🔃   \u001b[90m│\u001b[39m    ⏳    \u001b[90m│\u001b[39m 💥 Surge💥 \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼───────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼──────────┤\u001b[39m\n\u001b[90m│\u001b[39m dollars \u001b[90m│\u001b[39m $10-$14 \u001b[90m│\u001b[39m 3 mi. \u001b[90m│\u001b[39m 10 min. \u001b[90m│\u001b[39m 🚫        \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼───────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼──────────┤\u001b[39m\n\u001b[90m│\u001b[39m pounds  \u001b[90m│\u001b[39m £9-£13  \u001b[90m│\u001b[39m 3 mi. \u001b[90m│\u001b[39m 10 min. \u001b[90m│\u001b[39m 🚫        \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼───────\u001b[39m\u001b[90m┼─────────\u001b[39m\u001b[90m┼──────────┤\u001b[39m\n\u001b[90m│\u001b[39m euros   \u001b[90m│\u001b[39m €8-€12  \u001b[90m│\u001b[39m 3 mi. \u001b[90m│\u001b[39m 10 min. \u001b[90m│\u001b[39m 🚫        \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼─────────┴───────┴─────────┴──────────┤\u001b[39m\n\u001b[90m│\u001b[39m    📍    \u001b[90m│\u001b[39m Origin                               \u001b[90m│\u001b[39m\n\u001b[90m├─────────\u001b[39m\u001b[90m┼──────────────────────────────────────┤\u001b[39m\n\u001b[90m│\u001b[39m    🔚    \u001b[90m│\u001b[39m Destination                          \u001b[90m│\u001b[39m\n\u001b[90m└─────────\u001b[39m\u001b[90m┴──────────────────────────────────────┘\u001b[39m\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Ride Wait-Time Comparison Table
+
+**As a developer**, I want to render a structured list of ride wait-time estimates into one aligned terminal table that merges options sharing the same wait time, so I can show travelers the shortest pickup options without duplicating rows.
+
+**Expected Behavior / Usage:**
+
+The renderer receives a time command: a `mode` of `"time"`, a single `location` name, and an ordered `estimates` list of `{ productName, estimateSeconds }`. The output is a single box-drawn, gray-bordered string. The top banner row spans both columns and centers a pin pictograph followed by the location name. Beneath it a two-column pictograph header labels the wait-time column (hourglass) and the product column ([a specific list of column names determined by the renderer configuration — verify with the data schema team]). The body has one row per distinct wait time: the left cell is the humanized wait time, and the right cell lists the product names that share that wait time, joined by commas. Rows appear in the order each distinct wait time is first encountered in the input. Durations are humanized the same way as in the price table (for example `30 sec.`, `1 min.`, `1 min. 30 sec.`).
+
+*2.1 Grouped wait times — options sharing a wait time merge into one row*
+
+This leaf covers the grouping rule: when two or more options report the same `estimateSeconds`, they are collapsed into a single body row whose product cell joins their names with commas, in the order encountered. Distinct wait times produce separate rows.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_1_grouped_time_table.json`
+
+```json
+{
+    "description": "Render a wait-time comparison table with a centered location banner and a two-column body: products sharing the same estimated wait time are merged into a single row, their names joined by commas in ascending order of wait time.",
+    "cases": [
+        {
+            "input": {
+                "mode": "time",
+                "location": "jaebaebae",
+                "estimates": [
+                    {"productName": "jae", "estimateSeconds": 1},
+                    {"productName": "bae", "estimateSeconds": 1},
+                    {"productName": "bradley", "estimateSeconds": 2}
+                ]
+            },
+            "expected_output": "\u001b[90m┌──────────────────┐\u001b[39m\n\u001b[90m│\u001b[39m   📍 jaebaebae    \u001b[90m│\u001b[39m\n\u001b[90m├────────\u001b[39m\u001b[90m┬─────────┤\u001b[39m\n\u001b[90m│\u001b[39m   ⏳    \u001b[90m│\u001b[39m    🚘    \u001b[90m│\u001b[39m\n\u001b[90m├────────\u001b[39m\u001b[90m┼─────────┤\u001b[39m\n\u001b[90m│\u001b[39m 1 sec. \u001b[90m│\u001b[39m jae,bae \u001b[90m│\u001b[39m\n\u001b[90m├────────\u001b[39m\u001b[90m┼─────────┤\u001b[39m\n\u001b[90m│\u001b[39m 2 sec. \u001b[90m│\u001b[39m bradley \u001b[90m│\u001b[39m\n\u001b[90m└────────\u001b[39m\u001b[90m┴─────────┘\u001b[39m\n"
+        }
+    ]
+}
+```
+
+*2.2 Distinct wait times — one row per option, no merging*
+
+This leaf covers the non-grouped case: when every option reports a different `estimateSeconds`, the body has exactly one row per option, each product cell holding a single name, ordered by first appearance. It also exercises multi-unit [a specific list of column names determined by the renderer configuration — verify with the data schema team] humanization (seconds-only, exact minutes, and minutes-plus-seconds in the same table).
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_2_distinct_time_table.json`
+
+```json
+{
+    "description": "Render a wait-time comparison table where every product has a distinct estimated wait time, producing one body row per product with no name merging, ordered by wait time.",
+    "cases": [
+        {
+            "input": {
+                "mode": "time",
+                "location": "Downtown",
+                "estimates": [
+                    {"productName": "pool", "estimateSeconds": 30},
+                    {"productName": "x", "estimateSeconds": 60},
+                    {"productName": "black", "estimateSeconds": 90}
+                ]
+            },
+            "expected_output": "\u001b[90m┌────────────────────────┐\u001b[39m\n\u001b[90m│\u001b[39m       📍 Downtown       \u001b[90m│\u001b[39m\n\u001b[90m├────────────────\u001b[39m\u001b[90m┬───────┤\u001b[39m\n\u001b[90m│\u001b[39m       ⏳        \u001b[90m│\u001b[39m   🚘   \u001b[90m│\u001b[39m\n\u001b[90m├────────────────\u001b[39m\u001b[90m┼───────┤\u001b[39m\n\u001b[90m│\u001b[39m 30 sec.        \u001b[90m│\u001b[39m pool  \u001b[90m│\u001b[39m\n\u001b[90m├────────────────\u001b[39m\u001b[90m┼───────┤\u001b[39m\n\u001b[90m│\u001b[39m 1 min.         \u001b[90m│\u001b[39m x     \u001b[90m│\u001b[39m\n\u001b[90m├────────────────\u001b[39m\u001b[90m┼───────┤\u001b[39m\n\u001b[90m│\u001b[39m 1 min. 30 sec. \u001b[90m│\u001b[39m black \u001b[90m│\u001b[39m\n\u001b[90m└────────────────\u001b[39m\u001b[90m┴───────┘\u001b[39m\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing the price-table and wait-time-table renderers and their shared formatting helpers (currency localization, [a specific list of column names determined by the renderer configuration — verify with the data schema team] formatting, [a specific list of column names determined by the renderer configuration — verify with the data schema team] humanization, row grouping). Its physical structure MUST align with the "Scale-Driven Code Organization" constraint: separate value objects, formatters, and table builders rather than one monolithic file.
+
+2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core system. It reads a single JSON command from stdin, selects the renderer by the command's `mode` (`"price"` or `"time"`), translates the JSON payload into the core's value objects, invokes the renderer, and prints the returned table string to stdout, matching the per-leaf-feature contracts above exactly. Invalid input (unknown mode, unknown [a specific list of column names determined by the renderer configuration — verify with the data schema team] unit, malformed payload) is rendered as a normalized, language-neutral error category line (for example `error=undefined_mode` with the raw selector on its own field) and never leaks host runtime fault details. This adapter is logically and physically separated from the core domain.
+
+3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_1_full_price_table.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_1_full_price_table@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- align with the existing budget initialization pattern in core.layer.pricing

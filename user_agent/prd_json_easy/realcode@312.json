@@ -1,0 +1,1079 @@
+{
+  "fuzzy_prd": "# JSON-RPC 2.0 Server Engine\n\n## Project Goal\n\nBuild a server-side engine that implements the JSON-RPC 2.0 protocol: it accepts a JSON-RPC\nrequest (single or batched), dispatches it to a matching service operation, and produces a\ncorrectly-shaped JSON-RPC response. The engine must support both a raw byte-stream transport\nand an HTTP transport, and it must map service outcomes to standardized error categories and\nHTTP status codes.\n\nTo make the engine's externally-observable behavior verifiable, the deliverable also includes a\nthin **adapter** program. The adapter reads exactly one *case-input* JSON object from standard\ninput, drives the engine, and prints a **normalized, line-based view** of the resulting protocol\nresponse to standard output. All evaluation is performed against this normalized stdout, so the\ncontract below is defined entirely in terms of request inputs and normalized outputs \u2014 never in\nterms of any host-language type, class, or framework internal.\n\n## Background & Problem\n\nJSON-RPC 2.0 is a transport-agnostic remote-procedure-call protocol. A request names a `method`,\ncarries `params` (a positional array or a named object), and carries an `id` used to correlate the\nresponse. The server returns either a `result` (success) or an `error` object with a numeric\n`code`. A request without an `id` is a *notification* and yields no response on success. Multiple\nrequests can be sent as a JSON array (a *batch*), producing an array of correlated responses.\n\nA correct engine must make many subtle decisions consistently: how to bind positional vs. named\narguments to an operation, how to choose among overloaded operations, how to coerce argument types,\nwhat to do when too few or too many arguments arrive, how to surface service-thrown errors as\nprotocol errors without leaking host-language details, and how to translate protocol outcomes into\nHTTP status codes. These behaviors are the substance of this specification.\n\nThe standardized JSON-RPC error codes used throughout are:\n\n| category               | code    |\n|------------------------|---------|\n| `ok`                   | `0`     |\n| `parse_error`          | `-32700`|\n| `invalid_request`      | `-32600`|\n| `method_not_found`     | `-32601`|\n| `method_params_invalid`| `-32602`|\n| `internal_error`       | `-32603`|\n| `error_not_handled`    | `-32001`|\n| `bulk_error`           | `-32002`|\n\nAny other code is reported with the category `custom`.\n\n## Architecture & Engineering Constraints\n\n**Service surface under test.** The engine is exercised through a fixed demonstration service that\nexposes the following operations. Implementations must reproduce these exact externally-visible\nsemantics (the result strings encode which variant was selected, so dispatch decisions are\nobservable):\n\n- `echo(text: string) -> string` \u2014 returns `text` unchanged.\n- `addInts(a: int, b: int) -> int` \u2014 returns `a + b`.\n- `voidMethod(value: int) -> void` \u2014 returns no value (null result).\n- `overloadedMethod()` / `overloadedMethod(string)` / `overloadedMethod(string, string)` /\n  `overloadedMethod(int)` / `overloadedMethod(int, int)` \u2014 five overloads returning, respectively,\n  `\"overloaded:0\"`, `\"overloaded:string:<a>\"`, `\"overloaded:string,string:<a>,<b>\"`,\n  `\"overloaded:int:<i>\"`, `\"overloaded:int,int:<a+b>\"`.\n- `methodWithoutRequiredParam(param1: string, param2: string) -> string` \u2014 returns\n  `\"withoutRequired:<param1>|<param2>\"`, where a missing second argument renders as `<none>`.\n- `methodWithDifferentTypes(param1: boolean, param2: double, param3: uuid) -> string` \u2014 returns\n  `\"types:<boolean>,<double>,<uuid>\"`; used to exercise type coercion.\n- `customEcho(text: string)` published under the external alias `custom.echo` \u2014 returns\n  `\"custom:<text>\"`.\n- `throwsUnmapped()` \u2014 always raises an error that is **not** mapped to a specific code.\n- `throwsMapped()` \u2014 raises an error mapped to code `1234`.\n- `throwsMappedFull()` \u2014 raises an error mapped to code `-5678` with message `\"The message\"` and\n  data `\"The data\"`.\n- `throwsMappedWithExceptionMessage()` \u2014 raises an error mapped to code `1234` whose own message is\n  `\"exception message\"`.\n\n**Argument binding policy.** By default a call must supply exactly as many arguments as the chosen\noperation declares; otherwise it is rejected as `method_params_invalid`. Two switches relax this:\n`allowExtraParams` permits and ignores surplus arguments, and `allowLessParams` permits missing\ntrailing arguments (bound to their type default / null).\n\n**Error normalization (mandatory).** Service-thrown errors must be surfaced as JSON-RPC errors with\na numeric code and an optional message/data. The normalized output must express only\nlanguage-neutral signals: the numeric `error_code`, the derived `error_category`, and any\nengine-level `error_message`/`error_data` strings. Host-language artifacts \u2014 exception class names,\nfully-qualified type names, stack traces, runtime-specific message suffixes \u2014 must **never** appear\nin the output.\n\n**HTTP status mapping.** Over the HTTP transport the response additionally carries an HTTP status\nderived from the result code: `ok` \u2192 200, `method_not_found` \u2192 404, `parse_error`/`invalid_request`\n\u2192 400, and `method_params_invalid`/`internal_error`/`error_not_handled`/`bulk_error`/custom-server\ncodes \u2192 500. A batch in which any sub-request fails is reported as 500. A pluggable status-code\nprovider may remap every category to arbitrary numbers.\n\n**Adapter input schema.** The adapter consumes a single JSON object on stdin:\n\n```\n{\n  \"transport\":       \"raw\" | \"http_post\" | \"http_get\",   // default \"raw\"\n  \"request\":         <json>,        // the JSON-RPC request object or batch array\n  \"request_raw\":     \"<string>\",    // optional: exact request bytes (for malformed input)\n  \"query\":           {\"method\": \"...\", \"id\": \"...\", \"params\": \"...\"},  // http_get only\n  \"allowExtraParams\": <bool>,       // optional, default false\n  \"allowLessParams\":  <bool>,       // optional, default false\n  \"statusProvider\":   \"custom\"      // optional (http transports): use the remapping provider\n}\n```\n\n**Adapter output schema.** The adapter writes only the engine's normalized response to stdout, as\nnewline-terminated `key=value` lines:\n\n- A successful single response:\n  `jsonrpc=2.0`, `id=<json-id>`, `outcome=success`, `result=<compact-json>`.\n- A failed single response:\n  `jsonrpc=2.0`, `id=<json-id>`, `outcome=error`, `error_code=<int>`, `error_category=<name>`,\n  and \u2014 only when present \u2014 `error_message=<text>`, `error_data=<text>` (when the error data is a\n  string), or `error_data_message=<text>` (when the error data is a structured value carrying a\n  message).\n- A successful notification (no `id`) produces the single token `no_response`.\n- A batch produces `batch_size=<n>` followed by each entry, sorted by `id`, each prefixed by a `--`\n  separator line and rendered with the single-response fields above.\n- For HTTP transports the body is preceded by `http_status=<int>` and `content_type=<string>`; an\n  empty body is rendered as `body=empty`.\n\n**Determinism.** Output must depend only on the input. Batch entries are emitted in ascending `id`\norder. Field ordering within a response is fixed as listed above.\n\n**Build/runtime constraints.** The engine and adapter run on the JVM. The evaluation harness\n(`rcb_tests/test.sh`) resolves the project's runtime classpath offline, compiles the adapter against\nthe engine, runs one adapter process per case, and compares stdout to each case's\n`expected_output`. No network access is assumed.\n\n## Core Features\n\n### Feature 1: Positional dispatch, result types, id handling, notifications\n\nA request whose `params` is an array is routed to the operation with the matching positional arity.\nThe response echoes the request `id` faithfully whether it is an integer, a string, or a large\ninteger. A void operation yields a `null` result. A request with no `id` (a notification) that\nsucceeds produces no response at all.\n\n```json\n{\n  \"description\": \"Positional dispatch: a request with an array of params is routed to the matching method by position; the result envelope echoes the request id (integer, string, or large integer), a void method yields a null result, and a request without an id (a notification) that succeeds produces no response at all.\",\n  \"cases\": [\n    {\n      \"description\": \"echo a string value positionally\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"[a specific semantic version string]\", \"id\": 1, \"method\": \"echo\", \"params\": [\"hello\"] }\n      },\n      \"expected_output\": \"jsonrpc=[a specific semantic version string]\\nid=1\\noutcome=[a specific sentinel output state]\\nresult=\\\"hello\\\"\\n\"\n    },\n    {\n      \"description\": \"integer result from a two-argument call\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"[a specific semantic version string]\", \"id\": 1, \"method\": \"addInts\", \"params\": [2, 3] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=[a specific sentinel output state]\\nresult=5\\n\"\n    }\n  ]\n}\n```\n\n### Feature 2: Parameter arity validation\n\nSupplying too few or too many positional arguments is rejected with the `method_params_invalid`\nerror, unless the engine is configured to allow missing (`allowLessParams`) or extra\n(`allowExtraParams`) arguments, in which case the call proceeds.\n\n```json\n{\n  \"description\": \"Parameter arity validation for positional calls: supplying too few or too many positional arguments is rejected with the method-parameters-invalid error, unless the server is configured to allow missing (allowLessParams) or extra (allowExtraParams) arguments, in which case the call proceeds.\",\n  \"cases\": [\n    {\n      \"description\": \"too few positional arguments is rejected\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"addInts\", \"params\": [1] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=error\\nerror_code=-32602\\nerror_category=method_params_invalid\\nerror_message=method parameters invalid\\n\"\n    },\n    {\n      \"description\": \"too many positional arguments is rejected\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"echo\", \"params\": [\"a\", \"b\"] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=error\\nerror_code=-32602\\nerror_category=method_params_invalid\\nerror_message=method parameters invalid\\n\"\n    }\n  ]\n}\n```\n\n### Feature 3: Overload resolution by arity and type\n\nWhen several operations share a name, the engine selects the variant whose parameter count and\ntypes match the supplied positional arguments (no arguments, one string, one integer, two strings,\nor two integers). The returned value reveals which variant was chosen.\n\n```json\n{\n  \"description\": \"Overload resolution by argument count and type: when several methods share a name, the engine selects the variant whose parameter count and types match the supplied positional arguments (no args, one string, one integer, two strings, or two integers).\",\n  \"cases\": [\n    {\n      \"description\": \"no-argument overload\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"overloadedMethod\", \"params\": [] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=[a specific sentinel output state]\\nresult=\\\"overloaded:0\\\"\\n\"\n    },\n    {\n      \"description\": \"single string-argument overload\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"overloadedMethod\", \"params\": [\"x\"] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=success\\nresult=\\\"overloaded:string:x\\\"\\n\"\n    }\n  ]\n}\n```\n\n### Feature 4: Named-parameter dispatch and type coercion\n\nA request whose `params` is an object is matched to an operation by parameter names, including\noverload selection by the named set and types. Argument values are coerced to the declared\nparameter types; a value that cannot be coerced is rejected with `method_params_invalid`, and the\nmessage identifies the offending argument position.\n\n```json\n{\n  \"description\": \"Named-parameter dispatch: a request whose params is an object is matched to a method by parameter names, including overload selection by the named set and type; argument values are coerced to the declared parameter types, and a value that cannot be coerced is rejected with the method-parameters-invalid error identifying the offending argument position.\",\n  \"cases\": [\n    {\n      \"description\": \"named object selects the single-string overload\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"overloadedMethod\", \"params\": { \"param1\": \"x\" } }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=success\\nresult=\\\"overloaded:string:x\\\"\\n\"\n    },\n    {\n      \"description\": \"named object selects the single-integer overload\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"overloadedMethod\", \"params\": { \"param1\": 7 } }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=success\\nresult=\\\"overloaded:int:7\\\"\\n\"\n    }\n  ]\n}\n```\n\n### Feature 5: Custom external method names\n\nAn operation may be published under an alias. The alias dispatches to the implementation, and the\noperation also remains invocable by its original declared name.\n\n```json\n{\n  \"description\": \"Custom external method names: a method may be published under an alias; the alias dispatches to the implementation, and the method also remains invocable by its original declared name.\",\n  \"cases\": [\n    {\n      \"description\": \"invoking by the registered alias succeeds\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"custom.echo\", \"params\": [\"yo\"] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=success\\nresult=\\\"custom:yo\\\"\\n\"\n    },\n    {\n      \"description\": \"the original declared name remains invocable\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"customEcho\", \"params\": [\"yo\"] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=success\\nresult=\\\"custom:yo\\\"\\n\"\n    }\n  ]\n}\n```\n\n### Feature 6: Protocol-level error reporting\n\nMalformed JSON input is reported as a `parse_error`; an empty-line payload is likewise a\n`parse_error`; and a request naming an unknown operation is reported as `method_not_found`.\n\n```json\n{\n  \"description\": \"Protocol-level error reporting: malformed JSON input is reported as a parse error, an empty-line payload is also a parse error, and a request naming an unknown method is reported as method-not-found.\",\n  \"cases\": [\n    {\n      \"description\": \"malformed JSON yields a parse error\",\n      \"input\": { \"transport\": \"raw\", \"request_raw\": \"{ not valid json\" },\n      \"expected_output\": \"jsonrpc=2.0\\nid=\\\"null\\\"\\noutcome=error\\nerror_code=-32700\\nerror_category=parse_error\\nerror_message=JSON parse error\\n\"\n    },\n    {\n      \"description\": \"empty-line payload yields a parse error\",\n      \"input\": { \"transport\": \"raw\", \"request_raw\": \"\\n\" },\n      \"expected_output\": \"jsonrpc=2.0\\nid=\\\"null\\\"\\noutcome=error\\nerror_code=-32700\\nerror_category=parse_error\\nerror_message=JSON parse error\\n\"\n    }\n  ]\n}\n```\n\n### Feature 7: Service-error mapping\n\nAn unmapped error thrown by an operation becomes a generic `error_not_handled` response. Errors\nexplicitly mapped to a code are reported with that code; an explicit message and data override the\ndefaults, and when no message override is configured the thrown error's own message is surfaced.\nHost-language class names are never exposed in any field.\n\n```json\n{\n  \"description\": \"Service-error mapping: an unmapped exception thrown by a method becomes a generic error-not-handled response, while exceptions explicitly mapped to a code are reported with that code; an explicit message and data override the defaults, and when no message override is given the thrown exception's own message is surfaced. Host-language class names are never exposed.\",\n  \"cases\": [\n    {\n      \"description\": \"unmapped exception becomes error-not-handled\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"throwsUnmapped\", \"params\": [] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=error\\nerror_code=-32001\\nerror_category=error_not_handled\\n\"\n    },\n    {\n      \"description\": \"mapped exception reports the configured code\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"throwsMapped\", \"params\": [] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=error\\nerror_code=1234\\nerror_category=custom\\n\"\n    },\n    {\n      \"description\": \"explicit message and data override the defaults\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"throwsMappedFull\", \"params\": [] }\n      },\n      \"expected_output\": \"jsonrpc=2.0\\nid=1\\noutcome=error\\nerror_code=-5678\\nerror_category=custom\\nerror_message=The message\\nerror_data=The data\\n\"\n    }\n  ]\n}\n```\n\n### Feature 8: Batch processing\n\nAn array of requests produces an array of correlated responses, each keyed to its request `id`.\nSuccessful and failing sub-requests coexist in one batch, each carrying its own result or error.\n\n```json\n{\n  \"description\": \"Batch processing: an array of requests produces an array of correlated responses, each keyed to its request id; successful and failing sub-requests coexist in one batch, each carrying its own result or error.\",\n  \"cases\": [\n    {\n      \"description\": \"all sub-requests succeed\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": [\n          { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"echo\", \"params\": [\"a\"] },\n          { \"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"overloadedMethod\", \"params\": [5] }\n        ]\n      },\n      \"expected_output\": \"batch_size=2\\n--\\njsonrpc=2.0\\nid=1\\noutcome=success\\nresult=\\\"a\\\"\\n--\\njsonrpc=2.0\\nid=2\\noutcome=success\\nresult=\\\"overloaded:int:5\\\"\\n\"\n    },\n    {\n      \"description\": \"mixed success and error in one batch\",\n      \"input\": {\n        \"transport\": \"raw\",\n        \"request\": [\n          { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"overloadedMethod\", \"params\": [\"a\"] },\n          { \"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"throwsUnmapped\", \"params\": [] },\n          { \"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"echo\", \"params\": [\"c\"] }\n        ]\n      },\n      \"expected_output\": \"batch_size=3\\n--\\njsonrpc=2.0\\nid=1\\noutcome=success\\nresult=\\\"overloaded:string:a\\\"\\n--\\njsonrpc=2.0\\nid=2\\noutcome=error\\nerror_code=-32001\\nerror_category=error_not_handled\\n--\\njsonrpc=2.0\\nid=3\\noutcome=success\\nresult=\\\"c\\\"\\n\"\n    }\n  ]\n}\n```\n\n### Feature 9: HTTP transport and status-code mapping\n\nOver HTTP the response carries a status code derived from the JSON-RPC outcome: success is 200, an\nunknown method is 404, malformed input is 400, and a service or parameter error is 500; a batch\ncontaining any error reports 500. GET requests build the call from `method`/`id`/`params` query\nparameters, and a custom status-code provider can remap every category.\n\n```json\n{\n  \"description\": \"HTTP transport status mapping: over HTTP the response carries a status code derived from the JSON-RPC outcome - success is 200, an unknown method is 404, malformed input is 400, and a service or parameter error is 500; a batch containing any error reports 500. GET requests build the call from method/id/params query parameters, and a custom status-code provider can remap every category.\",\n  \"cases\": [\n    {\n      \"description\": \"successful call over HTTP is 200\",\n      \"input\": {\n        \"transport\": \"http_post\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"echo\", \"params\": [\"hi\"] }\n      },\n      \"expected_output\": \"http_status=200\\ncontent_type=[a specific media type constant]\\njsonrpc=2.0\\nid=1\\noutcome=success\\nresult=\\\"hi\\\"\\n\"\n    },\n    {\n      \"description\": \"unknown method over HTTP is 404\",\n      \"input\": {\n        \"transport\": \"http_post\",\n        \"request\": { \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"nope\", \"params\": [] }\n      },\n      \"expected_output\": \"http_status=404\\ncontent_type=[a specific media type constant]\\njsonrpc=2.0\\nid=1\\noutcome=error\\nerror_code=-32601\\nerror_category=method_not_found\\nerror_message=method not found\\n\"\n    },\n    {\n      \"description\": \"malformed input over HTTP is 400\",\n      \"input\": { \"transport\": \"http_post\", \"request_raw\": \"{bad\" },\n      \"expected_output\": \"http_status=400\\ncontent_type=[a specific media type constant]\\njsonrpc=2.0\\nid=\\\"null\\\"\\noutcome=error\\nerror_code=-32700\\nerror_category=parse_error\\nerror_message=JSON parse error\\n\"\n    }\n  ]\n}\n```\n\n## Deliverables\n\n- A JSON-RPC 2.0 server engine implementing the dispatch, argument-binding, overload-resolution,\n  type-coercion, error-mapping, batch, and HTTP-status behaviors specified above.\n- The demonstration service surface exactly as described in **Architecture & Engineering\n  Constraints**, with the stated externally-visible result semantics.\n- An adapter program that reads one case-input JSON object from stdin and emits the normalized,\n  line-based response described in the adapter output schema \u2014 performing all error normalization so\n  that no host-language identifiers ever reach stdout.\n- A single test entry point `rcb_tests/test.sh` accepting `--cases-dir <subdir>` (default\n  `test_cases`), which runs every case, writes each invocation's raw stdout to\n  `rcb_tests/stdout/<cases-dir>/<stem>@<NNN>.txt`, compares it against the case's `expected_output`,\n  and prints a final `test_cases: <pass>/<total> pass` line.\n- The hidden evaluation set under `rcb_tests/test_cases/` and its public mirror under\n  `rcb_tests/public_test_cases/` (the cases embedded in this document), grouped by feature.\n\n\n---\n**Implementation notes:**\n- rely on the signature matching heuristic used in the resolver module\n- apply the default fallback mapping registered in the error mapper configuration\n",
+  "oracle_data": {
+    "task_id": "briandilley__jsonrpc4j-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "what is the jsonrpc version",
+          "check version constant",
+          "get jsonrpc spec version",
+          "version 2.0 literal",
+          "jsonrpc protocol version string"
+        ],
+        "oracle_response": "The version string is exactly '2.0'."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what is the success flag value",
+          "check response outcome literal",
+          "get bool literal for success",
+          "response enum success value",
+          "jsonrpc status success string"
+        ],
+        "oracle_response": "The literal string value is exactly 'success'."
+      },
+      {
+        "constraint_id": "C028",
+        "trigger_keywords": [
+          "what is the content type header",
+          "get http header constant",
+          "check content type literal",
+          "custom json-rpc mime type",
+          "scheduler media type string"
+        ],
+        "oracle_response": "The value is exactly 'application/json-rpc'."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "rely on the signature matching heuristic used in the resolver module",
+        "actual_meaning": "The overload selection logic matching argument count and types exactly as defined in the dispatch resolver."
+      },
+      {
+        "vague_reference": "apply the default fallback mapping registered in the error mapper configuration",
+        "actual_meaning": "The specific raw error code (-32001) and category ('error_not_handled') mapped when no specific mapping exists for a thrown exception."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that \u2014 check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_positional_dispatch.json": {
+      "description": "Positional dispatch: a request with an array of params is routed to the matching method by position; the result envelope echoes the request id (integer, string, or large integer), a void method yields a null result, and a request without an id (a notification) that succeeds produces no response at all.",
+      "cases": [
+        {
+          "description": "echo a string value positionally",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "echo",
+              "params": [
+                "hello"
+              ]
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=success\nresult=\"hello\"\n"
+        },
+        {
+          "description": "integer result from a two-argument call",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "addInts",
+              "params": [
+                2,
+                3
+              ]
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=success\nresult=5\n"
+        }
+      ]
+    },
+    "feature2_parameter_arity.json": {
+      "description": "Parameter arity validation for positional calls: supplying too few or too many positional arguments is rejected with the method-parameters-invalid error, unless the server is configured to allow missing (allowLessParams) or extra (allowExtraParams) arguments, in which case the call proceeds.",
+      "cases": [
+        {
+          "description": "too few positional arguments is rejected",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "addInts",
+              "params": [
+                1
+              ]
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=error\nerror_code=-32602\nerror_category=method_params_invalid\nerror_message=method parameters invalid\n"
+        },
+        {
+          "description": "too many positional arguments is rejected",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "echo",
+              "params": [
+                "a",
+                "b"
+              ]
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=error\nerror_code=-32602\nerror_category=method_params_invalid\nerror_message=method parameters invalid\n"
+        }
+      ]
+    },
+    "feature3_overload_resolution.json": {
+      "description": "Overload resolution by argument count and type: when several methods share a name, the engine selects the variant whose parameter count and types match the supplied positional arguments (no args, one string, one integer, two strings, or two integers).",
+      "cases": [
+        {
+          "description": "no-argument overload",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "overloadedMethod",
+              "params": []
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=success\nresult=\"overloaded:0\"\n"
+        },
+        {
+          "description": "single string-argument overload",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "overloadedMethod",
+              "params": [
+                "x"
+              ]
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=success\nresult=\"overloaded:string:x\"\n"
+        }
+      ]
+    },
+    "feature4_named_parameters.json": {
+      "description": "Named-parameter dispatch: a request whose params is an object is matched to a method by parameter names, including overload selection by the named set and type; argument values are coerced to the declared parameter types, and a value that cannot be coerced is rejected with the method-parameters-invalid error identifying the offending argument position.",
+      "cases": [
+        {
+          "description": "named object selects the single-string overload",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "overloadedMethod",
+              "params": {
+                "param1": "x"
+              }
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=success\nresult=\"overloaded:string:x\"\n"
+        },
+        {
+          "description": "named object selects the single-integer overload",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "overloadedMethod",
+              "params": {
+                "param1": 7
+              }
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=success\nresult=\"overloaded:int:7\"\n"
+        }
+      ]
+    },
+    "feature5_custom_method_name.json": {
+      "description": "Custom external method names: a method may be published under an alias; the alias dispatches to the implementation, and the method also remains invocable by its original declared name.",
+      "cases": [
+        {
+          "description": "invoking by the registered alias succeeds",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "custom.echo",
+              "params": [
+                "yo"
+              ]
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=success\nresult=\"custom:yo\"\n"
+        },
+        {
+          "description": "the original declared name remains invocable",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "customEcho",
+              "params": [
+                "yo"
+              ]
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=success\nresult=\"custom:yo\"\n"
+        }
+      ]
+    },
+    "feature6_protocol_errors.json": {
+      "description": "Protocol-level error reporting: malformed JSON input is reported as a parse error, an empty-line payload is also a parse error, and a request naming an unknown method is reported as method-not-found.",
+      "cases": [
+        {
+          "description": "malformed JSON yields a parse error",
+          "input": {
+            "transport": "raw",
+            "request_raw": "{ not valid json"
+          },
+          "expected_output": "jsonrpc=2.0\nid=\"null\"\noutcome=error\nerror_code=-32700\nerror_category=parse_error\nerror_message=JSON parse error\n"
+        },
+        {
+          "description": "empty-line payload yields a parse error",
+          "input": {
+            "transport": "raw",
+            "request_raw": "\n"
+          },
+          "expected_output": "jsonrpc=2.0\nid=\"null\"\noutcome=error\nerror_code=-32700\nerror_category=parse_error\nerror_message=JSON parse error\n"
+        }
+      ]
+    },
+    "feature7_error_mapping.json": {
+      "description": "Service-error mapping: an unmapped exception thrown by a method becomes a generic error-not-handled response, while exceptions explicitly mapped to a code are reported with that code; an explicit message and data override the defaults, and when no message override is given the thrown exception's own message is surfaced. Host-language class names are never exposed.",
+      "cases": [
+        {
+          "description": "unmapped exception becomes error-not-handled",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "throwsUnmapped",
+              "params": []
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=error\nerror_code=-32001\nerror_category=error_not_handled\n"
+        },
+        {
+          "description": "mapped exception reports the configured code",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "throwsMapped",
+              "params": []
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=error\nerror_code=1234\nerror_category=custom\n"
+        },
+        {
+          "description": "explicit message and data override the defaults",
+          "input": {
+            "transport": "raw",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "throwsMappedFull",
+              "params": []
+            }
+          },
+          "expected_output": "jsonrpc=2.0\nid=1\noutcome=error\nerror_code=-5678\nerror_category=custom\nerror_message=The message\nerror_data=The data\n"
+        }
+      ]
+    },
+    "feature8_batch_processing.json": {
+      "description": "Batch processing: an array of requests produces an array of correlated responses, each keyed to its request id; successful and failing sub-requests coexist in one batch, each carrying its own result or error.",
+      "cases": [
+        {
+          "description": "all sub-requests succeed",
+          "input": {
+            "transport": "raw",
+            "request": [
+              {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "echo",
+                "params": [
+                  "a"
+                ]
+              },
+              {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "overloadedMethod",
+                "params": [
+                  5
+                ]
+              }
+            ]
+          },
+          "expected_output": "batch_size=2\n--\njsonrpc=2.0\nid=1\noutcome=success\nresult=\"a\"\n--\njsonrpc=2.0\nid=2\noutcome=success\nresult=\"overloaded:int:5\"\n"
+        },
+        {
+          "description": "mixed success and error in one batch",
+          "input": {
+            "transport": "raw",
+            "request": [
+              {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "overloadedMethod",
+                "params": [
+                  "a"
+                ]
+              },
+              {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "throwsUnmapped",
+                "params": []
+              },
+              {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "echo",
+                "params": [
+                  "c"
+                ]
+              }
+            ]
+          },
+          "expected_output": "batch_size=3\n--\njsonrpc=2.0\nid=1\noutcome=success\nresult=\"overloaded:string:a\"\n--\njsonrpc=2.0\nid=2\noutcome=error\nerror_code=-32001\nerror_category=error_not_handled\n--\njsonrpc=2.0\nid=3\noutcome=success\nresult=\"c\"\n"
+        }
+      ]
+    },
+    "feature9_http_status.json": {
+      "description": "HTTP transport status mapping: over HTTP the response carries a status code derived from the JSON-RPC outcome - success is 200, an unknown method is 404, malformed input is 400, and a service or parameter error is 500; a batch containing any error reports 500. GET requests build the call from method/id/params query parameters, and a custom status-code provider can remap every category.",
+      "cases": [
+        {
+          "description": "successful call over HTTP is 200",
+          "input": {
+            "transport": "http_post",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "echo",
+              "params": [
+                "hi"
+              ]
+            }
+          },
+          "expected_output": "http_status=200\ncontent_type=application/json-rpc\njsonrpc=2.0\nid=1\noutcome=success\nresult=\"hi\"\n"
+        },
+        {
+          "description": "unknown method over HTTP is 404",
+          "input": {
+            "transport": "http_post",
+            "request": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "nope",
+              "params": []
+            }
+          },
+          "expected_output": "http_status=404\ncontent_type=application/json-rpc\njsonrpc=2.0\nid=1\noutcome=error\nerror_code=-32601\nerror_category=method_not_found\nerror_message=method not found\n"
+        },
+        {
+          "description": "malformed input over HTTP is 400",
+          "input": {
+            "transport": "http_post",
+            "request_raw": "{bad"
+          },
+          "expected_output": "http_status=400\ncontent_type=application/json-rpc\njsonrpc=2.0\nid=\"null\"\noutcome=error\nerror_code=-32700\nerror_category=parse_error\nerror_message=JSON parse error\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "transport",
+      "input_condition": "input object contains 'transport' field",
+      "output_rule": "selects the transport mode for request handling",
+      "exact_values": [
+        "raw",
+        "http_post",
+        "http_get"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "request_ser",
+      "input_condition": "input object contains 'request_raw' field set",
+      "output_rule": "request JSON object is bypassed; raw bytes are parsed for JSON-RPC",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "http_get_ser",
+      "input_condition": "input object contains 'query' field set",
+      "output_rule": "request JSON object is bypassed; HTTP GET query parameters construct the request",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "request_format",
+      "input_condition": "transport is 'raw'",
+      "output_rule": "request body is sent as JSON array for batch requests or JSON object for single request",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "response_meta",
+      "input_condition": "successful response",
+      "output_rule": "response must include jsonrpc=2.0",
+      "exact_values": [
+        "2.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "response_meta",
+      "input_condition": "successful response",
+      "output_rule": "response must include id matching request id",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "response_meta",
+      "input_condition": "successful response",
+      "output_rule": "response must include outcome=success",
+      "exact_values": [
+        "success"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "response_meta",
+      "input_condition": "successful response",
+      "output_rule": "single response must include result key",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "response_meta",
+      "input_condition": "failed response",
+      "output_rule": "response must include outcome=error",
+      "exact_values": [
+        "error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "response_meta",
+      "input_condition": "failed response",
+      "output_rule": "response must include error_code key",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "response_meta",
+      "input_condition": "failed response",
+      "output_rule": "response must include error_category key",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "response_meta",
+      "input_condition": "failed response with string message",
+      "output_rule": "response must include error_message key",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "response_meta",
+      "input_condition": "failed response with string data",
+      "output_rule": "response must include error_data key",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "response_meta",
+      "input_condition": "failed response with data message",
+      "output_rule": "response must include error_data_message key",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "response_meta",
+      "input_condition": "successful response",
+      "output_rule": "single response must NOT include error fields",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "response_meta",
+      "input_condition": "notification (no id)",
+      "output_rule": "output must be exactly 'no_response'",
+      "exact_values": [
+        "no_response"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "response_format",
+      "input_condition": "successful result (string)",
+      "output_rule": "result value must be JSON string escaped",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "response_format",
+      "input_condition": "successful result (number)",
+      "output_rule": "result value must be JSON number",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "response_format",
+      "input_condition": "successful result (null)",
+      "output_rule": "result value must be JSON null",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "response_format",
+      "input_condition": "successful result (array)",
+      "output_rule": "result value must be JSON array",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "response_format",
+      "input_condition": "failed response",
+      "output_rule": "field order must be: jsonrpc, id, outcome",
+      "exact_values": null,
+      "ambiguous": true
+    },
+    {
+      "id": "C022",
+      "feature": "response_format",
+      "input_condition": "failed response",
+      "output_rule": "error fields order: error_code, error_category",
+      "exact_values": null,
+      "ambiguous": true
+    },
+    {
+      "id": "C023",
+      "feature": "response_format",
+      "input_condition": "failed response",
+      "output_rule": "optional error fields order: error_message, error_data, error_data_message consecutively after error_category",
+      "exact_values": null,
+      "ambiguous": true
+    },
+    {
+      "id": "C024",
+      "feature": "batch_output",
+      "input_condition": "batch request",
+      "output_rule": "output must prefix 'batch_size=<n>'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "batch_output",
+      "input_condition": "batch request",
+      "output_rule": "each batch entry must be prefixed with '--'",
+      "exact_values": [
+        "--"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "batch_output",
+      "input_condition": "batch request",
+      "output_rule": "batch entries must be sorted by id ascending",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "http_response",
+      "input_condition": "transport is http",
+      "output_rule": "response must include http_status key",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "http_response",
+      "input_condition": "transport is http",
+      "output_rule": "response must include content_type=application/json-rpc",
+      "exact_values": [
+        "application/json-rpc"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "http_response",
+      "input_condition": "transport is http and body not empty",
+      "output_rule": "response must include body keyword fields (implied by schema definition)",
+      "exact_values": null,
+      "ambiguous": true
+    },
+    {
+      "id": "C030",
+      "feature": "http_response",
+      "input_condition": "transport is http and body empty in adapter view",
+      "output_rule": "response must contain 'body=empty'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "id_handling",
+      "input_condition": "request has numeric id",
+      "output_rule": "response must return the exact same id value",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "id_handling",
+      "input_condition": "request has string id",
+      "output_rule": "response must return the exact same id value",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "id_handling",
+      "input_condition": "request has large integer id",
+      "output_rule": "response must return the exact same id value",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "id_handling",
+      "input_condition": "request has no id (notification)",
+      "output_rule": "no response line is produced",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "dispatch_logic",
+      "input_condition": "method was found",
+      "output_rule": "request must dispatch to service operation",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "dispatch_logic",
+      "input_condition": "method not found",
+      "output_rule": "must return method_not_found error (-32601)",
+      "exact_values": [
+        "method_not_found",
+        "-32601"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "dispatch_logic",
+      "input_condition": "method not found",
+      "output_rule": "HTTP status must be 404 (unless custom provider)",
+      "exact_values": [
+        "404"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "dispatch_logic",
+      "input_condition": "batch request has any error",
+      "output_rule": "HTTP status must be 500",
+      "exact_values": [
+        "500"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "dispatch_logic",
+      "input_condition": "request is array",
+      "output_rule": "params are treated as positional arguments for dispatch",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "dispatch_logic",
+      "input_condition": "request is object",
+      "output_rule": "params are treated as named arguments for dispatch",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C041",
+      "feature": "arity_validation",
+      "input_condition": "positional args count != declared arity",
+      "output_rule": "must return method_params_invalid (-32602)",
+      "exact_values": [
+        "method_params_invalid",
+        "-32602"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C042",
+      "feature": "arity_validation",
+      "input_condition": "allowExtraParams=false and args > arity",
+      "output_rule": "reject as method_params_invalid",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C043",
+      "feature": "arity_validation",
+      "input_condition": "allowExtraParams=true and args > arity",
+      "output_rule": "ignore extra args, proceed to dispatch",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C044",
+      "feature": "arity_validation",
+      "input_condition": "allowLessParams=false and args < arity",
+      "output_rule": "reject as method_params_invalid",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C045",
+      "feature": "arity_validation",
+      "input_condition": "allowLessParams=true and args < arity",
+      "output_rule": "fill missing args with type defaults or null, proceed to dispatch",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C046",
+      "feature": "overload_resolution",
+      "input_condition": "method has multiple overloads",
+      "output_rule": "select overload where argument count AND types match supplied positional args",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C047",
+      "feature": "overload_resolution",
+      "input_condition": "named params used",
+      "output_rule": "select overload where method names in params match declared param names AND types match",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C048",
+      "feature": "overload_resolution",
+      "input_condition": "named param with wrong type",
+      "output_rule": "reject as method_params_invalid identifying the failing position",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C049",
+      "feature": "overload_resolution",
+      "input_condition": "overloadedMethod without args",
+      "output_rule": "selects no-arg variant, returns 'overloaded:0'",
+      "exact_values": [
+        "overloaded:0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C050",
+      "feature": "overload_resolution",
+      "input_condition": "overloadedMethod with 1 string",
+      "output_rule": "selects single-string variant, returns 'overloaded:string:<arg>'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C051",
+      "feature": "overload_resolution",
+      "input_condition": "overloadedMethod with 1 int",
+      "output_rule": "selects single-int variant, returns 'overloaded:int:<arg>'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C052",
+      "feature": "custom_method_alias",
+      "input_condition": "method is prefixed with '.' (e.g. custom.echo)",
+      "output_rule": "dispatch to implementation under original name (customEcho) then prepend alias in result",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C053",
+      "feature": "custom_method_alias",
+      "input_condition": "method name matches original (customEcho)",
+      "output_rule": "dispatch to implementation, result is 'custom:echo'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C054",
+      "feature": "error_normalization",
+      "input_condition": "service throws error without mapping",
+      "output_rule": "normalize to error_not_handled (-32001)",
+      "exact_values": [
+        "-32001",
+        "error_not_handled"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C055",
+      "feature": "error_normalization",
+      "input_condition": "service throws mapped error",
+      "output_rule": "use configured error_code",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C056",
+      "feature": "error_normalization",
+      "input_condition": "mapped error has explicit message/data in mapping",
+      "output_rule": "override error_message and error_data with mapped values",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C057",
+      "feature": "http_status_mapping",
+      "input_condition": "outcome is ok",
+      "output_rule": "HTTP status 200",
+      "exact_values": [
+        "200"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C058",
+      "feature": "http_status_mapping",
+      "input_condition": "outcome is method_not_found",
+      "output_rule": "HTTP status 404",
+      "exact_values": [
+        "404"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C059",
+      "feature": "http_status_mapping",
+      "input_condition": "outcome is parse_error/invalid_request",
+      "output_rule": "HTTP status 400",
+      "exact_values": [
+        "400"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C060",
+      "feature": "http_status_mapping",
+      "input_condition": "outcome in [method_params_invalid,internal_error,error_not_handled,bulk_error,custom-server codes]",
+      "output_rule": "HTTP status 500",
+      "exact_values": [
+        "500"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C061",
+      "feature": "http_status_mapping",
+      "input_condition": "custom statusProvider is set",
+      "output_rule": "use provider's remapping rules instead of defaults",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C062",
+      "feature": "jsonrpc_validation",
+      "input_condition": "request does not contain jsonrpc field",
+      "output_rule": "reject as invalid_request (-32600)",
+      "exact_values": [
+        "invalid_request",
+        "-32600"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C063",
+      "feature": "jsonrpc_validation",
+      "input_condition": "request contains jsonrpc version other than 2.0",
+      "output_rule": "reject as invalid_request (-32600)",
+      "exact_values": [
+        "invalid_request",
+        "-32600"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C064",
+      "feature": "jsonrpc_validation",
+      "input_condition": "request contains id but it is null (without explicit null check in spec, but standard implies)",
+      "output_rule": "standard JSON-RPC rules apply (usually not null unless notification)",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C065",
+      "feature": "bad_json_input",
+      "input_condition": "input is malformed json",
+      "output_rule": "report parse_error (-32700)",
+      "exact_values": [
+        "-32700",
+        "parse_error",
+        "JSON parse error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C066",
+      "feature": "bad_json_input",
+      "input_condition": "input is empty line or whitespace",
+      "output_rule": "report parse_error (-32700)",
+      "exact_values": [
+        "-32700",
+        "parse_error",
+        "JSON parse error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C067",
+      "feature": "comment_syntax",
+      "input_condition": "request contains '//' or '/* */'",
+      "output_rule": "JSON parser will fail, report parse_error",
+      "exact_values": [
+        "-32700",
+        "parse_error"
+      ],
+      "ambiguous": true
+    },
+    {
+      "id": "C068",
+      "feature": "null_params",
+      "input_condition": "params value is null in request object",
+      "output_rule": "treat as satisfying arity (0 args) or reject based on method expecting params",
+      "exact_values": null,
+      "ambiguous": true
+    },
+    {
+      "id": "C069",
+      "feature": "unknown_method_alias",
+      "input_condition": "method is '.' prefixed name but implementation not registered",
+      "output_rule": "report method_not_found (-32601)",
+      "exact_values": [
+        "method_not_found",
+        "-32601"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C070",
+      "feature": "error_code_range",
+      "input_condition": "engine uses standard JSON-RPC error codes",
+      "output_rule": "codes must be within -32000 to -32768 or specific positive codes for mapping",
+      "exact_values": null,
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C005",
+        "replacement": "a specific semantic version string",
+        "exact_values_to_replace": [
+          "2.0"
+        ],
+        "trigger_keywords": [
+          "what is the jsonrpc version",
+          "check version constant",
+          "get jsonrpc spec version",
+          "version 2.0 literal",
+          "jsonrpc protocol version string"
+        ],
+        "oracle_response": "The version string is exactly '2.0'."
+      },
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific sentinel output state",
+        "exact_values_to_replace": [
+          "success"
+        ],
+        "trigger_keywords": [
+          "what is the success flag value",
+          "check response outcome literal",
+          "get bool literal for success",
+          "response enum success value",
+          "jsonrpc status success string"
+        ],
+        "oracle_response": "The literal string value is exactly 'success'."
+      },
+      {
+        "constraint_id": "C028",
+        "replacement": "a specific media type constant",
+        "exact_values_to_replace": [
+          "application/json-rpc"
+        ],
+        "trigger_keywords": [
+          "what is the content type header",
+          "get http header constant",
+          "check content type literal",
+          "custom json-rpc mime type",
+          "scheduler media type string"
+        ],
+        "oracle_response": "The value is exactly 'application/json-rpc'."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C046",
+        "vague_phrase": "rely on the signature matching heuristic used in the resolver module",
+        "actual_meaning": "The overload selection logic matching argument count and types exactly as defined in the dispatch resolver."
+      },
+      {
+        "constraint_id": "C054",
+        "vague_phrase": "apply the default fallback mapping registered in the error mapper configuration",
+        "actual_meaning": "The specific raw error code (-32001) and category ('error_not_handled') mapped when no specific mapping exists for a thrown exception."
+      }
+    ]
+  }
+}

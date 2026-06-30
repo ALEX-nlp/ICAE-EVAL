@@ -1,0 +1,653 @@
+{
+  "fuzzy_prd": "# Container Image Version Toolkit - Registry-Aware Tag Parsing & Comparison\n\n## Project Goal\n\nBuild a small library that allows developers to reason about container image references the way a registry-watching controller does: parse a raw image tag into a comparable version, decide which of two tags is older, recognise which public registry a host belongs to, decompose an image path into its repository and image parts, and route a full image URL to the registry that should serve it — all as pure, deterministic functions with no network access required.\n\n---\n\n## Background & Problem\n\nWithout this toolkit, developers who want to track \"is a newer image available?\" are forced to hand-roll fragile string parsing for every registry: tags come in wildly inconsistent shapes (`1`, `v1.0.1`, `0.21.0-debian-10-r39`, `v1.3.hello1-debian-3.hello-world-12`), each registry names repositories and images differently, and host detection done with naive substring checks accidentally matches look-alike domains such as `foodocker.io` or `docker.iofoo`. This leads to repetitive, error-prone boilerplate and subtle ordering bugs (e.g. treating a pre-release `-alpha` build as newer than its final release).\n\nWith this toolkit, a caller hands in a raw tag or image URL and gets back a structured, comparable result: a numeric version triple plus a preserved metadata suffix, a correct older/newer decision that understands pre-release suffixes and numeric-vs-lexical segments, strict host matching that only accepts a registry's real domain and its subdomains, and a single routing entry point that maps any image URL to the right registry, host, and path.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain has several distinct responsibilities — version parsing/comparison, per-registry host matching, per-registry path splitting, and URL routing — so it MUST be organised into clear, separated units (e.g. a version module and a registry/client module with one sub-unit per registry) rather than a single monolithic file. Do not over-engineer, but do not collapse distinct registries into one tangled function either.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below represent a **black-box testing contract** for an execution adapter, NOT the internal data model of the core system. The core logic must remain decoupled from stdin/stdout and JSON parsing. An execution adapter is solely responsible for translating JSON commands into idiomatic calls to the core domain and rendering results in the line-based contract shown here.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility:** Keep version logic, host matching, path splitting, routing, and output formatting in distinct units.\n   - **Open/Closed:** Adding a new registry should mean adding a new unit that satisfies the registry abstraction, not editing the router's core.\n   - **Liskov Substitution:** Every registry handler must be substitutable wherever the registry abstraction is expected.\n   - **Interface Segregation:** The registry abstraction should expose only what routing needs (host test, path split, tag listing).\n   - **Dependency Inversion:** The router must depend on the registry abstraction, not on any concrete registry implementation.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface must be elegant and idiomatic to the target language, hiding internal parsing complexity.\n   - **Resilience:** Edge cases (empty strings, single-segment paths, tags with no numbers, unknown registries) must be handled gracefully and deterministically rather than throwing generic faults. Where an input is invalid, errors are surfaced as a normalised, language-neutral category rather than a host-runtime exception.\n\n---\n\n## Core Features\n\n### Feature 1: Image Tag Version Parsing\n\n**As a developer**, I want to parse an arbitrary image tag into a numeric major/minor/patch triple plus a metadata suffix, so I can compare and reason about versions regardless of how the tag was formatted.\n\n**Expected Behavior / Usage:**\n\nThe input is a single tag string. The output reports the original tag, the three numeric components, and the metadata suffix. Parsing rules: an optional leading `v` is ignored; the version is read as up to three dot-separated leading integers; any component that is absent defaults to `0`. Everything after the matched numeric prefix is preserved verbatim as `metadata`. If the string does not begin with a number at all (e.g. `v` alone, or `hello-1.2.3`), the version is `0.0.0` and the entire original string becomes the metadata. Note that only the first three dot-separated groups are treated as numbers: in `v1.3.hello1-...` the third group is non-numeric, so patch is `0` and metadata begins at `.hello1...`. The output is five lines: `tag=<tag>`, `major=<n>`, `minor=<n>`, `patch=<n>`, `metadata=<suffix>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_version_parsing.json`\n\n```json\n{\n    \"description\": \"Parse a container image tag into a three-part numeric version (major, minor, patch) plus a free-form metadata suffix. A leading 'v' is optional. Missing numeric components default to 0. Any text that follows the patch number (or any text that prevents a leading numeric match) is preserved verbatim as metadata. Tags that do not start with a number yield a zero version and carry the whole string as metadata.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"parse_version\", \"tag\": \"v1.0.1\"},\n            \"expected_output\": \"tag=v1.0.1\\nmajor=1\\nminor=0\\npatch=1\\nmetadata=\"\n        },\n        {\n            \"input\": {\"action\": \"parse_version\", \"tag\": \"1.2\"},\n            \"expected_output\": \"tag=1.2\\nmajor=1\\nminor=2\\npatch=0\\nmetadata=\"\n        },\n        {\n            \"input\": {\"action\": \"parse_version\", \"tag\": \"v1.0.1-debian-3.hello-world-12\"},\n            \"expected_output\": \"tag=v1.0.1-debian-3.hello-world-12\\nmajor=1\\nminor=0\\npatch=1\\nmetadata=-debian-3.hello-world-12\"\n        },\n        {\n            \"input\": {\"action\": \"parse_version\", \"tag\": \"hello-1.2.3\"},\n            \"expected_output\": \"tag=hello-1.2.3\\nmajor=0\\nminor=0\\npatch=0\\nmetadata=hello-1.2.3\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Version Ordering (Older / Newer)\n\n**As a developer**, I want to ask whether one tag is strictly older than another, so I can decide if a newer image is available.\n\n**Expected Behavior / Usage:**\n\nThe input is two tag strings, `first` and `second`. The output echoes both and reports `[a specific boolean literal derived from string comparison]<bool>`, true when `first` represents an older version than `second`. Ordering rules, applied in order: (1) if either tag is empty, order purely by string length (shorter is \"less\", equal length is not less); (2) if `first` has no metadata suffix but `second` does, `first` is treated as the newer release, so the result is false — a final release outranks a same-numbered pre-release; (3) compare the numeric major/minor/patch triple, lower is older; (4) on a numeric tie, tokenise each metadata suffix into alternating runs of digits and non-digits and compare token-by-token left to right — digit runs compare numerically (so `r9` < `r39`), non-digit runs compare lexically (so `alpha` < `beta`); the side that runs out of tokens first is the older one. Two arbitrary non-numeric strings of differing content never compare as less-than under these rules.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_version_comparison.json`\n\n```json\n{\n    \"description\": \"Determine whether one image tag represents an older version than another, returning a boolean ordering result. Comparison first weighs the numeric major/minor/patch triple; ties are broken by tokenising the metadata suffix into alternating number/word segments and comparing them left-to-right (numbers compared numerically, words lexicographically). A tag with no metadata is considered newer than the same numeric version with a pre-release metadata suffix. Empty tags order purely by length. Two arbitrary non-numeric strings never order as less-than.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"compare_versions\", \"first\": \"v0.1.2\", \"second\": \"v0.1.3\"},\n            \"expected_output\": \"first=v0.1.2\\nsecond=v0.1.3\\n[a specific boolean literal derived from string comparison]true\"\n        },\n        {\n            \"input\": {\"action\": \"compare_versions\", \"first\": \"v0.1.2\", \"second\": \"v0.1.3-alpha\"},\n            \"expected_output\": \"first=v0.1.2\\nsecond=v0.1.3-alpha\\n[a specific boolean literal derived from string comparison]false\"\n        },\n        {\n            \"input\": {\"action\": \"compare_versions\", \"first\": \"v0.1.3-alpha.0\", \"second\": \"v0.1.3-alpha.1\"},\n            \"expected_output\": \"first=v0.1.3-alpha.0\\nsecond=v0.1.3-alpha.1\\n[a specific boolean literal derived from string comparison]true\"\n        },\n        {\n            \"input\": {\"action\": \"compare_versions\", \"first\": \"0.21.0-debian-10-r9\", \"second\": \"0.21.0-debian-10-r39\"},\n            \"expected_output\": \"first=0.21.0-debian-10-r9\\nsecond=0.21.0-debian-10-r39\\n[a specific boolean literal derived from string comparison]true\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Registry Host Recognition\n\n**As a developer**, I want to test whether a given host belongs to a specific public registry, so I can pick the right client without being fooled by look-alike domains.\n\n**Expected Behavior / Usage:**\n\nEach leaf below covers one registry. The input is a registry selector plus a host string; the output is `registry=<name>`, `host=<host>`, `match=<bool>`. A host matches a registry only if it equals the registry's canonical domain exactly, or is a subdomain ending in `.<canonical-domain>`. Substrings glued onto either end (e.g. `foodocker.io`, `docker.iofoo`) must NOT match, and an empty host never matches.\n\n*3.1 Docker Hub host recognition — matches `docker.io`, `docker.com`, and their subdomains*\n\nA host matches when it is exactly `docker.io` or `docker.com`, or ends in `.docker.io` / `.docker.com`. Anything else, including substring look-alikes and the empty string, does not match.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_host_match_docker.json`\n\n```json\n{\n    \"description\": \"Decide whether a registry host string belongs to the Docker Hub registry. A host matches only when it is exactly docker.io or docker.com, or any subdomain ending in .docker.io / .docker.com. Strings that merely contain the substring (prefix or suffix glued on) do not match, and an empty host never matches.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"docker\", \"host\": \"docker.io\"},\n            \"expected_output\": \"registry=docker\\nhost=docker.io\\nmatch=true\"\n        },\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"docker\", \"host\": \"foo.bar.docker.com\"},\n            \"expected_output\": \"registry=docker\\nhost=foo.bar.docker.com\\nmatch=true\"\n        },\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"docker\", \"host\": \"foodocker.io\"},\n            \"expected_output\": \"registry=docker\\nhost=foodocker.io\\nmatch=false\"\n        },\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"docker\", \"host\": \"docker.iofoo\"},\n            \"expected_output\": \"registry=docker\\nhost=docker.iofoo\\nmatch=false\"\n        }\n    ]\n}\n```\n\n*3.2 GCR host recognition — matches `gcr.io` and its subdomains*\n\nA host matches when it is exactly `gcr.io` or ends in `.gcr.io`. Substring look-alikes (`foogcr.io`, `gcr.iofoo`) and the empty string do not match.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_host_match_gcr.json`\n\n```json\n{\n    \"description\": \"Decide whether a registry host string belongs to the GCR registry. A host matches only when it is exactly gcr.io or any subdomain ending in .gcr.io. Strings that merely contain the substring (prefix or suffix glued on) do not match, and an empty host never matches.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"gcr\", \"host\": \"gcr.io\"},\n            \"expected_output\": \"registry=gcr\\nhost=gcr.io\\nmatch=true\"\n        },\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"gcr\", \"host\": \"k8s.gcr.io\"},\n            \"expected_output\": \"registry=gcr\\nhost=k8s.gcr.io\\nmatch=true\"\n        },\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"gcr\", \"host\": \"foogcr.io\"},\n            \"expected_output\": \"registry=gcr\\nhost=foogcr.io\\nmatch=false\"\n        }\n    ]\n}\n```\n\n*3.3 Quay host recognition — matches `quay.io` and its subdomains*\n\nA host matches when it is exactly `quay.io` or ends in `.quay.io`. Substring look-alikes (`fooquay.io`, `quay.iofoo`) and the empty string do not match.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_host_match_quay.json`\n\n```json\n{\n    \"description\": \"Decide whether a registry host string belongs to the Quay registry. A host matches only when it is exactly quay.io or any subdomain ending in .quay.io. Strings that merely contain the substring (prefix or suffix glued on) do not match, and an empty host never matches.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"quay\", \"host\": \"quay.io\"},\n            \"expected_output\": \"registry=quay\\nhost=quay.io\\nmatch=true\"\n        },\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"quay\", \"host\": \"k8s.quay.io\"},\n            \"expected_output\": \"registry=quay\\nhost=k8s.quay.io\\nmatch=true\"\n        },\n        {\n            \"input\": {\"action\": \"match_host\", \"registry\": \"quay\", \"host\": \"quay.iofoo\"},\n            \"expected_output\": \"registry=quay\\nhost=quay.iofoo\\nmatch=false\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Image Path Decomposition\n\n**As a developer**, I want to split a registry path into its repository and image name, so I can build the registry-specific API calls that list available tags.\n\n**Expected Behavior / Usage:**\n\nEach leaf below covers one registry, because each applies a different default for bare single-segment paths. The input is a registry selector plus a path; the output is `registry=<name>`, `path=<path>`, `repo=<repo>`, `image=<image>`.\n\n*4.1 Docker Hub path split — single segment defaults to the `library` repository*\n\nA single segment `x` becomes repository `library`, image `x`. With two or more slash-separated segments, only the last two are used: the second-to-last is the repository and the last is the image; any earlier segments are discarded.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_path_split_docker.json`\n\n```json\n{\n    \"description\": \"Split a Docker Hub image path into a repository and image name. A bare single segment is treated as an official image under the implicit 'library' repository. When the path has two or more segments, only the last two are used: the second-to-last is the repository and the last is the image (any leading registry segments are discarded).\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"split_path\", \"registry\": \"docker\", \"path\": \"nginx\"},\n            \"expected_output\": \"registry=docker\\npath=nginx\\nrepo=library\\nimage=nginx\"\n        },\n        {\n            \"input\": {\"action\": \"split_path\", \"registry\": \"docker\", \"path\": \"joshvanl/version-checker\"},\n            \"expected_output\": \"registry=docker\\npath=joshvanl/version-checker\\nrepo=joshvanl\\nimage=version-checker\"\n        },\n        {\n            \"input\": {\"action\": \"split_path\", \"registry\": \"docker\", \"path\": \"registry/joshvanl/version-checker\"},\n            \"expected_output\": \"registry=docker\\npath=registry/joshvanl/version-checker\\nrepo=joshvanl\\nimage=version-checker\"\n        }\n    ]\n}\n```\n\n*4.2 GCR path split — single segment defaults to the `google-containers` repository*\n\nA single segment `x` becomes repository `google-containers`, image `x`. When the path contains slashes, everything before the last slash is the repository (intermediate segments preserved) and the final segment is the image.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_path_split_gcr.json`\n\n```json\n{\n    \"description\": \"Split a GCR image path into a repository and image name. A bare single segment is treated as an image under the implicit 'google-containers' repository. When the path contains slashes, everything before the last slash becomes the repository (preserving intermediate segments) and the final segment is the image.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"split_path\", \"registry\": \"gcr\", \"path\": \"kube-scheduler\"},\n            \"expected_output\": \"registry=gcr\\npath=kube-scheduler\\nrepo=google-containers\\nimage=kube-scheduler\"\n        },\n        {\n            \"input\": {\"action\": \"split_path\", \"registry\": \"gcr\", \"path\": \"k8s-artifacts-prod/ingress-nginx/nginx\"},\n            \"expected_output\": \"registry=gcr\\npath=k8s-artifacts-prod/ingress-nginx/nginx\\nrepo=k8s-artifacts-prod/ingress-nginx\\nimage=nginx\"\n        }\n    ]\n}\n```\n\n*4.3 Quay path split — single segment becomes the repository with an empty image*\n\nA single segment `x` becomes repository `x`, image empty. When the path contains slashes, everything before the last slash is the repository (intermediate segments preserved) and the final segment is the image.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_path_split_quay.json`\n\n```json\n{\n    \"description\": \"Split a Quay image path into a repository and image name. A bare single segment is treated as the repository with an empty image. When the path contains slashes, everything before the last slash becomes the repository (preserving intermediate segments) and the final segment is the image.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"split_path\", \"registry\": \"quay\", \"path\": \"version-checker\"},\n            \"expected_output\": \"registry=quay\\npath=version-checker\\nrepo=version-checker\\nimage=\"\n        },\n        {\n            \"input\": {\"action\": \"split_path\", \"registry\": \"quay\", \"path\": \"jetstack/version-checker\"},\n            \"expected_output\": \"registry=quay\\npath=jetstack/version-checker\\nrepo=jetstack\\nimage=version-checker\"\n        },\n        {\n            \"input\": {\"action\": \"split_path\", \"registry\": \"quay\", \"path\": \"k8s-artifacts-prod/ingress-nginx/nginx\"},\n            \"expected_output\": \"registry=quay\\npath=k8s-artifacts-prod/ingress-nginx/nginx\\nrepo=k8s-artifacts-prod/ingress-nginx\\nimage=nginx\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Image URL Routing\n\n**As a developer**, I want to hand a full image URL to a single entry point and learn which registry will serve it together with the host and remaining path, so I can dispatch tag lookups without writing per-registry detection myself.\n\n**Expected Behavior / Usage:**\n\nThe input is one `url` string. The output is `url=<url>`, `registry=<name>`, `host=<host>`, `path=<path>`. Routing splits the URL on its first slash into a candidate host and a remainder. If the candidate host satisfies the Docker, GCR, or Quay host rules (Feature 3), the URL routes to that registry with that host and the remainder as the path. Otherwise — including when the URL has no slash at all, or when the leading segment is not a recognised registry host — it falls back to the Docker registry with an empty host and the entire original string as the path. The registry name reported is one of `docker`, `gcr`, or `quay`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_url_routing.json`\n\n```json\n{\n    \"description\": \"Route a full image URL to the registry that should handle it, also reporting the host and the remaining path. The first slash-delimited segment is treated as a candidate host: if it matches the Docker, GCR, or Quay host rules the URL is routed there with that host and the remainder as path. A URL with no slash, or whose leading segment matches no known registry host, falls back to the Docker registry with an empty host and the entire original string as the path.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"route_url\", \"url\": \"nginx\"},\n            \"expected_output\": \"url=nginx\\nregistry=docker\\nhost=\\npath=nginx\"\n        },\n        {\n            \"input\": {\"action\": \"route_url\", \"url\": \"docker.io/joshvanl/version-checker\"},\n            \"expected_output\": \"url=docker.io/joshvanl/version-checker\\nregistry=docker\\nhost=docker.io\\npath=joshvanl/version-checker\"\n        },\n        {\n            \"input\": {\"action\": \"route_url\", \"url\": \"us.gcr.io/k8s-artifacts-prod/ingress-nginx/nginx\"},\n            \"expected_output\": \"url=us.gcr.io/k8s-artifacts-prod/ingress-nginx/nginx\\nregistry=gcr\\nhost=us.gcr.io\\npath=k8s-artifacts-prod/ingress-nginx/nginx\"\n        },\n        {\n            \"input\": {\"action\": \"route_url\", \"url\": \"quay.io/jetstack/version-checker\"},\n            \"expected_output\": \"url=quay.io/jetstack/version-checker\\nregistry=quay\\nhost=quay.io\\npath=jetstack/version-checker\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features above — a version module (parsing + ordering) and a registry/client module with one cohesive sub-unit per registry (host matching + path splitting) behind a shared registry abstraction, plus the URL router that depends on that abstraction. The physical structure MUST follow the \"Scale-Driven Code Organization\" constraint: multiple files reflecting these responsibilities, not a single god file.\n\n2. **The Execution/Test Adapter:** A runnable program that acts as a client to the core system. It reads one JSON command from stdin (`action` plus the fields shown in each feature's cases), invokes the appropriate core logic, and prints the result to stdout in the exact line-based contract above. Invalid or unknown commands are rendered as a normalised, language-neutral `error=<category>` line (e.g. `error=unknown_action`, `error=unknown_registry`, `error=invalid_input`) — never as a host-runtime exception dump. This adapter must be logically and physically separated from the core domain.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to choose the directory (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_version_parsing.json` under `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_version_parsing@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` file contains **only** the raw stdout of the program under test (no PASS/FAIL or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- align with the standard Docker suffix patterns defined in C014\n- utilize the splitting logic for multi-segment paths as per C020\n",
+  "oracle_data": {
+    "task_id": "jetstack__version-checker-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "compare_versions output format",
+          "less_than variable assignment",
+          "boolean flag in compare action",
+          "true or false in version comparison line",
+          "literal string value for less_than"
+        ],
+        "oracle_response": "The exact value is the result of the comparison logic (either 'true' or 'false') based on input tags."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "metadata comparison algorithm",
+          "alternate comparison logic",
+          "lexicographic vs numeric run",
+          "string concatenation rule for metadata",
+          "non-numeric metadata sorting"
+        ],
+        "oracle_response": "Number runs are converted to integers for numeric comparison, while non-number runs are compared lexicographically. Comparison proceeds left-to-right across all runs."
+      },
+      {
+        "constraint_id": "C012",
+        "trigger_keywords": [
+          "unparseable tag comparison behavior",
+          "no ordering for invalid versions",
+          "equal comparison result for malformed tags",
+          "strict inequality failure case",
+          "remaining between two malformed tags"
+        ],
+        "oracle_response": "In this case, the output indicates the tags cannot be ordered; the comparison result is effectively equal or no-order, preventing any strict less-than or greater-than classification."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "align with the standard Docker suffix patterns defined in C014",
+        "actual_meaning": "Host comparison must match the exact 'docker.io' or 'docker.com' directly or appear as a suffix to the hostname, failing otherwise."
+      },
+      {
+        "vague_reference": "utilize the splitting logic for multi-segment paths as per C020",
+        "actual_meaning": "All but the last segment constitute the repository name, accessed by slicing the path string excluding the final slash and its contents."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_version_parsing.json": {
+      "description": "Parse a container image tag into a three-part numeric version (major, minor, patch) plus a free-form metadata suffix. A leading 'v' is optional. Missing numeric components default to 0. Any text that follows the patch number (or any text that prevents a leading numeric match) is preserved verbatim as metadata. Tags that do not start with a number yield a zero version and carry the whole string as metadata.",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_version",
+            "tag": "v1.0.1"
+          },
+          "expected_output": "tag=v1.0.1\nmajor=1\nminor=0\npatch=1\nmetadata="
+        },
+        {
+          "input": {
+            "action": "parse_version",
+            "tag": "1.2"
+          },
+          "expected_output": "tag=1.2\nmajor=1\nminor=2\npatch=0\nmetadata="
+        },
+        {
+          "input": {
+            "action": "parse_version",
+            "tag": "v1.0.1-debian-3.hello-world-12"
+          },
+          "expected_output": "tag=v1.0.1-debian-3.hello-world-12\nmajor=1\nminor=0\npatch=1\nmetadata=-debian-3.hello-world-12"
+        },
+        {
+          "input": {
+            "action": "parse_version",
+            "tag": "hello-1.2.3"
+          },
+          "expected_output": "tag=hello-1.2.3\nmajor=0\nminor=0\npatch=0\nmetadata=hello-1.2.3"
+        }
+      ]
+    },
+    "feature2_version_comparison.json": {
+      "description": "Determine whether one image tag represents an older version than another, returning a boolean ordering result. Comparison first weighs the numeric major/minor/patch triple; ties are broken by tokenising the metadata suffix into alternating number/word segments and comparing them left-to-right (numbers compared numerically, words lexicographically). A tag with no metadata is considered newer than the same numeric version with a pre-release metadata suffix. Empty tags order purely by length. Two arbitrary non-numeric strings never order as less-than.",
+      "cases": [
+        {
+          "input": {
+            "action": "compare_versions",
+            "first": "v0.1.2",
+            "second": "v0.1.3"
+          },
+          "expected_output": "first=v0.1.2\nsecond=v0.1.3\nless_than=true"
+        },
+        {
+          "input": {
+            "action": "compare_versions",
+            "first": "v0.1.2",
+            "second": "v0.1.3-alpha"
+          },
+          "expected_output": "first=v0.1.2\nsecond=v0.1.3-alpha\nless_than=false"
+        },
+        {
+          "input": {
+            "action": "compare_versions",
+            "first": "v0.1.3-alpha.0",
+            "second": "v0.1.3-alpha.1"
+          },
+          "expected_output": "first=v0.1.3-alpha.0\nsecond=v0.1.3-alpha.1\nless_than=true"
+        },
+        {
+          "input": {
+            "action": "compare_versions",
+            "first": "0.21.0-debian-10-r9",
+            "second": "0.21.0-debian-10-r39"
+          },
+          "expected_output": "first=0.21.0-debian-10-r9\nsecond=0.21.0-debian-10-r39\nless_than=true"
+        }
+      ]
+    },
+    "feature3_1_host_match_docker.json": {
+      "description": "Decide whether a registry host string belongs to the Docker Hub registry. A host matches only when it is exactly docker.io or docker.com, or any subdomain ending in .docker.io / .docker.com. Strings that merely contain the substring (prefix or suffix glued on) do not match, and an empty host never matches.",
+      "cases": [
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "docker",
+            "host": "docker.io"
+          },
+          "expected_output": "registry=docker\nhost=docker.io\nmatch=true"
+        },
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "docker",
+            "host": "foo.bar.docker.com"
+          },
+          "expected_output": "registry=docker\nhost=foo.bar.docker.com\nmatch=true"
+        },
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "docker",
+            "host": "foodocker.io"
+          },
+          "expected_output": "registry=docker\nhost=foodocker.io\nmatch=false"
+        },
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "docker",
+            "host": "docker.iofoo"
+          },
+          "expected_output": "registry=docker\nhost=docker.iofoo\nmatch=false"
+        }
+      ]
+    },
+    "feature3_2_host_match_gcr.json": {
+      "description": "Decide whether a registry host string belongs to the GCR registry. A host matches only when it is exactly gcr.io or any subdomain ending in .gcr.io. Strings that merely contain the substring (prefix or suffix glued on) do not match, and an empty host never matches.",
+      "cases": [
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "gcr",
+            "host": "gcr.io"
+          },
+          "expected_output": "registry=gcr\nhost=gcr.io\nmatch=true"
+        },
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "gcr",
+            "host": "k8s.gcr.io"
+          },
+          "expected_output": "registry=gcr\nhost=k8s.gcr.io\nmatch=true"
+        },
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "gcr",
+            "host": "foogcr.io"
+          },
+          "expected_output": "registry=gcr\nhost=foogcr.io\nmatch=false"
+        }
+      ]
+    },
+    "feature3_3_host_match_quay.json": {
+      "description": "Decide whether a registry host string belongs to the Quay registry. A host matches only when it is exactly quay.io or any subdomain ending in .quay.io. Strings that merely contain the substring (prefix or suffix glued on) do not match, and an empty host never matches.",
+      "cases": [
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "quay",
+            "host": "quay.io"
+          },
+          "expected_output": "registry=quay\nhost=quay.io\nmatch=true"
+        },
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "quay",
+            "host": "k8s.quay.io"
+          },
+          "expected_output": "registry=quay\nhost=k8s.quay.io\nmatch=true"
+        },
+        {
+          "input": {
+            "action": "match_host",
+            "registry": "quay",
+            "host": "quay.iofoo"
+          },
+          "expected_output": "registry=quay\nhost=quay.iofoo\nmatch=false"
+        }
+      ]
+    },
+    "feature4_1_path_split_docker.json": {
+      "description": "Split a Docker Hub image path into a repository and image name. A bare single segment is treated as an official image under the implicit 'library' repository. When the path has two or more segments, only the last two are used: the second-to-last is the repository and the last is the image (any leading registry segments are discarded).",
+      "cases": [
+        {
+          "input": {
+            "action": "split_path",
+            "registry": "docker",
+            "path": "nginx"
+          },
+          "expected_output": "registry=docker\npath=nginx\nrepo=library\nimage=nginx"
+        },
+        {
+          "input": {
+            "action": "split_path",
+            "registry": "docker",
+            "path": "joshvanl/version-checker"
+          },
+          "expected_output": "registry=docker\npath=joshvanl/version-checker\nrepo=joshvanl\nimage=version-checker"
+        },
+        {
+          "input": {
+            "action": "split_path",
+            "registry": "docker",
+            "path": "registry/joshvanl/version-checker"
+          },
+          "expected_output": "registry=docker\npath=registry/joshvanl/version-checker\nrepo=joshvanl\nimage=version-checker"
+        }
+      ]
+    },
+    "feature4_2_path_split_gcr.json": {
+      "description": "Split a GCR image path into a repository and image name. A bare single segment is treated as an image under the implicit 'google-containers' repository. When the path contains slashes, everything before the last slash becomes the repository (preserving intermediate segments) and the final segment is the image.",
+      "cases": [
+        {
+          "input": {
+            "action": "split_path",
+            "registry": "gcr",
+            "path": "kube-scheduler"
+          },
+          "expected_output": "registry=gcr\npath=kube-scheduler\nrepo=google-containers\nimage=kube-scheduler"
+        },
+        {
+          "input": {
+            "action": "split_path",
+            "registry": "gcr",
+            "path": "k8s-artifacts-prod/ingress-nginx/nginx"
+          },
+          "expected_output": "registry=gcr\npath=k8s-artifacts-prod/ingress-nginx/nginx\nrepo=k8s-artifacts-prod/ingress-nginx\nimage=nginx"
+        }
+      ]
+    },
+    "feature4_3_path_split_quay.json": {
+      "description": "Split a Quay image path into a repository and image name. A bare single segment is treated as the repository with an empty image. When the path contains slashes, everything before the last slash becomes the repository (preserving intermediate segments) and the final segment is the image.",
+      "cases": [
+        {
+          "input": {
+            "action": "split_path",
+            "registry": "quay",
+            "path": "version-checker"
+          },
+          "expected_output": "registry=quay\npath=version-checker\nrepo=version-checker\nimage="
+        },
+        {
+          "input": {
+            "action": "split_path",
+            "registry": "quay",
+            "path": "jetstack/version-checker"
+          },
+          "expected_output": "registry=quay\npath=jetstack/version-checker\nrepo=jetstack\nimage=version-checker"
+        },
+        {
+          "input": {
+            "action": "split_path",
+            "registry": "quay",
+            "path": "k8s-artifacts-prod/ingress-nginx/nginx"
+          },
+          "expected_output": "registry=quay\npath=k8s-artifacts-prod/ingress-nginx/nginx\nrepo=k8s-artifacts-prod/ingress-nginx\nimage=nginx"
+        }
+      ]
+    },
+    "feature5_url_routing.json": {
+      "description": "Route a full image URL to the registry that should handle it, also reporting the host and the remaining path. The first slash-delimited segment is treated as a candidate host: if it matches the Docker, GCR, or Quay host rules the URL is routed there with that host and the remainder as path. A URL with no slash, or whose leading segment matches no known registry host, falls back to the Docker registry with an empty host and the entire original string as the path.",
+      "cases": [
+        {
+          "input": {
+            "action": "route_url",
+            "url": "nginx"
+          },
+          "expected_output": "url=nginx\nregistry=docker\nhost=\npath=nginx"
+        },
+        {
+          "input": {
+            "action": "route_url",
+            "url": "docker.io/joshvanl/version-checker"
+          },
+          "expected_output": "url=docker.io/joshvanl/version-checker\nregistry=docker\nhost=docker.io\npath=joshvanl/version-checker"
+        },
+        {
+          "input": {
+            "action": "route_url",
+            "url": "us.gcr.io/k8s-artifacts-prod/ingress-nginx/nginx"
+          },
+          "expected_output": "url=us.gcr.io/k8s-artifacts-prod/ingress-nginx/nginx\nregistry=gcr\nhost=us.gcr.io\npath=k8s-artifacts-prod/ingress-nginx/nginx"
+        },
+        {
+          "input": {
+            "action": "route_url",
+            "url": "quay.io/jetstack/version-checker"
+          },
+          "expected_output": "url=quay.io/jetstack/version-checker\nregistry=quay\nhost=quay.io\npath=jetstack/version-checker"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "parse_version_action",
+      "input_condition": "Action is 'parse_version' and input contains 'tag' string",
+      "output_rule": "Output must contain exactly 5 lines with specific key=value format",
+      "exact_values": [
+        "tag=",
+        "major=",
+        "minor=",
+        "patch=",
+        "metadata="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "parse_version_v_prefix",
+      "input_condition": "Tag string starts with optional 'v' followed by digits or dot",
+      "output_rule": "Leading 'v' is stripped from the version components but preserved in the 'tag' output line",
+      "exact_values": [
+        "tag="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "parse_version_numeric_extraction",
+      "input_condition": "Tag string contains dot-separated numbers",
+      "output_rule": "Extract up to 3 leading dot-separated integers as major/minor/patch. Missing components default to 0.",
+      "exact_values": [
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "parse_version_metadata_boundaries",
+      "input_condition": "Tag string portion immediately following the matched third numeric patch group",
+      "output_rule": "This remaining text becomes the 'metadata' value. If no non-version text follows, metadata is empty.",
+      "exact_values": []
+    },
+    {
+      "id": "C005",
+      "feature": "parse_version_no_starting_number",
+      "input_condition": "Tag string does not begin with a number (e.g., starts with 'v' alone or text like 'hello-')",
+      "output_rule": "Major/Minor/Patch must be 0/0/0. The entire original tag string goes to metadata.",
+      "exact_values": [
+        "0.0.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "parse_version_metadata_trailing_dots",
+      "input_condition": "Patch number ends with a dot (e.g., '1.3.' implied by context of mixed strings)",
+      "output_rule": "The metadata capture starts immediately after the patch integer. Dots are preserved.",
+      "exact_values": []
+    },
+    {
+      "id": "C007",
+      "feature": "compare_versions_action",
+      "input_condition": "Action is 'compare_versions' and input contains 'first' and 'second' tag strings",
+      "output_rule": "Output must have 3 lines: echo original tags, then 'less_than=<bool>'",
+      "exact_values": [
+        "first=",
+        "second=",
+        "less_than="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "compare_versions_empty_tag_length",
+      "input_condition": "Either 'first' or 'second' tag is an empty string",
+      "output_rule": "Compare strictly by string length. If lengths differ, shorter is 'less_than=true'. If lengths identical, 'less_than=false'.",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "compare_versions_pre_release_newer",
+      "input_condition": "Numeric major/minor/patch triple is identical between first and second",
+      "output_rule": "If 'first' has no metadata suffix and 'second' has a non-empty metadata suffix, 'less_than=false' (release is newer).",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "compare_versions_integer_token_comparison",
+      "input_condition": "Primary version triple is identical; compare metadata suffixes lexically using alternates (number/run vs non-num/run)",
+      "output_rule": "Number runs compared numerically. Non-number runs compared lexicographically. Runs align left-to-right.",
+      "exact_values": []
+    },
+    {
+      "id": "C011",
+      "feature": "compare_versions_token_run_v2",
+      "input_condition": "Metadata run contains multiple digits (e.g., 'r39' vs 'r9')",
+      "output_rule": "Compare the numeric value of the run. 'r9' < 'r39' because 9 < 39.",
+      "exact_values": []
+    },
+    {
+      "id": "C012",
+      "feature": "compare_versions_non_numeric_no_order",
+      "input_condition": "Neither 'first' nor 'second' resolve to a valid version triple (no starting numbers, no metadata separators)",
+      "output_rule": "The two tags must NEVER be strictly less/greater than each other.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "match_host_docker_action",
+      "input_condition": "Action is 'match_host', registry is 'docker', and host is not empty",
+      "output_rule": "Returns 3 lines. 'match=true' if host ends with '.docker.io' or '.docker.com'. 'match=false' otherwise.",
+      "exact_values": [
+        "registry=docker",
+        "host=",
+        "match="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "match_host_docker_exact_domain",
+      "input_condition": "Host string is exactly 'docker.io' or 'docker.com'",
+      "output_rule": "Treats substring matches like 'foodocker.io' as false. Only exact match or suffix match returns true.",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "match_host_gcr_channel",
+      "input_condition": "Host matches gcr suffix but includes version/channel (e.g. 'us.gcr.io', 'k8s.gcr.io')",
+      "output_rule": "Matches the canonical domain pattern (.gcr.io), allowing subdomain prefixes.",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "match_host_quay",
+      "input_condition": "Host matches quay.io canonical domain",
+      "output_rule": "Returns true if structure ends in '.quay.io'. Returns false if glued to other text.",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "split_path_docker_single",
+      "input_condition": "Action is 'split_path', registry 'docker', and path has exactly 1 segment",
+      "output_rule": "Output: repo='library', image=<path>",
+      "exact_values": [
+        "repo=library"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "split_path_docker_multi",
+      "input_condition": "Action is 'split_path', registry 'docker', and path has 2+ segments",
+      "output_rule": "Output: repo=second to last segment, image=last segment. Discard all preceding segments.",
+      "exact_values": []
+    },
+    {
+      "id": "C019",
+      "feature": "split_path_gcr_single",
+      "input_condition": "Action is 'split_path', registry 'gcr', and path has exactly 1 segment",
+      "output_rule": "Output: repo='google-containers', image=<path>",
+      "exact_values": [
+        "repo=google-containers"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "split_path_gcr_multi",
+      "input_condition": "Action is 'split_path', registry 'gcr', and path has 2+ segments",
+      "output_rule": "Output: repo=everything before last slash, image=last segment.",
+      "exact_values": []
+    },
+    {
+      "id": "C021",
+      "feature": "split_path_quay_single",
+      "input_condition": "Action is 'split_path', registry 'quay', and path has exactly 1 segment",
+      "output_rule": "Output: repo=<path>, image='' (empty string)",
+      "exact_values": [
+        "image="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "split_path_quay_multi",
+      "input_condition": "Action is 'split_path', registry 'quay', and path has 2+ segments",
+      "output_rule": "Output: repo=everything before last slash, image=last segment.",
+      "exact_values": []
+    },
+    {
+      "id": "C023",
+      "feature": "route_url_action",
+      "input_condition": "Action is 'route_url' and input contains 'url' string",
+      "output_rule": "Output must expose href='url', path='<registry_host>', where registry is inferred from host",
+      "exact_values": [
+        "url=",
+        "registry=",
+        "host=",
+        "path="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "route_url_host_detection",
+      "input_condition": "URL start segment matches 'docker.io', 'docker.com', 'gcr.io', 'us.gcr.io', or 'quay.io'",
+      "output_rule": "Route to inferred registry ('docker', 'gcr', or 'quay') and host. Path is remainder after host.",
+      "exact_values": []
+    },
+    {
+      "id": "C025",
+      "feature": "route_url_host_no_match",
+      "input_condition": "URL start segment does not match any known registry host (e.g. 'nginx', 'random.io')",
+      "output_rule": "Route to 'docker' registry. If host hostname itself is not docker.com or docker.io, the initial host string in path is set to empty.",
+      "exact_values": [
+        "registry=docker",
+        "host="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "route_url_path_default",
+      "input_condition": "URL has no slashes or is a single identifier (no match above C025)",
+      "output_rule": "Treat the whole URL as the path. Default to 'docker' registry. Host is empty string.",
+      "exact_values": [
+        "host="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "output_line_ordering",
+      "input_condition": "ALL actions",
+      "output_rule": "Output lines must be printed in the exact sequence defined by each JSON test case's expected_output block. Deviation implies failure.",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific boolean literal derived from string comparison",
+        "exact_values_to_replace": [
+          "less_than="
+        ],
+        "trigger_keywords": [
+          "compare_versions output format",
+          "less_than variable assignment",
+          "boolean flag in compare action",
+          "true or false in version comparison line",
+          "literal string value for less_than"
+        ],
+        "oracle_response": "The exact value is the result of the comparison logic (either 'true' or 'false') based on input tags."
+      },
+      {
+        "constraint_id": "C010",
+        "replacement": "a specific lexicographic ordering rule for metadata suffixes",
+        "exact_values_to_replace": [
+          "Number",
+          "Non-number",
+          "Run"
+        ],
+        "trigger_keywords": [
+          "metadata comparison algorithm",
+          "alternate comparison logic",
+          "lexicographic vs numeric run",
+          "string concatenation rule for metadata",
+          "non-numeric metadata sorting"
+        ],
+        "oracle_response": "Number runs are converted to integers for numeric comparison, while non-number runs are compared lexicographically. Comparison proceeds left-to-right across all runs."
+      },
+      {
+        "constraint_id": "C012",
+        "replacement": "an unordered state for unparseable tags",
+        "exact_values_to_replace": [
+          "NEVER be strictly less"
+        ],
+        "trigger_keywords": [
+          "unparseable tag comparison behavior",
+          "no ordering for invalid versions",
+          "equal comparison result for malformed tags",
+          "strict inequality failure case",
+          "remaining between two malformed tags"
+        ],
+        "oracle_response": "In this case, the output indicates the tags cannot be ordered; the comparison result is effectively equal or no-order, preventing any strict less-than or greater-than classification."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C013",
+        "vague_phrase": "align with the standard Docker suffix patterns defined in C014",
+        "actual_meaning": "Host comparison must match the exact 'docker.io' or 'docker.com' directly or appear as a suffix to the hostname, failing otherwise."
+      },
+      {
+        "constraint_id": "C018",
+        "vague_phrase": "utilize the splitting logic for multi-segment paths as per C020",
+        "actual_meaning": "All but the last segment constitute the repository name, accessed by slicing the path string excluding the final slash and its contents."
+      }
+    ]
+  }
+}

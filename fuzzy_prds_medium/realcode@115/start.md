@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+We need a Rust library that lets developers temporarily replace how any function behaves at runtime, without touching that function's source code or its call sites. Think of it as a behavioral shim: a developer names a function they want to intercept, describes what it should do instead, and the library takes care of the rest for the duration of the override's lifetime. Once the override goes out of scope, everything returns to normal automatically.
+
+Key capabilities the library must support: forcing a boolean-returning function to always produce a fixed value; making an override active only while a given code block is executing and then restoring the original; applying an override only when certain argument conditions are met, rejecting non-matching calls with a clean error; computing the return value dynamically from the real arguments rather than returning a constant; writing values into mutable output parameters; counting how many times the intercepted function was actually called and verifying it matches an expectation; replacing the entire function body with a caller-supplied closure or function; overriding one specific instantiation of a generic function while leaving other instantiations alone; faking async functions and methods; and even intercepting platform-level system calls.
+
+The library should refuse invalid configuration—such as a null replacement—cleanly upfront rather than crashing. The system should follow the internal conventions described in the project's architecture notes, and the adapter component should route each scenario to the right handler without the core engine knowing about input/output formatting.
+
+One small thing the team asked about on lifetime behavior: the override is active for exactly the lifetime of the InjectorPP instance. When the InjectorPP struct is dropped (goes out of scope), its stored Vec<PatchGuard> are dropped, which deterministically restores the original function bytes. There is no explicit uninstall call; restoration is driven purely by Rust's drop semantics.
+
+Also on bad targets, when FuncPtr::new is called with a null pointer (std::ptr::null()), it panics because NonNull::new returns None and the expect fires. The adapter catches this panic via catch_unwind and prints exactly: error=null_target
+
+For call counting, the behavior depends on when the mismatch shows up, but the output format stays the same. When actual invocations exceed expected, the panic is caught during the loop and the adapter prints: error=call_count_mismatch\nexpected=<N>\nactual=<M>\n. When actual is fewer than expected, the panic fires during drop of InjectorPP and the adapter prints the same three lines. When counts match, it prints: expected=<N>\nactual=<N>\nstatus=satisfied\n
+
+One more detail on argument-gated fakes: when the fake! macro's `when` condition evaluates to false, the generated fake function panics with 'Fake function called with unexpected arguments'. The adapter wraps the call in catch_unwind and, on catching that panic, prints exactly: error=unexpected_argument\n
+
+And for structure, this should still follow the scale-driven code organization and SOLID design principles section in start.md (lines 19-35), which mandates multi-file structure for complex systems, separation of the core engine from I/O, and distinct modules for parsing, routing, the override engine, and target-function catalog.

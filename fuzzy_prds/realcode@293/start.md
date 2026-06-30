@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to put together that shared plumbing library we keep talking about for the annotation-driven framework. Right now every app team is doing their own thing for basic stuff — figuring out where their classes live, running startup steps in the right order, turning handler responses into something the client can actually read, and dealing with messy incoming request values. It's causing inconsistencies and a bunch of copy-paste bugs.
+
+Basically we need four or five small building blocks. One for reading a project config and knowing which packages to scan (the convention stuff we agreed on, like we did for the login module layout — check how that was structured). One for running async startup tasks one-at-a-time so nothing fires out of order. Something to track what kind of value a handler actually returned so downstream logic knows what to do with it. Then serialisation — both the happy-path response and error/status outcomes — into whatever format the client asked for (we're supporting at least two formats). And finally a converter for raw incoming text params so handlers get proper typed values and bad input doesn't blow up with internal stack traces leaking out.
+
+Errors should never expose internal runtime details to the client, ever. Keep output consistent across all the formatters. The async piece especially needs to be rock-solid — order must be guaranteed. Let me know if anything's unclear, I'm around.

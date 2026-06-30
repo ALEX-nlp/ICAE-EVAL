@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need to ship the distributed tracing toolkit we've been talking about. basically the pain point is that every service team is rolling their own header parsing and sampling logic and they keep breaking each other's traces because nothing lines up end-to-end. we had that incident last quarter where the checkout service dropped 40% of traces because their hex encoding was subtly wrong compared to what the auth service expected — that kind of thing.
+
+the core pieces we need: some way to pack and unpack the trace context into a single header string (remember how we handled the sign/unsigned thing in that payments codec? do something consistent like that), a few different sampling strategies including one that gives a guaranteed floor so low-traffic operations still show up, a token bucket thing for rate controlling the volume (needs to work with a fake clock for testing), some small helpers for IP addresses and metadata keys, support for the B3 headers that zipkin folks use, the text-map propagation config, a metrics backend for counting spans, and a baggage policy checker.
+
+please keep things modular — last time someone jammed everything into one file and it was a nightmare. errors should be clean categories not raw exception dumps. ping me if you have questions on the sampling math or the wire format details.

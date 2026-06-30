@@ -1,0 +1,437 @@
+{
+  "fuzzy_prd": "# Source-Aware Spell Checker - Spell Checking for Code and Prose\n\n## Project Goal\n\nBuild a spell-checking engine that understands source code, so developers can flag genuine spelling mistakes in identifiers, comments, and string literals without drowning in false positives from keywords, syntax, URLs, hex colors, and other technical strings that ordinary spell checkers cannot tell apart from real words.\n\n---\n\n## Background & Problem\n\nWithout a code-aware checker, developers either skip spell checking on their source entirely or run a prose spell checker over it and are buried under noise: every language keyword, every `camelCase` identifier, every URL, hex color, file path, and base64 blob is reported as \"misspelled\". The signal-to-noise ratio is so poor that the tool gets disabled. Catching a typo in a public method name or a user-facing string then falls back to manual review, where it is routinely missed and ships to production.\n\nWith this engine, the same body of code is parsed structurally first: only the regions a human actually wrote as words — declared names, comments, and string contents — are examined, each identifier is split into its real constituent words, and technical strings are masked out before checking. The result is a short, trustworthy list of true misspellings with their exact byte positions, plus correction suggestions, suitable for driving an editor's squiggly underlines.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This is a multi-responsibility system (identifier splitting, technical-string masking, syntax-aware region extraction, dictionary lookup, suggestion generation, end-to-end orchestration, and a configuration layer). It MUST NOT be a single \"god file\"; output a clear, multi-file directory tree (e.g. `src/` with cohesive modules, `tests/`) that reflects a production-grade repository. Do not over-engineer, but strictly avoid monolithic files here.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core spell-checking logic must remain completely decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls to the core domain and rendering results as text.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Separate word splitting, skip-pattern masking, source-region extraction, dictionary membership, suggestion generation, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** Adding a new source language or a new skip pattern must not require modifying the core checking engine.\n   - **Liskov Substitution Principle (LSP):** All dictionary kinds (in-memory word list, affix-based) must be substitutable behind one dictionary abstraction.\n   - **Interface Segregation Principle (ISP):** Keep the dictionary and configuration interfaces small and cohesive.\n   - **Dependency Inversion Principle (DIP):** The engine must depend on a dictionary abstraction and a configuration abstraction, not on concrete file/network loaders.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core must be elegant and idiomatic to the target language, hiding parsing and dictionary plumbing.\n   - **Resilience:** All byte offsets must be valid UTF-8 boundaries and remain correct in the presence of multi-byte and multi-codepoint characters. Invalid or unsupported requests must be modeled as explicit errors, not crashes. Unsupported language identifiers degrade gracefully to plain-prose handling rather than failing.\n\n---\n\n## Core Features\n\n### Feature 1: Identifier Word Splitting\n\n**As a developer**, I want a single compound identifier broken into the real words it contains, so I can spell-check each word of a `camelCase`, `snake_case`, or `SCREAMING_SNAKE` name independently.\n\n**Expected Behavior / Usage:**\n\nThe input is one contiguous token. The splitter emits the constituent words with their positions. Splits happen at: a lowercase letter immediately followed by an uppercase letter (a case hump); inside a run of uppercase letters, where the last capital of the run attaches to the following lowercase word (so an acronym directly before a capitalized word, like an all-caps prefix joined to a `Capitalized` word, is separated correctly); at underscores, periods, colons, and hyphens, which act purely as separators and are themselves never emitted; and at every transition between letters and digits. Any segment consisting only of digits is discarded. Each surviving word is reported on its own line as `<start_byte> <end_byte> <word>`, where the offsets are UTF-8 byte offsets into the original token, ordered by position. The request shape is `{\"op\":\"split\",\"text\":<token>}` with no language field.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_identifier_splitting.json`\n\n```json\n{\n  \"description\": \"A single contiguous identifier or token is broken into its constituent words. Splits occur at lowercase-to-uppercase humps, inside uppercase runs (an uppercase run keeps its trailing capital with the following lowercase word, so an acronym immediately before a capitalized word is separated correctly), at underscores, periods, colons and hyphens (these separators are consumed and never emitted), and at every transition between letters and digits. Segments made only of digits are discarded. Each surviving word is reported as its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\\\"op\\\":\\\"split\\\",\\\"text\\\":<token>} with no language.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"split\", \"text\": \"calculateUserAge\"},\n      \"expected_output\": \"0 9 calculate\\n9 13 User\\n13 16 Age\\n\"\n    },\n    {\n      \"input\": {\"op\": \"split\", \"text\": \"XMLHttpRequest\"},\n      \"expected_output\": \"0 3 XML\\n3 7 Http\\n7 14 Request\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 2: Technical-String Masking\n\n**As a developer**, I want URLs, emails, hex colors, file paths, and hashes ignored when checking prose, so the random-looking letters inside them are never reported as misspelled words.\n\n**Expected Behavior / Usage:**\n\nThe input is a line of prose that may contain technical strings. Before tokenizing, spans that match the built-in skip patterns are masked out; any word that is fully or partially covered by a masked span is dropped, while ordinary words around it are kept. The built-in patterns cover web URLs (`http`/`https`), email addresses, hex color codes introduced by a leading `#`, absolute filesystem paths, and long hexadecimal hashes. Each surviving word is reported on its own line as `<start_byte> <end_byte> <word>` using UTF-8 byte offsets into the original text, ordered by position. The request shape is `{\"op\":\"skip\",\"text\":<text>}`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_skip_patterns.json`\n\n```json\n{\n  \"description\": \"Before tokenizing prose, spans matching built-in skip patterns for technical strings are masked out, so any word fully or partially covered by such a span is removed from the results while ordinary surrounding words are still emitted. The default patterns cover web URLs, email addresses, hex color codes introduced by a leading hash sign, absolute filesystem paths, and long hexadecimal hashes. Each surviving word is reported as its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\\\"op\\\":\\\"skip\\\",\\\"text\\\":<text>}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"skip\", \"text\": \"visit https://example.com/page now\"},\n      \"expected_output\": \"0 5 visit\\n31 34 now\\n\"\n    },\n    {\n      \"input\": {\"op\": \"skip\", \"text\": \"contact admin@example.com please\"},\n      \"expected_output\": \"0 7 contact\\n26 32 please\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 3: Word-List Dictionary Membership\n\n**As a developer**, I want to ask whether a word exists in a known word list, case-insensitively, so I can decide whether it is spelled correctly regardless of capitalization.\n\n**Expected Behavior / Usage:**\n\nA plain dictionary is built from a list of entry strings, then answers membership for a list of query words. A query word is considered known when its lowercased form equals the lowercased form of any entry; the original casing on either side is irrelevant. For each query word the output is one line: the query word exactly as given, a single space, and `true` if known or `false` if unknown — in the same order the query words were supplied. The request shape is `{\"op\":\"check\",\"dict\":[entries...],\"words\":[queries...]}`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_dictionary_lookup.json`\n\n```json\n{\n  \"description\": \"A plain word-list dictionary is built from a list of entries and answers membership queries case-insensitively: a query word is known when its lowercased form equals the lowercased form of any entry, regardless of the original casing on either side. For each query word the result is the word, a space, and either true (known) or false (unknown), one per line, in the order the query words were given. The request is {\\\"op\\\":\\\"check\\\",\\\"dict\\\":[entries...],\\\"words\\\":[queries...]}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"check\", \"dict\": [\"Hello\", \"world\", \"Rust\"], \"words\": [\"hello\", \"WORLD\", \"rust\", \"python\"]},\n      \"expected_output\": \"hello true\\nWORLD true\\nrust true\\npython false\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 4: Correction Suggestions\n\n**As a developer**, I want a short ranked list of plausible corrections for a misspelled word, so I can offer quick fixes in an editor.\n\n**Expected Behavior / Usage:**\n\nThe input is a single word. Using an affix-based English dictionary fixture, the engine returns an ordered list of at most five candidate corrections. The casing of the candidates is adapted to the casing of the query word: an all-uppercase query upper-cases every candidate, an all-lowercase query lower-cases every candidate, and a mixed- or title-cased query leaves the candidate text unchanged. Each candidate is printed on its own line, in ranked suggestion order. The request shape is `{\"op\":\"suggest\",\"word\":<word>}`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_suggestions.json`\n\n```json\n{\n  \"description\": \"Given a misspelled word, an ordered list of at most five correction candidates is produced from the bundled English affix/dictionary fixture. The casing of the candidates follows the casing of the query word: an all-uppercase query upper-cases the candidates, an all-lowercase query lower-cases them, and mixed or title casing leaves candidate text unchanged. Each candidate is printed on its own line in suggestion order. The request is {\\\"op\\\":\\\"suggest\\\",\\\"word\\\":<word>}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"suggest\", \"word\": \"wrld\"},\n      \"expected_output\": \"world\\nweld\\nwild\\nwold\\n\"\n    },\n    {\n      \"input\": {\"op\": \"suggest\", \"word\": \"colot\"},\n      \"expected_output\": \"clot\\ncoot\\ncolt\\ncolon\\ncolor\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 5: Source-Region Extraction\n\n**As a developer**, I want only the human-authored words in my source extracted before splitting, so keywords, operators, punctuation, and numeric literals are never spell-checked.\n\n**Expected Behavior / Usage:**\n\nThe input is a fragment of source code plus a language identifier (for example `rust` or `python`). The engine performs a syntax-aware parse and extracts only the spell-checkable regions: declared names (function, parameter, local binding, type, and field names), comment text, and the contents of string literals. Language keywords, operators, punctuation, and numeric literals are excluded. Each extracted region is then run through the same word splitter from Feature 1 (case humps, separators consumed, letter/digit transitions, digit-only segments discarded). Every resulting word is reported on its own line as `<start_byte> <end_byte> <word>`, where offsets are UTF-8 byte offsets into the whole original input, ordered by position. An unrecognized language identifier falls back to treating the input as plain prose. The request shape is `{\"op\":\"split\",\"text\":<source>,\"lang\":<id>}`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_code_extraction.json`\n\n```json\n{\n  \"description\": \"When a source language is supplied, a syntax-aware parse first extracts only the spell-checkable regions of code: declared names (function, parameter, local binding, type, field names), comment text, and the contents of string literals. Language keywords, operators, punctuation and numeric literals are not extracted. The extracted regions are then run through the same word splitter (case humps, separators, letter/digit transitions, digit-only segments discarded). Each resulting word is reported as its UTF-8 start byte offset within the whole input, end byte offset, and text, one per line, ordered by position. The request is {\\\"op\\\":\\\"split\\\",\\\"text\\\":<source>,\\\"lang\\\":<id>}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"split\", \"lang\": \"rust\", \"text\": \"let userName = 42; // greet visitor\"},\n      \"expected_output\": \"4 8 user\\n8 12 Name\\n22 27 greet\\n28 35 visitor\\n\"\n    },\n    {\n      \"input\": {\"op\": \"split\", \"lang\": \"rust\", \"text\": \"fn parseValue() { let s = \\\"helloWorld\\\"; }\"},\n      \"expected_output\": \"3 8 parse\\n8 13 Value\\n22 23 s\\n27 32 hello\\n32 37 World\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 6: End-to-End Spell Checking\n\n**As a developer**, I want one call that takes text or source and returns exactly the words that are genuinely misspelled, with their positions, so I can drive editor diagnostics directly.\n\n**Expected Behavior / Usage:**\n\nThis feature composes the previous building blocks into a single pipeline: optional source-region extraction, technical-string masking, identifier splitting, and dictionary membership. A word is reported as misspelled only when it is not found in any active dictionary after all masking and allowances are applied. Every reported misspelling is one line `<start_byte> <end_byte> <word>` with UTF-8 byte offsets into the whole original input, ordered by position. Correctly spelled input produces empty output. The request shape is `{\"op\":\"spellcheck\",\"text\":<text>,\"lang\":<id>, ...}`, where the optional `lang` selects a source parser (omit or use `text` for plain prose) and optional configuration fields are described in the sub-features below.\n\n*6.1 Prose Spell Checking — checking plain text*\n\nWhen `lang` is `text` (or omitted), the input is treated as prose: it is tokenized into words and every word not found in the active dictionaries is reported as a misspelling. Correctly spelled prose yields empty output. Offsets are UTF-8 byte offsets into the input, ordered by position.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_prose_spellcheck.json`\n\n```json\n{\n  \"description\": \"Plain prose is checked end to end: the text is tokenized into words and every word that is not found in the active dictionaries is reported as a misspelling, while correctly spelled words produce no output. Each misspelled word is reported as its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position; correctly spelled input yields empty output. The request is {\\\"op\\\":\\\"spellcheck\\\",\\\"text\\\":<text>,\\\"lang\\\":\\\"text\\\"}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"text\", \"text\": \"hello regular regu\"},\n      \"expected_output\": \"14 18 regu\\n\"\n    },\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"text\", \"text\": \"the quick brown fox jumps over the lazy dog\"},\n      \"expected_output\": \"\"\n    }\n  ]\n}\n```\n\n*6.2 Source Spell Checking — checking code in a given language*\n\nWhen a source `lang` is supplied, the spell-checkable regions (declared names, comments, string literals) are extracted with a syntax-aware parse, split into words, and each word not found in the active dictionaries is reported. Keywords, syntax, numeric literals, and dictionary-known words produce no output, so standard identifiers and dotted call targets are not flagged. Offsets are UTF-8 byte offsets into the whole original input, ordered by position.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_source_spellcheck.json`\n\n```json\n{\n  \"description\": \"Source code is checked end to end: the spell-checkable regions (declared names, comments, string literals) are extracted with a syntax-aware parse, split into words, and each word not found in the active dictionaries is reported as a misspelling. Keywords, syntax, numbers, and dictionary-known words produce no output, so dotted call targets and standard identifiers are not flagged. The supplied language id selects the parser. Each misspelling is reported as its UTF-8 start byte offset within the whole input, end byte offset, and text, one per line, ordered by position. The request is {\\\"op\\\":\\\"spellcheck\\\",\\\"text\\\":<source>,\\\"lang\\\":<id>}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"rust\", \"text\": \"\\n        // Comment with a typo: mment\\n        \"},\n      \"expected_output\": \"33 38 mment\\n\"\n    },\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"rust\", \"text\": \"\\n        pub struct BadSpeler {\\n            /// Terrible spelling: dwnloader\\n            pub dataz: String,\\n        }\\n        \"},\n      \"expected_output\": \"23 29 Speler\\n67 76 dwnloader\\n93 98 dataz\\n\"\n    },\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"python\", \"text\": \"\\n        def calculat_user_age(bithDate) -> int:\\n            # This is an examle_function that calculates age\\n            usrAge = get_curent_date() - bithDate\\n            userAge\\n    \"},\n      \"expected_output\": \"13 21 calculat\\n31 35 bith\\n74 80 examle\\n\"\n    }\n  ]\n}\n```\n\n*6.3 Technical-String Masking In Context — skip patterns during a full check*\n\nDuring an end-to-end check, technical strings embedded in prose or source are masked before tokenizing, so the letters inside web URLs, email addresses, hex color codes, and absolute filesystem paths are never reported as misspellings even though they are not real words. Ordinary misspelled words around them are still flagged. Offsets are UTF-8 byte offsets into the input, ordered by position.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_skip_in_context.json`\n\n```json\n{\n  \"description\": \"During an end-to-end check, technical strings embedded in prose or source are masked before tokenizing, so the letters inside web URLs, email addresses, hex color codes, and absolute filesystem paths are never reported as misspellings even though they are not real words. Ordinary misspelled words around them are still flagged. Each reported misspelling is its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\\\"op\\\":\\\"spellcheck\\\",\\\"text\\\":<text>,\\\"lang\\\":\\\"text\\\"}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"text\", \"text\": \"\\n        Visit https://www.exampl.com/badspeling for more info.\\n        But this actualbadword should be flagged.\\n    \"},\n      \"expected_output\": \"81 94 actualbadword\\n\"\n    },\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"text\", \"text\": \"\\n        Contact usr@exampl.com or admin@badspeling.org\\n        This misspelledword should be flagged though.\\n    \"},\n      \"expected_output\": \"69 83 misspelledword\\n\"\n    }\n  ]\n}\n```\n\n*6.4 Allowlist — accepting project-specific words*\n\nAn end-to-end check can be given an allowlist of accepted words. Any query word whose lowercased form is on the allowlist is treated as correctly spelled and never reported, even if it is unknown to every dictionary. Words that are neither on the allowlist nor in any dictionary are still reported. Offsets are UTF-8 byte offsets into the input, ordered by position. The optional field is `\"allow\":[words...]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_4_allowlist.json`\n\n```json\n{\n  \"description\": \"An end-to-end check can be given an allowlist of accepted words; any query word whose lowercased form is on the allowlist is treated as correctly spelled and never reported, even if it is not in any dictionary. Words not on the allowlist and not in any dictionary are still reported. Each reported misspelling is its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\\\"op\\\":\\\"spellcheck\\\",\\\"text\\\":<text>,\\\"lang\\\":\\\"text\\\",\\\"allow\\\":[words...]}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"text\", \"allow\": [\"testword\"], \"text\": \"\\n        ok words\\n        testword\\n        good words\\n        actualbad\\n\"},\n      \"expected_output\": \"62 71 actualbad\\n\"\n    }\n  ]\n}\n```\n\n*6.5 Ignore Patterns — user-supplied skip regexes*\n\nAn end-to-end check can be given a list of regular expressions. Any word matching one of the supplied patterns is skipped and never reported, in addition to the built-in technical-string patterns. Words that match no pattern and are unknown to the dictionaries are still reported. Offsets are UTF-8 byte offsets into the input, ordered by position. The optional field is `\"ignore_patterns\":[regexes...]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_5_ignore_patterns.json`\n\n```json\n{\n  \"description\": \"An end-to-end check can be given a list of regular expressions; any word matching one of the supplied patterns is skipped and never reported as a misspelling, in addition to the built-in technical-string patterns. Words that match no pattern and are unknown to the dictionaries are still reported. Each reported misspelling is its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\\\"op\\\":\\\"spellcheck\\\",\\\"text\\\":<text>,\\\"lang\\\":\\\"text\\\",\\\"ignore_patterns\\\":[regexes...]}.\",\n  \"cases\": [\n    {\n      \"input\": {\"op\": \"spellcheck\", \"lang\": \"text\", \"ignore_patterns\": [\"^[A-Z]{2,}$\", \"\\\\bcustom\\\\w*\", \"testpattern\"], \"text\": \"\\n        This text has HTML and CSS frameworks.\\n        Also customword and testpattern should be ignored.\\n        But badword and anotherbadword should be flagged.\\n    \"},\n      \"expected_output\": \"119 126 badword\\n131 145 anotherbadword\\n\"\n    }\n  ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the features above — identifier splitting, technical-string masking, syntax-aware source-region extraction, dictionary membership and suggestions, and the end-to-end checking pipeline with its configuration layer — with high cohesion and clear module boundaries, free of stdin/stdout/JSON coupling.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core. It reads a single JSON request from stdin, dispatches on the `op` field, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-leaf-feature contracts above. Invalid or unsupported requests are rendered as a neutral, language-neutral `error=<category>` line (for example `error=unknown_op`, `error=missing_text`); host-language exception identifiers and runtime message fragments must never appear in stdout. This adapter must be logically and physically separated from the core domain.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_identifier_splitting.json` under `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_identifier_splitting@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n",
+  "oracle_data": {
+    "task_id": "blopker__codebook-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "XMLHttpRequest split",
+          "uppercase acronym boundary",
+          "how are acronyms split",
+          "test case XML HttpRequest",
+          "byte offset 0-3",
+          "acronym split logic"
+        ],
+        "oracle_response": "In 'XMLHttpRequest', the acronym 'XML' is preserved as a single token at bytes 0-3. The split point is after 'X' (length 3), so 'Http' starts at 3-7 and 'Request' at 7-14. No internal split occurs within the all-caps acronym unless specific grammar rules override the simple 'all-caps is one word' heuristic."
+      },
+      {
+        "constraint_id": "C017",
+        "trigger_keywords": [],
+        "oracle_response": ""
+      },
+      {
+        "constraint_id": "TC_feature1_identifier_splitting",
+        "trigger_keywords": [
+          "test cases for feature1 identifier splitting",
+          "show me feature1 identifier splitting test cases",
+          "what are the feature1 identifier splitting inputs and outputs",
+          "give me the feature1_identifier_splitting test file",
+          "feature1 identifier splitting expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_identifier_splitting:\n{\n  \"description\": \"A single contiguous identifier or token is broken into its constituent words. Splits occur at lowercase-to-uppercase humps, inside uppercase runs (an uppercase run keeps its trailing capital with the following lowercase word, so an acronym immediately before a capitalized word is separated correctly), at underscores, periods, colons and hyphens (these separators are consumed and never emitted), and at every transition between letters and digits. Segments made only of digits are discarded. Each surviving word is reported as its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\\\"op\\\":\\\"split\\\",\\\"text\\\":<token>} with no language.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"split\",\n        \"text\": \"calculateUserAge\"\n      },\n      \"expected_output\": \"0 9 calculate\\n9 13 User\\n13 16 Age\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"split\",\n        \"text\": \"XMLHttpRequest\"\n      },\n      \"expected_output\": \"0 3 XML\\n3 7 Http\\n7 14 Request\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_prose_spellcheck",
+        "trigger_keywords": [
+          "test cases for feature6 1 prose spellcheck",
+          "show me feature6 1 prose spellcheck test cases",
+          "what are the feature6 1 prose spellcheck inputs and outputs",
+          "give me the feature6_1_prose_spellcheck test file",
+          "feature6 1 prose spellcheck expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_prose_spellcheck:\n{\n  \"description\": \"Plain prose is checked end to end: the text is tokenized into words and every word that is not found in the active dictionaries is reported as a misspelling, while correctly spelled words produce no output. Each misspelled word is reported as its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position; correctly spelled input yields empty output. The request is {\\\"op\\\":\\\"spellcheck\\\",\\\"text\\\":<text>,\\\"lang\\\":\\\"text\\\"}.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"spellcheck\",\n        \"lang\": \"text\",\n        \"text\": \"hello regular regu\"\n      },\n      \"expected_output\": \"14 18 regu\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"spellcheck\",\n        \"lang\": \"text\",\n        \"text\": \"the quick brown fox jumps over the lazy dog\"\n      },\n      \"expected_output\": \"\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_identifier_splitting.json": {
+      "description": "A single contiguous identifier or token is broken into its constituent words. Splits occur at lowercase-to-uppercase humps, inside uppercase runs (an uppercase run keeps its trailing capital with the following lowercase word, so an acronym immediately before a capitalized word is separated correctly), at underscores, periods, colons and hyphens (these separators are consumed and never emitted), and at every transition between letters and digits. Segments made only of digits are discarded. Each surviving word is reported as its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\"op\":\"split\",\"text\":<token>} with no language.",
+      "cases": [
+        {
+          "input": {
+            "op": "split",
+            "text": "calculateUserAge"
+          },
+          "expected_output": "0 9 calculate\n9 13 User\n13 16 Age\n"
+        },
+        {
+          "input": {
+            "op": "split",
+            "text": "XMLHttpRequest"
+          },
+          "expected_output": "0 3 XML\n3 7 Http\n7 14 Request\n"
+        }
+      ]
+    },
+    "feature2_skip_patterns.json": {
+      "description": "Before tokenizing prose, spans matching built-in skip patterns for technical strings are masked out, so any word fully or partially covered by such a span is removed from the results while ordinary surrounding words are still emitted. The default patterns cover web URLs, email addresses, hex color codes introduced by a leading hash sign, absolute filesystem paths, and long hexadecimal hashes. Each surviving word is reported as its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\"op\":\"skip\",\"text\":<text>}.",
+      "cases": [
+        {
+          "input": {
+            "op": "skip",
+            "text": "visit https://example.com/page now"
+          },
+          "expected_output": "0 5 visit\n31 34 now\n"
+        },
+        {
+          "input": {
+            "op": "skip",
+            "text": "contact admin@example.com please"
+          },
+          "expected_output": "0 7 contact\n26 32 please\n"
+        }
+      ]
+    },
+    "feature3_dictionary_lookup.json": {
+      "description": "A plain word-list dictionary is built from a list of entries and answers membership queries case-insensitively: a query word is known when its lowercased form equals the lowercased form of any entry, regardless of the original casing on either side. For each query word the result is the word, a space, and either true (known) or false (unknown), one per line, in the order the query words were given. The request is {\"op\":\"check\",\"dict\":[entries...],\"words\":[queries...]}.",
+      "cases": [
+        {
+          "input": {
+            "op": "check",
+            "dict": [
+              "Hello",
+              "world",
+              "Rust"
+            ],
+            "words": [
+              "hello",
+              "WORLD",
+              "rust",
+              "python"
+            ]
+          },
+          "expected_output": "hello true\nWORLD true\nrust true\npython false\n"
+        }
+      ]
+    },
+    "feature4_suggestions.json": {
+      "description": "Given a misspelled word, an ordered list of at most five correction candidates is produced from the bundled English affix/dictionary fixture. The casing of the candidates follows the casing of the query word: an all-uppercase query upper-cases the candidates, an all-lowercase query lower-cases them, and mixed or title casing leaves candidate text unchanged. Each candidate is printed on its own line in suggestion order. The request is {\"op\":\"suggest\",\"word\":<word>}.",
+      "cases": [
+        {
+          "input": {
+            "op": "suggest",
+            "word": "wrld"
+          },
+          "expected_output": "world\nweld\nwild\nwold\n"
+        },
+        {
+          "input": {
+            "op": "suggest",
+            "word": "colot"
+          },
+          "expected_output": "clot\ncoot\ncolt\ncolon\ncolor\n"
+        }
+      ]
+    },
+    "feature5_code_extraction.json": {
+      "description": "When a source language is supplied, a syntax-aware parse first extracts only the spell-checkable regions of code: declared names (function, parameter, local binding, type, field names), comment text, and the contents of string literals. Language keywords, operators, punctuation and numeric literals are not extracted. The extracted regions are then run through the same word splitter (case humps, separators, letter/digit transitions, digit-only segments discarded). Each resulting word is reported as its UTF-8 start byte offset within the whole input, end byte offset, and text, one per line, ordered by position. The request is {\"op\":\"split\",\"text\":<source>,\"lang\":<id>}.",
+      "cases": [
+        {
+          "input": {
+            "op": "split",
+            "lang": "rust",
+            "text": "let userName = 42; // greet visitor"
+          },
+          "expected_output": "4 8 user\n8 12 Name\n22 27 greet\n28 35 visitor\n"
+        },
+        {
+          "input": {
+            "op": "split",
+            "lang": "rust",
+            "text": "fn parseValue() { let s = \"helloWorld\"; }"
+          },
+          "expected_output": "3 8 parse\n8 13 Value\n22 23 s\n27 32 hello\n32 37 World\n"
+        }
+      ]
+    },
+    "feature6_1_prose_spellcheck.json": {
+      "description": "Plain prose is checked end to end: the text is tokenized into words and every word that is not found in the active dictionaries is reported as a misspelling, while correctly spelled words produce no output. Each misspelled word is reported as its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position; correctly spelled input yields empty output. The request is {\"op\":\"spellcheck\",\"text\":<text>,\"lang\":\"text\"}.",
+      "cases": [
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "text",
+            "text": "hello regular regu"
+          },
+          "expected_output": "14 18 regu\n"
+        },
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "text",
+            "text": "the quick brown fox jumps over the lazy dog"
+          },
+          "expected_output": ""
+        }
+      ]
+    },
+    "feature6_2_source_spellcheck.json": {
+      "description": "Source code is checked end to end: the spell-checkable regions (declared names, comments, string literals) are extracted with a syntax-aware parse, split into words, and each word not found in the active dictionaries is reported as a misspelling. Keywords, syntax, numbers, and dictionary-known words produce no output, so dotted call targets and standard identifiers are not flagged. The supplied language id selects the parser. Each misspelling is reported as its UTF-8 start byte offset within the whole input, end byte offset, and text, one per line, ordered by position. The request is {\"op\":\"spellcheck\",\"text\":<source>,\"lang\":<id>}.",
+      "cases": [
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "rust",
+            "text": "\n        // Comment with a typo: mment\n        "
+          },
+          "expected_output": "33 38 mment\n"
+        },
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "rust",
+            "text": "\n        pub struct BadSpeler {\n            /// Terrible spelling: dwnloader\n            pub dataz: String,\n        }\n        "
+          },
+          "expected_output": "23 29 Speler\n67 76 dwnloader\n93 98 dataz\n"
+        },
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "python",
+            "text": "\n        def calculat_user_age(bithDate) -> int:\n            # This is an examle_function that calculates age\n            usrAge = get_curent_date() - bithDate\n            userAge\n    "
+          },
+          "expected_output": "13 21 calculat\n31 35 bith\n74 80 examle\n"
+        }
+      ]
+    },
+    "feature6_3_skip_in_context.json": {
+      "description": "During an end-to-end check, technical strings embedded in prose or source are masked before tokenizing, so the letters inside web URLs, email addresses, hex color codes, and absolute filesystem paths are never reported as misspellings even though they are not real words. Ordinary misspelled words around them are still flagged. Each reported misspelling is its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\"op\":\"spellcheck\",\"text\":<text>,\"lang\":\"text\"}.",
+      "cases": [
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "text",
+            "text": "\n        Visit https://www.exampl.com/badspeling for more info.\n        But this actualbadword should be flagged.\n    "
+          },
+          "expected_output": "81 94 actualbadword\n"
+        },
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "text",
+            "text": "\n        Contact usr@exampl.com or admin@badspeling.org\n        This misspelledword should be flagged though.\n    "
+          },
+          "expected_output": "69 83 misspelledword\n"
+        }
+      ]
+    },
+    "feature6_4_allowlist.json": {
+      "description": "An end-to-end check can be given an allowlist of accepted words; any query word whose lowercased form is on the allowlist is treated as correctly spelled and never reported, even if it is not in any dictionary. Words not on the allowlist and not in any dictionary are still reported. Each reported misspelling is its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\"op\":\"spellcheck\",\"text\":<text>,\"lang\":\"text\",\"allow\":[words...]}.",
+      "cases": [
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "text",
+            "allow": [
+              "testword"
+            ],
+            "text": "\n        ok words\n        testword\n        good words\n        actualbad\n"
+          },
+          "expected_output": "62 71 actualbad\n"
+        }
+      ]
+    },
+    "feature6_5_ignore_patterns.json": {
+      "description": "An end-to-end check can be given a list of regular expressions; any word matching one of the supplied patterns is skipped and never reported as a misspelling, in addition to the built-in technical-string patterns. Words that match no pattern and are unknown to the dictionaries are still reported. Each reported misspelling is its UTF-8 start byte offset, end byte offset, and text, one per line, ordered by position. The request is {\"op\":\"spellcheck\",\"text\":<text>,\"lang\":\"text\",\"ignore_patterns\":[regexes...]}.",
+      "cases": [
+        {
+          "input": {
+            "op": "spellcheck",
+            "lang": "text",
+            "ignore_patterns": [
+              "^[A-Z]{2,}$",
+              "\\bcustom\\w*",
+              "testpattern"
+            ],
+            "text": "\n        This text has HTML and CSS frameworks.\n        Also customword and testpattern should be ignored.\n        But badword and anotherbadword should be flagged.\n    "
+          },
+          "expected_output": "119 126 badword\n131 145 anotherbadword\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "identifier_splitting",
+      "input_condition": "Operation 'split' with a single text token and no language specification.",
+      "output_rule": "Output words with UTF-8 start/end byte offsets relative to the input token.",
+      "exact_values": [
+        "op:split",
+        "format: <start_byte> <end_byte> <word>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "identifier_splitting",
+      "input_condition": "Input token is a contiguous identifier.",
+      "output_rule": "Split at lowercase-to-uppercase humps, inside uppercase runs (trailing capital attaches to following lowercase), at underscores/periods/colons/hyphens, and at letter-digit transitions.",
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "identifier_splitting",
+      "input_condition": "Splitting occurs within uppercase runs.",
+      "output_rule": "An uppercase run keeps its trailing capital when splitting from the next capitalized word (e.g., 'XML' in 'XMLHttpRequest' is separator; the last cap of 'XML' attaches to 'Http' is not how it works, rather: 'XML' is an acronym, the split is between 'ML' and 'Http'? Wait, test case shows '0 3 XML', '3 7 Http'. This implies 'XML' is kept intact. The rule 'inside a run of uppercase letters, where the last capital of the run attaches to the following lowercase word' seems to contradict the test case if 'XML' is all caps. Let's re-read: 'inside an uppercase run, where the last capital of the run attaches to the following capitalized word, so an acronym immediately before a capitalized word... is separated correctly'. Actually, looking at 'XMLHttpRequest', 'XML' is 0-3. 'Http' is 3-7. 'Request' is 7-14. The split logic must be: No split inside all-caps unless followed by a capital word with a lowercase start? No, that doesn't fit 'XML'. Let's look at the rule text again: 'inside an uppercase run, where the last capital of the run attaches to the following lowercase word'. This is confusing. Let's rely on the test cases. 'XMLHttpRequest' -> 'XML' 'Http' 'Request'. The split is after 'X'... no, length 3. So 'XML' is preserved. The rule might mean: if you have '..',..,'AA' then 'B', split? The test case implies 'XML' is kept. The rule text says 'inside an uppercase run... attaches to the following lowercase word'. This is likely describing the edge case of 'AAabc' -> 'Aa' 'bc'? Or 'XML' is treated as a block. Let's stick to the test case outputs as ground truth for splits: 'XML' is bytes 0-3. 'Http' is 3-7. 'Request' is 7-14. So the split logic handles 'HTTP' followed by 'Url' correctly. For 'XML', no split inside. The text says 'last capital ... attaches to following lowercase'. This applies to 'URLHttpRequest' -> 'URL' 'Http'? No. Let's ignore the confusing text description and trust the tests: 'XMLHttpRequest' splits at word boundaries.",
+      "ambiguous": true
+    },
+    {
+      "id": "C004",
+      "feature": "identifier_splitting",
+      "input_condition": "Segment consists only of digits after splitting.",
+      "output_rule": "Discard (do not emit).",
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "skip_patterns",
+      "input_condition": "Operation 'skip' with text containing technical strings.",
+      "output_rule": "Mask out spans matching patterns (URLs, emails, hex colors, paths, hashes). Emit only surviving words.",
+      "exact_values": [
+        "patterns: URLs (http/https), emails, hex colors (#...), fs paths, hashes",
+        "format: <start_byte> <end_byte> <word>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "skip_patterns",
+      "input_condition": "A word is fully or partially covered by a masked span.",
+      "output_rule": "The word is dropped from results.",
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "dictionary_lookup",
+      "input_condition": "Operation 'check' with a dict list and words list.",
+      "output_rule": "Query result is: word + space + (true/false). Case-insensitive match.",
+      "exact_values": [
+        "op:check",
+        "format: <query_word> <true|false>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "suggestions",
+      "input_condition": "Operation 'suggest' with a single word.",
+      "output_rule": "Return up to 5 candidates. Casing adapts to query word (Upper -> Upper, Lower -> Lower, Mixed -> Original).",
+      "exact_values": [
+        "op:suggest",
+        "max_candidates: 5",
+        "format: <candidate_word>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "code_extraction",
+      "input_condition": "Operation 'split' with source text and a language identifier.",
+      "output_rule": "Extract spell-checkable regions (names, comments, strings). Skip keywords, operators, punctuation, numbers. Split extracted regions.",
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "code_extraction",
+      "input_condition": "Language identifier is unrecognized.",
+      "output_rule": "Degrade gracefully to plain prose handling (extract all text/comments/strings, likely skipping code structure).",
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "end_to_end",
+      "input_condition": "Operation 'spellcheck' on code with language specified.",
+      "output_rule": "Composed pipeline: extract -> split -> mask -> check. Keyword/syntax/dictionary-known words produce no output.",
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "end_to_end",
+      "input_condition": "Operation 'spellcheck' on code without language (or lang='text').",
+      "output_rule": "Treat as plain prose: tokenize -> split (simple) -> check.",
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "allowlist",
+      "input_condition": "Bug fix: Operation 'spellcheck' with 'allow' array.",
+      "output_rule": "Words on allowlist are treated as correctly spelled even if not in dictionary.",
+      "exact_values": [
+        "field: allow",
+        "implicit: case-insensitive"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "ignore_patterns",
+      "input_condition": "Bug fix: Operation 'spellcheck' with 'ignore_patterns' array.",
+      "output_rule": "Words matching regex patterns are skipped.",
+      "exact_values": [
+        "field: ignore_patterns",
+        "implicit: combined with built-in patterns"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "output_format",
+      "input_condition": "All features (split, skip, check, suggest, extract, spellcheck) use byte offsets.",
+      "output_rule": "Offsets must be valid UTF-8 byte positions.",
+      "exact_values": [
+        "invalid: rounded/truncated offsets must not happen",
+        "error: modeled as explicit error or fallback"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "line_ordering",
+      "input_condition": "All output lists of words.",
+      "output_rule": "Ordered by byte offset (start_byte) ascending.",
+      "exact_values": [
+        "format: <start> <end> <word>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "prose_spellcheck",
+      "input_condition": "Spellcheck on text 'hello regular regu'."
+    },
+    "exact_values"
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C003",
+        "replacement": "complex acronym handling logic",
+        "exact_values_to_replace": [
+          "'XML' is bytes 0-3. 'Http' is 3-7. 'Request' is 7-14. So the split logic handles 'HTTP' followed by 'Url' correctly."
+        ],
+        "trigger_keywords": [
+          "XMLHttpRequest split",
+          "uppercase acronym boundary",
+          "how are acronyms split",
+          "test case XML HttpRequest",
+          "byte offset 0-3",
+          "acronym split logic"
+        ],
+        "oracle_response": "In 'XMLHttpRequest', the acronym 'XML' is preserved as a single token at bytes 0-3. The split point is after 'X' (length 3), so 'Http' starts at 3-7 and 'Request' at 7-14. No internal split occurs within the all-caps acronym unless specific grammar rules override the simple 'all-caps is one word' heuristic."
+      },
+      {
+        "constraint_id": "C017",
+        "replacement": "standard spelling output format",
+        "exact_values_to_replace": [
+          "exact_values"
+        ]
+      },
+      "trigger_keywords\": ["
+    ]
+  }
+}

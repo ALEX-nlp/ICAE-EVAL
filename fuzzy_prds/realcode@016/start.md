@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need a PNG image comparison tool — basically something devs can drop into their screenshot testing pipeline so they stop writing all that manual pixel-diffing boilerplate every time. the core idea is: give it two images, get back whether they look the same or not, and optionally spit out a diff image that highlights what changed. we've had a bunch of regressions slip through lately because people are copy-pasting their own ad-hoc comparison scripts and the tolerance logic is all over the place.
+
+for the comparison side, there should be a few modes — something strict for exact matching, something more lenient for when pixel values are close enough that a human wouldn't notice, and also a special case for that cursor/caret flicker issue we keep seeing in the editor screenshot tests (you know the one, same kind of ignore logic we used in that rendering QA spike last quarter). images can come in either from disk or from memory, similar to how we handled the two transport modes in the login asset loader.
+
+for the diff output, matching pixels should be preserved from the reference, changed areas get painted with a configurable highlight color, and you can get the result back as a file or as raw bytes. if someone tries to combine modes that don't make sense together, we need a clean error back — not a crash. output should be structured and machine-readable so the CI pipeline can parse it. keep the core logic separate from the CLI wiring please.

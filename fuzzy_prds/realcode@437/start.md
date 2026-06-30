@@ -1,0 +1,3 @@
+## Product Requirement Document
+
+We need to complete the OpenAPI contract code-generation behavior covered by the tests. The scope includes YAML parsing edge cases, quoted enum preservation, anchor/alias detection, alias enum resolution, OpenAPI encoding validation, primitive model serialization/deserialization, enum JSON mapping, unique array handling, map serialization, HTTP client request mapping, HTTP client result mapping, and server routing. The adapter should route by feature and produce deterministic summaries of generated/model behavior.

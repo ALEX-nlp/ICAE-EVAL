@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need to wrap the dart_style formatter into a little adapter layer so other tools can drive it over stdin/stdout with JSON. Basically something reads a JSON blob in, calls the formatter, and spits out the result. The tricky part is we want this to feel clean — not just one giant script doing everything. Think about how we separated concerns in that old analysis pipeline we built, where the I/O layer never touched the business logic directly.
+
+The formatter itself needs to handle whole files and also smaller snippets differently — files get a trailing newline, snippets don't. Width settings and the style version (old vs new dart style) should affect how arguments and collections get split across lines. Line endings should either follow what's already in the source or be overridable. There's also some trailing comma behavior that affects whether things stay on one line or split.
+
+When things go wrong — bad syntax, unsafe output — we need a clean, consistent error format that doesn't leak any runtime internals like stack traces or exception class names. Also, editor-style selection range tracking needs to work, and there's a utility for splitting source into before/selected/after segments that needs proper validation.
+
+We need a test runner script that can point at a folder of JSON case files and run all of them automatically. Make sure the whole thing is properly structured, not a god file.
+
+One quick follow-up from the questions that came in: for success cases, `scope=file` needs to end with exactly one trailing `\n`, and `scope=statement` must not append any file-level trailing newline. Same idea as before, just calling out that this is strict. Also, if the source starts with a comment like `// @dart=X.Y`, that takes precedence over the `language_version` coming in through JSON, and both parsing behavior and formatting style should follow the version from that comment whenever it exists.
+
+A couple other defaults to keep in mind: if `page_width` isn’t present in the input, we should use dart_style’s default of 80 for layout decisions. The optional `uri` can be passed through as the source file URI too. It doesn’t directly change the formatted output, but it can show up in diagnostics and gives the underlying formatter more context.
+
+On style behavior, language version < 3.7 uses the old Dart style, which means 4-space argument indentation and no trailing comma on split argument lists. Language version >= 3.7 uses the new style, which means 2-space indentation and a trailing comma after the last argument when split. For line endings, if `line_ending` is explicitly set in the JSON input, every formatter-produced line break should use that exact string. If it’s omitted, detect the first line ending already present in the source and use that consistently. If there isn’t one in the source either, fall back to `\n`.
+
+And just to underline the structure piece since that came up too: keep the JSON adapter on stdin/stdout physically separate from the core formatting domain. The adapter shouldn’t blur into the formatter logic, and the core piece should depend only on abstractions per DIP, same spirit as the separation we wanted from the start.

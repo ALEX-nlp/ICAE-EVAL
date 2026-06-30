@@ -1,0 +1,1752 @@
+{
+  "fuzzy_prd": "Hey team, we need to wrap up the AWS lambda adapter thing we've been talking about. The basic idea is that devs should be able to take their existing fastify app and just... plug it into lambda without rewriting anything. The gateway sends us these weird event blobs and we need to turn them into something fastify understands, run the request through the app, and then package up the response in whatever shape lambda expects back.\n\nThere are a bunch of annoying edge cases around how the path gets computed — remember how we handled that stage-prefix stripping thing in the routing module? Same kind of logic applies here. Also the query string situation is a mess because different event versions encode things differently, and there's that comma thing for v2 payloads we discussed.\n\nOn the response side, cookies behave differently depending on which payload version we're dealing with, and we need to handle binary payloads correctly — the caller should be able to plug in their own logic for deciding when to base64 encode, not just rely on a static list.\n\nAlso important: the handler needs to work both as a promise and with the old callback style. And if something blows up internally, we absolutely cannot let a raw exception bubble up to the caller — it has to degrade gracefully. Oh and multipart uploads need to work too. Ping me if anything's unclear.\n\nA couple follow-ups from the questions that came in. On the request body side, if the event shows `isBase64Encoded: true`, we need to decode that body from Base64 to its raw bytes before handing it to the framework. And if the gateway didn’t give us a `content-length` header, we should compute it from the decoded byte length and inject it so the body parser sees the right raw bytes and length.\n\nFor path and method picking, the order matters. If `pathParameterUsedAsPath` is configured and that named path parameter exists on the event, we use that value prefixed with `/`. If not, we prefer the explicit `path` field on the event, and if that’s not there we fall back to `rawPath`. Method comes from `httpMethod` when it exists, otherwise from `requestContext.http.method`. Also on the stage-prefix thing, default behavior is still to strip the leading stage segment when `requestContext.stage` prefixes the `path` but the resource path does not start with that segment. If `options.retainStage: true` is set, we do not strip it and just leave the path alone. Same rule applies in the core path resolution bit as discussed.\n\nOn invocation style, the returned handler needs to work the same whether someone is awaiting it as a promise or calling it the old node way where the third argument is a function. Both modes should produce identical result shapes. If `options.callbackWaitsForEmptyEventLoop` is defined, write that boolean onto the invocation context object before request processing begins. And if something unexpected blows up internally during request processing, we still do not leak the raw exception. We return, or pass to the callback, a well-formed error result with `status: 500` and an empty body, with no response headers, in both promise and callback modes.\n\nA few response details too. Non-string response header values need to be coerced to strings in the result. If the handler explicitly removes the Content-Type header, it should stay absent in the result and not get defaulted back in. And if the handler response body is empty, the returned body should be an empty string with a `content-length` of `0`.\n\nFor multipart, when a multipart/form-data parser is registered, uploaded file parts need to come through with `fieldname`, `filename`, `encoding`, `mimetype`, and `content`, where `content` is the file content as a string. Text fields should come through with `fieldname`, `encoding`, `mimetype`, and `value`. We need this to work for both plain raw string multipart bodies and Base64-encoded multipart bodies.\n\nOne other thing the team asked about: every incoming request should be decorated with `awsLambdaEvent` and `awsLambdaContext` directly on the request object, and that needs to be available not just in route handlers but also in lifecycle hooks like `onRequest`. There’s also an optional `decorateRequest` option if someone wants to customize that behavior a bit further.\n\nAnd on binary responses, the custom hook for the encoding decision is `enforceBase64`, which is a caller-supplied predicate function `(headers) => boolean` checked during response encoding selection. That’s the extension point we want people using instead of baking in more fixed rules.",
+  "oracle_data": {
+    "task_id": "fastify-aws-lambda-adapter-001",
+    "golden_api_signature": "awsLambdaFastify(app, options?) => handler(event, context, callback?)",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "multi-valued query parameters",
+          "how are repeated query params handled",
+          "multiValueQueryStringParameters behavior"
+        ],
+        "oracle_response": "When the event provides `multiValueQueryStringParameters`, those values take precedence and each parameter is exposed to the handler as an array of its values. For payload format version 2.0, a single query value containing commas is split into an array by default; this behavior can be disabled by setting `options.parseCommaSeparatedQueryParams: false`. Splitting must not mutate the original event object."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "ELB query string URL decoding",
+          "load balancer event query params",
+          "should query keys and values be URL decoded"
+        ],
+        "oracle_response": "For load-balancer sourced events (identified by `requestContext.elb` being present), both query parameter keys and values must be URL-decoded before being forwarded to the framework. For all other event sources (API Gateway v1, v2), query values are passed through verbatim without any URL-decoding."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "cookies in v2 event",
+          "how are cookies forwarded from the event to the handler",
+          "protocol v2 cookie array handling"
+        ],
+        "oracle_response": "For payload format v2.0, the `cookies` array in the event must be joined into a single `Cookie` request header (semicolon or comma joined) and forwarded to the framework so the handler sees it as a normal Cookie header."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "multi-value request headers promotion",
+          "when are multi-value headers merged into one",
+          "multiValueHeaders promotion rules"
+        ],
+        "oracle_response": "A header from `multiValueHeaders` is only promoted to the request if it carries more than one value. A multi-header entry with exactly one value is ignored (not promoted). When a header has multiple values, they are comma-joined into a single combined header value and forwarded to the framework."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "serializing the lambda event into a header",
+          "x-apigateway-event header",
+          "serializeLambdaArguments option"
+        ],
+        "oracle_response": "When `options.serializeLambdaArguments: true` is set, the library URL-encodes the original invocation event as JSON and injects it into the request as the `x-apigateway-event` header. This header is absent by default (when the option is not set or is false)."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "Set-Cookie response header differences between v1 and v2",
+          "how cookies are returned in the response",
+          "cookies field vs multiValueHeaders in response"
+        ],
+        "oracle_response": "For protocol v2.0 responses, Set-Cookie headers must be placed in a dedicated top-level `cookies` array in the result, not in the headers map. For v1 (no version field) responses, Set-Cookie values must be placed under `multiValueHeaders` as an array. Other multi-valued response headers in v1 are comma-joined into a single `headers` entry."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "when should the response body be base64 encoded",
+          "binary mime type matching",
+          "custom predicate for base64 encoding decision"
+        ],
+        "oracle_response": "The response body is Base64-encoded and `isBase64Encoded` set to true when: (1) the response Content-Type matches one of the configured `binaryMimeTypes`; (2) the response has a non-identity `Content-Encoding` header (e.g. `br`, `gzip`); or (3) a caller-supplied `enforceBase64` predicate function returns true given the response headers. The predicate is open for extension without modifying the core library."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature10_1_multipart_file_fields",
+        "trigger_keywords": [
+          "test cases for feature10 1 multipart file fields",
+          "show me feature10 1 multipart file fields test cases",
+          "what are the feature10 1 multipart file fields test inputs",
+          "give me the feature10_1_multipart_file_fields test file",
+          "test cases for feature 10",
+          "feature10 1 multipart file fields expected output",
+          "what does feature10 1 multipart file fields expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_1_multipart_file_fields:\n{\n  \"description\": \"Parse a multipart/form-data body (provided either as a raw string or Base64-encoded) and expose the uploaded file part to the handler.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"multipart\": true,\n        \"route\": {\n          \"method\": \"POST\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoMultipart\",\n              \"fields\": [\n                \"uploadFile1\"\n              ]\n            }\n          }\n        },\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"POST\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"content-type\": \"multipart/form-data; boundary=----WebKitFormBoundaryDP6Z1qHQSzB6Pf8c\"\n          },\n          \"body\": \"------WebKitFormBoundaryDP6Z1qHQSzB6Pf8c\\r\\nContent-Disposition: form-data; name=\\\"uploadFile1\\\"; filename=\\\"test.txt\\\"\\r\\nContent-Type: text/plain\\r\\n\\r\\nHello World!\\r\\n------WebKitFormBoundaryDP6Z1qHQSzB6Pf8c--\",\n          \"isBase64Encoded\": false\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"uploadFile1\\\":{\\\"fieldname\\\":\\\"uploadFile1\\\",\\\"filename\\\":\\\"test.txt\\\",\\\"encoding\\\":\\\"7bit\\\",\\\"mimetype\\\":\\\"text/plain\\\",\\\"content\\\":\\\"Hello World!\\\"}}\\nheader.connection=keep-alive\\nheader.content-length=132\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"multipart\": true,\n        \"route\": {\n          \"method\": \"POST\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoMultipart\",\n              \"fields\": [\n                \"uploadFile1\"\n              ]\n            }\n          }\n        },\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"POST\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"content-type\": \"multipart/form-data; boundary=----WebKitFormBoundaryDP6Z1qHQSzB6Pf8c\"\n          },\n          \"body\": \"LS0tLS0tV2ViS2l0Rm9ybUJvdW5kYXJ5RFA2WjFxSFFTekI2UGY4Yw0KQ29udGVudC1EaXNwb3NpdGlvbjogZm9ybS1kYXRhOyBuYW1lPSJ1cGxvYWRGaWxlMSI7IGZpbGVuYW1lPSJ0ZXN0LnR4dCINCkNvbnRlbnQtVHlwZTogdGV4dC9wbGFpbg0KDQpIZWxsbyBXb3JsZCENCi0tLS0tLVdlYktpdEZvcm1Cb3VuZGFyeURQNloxcUhRU3pCNlBmOGMtLQ==\",\n          \"isBase64Encoded\": true\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"uploadFile1\\\":{\\\"fieldname\\\":\\\"uploadFile1\\\",\\\"filename\\\":\\\"test.txt\\\",\\\"encoding\\\":\\\"7bit\\\",\\\"mimetype\\\":\\\"text/plain\\\",\\\"content\\\":\\\"Hello World!\\\"}}\\nheader.connection=keep-alive\\nheader.content-length=132\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_2_multipart_value_field",
+        "trigger_keywords": [
+          "test cases for feature10 2 multipart value field",
+          "show me feature10 2 multipart value field test cases",
+          "what are the feature10 2 multipart value field test inputs",
+          "give me the feature10_2_multipart_value_field test file",
+          "test cases for feature 10",
+          "feature10 2 multipart value field expected output",
+          "what does feature10 2 multipart value field expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_2_multipart_value_field:\n{\n  \"description\": \"Parse a multipart/form-data text field and expose its decoded value to the handler.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"multipart\": true,\n        \"route\": {\n          \"method\": \"POST\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoMultipart\",\n              \"fields\": [\n                \"html\"\n              ]\n            }\n          }\n        },\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"POST\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"content-type\": \"multipart/form-data; boundary=xYzZY\"\n          },\n          \"body\": \"--xYzZY\\r\\nContent-Disposition: form-data; name=\\\"html\\\"\\r\\n\\r\\n<p>Hello World</p>\\r\\n--xYzZY--\\r\\n\",\n          \"isBase64Encoded\": false\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"html\\\":{\\\"fieldname\\\":\\\"html\\\",\\\"encoding\\\":\\\"7bit\\\",\\\"mimetype\\\":\\\"text/plain\\\",\\\"value\\\":\\\"<p>Hello World</p>\\\"}}\\nheader.connection=keep-alive\\nheader.content-length=100\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_request_body",
+        "trigger_keywords": [
+          "test cases for feature1 request body",
+          "show me feature1 request body test cases",
+          "what are the feature1 request body test inputs",
+          "give me the feature1_request_body test file",
+          "test cases for feature 1",
+          "feature1 request body expected output",
+          "what does feature1 request body expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_request_body:\n{\n  \"description\": \"Decode an incoming request body and forward it to the routed handler, computing the Content-Length header; supports both a plain UTF-8 body and a Base64-encoded body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"POST\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world2\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"headers.content-type\",\n          \"headers.content-length\",\n          \"body\"\n        ],\n        \"event\": {\n          \"httpMethod\": \"POST\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\",\n            \"Content-Type\": \"application/json\"\n          },\n          \"body\": \"{\\\"greet\\\":\\\"hi\\\"}\"\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.headers.content-type=application/json\\nrequest.headers.content-length=14\\nrequest.body={\\\"greet\\\":\\\"hi\\\"}\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world2\\\"}\\nheader.connection=keep-alive\\nheader.content-length=18\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"POST\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world2\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"headers.content-type\",\n          \"headers.content-length\",\n          \"body\"\n        ],\n        \"event\": {\n          \"httpMethod\": \"POST\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\",\n            \"Content-Type\": \"application/json\"\n          },\n          \"body\": \"eyJncmVldCI6ICJoaSJ9\",\n          \"isBase64Encoded\": true\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.headers.content-type=application/json\\nrequest.headers.content-length=15\\nrequest.body={\\\"greet\\\":\\\"hi\\\"}\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world2\\\"}\\nheader.connection=keep-alive\\nheader.content-length=18\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_path_resolution",
+        "trigger_keywords": [
+          "test cases for feature2 1 path resolution",
+          "show me feature2 1 path resolution test cases",
+          "what are the feature2 1 path resolution test inputs",
+          "give me the feature2_1_path_resolution test file",
+          "test cases for feature 2",
+          "feature2 1 path resolution expected output",
+          "what does feature2 1 path resolution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_path_resolution:\n{\n  \"description\": \"Choose the path the framework routes to: prefer the explicit request path, and fall back to the raw path (deriving the method from the request context) when only that is present.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"url\"\n        ],\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.url=/test\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/prod/projects\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"url\",\n          \"query.t\"\n        ],\n        \"event\": {\n          \"version\": \"2.0\",\n          \"rawPath\": \"/prod/projects\",\n          \"requestContext\": {\n            \"http\": {\n              \"method\": \"GET\",\n              \"path\": \"/prod/projects\"\n            }\n          },\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"queryStringParameters\": {\n            \"t\": \"1698604776681\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.url=/prod/projects?t=1698604776681\\nrequest.query.t=1698604776681\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_path_parameter_as_path",
+        "trigger_keywords": [
+          "test cases for feature2 2 path parameter as path",
+          "show me feature2 2 path parameter as path test cases",
+          "what are the feature2 2 path parameter as path test inputs",
+          "give me the feature2_2_path_parameter_as_path test file",
+          "test cases for feature 2",
+          "feature2 2 path parameter as path expected output",
+          "what does feature2 2 path parameter as path expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_path_parameter_as_path:\n{\n  \"description\": \"When configured to use a named path parameter as the path, route to that parameter value instead of the full request/raw path, for both proxy-integration event shapes.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"options\": {\n          \"pathParameterUsedAsPath\": \"proxy\"\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/projects\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"url\"\n        ],\n        \"event\": {\n          \"version\": \"2.0\",\n          \"rawPath\": \"/prod/projects\",\n          \"requestContext\": {\n            \"http\": {\n              \"method\": \"GET\",\n              \"path\": \"/prod/projects\"\n            }\n          },\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"queryStringParameters\": {\n            \"t\": \"1698604776681\"\n          },\n          \"pathParameters\": {\n            \"proxy\": \"projects\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.url=/projects?t=1698604776681\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"options\": {\n          \"pathParameterUsedAsPath\": \"proxy\"\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/projects\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"url\"\n        ],\n        \"event\": {\n          \"path\": \"/area/projects\",\n          \"httpMethod\": \"GET\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"queryStringParameters\": {\n            \"t\": \"1698604776681\"\n          },\n          \"pathParameters\": {\n            \"proxy\": \"projects\"\n          },\n          \"requestContext\": {\n            \"resourcePath\": \"/area/{proxy+}\",\n            \"httpMethod\": \"GET\",\n            \"path\": \"/dev/area/projects\",\n            \"stage\": \"dev\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.url=/projects?t=1698604776681\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_stage_handling",
+        "trigger_keywords": [
+          "test cases for feature2 3 stage handling",
+          "show me feature2 3 stage handling test cases",
+          "what are the feature2 3 stage handling test inputs",
+          "give me the feature2_3_stage_handling test file",
+          "test cases for feature 2",
+          "feature2 3 stage handling expected output",
+          "what does feature2 3 stage handling expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_stage_handling:\n{\n  \"description\": \"Strip the API stage prefix from the path by default so handlers are stage-agnostic; retain the stage prefix when explicitly requested.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"url\"\n        ],\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/dev/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"requestContext\": {\n            \"resourcePath\": \"/test\",\n            \"stage\": \"dev\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.url=/test\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"options\": {\n          \"retainStage\": true\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/dev/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"url\"\n        ],\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/dev/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"requestContext\": {\n            \"resourcePath\": \"/test\",\n            \"stage\": \"dev\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.url=/dev/test\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_multi_value_query",
+        "trigger_keywords": [
+          "test cases for feature3 1 multi value query",
+          "show me feature3 1 multi value query test cases",
+          "what are the feature3 1 multi value query test inputs",
+          "give me the feature3_1_multi_value_query test file",
+          "test cases for feature 3",
+          "feature3 1 multi value query expected output",
+          "what does feature3 1 multi value query expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_multi_value_query:\n{\n  \"description\": \"Expose multi-valued query string parameters to the handler as arrays of values.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoQuery\"\n            }\n          }\n        },\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"queryStringParameters\": {\n            \"foo\": \"bar\"\n          },\n          \"multiValueQueryStringParameters\": {\n            \"foo\": [\n              \"qux\",\n              \"bar\"\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"foo\\\":[\\\"qux\\\",\\\"bar\\\"]}\\nheader.connection=keep-alive\\nheader.content-length=21\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_comma_separated_query",
+        "trigger_keywords": [
+          "test cases for feature3 2 comma separated query",
+          "show me feature3 2 comma separated query test cases",
+          "what are the feature3 2 comma separated query test inputs",
+          "give me the feature3_2_comma_separated_query test file",
+          "test cases for feature 3",
+          "feature3 2 comma separated query expected output",
+          "what does feature3 2 comma separated query expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_comma_separated_query:\n{\n  \"description\": \"For protocol version 2.0, optionally split comma-separated query values into arrays; a toggle controls whether the split happens.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoQuery\"\n            }\n          }\n        },\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"queryStringParameters\": {\n            \"foo\": \"qux,bar\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"foo\\\":[\\\"qux\\\",\\\"bar\\\"]}\\nheader.connection=keep-alive\\nheader.content-length=21\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"options\": {\n          \"parseCommaSeparatedQueryParams\": false\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoQuery\"\n            }\n          }\n        },\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"queryStringParameters\": {\n            \"foo\": \"qux,bar\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"foo\\\":\\\"qux,bar\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_elb_url_decoding",
+        "trigger_keywords": [
+          "test cases for feature3 3 elb url decoding",
+          "show me feature3 3 elb url decoding test cases",
+          "what are the feature3 3 elb url decoding test inputs",
+          "give me the feature3_3_elb_url_decoding test file",
+          "test cases for feature 3",
+          "feature3 3 elb url decoding expected output",
+          "what does feature3 3 elb url decoding expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_elb_url_decoding:\n{\n  \"description\": \"For load-balancer sourced events, URL-decode both query keys and query values (single and multi-valued).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoQuery\"\n            }\n          }\n        },\n        \"event\": {\n          \"requestContext\": {\n            \"elb\": {\n              \"targetGroupArn\": \"xxx\"\n            }\n          },\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"queryStringParameters\": {\n            \"q%24\": \"foo%3Fbar\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"q$\\\":\\\"foo?bar\\\"}\\nheader.connection=keep-alive\\nheader.content-length=16\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoQuery\"\n            }\n          }\n        },\n        \"event\": {\n          \"requestContext\": {\n            \"elb\": {\n              \"targetGroupArn\": \"xxx\"\n            }\n          },\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"queryStringParameters\": {\n            \"q%24\": \"foo%3Fbar\"\n          },\n          \"multiValueQueryStringParameters\": {\n            \"q%24\": [\n              \"foo%40bar\",\n              \"foo%3Fbar\"\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"q$\\\":[\\\"foo@bar\\\",\\\"foo?bar\\\"]}\\nheader.connection=keep-alive\\nheader.content-length=28\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_4_query_no_decode",
+        "trigger_keywords": [
+          "test cases for feature3 4 query no decode",
+          "show me feature3 4 query no decode test cases",
+          "what are the feature3 4 query no decode test inputs",
+          "give me the feature3_4_query_no_decode test file",
+          "test cases for feature 3",
+          "feature3 4 query no decode expected output",
+          "what does feature3 4 query no decode expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_4_query_no_decode:\n{\n  \"description\": \"For non load-balancer events, query values are passed through verbatim, without URL-decoding.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoQuery\"\n            }\n          }\n        },\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"queryStringParameters\": {\n            \"foo\": \"foo%3Fbar\"\n          },\n          \"multiValueQueryStringParameters\": {\n            \"foo\": [\n              \"foo%40bar\",\n              \"foo%3Fbar\"\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"foo\\\":[\\\"foo%40bar\\\",\\\"foo%3Fbar\\\"]}\\nheader.connection=keep-alive\\nheader.content-length=33\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_5_retain_event_query",
+        "trigger_keywords": [
+          "test cases for feature3 5 retain event query",
+          "show me feature3 5 retain event query test cases",
+          "what are the feature3 5 retain event query test inputs",
+          "give me the feature3_5_retain_event_query test file",
+          "test cases for feature 3",
+          "feature3 5 retain event query expected output",
+          "what does feature3 5 retain event query expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_5_retain_event_query:\n{\n  \"description\": \"Splitting comma-separated values for the handler must not mutate the original event's query parameters, which remain readable through request decoration regardless of the split toggle.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoQuery\"\n            }\n          }\n        },\n        \"probe\": [\n          \"awsLambdaEvent.queryStringParameters\"\n        ],\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"queryStringParameters\": {\n            \"foo\": \"qux,bar\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.awsLambdaEvent.queryStringParameters={\\\"foo\\\":\\\"qux,bar\\\"}\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"foo\\\":[\\\"qux\\\",\\\"bar\\\"]}\\nheader.connection=keep-alive\\nheader.content-length=21\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"options\": {\n          \"parseCommaSeparatedQueryParams\": false\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"echoQuery\"\n            }\n          }\n        },\n        \"probe\": [\n          \"awsLambdaEvent.queryStringParameters\"\n        ],\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"queryStringParameters\": {\n            \"foo\": \"qux,bar\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.awsLambdaEvent.queryStringParameters={\\\"foo\\\":\\\"qux,bar\\\"}\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"foo\\\":\\\"qux,bar\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_cookies_to_cookie_header",
+        "trigger_keywords": [
+          "test cases for feature4 1 cookies to cookie header",
+          "show me feature4 1 cookies to cookie header test cases",
+          "what are the feature4 1 cookies to cookie header test inputs",
+          "give me the feature4_1_cookies_to_cookie_header test file",
+          "test cases for feature 4",
+          "feature4 1 cookies to cookie header expected output",
+          "what does feature4 1 cookies to cookie header expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_cookies_to_cookie_header:\n{\n  \"description\": \"Join the protocol v2 cookie list into a single Cookie request header visible to the handler.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"headers.cookie\"\n        ],\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"cookies\": [\n            \"foo=bar\"\n          ],\n          \"queryStringParameters\": \"\"\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.headers.cookie=foo=bar\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_multi_value_headers",
+        "trigger_keywords": [
+          "test cases for feature4 2 multi value headers",
+          "show me feature4 2 multi value headers test cases",
+          "what are the feature4 2 multi value headers test inputs",
+          "give me the feature4_2_multi_value_headers test file",
+          "test cases for feature 4",
+          "feature4 2 multi value headers expected output",
+          "what does feature4 2 multi value headers expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_2_multi_value_headers:\n{\n  \"description\": \"Promote a header to the request only when it carries more than one value; a multi-header with a single value is not promoted, and a header with several values is exposed as the combined value.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"headers.x-multi\"\n        ],\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"x-multi\": \"just-the-first\"\n          },\n          \"multiValueHeaders\": {\n            \"x-multi\": [\n              \"just-the-first\",\n              \"and-the-second\"\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.headers.x-multi=just-the-first,and-the-second\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"headers.x-custom-multi-bad\",\n          \"headers.x-custom-multi-gut\"\n        ],\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"multiValueHeaders\": {\n            \"x-custom-multi-bad\": [\n              \"100\"\n            ],\n            \"x-custom-multi-gut\": [\n              \"100\",\n              \"200\"\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.headers.x-custom-multi-bad=<undefined>\\nrequest.headers.x-custom-multi-gut=100,200\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_3_serialize_event_header",
+        "trigger_keywords": [
+          "test cases for feature4 3 serialize event header",
+          "show me feature4 3 serialize event header test cases",
+          "what are the feature4 3 serialize event header test inputs",
+          "give me the feature4_3_serialize_event_header test file",
+          "test cases for feature 4",
+          "feature4 3 serialize event header expected output",
+          "what does feature4 3 serialize event header expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_3_serialize_event_header:\n{\n  \"description\": \"Optionally serialize the original invocation event into a URL-encoded request header so handlers can inspect the raw event; the header is absent when the feature is off (the default).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"options\": {\n          \"serializeLambdaArguments\": true\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"headers.x-apigateway-event\"\n        ],\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.headers.x-apigateway-event=%7B%22version%22%3A%222.0%22%2C%22httpMethod%22%3A%22GET%22%2C%22path%22%3A%22%2Ftest%22%2C%22headers%22%3A%7B%22X-My-Header%22%3A%22wuuusaaa%22%7D%7D\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    },\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"headers.x-apigateway-event\"\n        ],\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.headers.x-apigateway-event=<undefined>\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_response_json_cookies_v2",
+        "trigger_keywords": [
+          "test cases for feature5 1 response json cookies v2",
+          "show me feature5 1 response json cookies v2 test cases",
+          "what are the feature5 1 response json cookies v2 test inputs",
+          "give me the feature5_1_response_json_cookies_v2 test file",
+          "test cases for feature 5",
+          "feature5 1 response json cookies v2 expected output",
+          "what does feature5 1 response json cookies v2 expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_response_json_cookies_v2:\n{\n  \"description\": \"Render a JSON handler response into a proxy result; for protocol v2, Set-Cookie headers are returned as a dedicated cookie list rather than response headers.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"headers\": {\n              \"Set-Cookie\": [\n                \"qwerty=one\",\n                \"qwerty=two\"\n              ]\n            },\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\ncookies=qwerty=one,qwerty=two\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_response_v1_cookies_and_joined_header",
+        "trigger_keywords": [
+          "test cases for feature5 2 response v1 cookies and joined header",
+          "show me feature5 2 response v1 cookies and joined header test cases",
+          "what are the feature5 2 response v1 cookies and joined header test inputs",
+          "give me the feature5_2_response_v1_cookies_and_joined_header test file",
+          "test cases for feature 5",
+          "feature5 2 response v1 cookies and joined header expected output",
+          "what does feature5 2 response v1 cookies and joined header expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_response_v1_cookies_and_joined_header:\n{\n  \"description\": \"For protocol v1 (no version field), Set-Cookie values are returned under a multi-value headers map; other multi-valued response headers are comma-joined into a single header value.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"POST\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"headers\": {\n              \"Set-Cookie\": [\n                \"qwerty=one\",\n                \"qwerty=two\"\n              ],\n              \"X-Custom-Header\": [\n                \"ciao\",\n                \"salve\"\n              ]\n            },\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world2\"\n              }\n            }\n          }\n        },\n        \"event\": {\n          \"httpMethod\": \"POST\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"Content-Type\": \"application/json\"\n          },\n          \"body\": \"{\\\"greet\\\":\\\"hi\\\"}\"\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world2\\\"}\\nheader.connection=keep-alive\\nheader.content-length=18\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\nheader.x-custom-header=ciao,salve\\nmultiValueHeaders.set-cookie=qwerty=one,qwerty=two\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_3_response_empty_and_coercion",
+        "trigger_keywords": [
+          "test cases for feature5 3 response empty and coercion",
+          "show me feature5 3 response empty and coercion test cases",
+          "what are the feature5 3 response empty and coercion test inputs",
+          "give me the feature5_3_response_empty_and_coercion test file",
+          "test cases for feature 5",
+          "feature5 3 response empty and coercion expected output",
+          "what does feature5 3 response empty and coercion expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_response_empty_and_coercion:\n{\n  \"description\": \"An empty handler response yields an empty body with zero Content-Length; non-string response header values are coerced to strings; removing Content-Type omits it from the result.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"headers\": {\n              \"Set-Cookie\": [\n                \"qwerty=one\",\n                \"qwerty=two\"\n              ],\n              \"x-non-string\": 1717171717171\n            },\n            \"removeContentType\": true,\n            \"body\": {\n              \"type\": \"empty\"\n            }\n          }\n        },\n        \"event\": {\n          \"requestContext\": {\n            \"http\": {\n              \"method\": \"GET\"\n            }\n          },\n          \"rawPath\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"queryStringParameters\": \"\"\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody=\\nheader.connection=keep-alive\\nheader.content-length=0\\nheader.date=<present>\\nheader.x-non-string=1717171717171\\nmultiValueHeaders.set-cookie=qwerty=one,qwerty=two\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_binary_mime_types",
+        "trigger_keywords": [
+          "test cases for feature6 1 binary mime types",
+          "show me feature6 1 binary mime types test cases",
+          "what are the feature6 1 binary mime types test inputs",
+          "give me the feature6_1_binary_mime_types test file",
+          "test cases for feature 6",
+          "feature6 1 binary mime types expected output",
+          "what does feature6 1 binary mime types expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_binary_mime_types:\n{\n  \"description\": \"When the response Content-Type matches a configured binary MIME type, the body is Base64-encoded and flagged as such.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"options\": {\n          \"binaryMimeTypes\": [\n            \"application/octet-stream\"\n          ]\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"bytes\",\n              \"value\": \"SGVsbG8gYmluYXJ5IHBheWxvYWQh\"\n            }\n          }\n        },\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=true\\nbody=SGVsbG8gYmluYXJ5IHBheWxvYWQh\\nheader.connection=keep-alive\\nheader.content-length=21\\nheader.content-type=application/octet-stream\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_2_content_encoding_base64",
+        "trigger_keywords": [
+          "test cases for feature6 2 content encoding base64",
+          "show me feature6 2 content encoding base64 test cases",
+          "what are the feature6 2 content encoding base64 test inputs",
+          "give me the feature6_2_content_encoding_base64 test file",
+          "test cases for feature 6",
+          "feature6 2 content encoding base64 expected output",
+          "what does feature6 2 content encoding base64 expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_2_content_encoding_base64:\n{\n  \"description\": \"A compressed response (non-identity Content-Encoding) is Base64-encoded by default even without a configured binary MIME type.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"options\": {\n          \"binaryMimeTypes\": []\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"headers\": {\n              \"content-encoding\": \"br\"\n            },\n            \"body\": {\n              \"type\": \"bytes\",\n              \"value\": \"SGVsbG8gYmluYXJ5IHBheWxvYWQh\"\n            }\n          }\n        },\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=true\\nbody=SGVsbG8gYmluYXJ5IHBheWxvYWQh\\nheader.connection=keep-alive\\nheader.content-encoding=br\\nheader.content-length=21\\nheader.content-type=application/octet-stream\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_3_custom_base64_predicate",
+        "trigger_keywords": [
+          "test cases for feature6 3 custom base64 predicate",
+          "show me feature6 3 custom base64 predicate test cases",
+          "what are the feature6 3 custom base64 predicate test inputs",
+          "give me the feature6_3_custom_base64_predicate test file",
+          "test cases for feature 6",
+          "feature6 3 custom base64 predicate expected output",
+          "what does feature6 3 custom base64 predicate expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_3_custom_base64_predicate:\n{\n  \"description\": \"A caller-supplied predicate decides whether a response should be Base64-encoded based on the response headers.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"options\": {\n          \"binaryMimeTypes\": []\n        },\n        \"enforceBase64\": {\n          \"header\": \"x-base64-encoded\",\n          \"equals\": \"1\"\n        },\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"headers\": {\n              \"X-Base64-Encoded\": \"1\"\n            },\n            \"body\": {\n              \"type\": \"bytes\",\n              \"value\": \"SGVsbG8gYmluYXJ5IHBheWxvYWQh\"\n            }\n          }\n        },\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=true\\nbody=SGVsbG8gYmluYXJ5IHBheWxvYWQh\\nheader.connection=keep-alive\\nheader.content-length=21\\nheader.content-type=application/octet-stream\\nheader.date=<present>\\nheader.x-base64-encoded=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_1_request_decoration",
+        "trigger_keywords": [
+          "test cases for feature7 1 request decoration",
+          "show me feature7 1 request decoration test cases",
+          "what are the feature7 1 request decoration test inputs",
+          "give me the feature7_1_request_decoration test file",
+          "test cases for feature 7",
+          "feature7 1 request decoration expected output",
+          "what does feature7 1 request decoration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_1_request_decoration:\n{\n  \"description\": \"Decorate the request so the handler can read the original invocation event and the original invocation context.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"probe\": [\n          \"awsLambdaEvent.httpMethod\",\n          \"awsLambdaContext\"\n        ],\n        \"context\": {\n          \"functionName\": \"fn\"\n        },\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nrequest.awsLambdaEvent.httpMethod=GET\\nrequest.awsLambdaContext={\\\"functionName\\\":\\\"fn\\\"}\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_2_decoration_in_hook",
+        "trigger_keywords": [
+          "test cases for feature7 2 decoration in hook",
+          "show me feature7 2 decoration in hook test cases",
+          "what are the feature7 2 decoration in hook test inputs",
+          "give me the feature7_2_decoration_in_hook test file",
+          "test cases for feature 7",
+          "feature7 2 decoration in hook expected output",
+          "what does feature7 2 decoration in hook expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_2_decoration_in_hook:\n{\n  \"description\": \"The request decoration is available in lifecycle hooks that run before the handler, not only inside the handler.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"onRequestProbe\": [\n          \"awsLambdaEvent.httpMethod\"\n        ],\n        \"event\": {\n          \"version\": \"2.0\",\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[request]\\nonRequest.awsLambdaEvent.httpMethod=GET\\n[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_1_callback_invocation",
+        "trigger_keywords": [
+          "test cases for feature8 1 callback invocation",
+          "show me feature8 1 callback invocation test cases",
+          "what are the feature8 1 callback invocation test inputs",
+          "give me the feature8_1_callback_invocation test file",
+          "test cases for feature 8",
+          "feature8 1 callback invocation expected output",
+          "what does feature8 1 callback invocation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_1_callback_invocation:\n{\n  \"description\": \"Support node-style callback invocation: the proxy delivers the same proxy result through a callback as it does through a promise.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"invoke\": \"callback\",\n        \"context\": {},\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"headers\": {\n              \"Set-Cookie\": [\n                \"qwerty=one\",\n                \"qwerty=two\"\n              ]\n            },\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"event\": {\n          \"version\": \"2.0\",\n          \"requestContext\": {\n            \"http\": {\n              \"method\": \"GET\"\n            }\n          },\n          \"rawPath\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          },\n          \"queryStringParameters\": \"\"\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\ncookies=qwerty=one,qwerty=two\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_2_callback_waits_option",
+        "trigger_keywords": [
+          "test cases for feature8 2 callback waits option",
+          "show me feature8 2 callback waits option test cases",
+          "what are the feature8 2 callback waits option test inputs",
+          "give me the feature8_2_callback_waits_option test file",
+          "test cases for feature 8",
+          "feature8 2 callback waits option expected output",
+          "what does feature8 2 callback waits option expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_2_callback_waits_option:\n{\n  \"description\": \"When provided, the empty-event-loop-wait flag is written onto the invocation context before the request is processed.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"options\": {\n          \"callbackWaitsForEmptyEventLoop\": false\n        },\n        \"invoke\": \"callback\",\n        \"context\": {},\n        \"emitContext\": [\n          \"callbackWaitsForEmptyEventLoop\"\n        ],\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n[context]\\ncontext.callbackWaitsForEmptyEventLoop=false\\n\"\n    },\n    {\n      \"input\": {\n        \"options\": {\n          \"callbackWaitsForEmptyEventLoop\": true\n        },\n        \"invoke\": \"callback\",\n        \"context\": {},\n        \"emitContext\": [\n          \"callbackWaitsForEmptyEventLoop\"\n        ],\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"event\": {\n          \"httpMethod\": \"GET\",\n          \"path\": \"/test\",\n          \"headers\": {\n            \"X-My-Header\": \"wuuusaaa\"\n          }\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=200\\nisBase64Encoded=false\\nbody={\\\"hello\\\":\\\"world\\\"}\\nheader.connection=keep-alive\\nheader.content-length=17\\nheader.content-type=application/json; charset=utf-8\\nheader.date=<present>\\n[context]\\ncontext.callbackWaitsForEmptyEventLoop=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_error_resilience",
+        "trigger_keywords": [
+          "test cases for feature9 error resilience",
+          "show me feature9 error resilience test cases",
+          "what are the feature9 error resilience test inputs",
+          "give me the feature9_error_resilience test file",
+          "test cases for feature 9",
+          "feature9 error resilience expected output",
+          "what does feature9 error resilience expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_error_resilience:\n{\n  \"description\": \"If the underlying request processing fails unexpectedly, the proxy returns a 500 result with an empty body and no headers instead of leaking the failure, for both promise and callback invocation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"simulateInjectError\": true,\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"event\": {\n          \"requestContext\": {},\n          \"rawPath\": \"/test\",\n          \"queryStringParameters\": \"\"\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=500\\nisBase64Encoded=<undefined>\\nbody=\\n\"\n    },\n    {\n      \"input\": {\n        \"simulateInjectError\": true,\n        \"invoke\": \"callback\",\n        \"context\": null,\n        \"route\": {\n          \"method\": \"GET\",\n          \"path\": \"/test\",\n          \"reply\": {\n            \"body\": {\n              \"type\": \"json\",\n              \"value\": {\n                \"hello\": \"world\"\n              }\n            }\n          }\n        },\n        \"event\": {\n          \"requestContext\": {},\n          \"rawPath\": \"/test\",\n          \"queryStringParameters\": \"\"\n        }\n      },\n      \"expected_output\": \"[response]\\nstatus=500\\nisBase64Encoded=<undefined>\\nbody=\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "that comma thing for v2 payloads",
+        "actual_meaning": "The `parseCommaSeparatedQueryParams` option (default true): for payload version 2.0 events, comma-separated query values are split into arrays; controlled by `options.parseCommaSeparatedQueryParams`, tested in `feature3_2_comma_separated_query.json`"
+      },
+      {
+        "vague_reference": "the weird event blobs",
+        "actual_meaning": "AWS API Gateway proxy integration events in three shapes: payload format v1.0 (httpMethod + path), payload format v2.0 (version: '2.0' + rawPath + requestContext.http), and Application Load Balancer events (requestContext.elb present) — each requiring different normalization paths in the event parsing unit"
+      }
+    ],
+    "fallback_response": "That's a good question but I don't have specific details on that aspect — you'll need to look at the existing routing and encoding modules in the codebase to find the right pattern, or check with the original dev who built the login compatibility logic we referenced earlier."
+  },
+  "public_test_cases": {
+    "feature10_1_multipart_file_fields.json": {
+      "description": "Parse a multipart/form-data body (provided either as a raw string or Base64-encoded) and expose the uploaded file part to the handler.",
+      "cases": [
+        {
+          "input": {
+            "multipart": true,
+            "route": {
+              "method": "POST",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoMultipart",
+                  "fields": [
+                    "uploadFile1"
+                  ]
+                }
+              }
+            },
+            "event": {
+              "version": "2.0",
+              "httpMethod": "POST",
+              "path": "/test",
+              "headers": {
+                "content-type": "multipart/form-data; boundary=----WebKitFormBoundaryDP6Z1qHQSzB6Pf8c"
+              },
+              "body": "------WebKitFormBoundaryDP6Z1qHQSzB6Pf8c\r\nContent-Disposition: form-data; name=\"uploadFile1\"; filename=\"test.txt\"\r\nContent-Type: text/plain\r\n\r\nHello World!\r\n------WebKitFormBoundaryDP6Z1qHQSzB6Pf8c--",
+              "isBase64Encoded": false
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"uploadFile1\":{\"fieldname\":\"uploadFile1\",\"filename\":\"test.txt\",\"encoding\":\"7bit\",\"mimetype\":\"text/plain\",\"content\":\"Hello World!\"}}\nheader.connection=keep-alive\nheader.content-length=132\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "multipart": true,
+            "route": {
+              "method": "POST",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoMultipart",
+                  "fields": [
+                    "uploadFile1"
+                  ]
+                }
+              }
+            },
+            "event": {
+              "version": "2.0",
+              "httpMethod": "POST",
+              "path": "/test",
+              "headers": {
+                "content-type": "multipart/form-data; boundary=----WebKitFormBoundaryDP6Z1qHQSzB6Pf8c"
+              },
+              "body": "LS0tLS0tV2ViS2l0Rm9ybUJvdW5kYXJ5RFA2WjFxSFFTekI2UGY4Yw0KQ29udGVudC1EaXNwb3NpdGlvbjogZm9ybS1kYXRhOyBuYW1lPSJ1cGxvYWRGaWxlMSI7IGZpbGVuYW1lPSJ0ZXN0LnR4dCINCkNvbnRlbnQtVHlwZTogdGV4dC9wbGFpbg0KDQpIZWxsbyBXb3JsZCENCi0tLS0tLVdlYktpdEZvcm1Cb3VuZGFyeURQNloxcUhRU3pCNlBmOGMtLQ==",
+              "isBase64Encoded": true
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"uploadFile1\":{\"fieldname\":\"uploadFile1\",\"filename\":\"test.txt\",\"encoding\":\"7bit\",\"mimetype\":\"text/plain\",\"content\":\"Hello World!\"}}\nheader.connection=keep-alive\nheader.content-length=132\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature10_2_multipart_value_field.json": {
+      "description": "Parse a multipart/form-data text field and expose its decoded value to the handler.",
+      "cases": [
+        {
+          "input": {
+            "multipart": true,
+            "route": {
+              "method": "POST",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoMultipart",
+                  "fields": [
+                    "html"
+                  ]
+                }
+              }
+            },
+            "event": {
+              "version": "2.0",
+              "httpMethod": "POST",
+              "path": "/test",
+              "headers": {
+                "content-type": "multipart/form-data; boundary=xYzZY"
+              },
+              "body": "--xYzZY\r\nContent-Disposition: form-data; name=\"html\"\r\n\r\n<p>Hello World</p>\r\n--xYzZY--\r\n",
+              "isBase64Encoded": false
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"html\":{\"fieldname\":\"html\",\"encoding\":\"7bit\",\"mimetype\":\"text/plain\",\"value\":\"<p>Hello World</p>\"}}\nheader.connection=keep-alive\nheader.content-length=100\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature1_request_body.json": {
+      "description": "Decode an incoming request body and forward it to the routed handler, computing the Content-Length header; supports both a plain UTF-8 body and a Base64-encoded body.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "POST",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world2"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "headers.content-type",
+              "headers.content-length",
+              "body"
+            ],
+            "event": {
+              "httpMethod": "POST",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa",
+                "Content-Type": "application/json"
+              },
+              "body": "{\"greet\":\"hi\"}"
+            }
+          },
+          "expected_output": "[request]\nrequest.headers.content-type=application/json\nrequest.headers.content-length=14\nrequest.body={\"greet\":\"hi\"}\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world2\"}\nheader.connection=keep-alive\nheader.content-length=18\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "route": {
+              "method": "POST",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world2"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "headers.content-type",
+              "headers.content-length",
+              "body"
+            ],
+            "event": {
+              "httpMethod": "POST",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa",
+                "Content-Type": "application/json"
+              },
+              "body": "eyJncmVldCI6ICJoaSJ9",
+              "isBase64Encoded": true
+            }
+          },
+          "expected_output": "[request]\nrequest.headers.content-type=application/json\nrequest.headers.content-length=15\nrequest.body={\"greet\":\"hi\"}\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world2\"}\nheader.connection=keep-alive\nheader.content-length=18\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature2_1_path_resolution.json": {
+      "description": "Choose the path the framework routes to: prefer the explicit request path, and fall back to the raw path (deriving the method from the request context) when only that is present.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "url"
+            ],
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.url=/test\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/prod/projects",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "url",
+              "query.t"
+            ],
+            "event": {
+              "version": "2.0",
+              "rawPath": "/prod/projects",
+              "requestContext": {
+                "http": {
+                  "method": "GET",
+                  "path": "/prod/projects"
+                }
+              },
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "queryStringParameters": {
+                "t": "1698604776681"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.url=/prod/projects?t=1698604776681\nrequest.query.t=1698604776681\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature2_2_path_parameter_as_path.json": {
+      "description": "When configured to use a named path parameter as the path, route to that parameter value instead of the full request/raw path, for both proxy-integration event shapes.",
+      "cases": [
+        {
+          "input": {
+            "options": {
+              "pathParameterUsedAsPath": "proxy"
+            },
+            "route": {
+              "method": "GET",
+              "path": "/projects",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "url"
+            ],
+            "event": {
+              "version": "2.0",
+              "rawPath": "/prod/projects",
+              "requestContext": {
+                "http": {
+                  "method": "GET",
+                  "path": "/prod/projects"
+                }
+              },
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "queryStringParameters": {
+                "t": "1698604776681"
+              },
+              "pathParameters": {
+                "proxy": "projects"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.url=/projects?t=1698604776681\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "options": {
+              "pathParameterUsedAsPath": "proxy"
+            },
+            "route": {
+              "method": "GET",
+              "path": "/projects",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "url"
+            ],
+            "event": {
+              "path": "/area/projects",
+              "httpMethod": "GET",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "queryStringParameters": {
+                "t": "1698604776681"
+              },
+              "pathParameters": {
+                "proxy": "projects"
+              },
+              "requestContext": {
+                "resourcePath": "/area/{proxy+}",
+                "httpMethod": "GET",
+                "path": "/dev/area/projects",
+                "stage": "dev"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.url=/projects?t=1698604776681\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature2_3_stage_handling.json": {
+      "description": "Strip the API stage prefix from the path by default so handlers are stage-agnostic; retain the stage prefix when explicitly requested.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "url"
+            ],
+            "event": {
+              "httpMethod": "GET",
+              "path": "/dev/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "requestContext": {
+                "resourcePath": "/test",
+                "stage": "dev"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.url=/test\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "options": {
+              "retainStage": true
+            },
+            "route": {
+              "method": "GET",
+              "path": "/dev/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "url"
+            ],
+            "event": {
+              "httpMethod": "GET",
+              "path": "/dev/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "requestContext": {
+                "resourcePath": "/test",
+                "stage": "dev"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.url=/dev/test\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature3_1_multi_value_query.json": {
+      "description": "Expose multi-valued query string parameters to the handler as arrays of values.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoQuery"
+                }
+              }
+            },
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "queryStringParameters": {
+                "foo": "bar"
+              },
+              "multiValueQueryStringParameters": {
+                "foo": [
+                  "qux",
+                  "bar"
+                ]
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"foo\":[\"qux\",\"bar\"]}\nheader.connection=keep-alive\nheader.content-length=21\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature3_2_comma_separated_query.json": {
+      "description": "For protocol version 2.0, optionally split comma-separated query values into arrays; a toggle controls whether the split happens.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoQuery"
+                }
+              }
+            },
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "queryStringParameters": {
+                "foo": "qux,bar"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"foo\":[\"qux\",\"bar\"]}\nheader.connection=keep-alive\nheader.content-length=21\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "options": {
+              "parseCommaSeparatedQueryParams": false
+            },
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoQuery"
+                }
+              }
+            },
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "queryStringParameters": {
+                "foo": "qux,bar"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"foo\":\"qux,bar\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature3_3_elb_url_decoding.json": {
+      "description": "For load-balancer sourced events, URL-decode both query keys and query values (single and multi-valued).",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoQuery"
+                }
+              }
+            },
+            "event": {
+              "requestContext": {
+                "elb": {
+                  "targetGroupArn": "xxx"
+                }
+              },
+              "httpMethod": "GET",
+              "path": "/test",
+              "queryStringParameters": {
+                "q%24": "foo%3Fbar"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"q$\":\"foo?bar\"}\nheader.connection=keep-alive\nheader.content-length=16\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoQuery"
+                }
+              }
+            },
+            "event": {
+              "requestContext": {
+                "elb": {
+                  "targetGroupArn": "xxx"
+                }
+              },
+              "httpMethod": "GET",
+              "path": "/test",
+              "queryStringParameters": {
+                "q%24": "foo%3Fbar"
+              },
+              "multiValueQueryStringParameters": {
+                "q%24": [
+                  "foo%40bar",
+                  "foo%3Fbar"
+                ]
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"q$\":[\"foo@bar\",\"foo?bar\"]}\nheader.connection=keep-alive\nheader.content-length=28\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature3_4_query_no_decode.json": {
+      "description": "For non load-balancer events, query values are passed through verbatim, without URL-decoding.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoQuery"
+                }
+              }
+            },
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "queryStringParameters": {
+                "foo": "foo%3Fbar"
+              },
+              "multiValueQueryStringParameters": {
+                "foo": [
+                  "foo%40bar",
+                  "foo%3Fbar"
+                ]
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"foo\":[\"foo%40bar\",\"foo%3Fbar\"]}\nheader.connection=keep-alive\nheader.content-length=33\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature3_5_retain_event_query.json": {
+      "description": "Splitting comma-separated values for the handler must not mutate the original event's query parameters, which remain readable through request decoration regardless of the split toggle.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoQuery"
+                }
+              }
+            },
+            "probe": [
+              "awsLambdaEvent.queryStringParameters"
+            ],
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "queryStringParameters": {
+                "foo": "qux,bar"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.awsLambdaEvent.queryStringParameters={\"foo\":\"qux,bar\"}\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"foo\":[\"qux\",\"bar\"]}\nheader.connection=keep-alive\nheader.content-length=21\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "options": {
+              "parseCommaSeparatedQueryParams": false
+            },
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "echoQuery"
+                }
+              }
+            },
+            "probe": [
+              "awsLambdaEvent.queryStringParameters"
+            ],
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "queryStringParameters": {
+                "foo": "qux,bar"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.awsLambdaEvent.queryStringParameters={\"foo\":\"qux,bar\"}\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"foo\":\"qux,bar\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature4_1_cookies_to_cookie_header.json": {
+      "description": "Join the protocol v2 cookie list into a single Cookie request header visible to the handler.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "headers.cookie"
+            ],
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "cookies": [
+                "foo=bar"
+              ],
+              "queryStringParameters": ""
+            }
+          },
+          "expected_output": "[request]\nrequest.headers.cookie=foo=bar\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature4_2_multi_value_headers.json": {
+      "description": "Promote a header to the request only when it carries more than one value; a multi-header with a single value is not promoted, and a header with several values is exposed as the combined value.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "headers.x-multi"
+            ],
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "x-multi": "just-the-first"
+              },
+              "multiValueHeaders": {
+                "x-multi": [
+                  "just-the-first",
+                  "and-the-second"
+                ]
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.headers.x-multi=just-the-first,and-the-second\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "headers.x-custom-multi-bad",
+              "headers.x-custom-multi-gut"
+            ],
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "multiValueHeaders": {
+                "x-custom-multi-bad": [
+                  "100"
+                ],
+                "x-custom-multi-gut": [
+                  "100",
+                  "200"
+                ]
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.headers.x-custom-multi-bad=<undefined>\nrequest.headers.x-custom-multi-gut=100,200\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature4_3_serialize_event_header.json": {
+      "description": "Optionally serialize the original invocation event into a URL-encoded request header so handlers can inspect the raw event; the header is absent when the feature is off (the default).",
+      "cases": [
+        {
+          "input": {
+            "options": {
+              "serializeLambdaArguments": true
+            },
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "headers.x-apigateway-event"
+            ],
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.headers.x-apigateway-event=%7B%22version%22%3A%222.0%22%2C%22httpMethod%22%3A%22GET%22%2C%22path%22%3A%22%2Ftest%22%2C%22headers%22%3A%7B%22X-My-Header%22%3A%22wuuusaaa%22%7D%7D\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        },
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "headers.x-apigateway-event"
+            ],
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.headers.x-apigateway-event=<undefined>\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature5_1_response_json_cookies_v2.json": {
+      "description": "Render a JSON handler response into a proxy result; for protocol v2, Set-Cookie headers are returned as a dedicated cookie list rather than response headers.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "headers": {
+                  "Set-Cookie": [
+                    "qwerty=one",
+                    "qwerty=two"
+                  ]
+                },
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\ncookies=qwerty=one,qwerty=two\n"
+        }
+      ]
+    },
+    "feature5_2_response_v1_cookies_and_joined_header.json": {
+      "description": "For protocol v1 (no version field), Set-Cookie values are returned under a multi-value headers map; other multi-valued response headers are comma-joined into a single header value.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "POST",
+              "path": "/test",
+              "reply": {
+                "headers": {
+                  "Set-Cookie": [
+                    "qwerty=one",
+                    "qwerty=two"
+                  ],
+                  "X-Custom-Header": [
+                    "ciao",
+                    "salve"
+                  ]
+                },
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world2"
+                  }
+                }
+              }
+            },
+            "event": {
+              "httpMethod": "POST",
+              "path": "/test",
+              "headers": {
+                "Content-Type": "application/json"
+              },
+              "body": "{\"greet\":\"hi\"}"
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world2\"}\nheader.connection=keep-alive\nheader.content-length=18\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\nheader.x-custom-header=ciao,salve\nmultiValueHeaders.set-cookie=qwerty=one,qwerty=two\n"
+        }
+      ]
+    },
+    "feature5_3_response_empty_and_coercion.json": {
+      "description": "An empty handler response yields an empty body with zero Content-Length; non-string response header values are coerced to strings; removing Content-Type omits it from the result.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "headers": {
+                  "Set-Cookie": [
+                    "qwerty=one",
+                    "qwerty=two"
+                  ],
+                  "x-non-string": 1717171717171
+                },
+                "removeContentType": true,
+                "body": {
+                  "type": "empty"
+                }
+              }
+            },
+            "event": {
+              "requestContext": {
+                "http": {
+                  "method": "GET"
+                }
+              },
+              "rawPath": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "queryStringParameters": ""
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody=\nheader.connection=keep-alive\nheader.content-length=0\nheader.date=<present>\nheader.x-non-string=1717171717171\nmultiValueHeaders.set-cookie=qwerty=one,qwerty=two\n"
+        }
+      ]
+    },
+    "feature6_1_binary_mime_types.json": {
+      "description": "When the response Content-Type matches a configured binary MIME type, the body is Base64-encoded and flagged as such.",
+      "cases": [
+        {
+          "input": {
+            "options": {
+              "binaryMimeTypes": [
+                "application/octet-stream"
+              ]
+            },
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "bytes",
+                  "value": "SGVsbG8gYmluYXJ5IHBheWxvYWQh"
+                }
+              }
+            },
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=true\nbody=SGVsbG8gYmluYXJ5IHBheWxvYWQh\nheader.connection=keep-alive\nheader.content-length=21\nheader.content-type=application/octet-stream\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature6_2_content_encoding_base64.json": {
+      "description": "A compressed response (non-identity Content-Encoding) is Base64-encoded by default even without a configured binary MIME type.",
+      "cases": [
+        {
+          "input": {
+            "options": {
+              "binaryMimeTypes": []
+            },
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "headers": {
+                  "content-encoding": "br"
+                },
+                "body": {
+                  "type": "bytes",
+                  "value": "SGVsbG8gYmluYXJ5IHBheWxvYWQh"
+                }
+              }
+            },
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=true\nbody=SGVsbG8gYmluYXJ5IHBheWxvYWQh\nheader.connection=keep-alive\nheader.content-encoding=br\nheader.content-length=21\nheader.content-type=application/octet-stream\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature6_3_custom_base64_predicate.json": {
+      "description": "A caller-supplied predicate decides whether a response should be Base64-encoded based on the response headers.",
+      "cases": [
+        {
+          "input": {
+            "options": {
+              "binaryMimeTypes": []
+            },
+            "enforceBase64": {
+              "header": "x-base64-encoded",
+              "equals": "1"
+            },
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "headers": {
+                  "X-Base64-Encoded": "1"
+                },
+                "body": {
+                  "type": "bytes",
+                  "value": "SGVsbG8gYmluYXJ5IHBheWxvYWQh"
+                }
+              }
+            },
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=true\nbody=SGVsbG8gYmluYXJ5IHBheWxvYWQh\nheader.connection=keep-alive\nheader.content-length=21\nheader.content-type=application/octet-stream\nheader.date=<present>\nheader.x-base64-encoded=1\n"
+        }
+      ]
+    },
+    "feature7_1_request_decoration.json": {
+      "description": "Decorate the request so the handler can read the original invocation event and the original invocation context.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "probe": [
+              "awsLambdaEvent.httpMethod",
+              "awsLambdaContext"
+            ],
+            "context": {
+              "functionName": "fn"
+            },
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[request]\nrequest.awsLambdaEvent.httpMethod=GET\nrequest.awsLambdaContext={\"functionName\":\"fn\"}\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature7_2_decoration_in_hook.json": {
+      "description": "The request decoration is available in lifecycle hooks that run before the handler, not only inside the handler.",
+      "cases": [
+        {
+          "input": {
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "onRequestProbe": [
+              "awsLambdaEvent.httpMethod"
+            ],
+            "event": {
+              "version": "2.0",
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[request]\nonRequest.awsLambdaEvent.httpMethod=GET\n[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n"
+        }
+      ]
+    },
+    "feature8_1_callback_invocation.json": {
+      "description": "Support node-style callback invocation: the proxy delivers the same proxy result through a callback as it does through a promise.",
+      "cases": [
+        {
+          "input": {
+            "invoke": "callback",
+            "context": {},
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "headers": {
+                  "Set-Cookie": [
+                    "qwerty=one",
+                    "qwerty=two"
+                  ]
+                },
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "event": {
+              "version": "2.0",
+              "requestContext": {
+                "http": {
+                  "method": "GET"
+                }
+              },
+              "rawPath": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              },
+              "queryStringParameters": ""
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\ncookies=qwerty=one,qwerty=two\n"
+        }
+      ]
+    },
+    "feature8_2_callback_waits_option.json": {
+      "description": "When provided, the empty-event-loop-wait flag is written onto the invocation context before the request is processed.",
+      "cases": [
+        {
+          "input": {
+            "options": {
+              "callbackWaitsForEmptyEventLoop": false
+            },
+            "invoke": "callback",
+            "context": {},
+            "emitContext": [
+              "callbackWaitsForEmptyEventLoop"
+            ],
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n[context]\ncontext.callbackWaitsForEmptyEventLoop=false\n"
+        },
+        {
+          "input": {
+            "options": {
+              "callbackWaitsForEmptyEventLoop": true
+            },
+            "invoke": "callback",
+            "context": {},
+            "emitContext": [
+              "callbackWaitsForEmptyEventLoop"
+            ],
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "event": {
+              "httpMethod": "GET",
+              "path": "/test",
+              "headers": {
+                "X-My-Header": "wuuusaaa"
+              }
+            }
+          },
+          "expected_output": "[response]\nstatus=200\nisBase64Encoded=false\nbody={\"hello\":\"world\"}\nheader.connection=keep-alive\nheader.content-length=17\nheader.content-type=application/json; charset=utf-8\nheader.date=<present>\n[context]\ncontext.callbackWaitsForEmptyEventLoop=true\n"
+        }
+      ]
+    },
+    "feature9_error_resilience.json": {
+      "description": "If the underlying request processing fails unexpectedly, the proxy returns a 500 result with an empty body and no headers instead of leaking the failure, for both promise and callback invocation.",
+      "cases": [
+        {
+          "input": {
+            "simulateInjectError": true,
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "event": {
+              "requestContext": {},
+              "rawPath": "/test",
+              "queryStringParameters": ""
+            }
+          },
+          "expected_output": "[response]\nstatus=500\nisBase64Encoded=<undefined>\nbody=\n"
+        },
+        {
+          "input": {
+            "simulateInjectError": true,
+            "invoke": "callback",
+            "context": null,
+            "route": {
+              "method": "GET",
+              "path": "/test",
+              "reply": {
+                "body": {
+                  "type": "json",
+                  "value": {
+                    "hello": "world"
+                  }
+                }
+              }
+            },
+            "event": {
+              "requestContext": {},
+              "rawPath": "/test",
+              "queryStringParameters": ""
+            }
+          },
+          "expected_output": "[response]\nstatus=500\nisBase64Encoded=<undefined>\nbody=\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

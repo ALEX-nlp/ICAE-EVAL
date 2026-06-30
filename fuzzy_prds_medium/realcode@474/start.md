@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we've been getting some complaints from internal devs that the new HTTP service scaffold we're building doesn't behave consistently across a few scenarios they care about. Specifically there are issues around how shared service instances behave when multiple things depend on them — like, does changing a setting in one place actually reflect everywhere else that uses the same object? Also someone mentioned the 'same pattern we used for the login module' when talking about how beans get wired into non-JAX-RS components, but I'm not 100% sure what they meant by that, you'd probably need to dig through the existing resource setup to figure it out.
+
+Also we need to make sure that when things go wrong inside a resource handler, the error gets translated into a clean HTTP response rather than blowing up in some ugly way. There were a few notes about filtering too — apparently a post-processing step should run exactly once per response and add something to it, but it's been flaky.
+
+Finally, the team wants to deploy two versions of the app side by side under different URL prefixes and confirm their internal wiring stays completely separate. This came up because someone saw context bleed between environments in staging and it caused some weird data issues. We're on port 9998 for all of this. Can someone make sure all these behaviors are locked down properly?
+
+One more pass after the team questions: for the stutter/repeating echo piece, that collaborator needs to be application-scoped, so if someone does a PUT to `stutter-service-factor` with an integer body like `3`, that updates the repeat factor for the shared instance and every later GET to `stutter?s=<value>` needs to reflect the new factor everywhere. The PUT itself should come back HTTP 204 with an empty body, and if nobody has changed anything yet the default repeat factor is 2.
+
+Also, for `jcdibean/per-request` and `jcdibean/dependent/per-request`, both of those need to behave request-scoped, meaning brand new instance every HTTP request. Because of that, the per-instance counter in the response body should always be 0. The response body format needs to stay exactly `<full-request-uri>: queryParam=<x> 0`. One small gotcha they called out: special characters in `x` should show up percent-encoded in the URL but decoded in the body, and a space encodes as `+` in the URL.
+
+For the side-by-side app setup, this is specifically on localhost port 9998, with the main app rooted at `/main` and the secondary at `/secondary`. All routed URLs in output need to follow `http://localhost:9998/{app}/{path}` exactly, no alternate formatting.
+
+There were also questions on the singleton counters. The resource at `jcdibean/singleton/{p}/counter` and the one at `jcdibean/dependent/singleton/{p}/counter` both need to hold onto a persistent integer counter across requests. A GET returns the current value and then post-increments it, so that is HTTP 200 with the body as the integer. A PUT with an integer body sets the counter and returns HTTP 204 with an empty body.
+
+On the exception behavior, when `jcdibean/singleton/{p}/exception` is hit, it should raise its domain exception and that should be translated by the registered mapper into HTTP 500 with body `JDCIBeanException`. For `jcdibean/dependent/singleton/{p}/exception`, same idea but the body must be `JDCIBeanDependentException`. Those are intentionally two separate exceptions and two separate mappers.
+
+And on the filtering bit, this is the application-level JAX-RS ContainerResponseFilter and it needs to append exactly one specific response header to every reply, no duplicates and never skipped. When the harness sends `report_filter: true`, the output should include `filter_invoked_count=1` after the body line. Same expectation everywhere: the filter runs exactly once per response.
+
+Last thing, the bean wiring question was about using the CDI bean injection pattern for non-JAX-RS beans that carry request-context injection points, specifically the same kind of setup used for the `non-jaxrs-bean-injected` resource in both the main and secondary application contexts. That’s the pattern they want mirrored here so the two app contexts stay isolated while still injecting correctly.

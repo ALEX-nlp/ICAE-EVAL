@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need to build out that sidecar injection config engine we've been talking about. basically the idea is: given some annotations on a workload, the system figures out whether to inject a helper container, fills in all the missing defaults, validates stuff, and spits out the patch operations for the admission controller. it's a stdin/stdout JSON thing, one request in, one response out. we want it to be totally deterministic so tests can byte-compare the output — make sure keys come out in alphabetical order always.
+
+the tricky parts are: (1) there's a bunch of defaulting logic where blank fields need to fall back to the platform's standard values for things like image version, identity settings, resource sizing, etc. — refer to the same defaults pattern we landed on for the agent rollout last quarter; (2) the secret discovery needs to handle a bunch of annotation sub-types (templates, file overrides, commands, etc.) and the precedence rules between them are subtle; (3) the admission decision needs to block requests from the control-plane namespaces; (4) resource quantity strings have some gotchas with casing — lower-case suffixes that look valid should actually be rejected.
+
+when something goes wrong we want stable category strings in the response, never raw exception text. the full list of ops is in the internal spec doc. the environment var computation for the agent container also needs to handle the config-map suppression case that came up in the last review.

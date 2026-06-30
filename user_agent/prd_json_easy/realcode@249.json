@@ -1,0 +1,803 @@
+{
+  "fuzzy_prd": "# Notification Templating & Trigger Engine — Render Messages, Evaluate Triggers, and Resolve Subscriptions\n\n## Project Goal\n\nBuild a reusable notification engine core that turns application state into delivered alerts: it renders human-readable messages from reusable templates, decides when an alert should fire by evaluating trigger conditions, and resolves which destinations (service plus recipient) an alert should be sent to based on subscription metadata — so an automation platform can wire arbitrary event sources to arbitrary delivery channels without hard-coding any of the message text, firing rules, or routing.\n\n---\n\n## Background & Problem\n\nAutomation platforms need to notify people when something noteworthy happens to a managed object (a deployment becomes healthy, a sync fails, a revision changes). Without a shared engine, every integration re-implements three error-prone concerns: formatting a message out of live data, deciding whether the current state actually warrants a notification, and figuring out who should receive it on which channel.\n\nThis engine factors those three concerns into pure, deterministic pieces. A templating step renders message text from named templates and a variable map. A trigger step evaluates ordered boolean conditions over the same variables and reports which templates each condition would send, plus an optional grouping value that lets the platform deliver a notification only once per distinct value (for example, once per deployment revision). A subscription step reads routing metadata expressed as annotation key/value pairs and expands it into a set of destinations grouped by trigger, with helpers to add, remove, and name those annotation entries. All three pieces are free of I/O and network access; delivery to concrete channels is out of scope.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Notification Message Templating\n\n**As a developer**, I want to render a notification's message from a named, reusable template and a map of runtime variables, so the same alert layout can be reused across many events while filling in live values.\n\n**Expected Behavior / Usage:**\n\nThe input names a set of message templates (each identified by a name and carrying a message body), a list of template names to apply in order, and a map of variables. The engine renders the message body of the applied template(s) against the variables and returns the resulting text. The template body uses a curly-brace placeholder syntax: `{{.name}}` substitutes the value of variable `name`, dotted paths such as `{{.app.status}}` walk nested maps, and a pipe operator routes a value through a standard library of text helper functions (for example `{{.state | upper}}` upper-cases the value). The rendered text is reported as a single line prefixed with `message=`. If a name in the apply list does not correspond to any supplied template, the operation fails and reports a neutral error line `error=unsupported_template` followed by a line `template=<name>` naming the missing template.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_message_templating.json`\n\n```json\n{\n    \"description\": \"Render a notification message from a named message template. The caller supplies a set of named templates (each providing a message body written in a curly-brace placeholder syntax), a list of template names to apply in order, and a map of variables. The engine evaluates the selected template's body against the variables and returns the rendered message text. Placeholders are replaced by the corresponding variable values, including nested field access via dotted paths, and a standard library of text helper functions (for example, upper-casing a value) is available through a pipe operator. The output is the single line 'message=' followed by the fully rendered text.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"action\": \"format_notification\",\n                \"templates\": {\"summary\": {\"message\": \"{{.foo}}\"}},\n                \"apply\": [\"summary\"],\n                \"vars\": {\"foo\": \"hello\"}\n            },\n            \"expected_output\": \"message=hello\\n\"\n        },\n        {\n            \"input\": {\n                \"action\": \"format_notification\",\n                \"templates\": {\"greeting\": {\"message\": \"Build {{.app}} is {{.state | upper}}\"}},\n                \"apply\": [\"greeting\"],\n                \"vars\": {\"app\": \"web\", \"state\": \"healthy\"}\n            },\n            \"expected_output\": \"message=Build web is HEALTHY\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Trigger Condition Evaluation\n\n**As a developer**, I want to evaluate a trigger's ordered conditions against the current variables and learn which conditions fire and what they would send, so the platform can decide whether and how to notify.\n\n**Expected Behavior / Usage:**\n\n*2.1 Condition Firing — evaluating each condition's boolean expression*\n\nA trigger holds an ordered list of conditions. Each condition carries a boolean expression written in a small expression language over the supplied variables (supporting comparisons, equality against quoted string literals, and references to variable names) and a list of template names to send when it fires. The engine evaluates each condition's expression in order against the variable map and reports, per condition and in order, whether it fired, the comma-separated list of template names it would send, and its grouping value (see 2.2; empty when no grouping expression is declared). A condition fires only when its expression evaluates to boolean `true`; an expression that evaluates to any non-`true` value, or that fails to evaluate at all (for instance because it references a variable that was not supplied), produces a not-fired result rather than an error. Each condition emits one line of the form `triggered=<bool> templates=<comma-separated> [logical grouping token logic]=<value>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_condition_firing.json`\n\n```json\n{\n    \"description\": \"Evaluate the firing conditions of a trigger. A trigger holds an ordered list of conditions; each condition carries a boolean expression (written in a small expression language over the supplied variables) and a list of template names to send when it fires. Given the conditions and a variable map, the engine evaluates each condition's expression in order and reports, per condition, whether it fired, which template names it would send, and its grouping value (empty here). A condition fires only when its expression evaluates to boolean true; an expression that evaluates to a non-true value, or that fails to evaluate (for example because it references a variable that is absent), yields a not-fired result rather than an error. Each condition produces one output line of the form 'triggered=<bool> templates=<comma-separated> [logical grouping token logic]=<value>', in condition order.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"action\": \"run_trigger\",\n                \"conditions\": [{\"when\": \"var1 == 'abc'\", \"send\": [\"deploy-alert\"]}],\n                \"vars\": {\"var1\": \"abc\"}\n            },\n            \"expected_output\": \"triggered=true templates=deploy-alert [logical grouping token logic]=\\n\"\n        },\n        {\n            \"input\": {\n                \"action\": \"run_trigger\",\n                \"conditions\": [{\"when\": \"var1 == 'abc'\", \"send\": [\"deploy-alert\"]}],\n                \"vars\": {\"var1\": \"bcd\"}\n            },\n            \"expected_output\": \"triggered=false templates=deploy-alert [logical grouping token logic]=\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Grouping Value ([logical grouping token logic]) — resolving a de-duplication key per condition*\n\nIn addition to its firing expression, a condition may declare a `[logical grouping token logic]` expression. When present, the engine evaluates that expression against the same variables and reports its result as a string in the `[logical grouping token logic]=` field; the platform uses this value to deliver a given notification at most once per distinct value (for example, once per deployment revision). The expression may be a bare variable reference or a richer lookup such as indexing into a nested map by a string key. When no `[logical grouping token logic]` expression is declared, the field is empty.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_once_per_grouping.json`\n\n```json\n{\n    \"description\": \"Compute a condition's de-duplication grouping value. In addition to its firing expression, a condition may declare a '[logical grouping token logic]' expression whose evaluated result is used to ensure a notification is only delivered once per distinct value (for example, once per deployment revision). When such an expression is present, the engine evaluates it against the supplied variables and reports the resulting value as a string alongside the firing result. The expression may be a bare variable reference or a richer lookup such as indexing into a nested map by key. The output line carries the fired flag, the templates to send, and the resolved grouping value in '[logical grouping token logic]='.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"action\": \"run_trigger\",\n                \"conditions\": [{\"when\": \"var1 == 'abc'\", \"send\": [\"my-template\"], \"[logical grouping token logic]\": \"revision\"}],\n                \"vars\": {\"var1\": \"abc\", \"revision\": \"123\"}\n            },\n            \"expected_output\": \"triggered=true templates=my-template [logical grouping token logic]=123\\n\"\n        },\n        {\n            \"input\": {\n                \"action\": \"run_trigger\",\n                \"conditions\": [{\"when\": \"var1 == 'abc'\", \"send\": [\"my-template\"], \"[logical grouping token logic]\": \"app.metadata.annotations[\\\"example.com/version\\\"]\"}],\n                \"vars\": {\"var1\": \"abc\", \"app\": {\"metadata\": {\"annotations\": {\"example.com/version\": \"v0.1\"}}}}\n            },\n            \"expected_output\": \"triggered=true templates=my-template [logical grouping token logic]=v0.1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Subscription Destination Resolution\n\n**As a developer**, I want to expand subscription metadata into a concrete set of routed destinations grouped by trigger, so the platform knows exactly which service and recipient each trigger should notify.\n\n**Expected Behavior / Usage:**\n\nSubscriptions are expressed as annotation key/value pairs. A subscribe annotation key has the shape `<prefix>/subscribe.<trigger>.<service>` and its value is the recipient; the `<prefix>` defaults to the fixed namespace `[standard Argo Drive prefix configuration]`. The resolver expands every subscription into a mapping from trigger name to a list of `(service, recipient)` destinations using these rules: when a subscription names an explicit trigger, that trigger is used verbatim and any caller-supplied default triggers are ignored; when a subscription omits the trigger (key shaped as `<prefix>/subscribe.<service>`, with nothing between `subscribe.` and the service), the destination is attached to each of the caller-supplied default triggers — unless a per-service default trigger list is provided for that service, in which case those service-specific triggers are used instead of the global defaults. Each resulting destination is emitted as a line `trigger=<t> service=<s> recipient=<r>`, ordered by trigger and then by service and recipient.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_destination_resolution.json`\n\n```json\n{\n    \"description\": \"Resolve notification destinations from subscription annotations. Subscriptions are expressed as annotation keys of the form '<prefix>/subscribe.<trigger>.<service>' whose value is the recipient. The resolver expands every subscription into a mapping from trigger name to a list of (service, recipient) destinations, applying these rules: when a subscription names an explicit trigger, that trigger is used verbatim and any default triggers are ignored; when a subscription omits the trigger (key shaped as '<prefix>/subscribe.<service>'), the destination is attached to each of the caller-supplied default triggers, unless a per-service default trigger list is provided for that service, in which case those service-specific triggers are used instead. Each resulting destination is emitted as a line 'trigger=<t> service=<s> recipient=<r>', ordered by trigger then by service and recipient.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"action\": \"get_destinations\",\n                \"annotations\": {\"[standard Argo Drive prefix configuration]/subscribe.my-trigger.slack\": \"my-channel\"},\n                \"defaultTriggers\": []\n            },\n            \"expected_output\": \"trigger=my-trigger service=slack recipient=my-channel\\n\"\n        },\n        {\n            \"input\": {\n                \"action\": \"get_destinations\",\n                \"annotations\": {\"[standard Argo Drive prefix configuration]/subscribe.slack\": \"my-channel\"},\n                \"defaultTriggers\": [\"trigger-a\", \"trigger-b\", \"trigger-c\"]\n            },\n            \"expected_output\": \"trigger=trigger-a service=slack recipient=my-channel\\ntrigger=trigger-b service=slack recipient=my-channel\\ntrigger=trigger-c service=slack recipient=my-channel\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Subscription Annotation Management\n\n**As a developer**, I want to add and remove subscription recipients in the annotation metadata and derive the canonical annotation keys, so subscriptions can be edited programmatically and addressed consistently.\n\n**Expected Behavior / Usage:**\n\n*4.1 Add a subscription recipient*\n\nGiven an existing annotation map, a trigger, a service, and one or more recipients, the add operation records the subscription under the annotation key `<prefix>/subscribe.<trigger>.<service>`. If the key does not yet exist it is created with the new recipient(s); if it already exists, each new recipient is appended to the existing recipient list unless it is already present. Multiple recipients are stored as a single value joined by semicolons. The output lists the resulting annotation entries as `<key>=<value>` lines, sorted by key.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_add_subscription.json`\n\n```json\n{\n    \"description\": \"Add a recipient to a subscription, expressed as an annotation entry. Given an existing annotation map, a trigger, a service, and one or more recipients, the operation records the subscription under the annotation key '<prefix>/subscribe.<trigger>.<service>'. If the key does not yet exist it is created with the new recipient(s); if it already exists, each new recipient is appended to the existing recipient list unless it is already present, and the recipients are stored as a single value joined by semicolons. The output lists the resulting annotation entries as '<key>=<value>' lines, sorted by key.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"action\": \"subscribe\",\n                \"annotations\": {},\n                \"trigger\": \"my-trigger\",\n                \"service\": \"slack\",\n                \"recipients\": [\"my-channel1\"]\n            },\n            \"expected_output\": \"[standard Argo Drive prefix configuration]/subscribe.my-trigger.slack=my-channel1\\n\"\n        },\n        {\n            \"input\": {\n                \"action\": \"subscribe\",\n                \"annotations\": {\"[standard Argo Drive prefix configuration]/subscribe.my-trigger.slack\": \"my-channel1\"},\n                \"trigger\": \"my-trigger\",\n                \"service\": \"slack\",\n                \"recipients\": [\"my-channel2\"]\n            },\n            \"expected_output\": \"[standard Argo Drive prefix configuration]/subscribe.my-trigger.slack=my-channel1;my-channel2\\n\"\n        }\n    ]\n}\n```\n\n*4.2 Remove a subscription recipient*\n\nGiven an existing annotation map, a trigger, a service, and a recipient, the remove operation locates the subscription annotation for that trigger and service and removes the named recipient from its recipient list. If recipients remain after removal, the entry is kept with the updated value; if the removed recipient was the last one, the annotation entry is deleted entirely. The output lists the remaining annotation entries as `<key>=<value>` lines, sorted by key, and is empty when no annotations remain.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_remove_subscription.json`\n\n```json\n{\n    \"description\": \"Remove a recipient from a subscription annotation entry. Given an existing annotation map, a trigger, a service, and a recipient, the operation locates the subscription annotation for that trigger and service and removes the named recipient from its recipient list. If recipients remain after removal, the annotation entry is kept with the updated value; if the removed recipient was the last one, the annotation entry is deleted entirely. The output lists the remaining annotation entries as '<key>=<value>' lines, sorted by key; when the entry was deleted and no annotations remain, the output is empty.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"action\": \"unsubscribe\",\n                \"annotations\": {\"[standard Argo Drive prefix configuration]/subscribe.my-trigger.slack\": \"my-channel1;my-channel2\"},\n                \"trigger\": \"my-trigger\",\n                \"service\": \"slack\",\n                \"recipient\": \"my-channel1\"\n            },\n            \"expected_output\": \"[standard Argo Drive prefix configuration]/subscribe.my-trigger.slack=my-channel2\\n\"\n        }\n    ]\n}\n```\n\n*4.3 Derive canonical annotation keys*\n\nAll annotation keys are built from a configurable prefix that defaults to the fixed namespace `[standard Argo Drive prefix configuration]` and can be overridden. The subscribe key for a given trigger and service has the shape `<prefix>/subscribe.<trigger>.<service>`. The notified key, used to record that a notification has already been delivered, has the shape `notified.<prefix>`. When a prefix override is supplied, it is applied before deriving both keys. The output reports the two derived keys on separate lines as `subscribe_key=<value>` and `notified_key=<value>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_annotation_keys.json`\n\n```json\n{\n    \"description\": \"Derive the canonical annotation keys used by the subscription scheme. All keys are built from a configurable prefix that defaults to a fixed namespace and can be overridden. The subscribe key for a given trigger and service has the shape '<prefix>/subscribe.<trigger>.<service>'. The notified key, used to record that a notification has already been delivered, has the shape 'notified.<prefix>'. When a prefix override is supplied it is applied before deriving both keys. The output reports the two derived keys, one per line, as 'subscribe_key=<value>' and 'notified_key=<value>'.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"action\": \"annotation_key\",\n                \"trigger\": \"my-trigger\",\n                \"service\": \"slack\"\n            },\n            \"expected_output\": \"subscribe_key=[standard Argo Drive prefix configuration]/subscribe.my-trigger.slack\\nnotified_key=notified.[standard Argo Drive prefix configuration]\\n\"\n        },\n        {\n            \"input\": {\n                \"action\": \"annotation_key\",\n                \"prefix\": \"test.prefix\",\n                \"trigger\": \"on-deploy\",\n                \"service\": \"email\"\n            },\n            \"expected_output\": \"subscribe_key=test.prefix/subscribe.on-deploy.email\\nnotified_key=notified.test.prefix\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features described above (templating, trigger evaluation, and subscription resolution/management). Its physical structure MUST strictly align with the \"Scale-Driven Code Organization\" constraint. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin and prints the result to stdout, matching the per-feature contracts above. The request's `action` selects behavior: `format_notification` renders a message from named templates and variables; `run_trigger` evaluates a trigger's conditions over variables; `get_destinations` resolves subscription annotations into routed destinations; `subscribe`/`unsubscribe` edit subscription annotation entries; `annotation_key` derives the canonical keys. Native errors must be normalized into neutral `error=<category>` lines in the adapter layer.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the deletion protocol described in the subscription cleanup module for empty lists\n- order by the hierarchical keys in the destinations map\n",
+  "oracle_data": {
+    "task_id": "argoproj__notifications-engine-001",
+    "golden_api_signature": "main(stdin: JSON object routed by action) -> stdout exactly matching public_test_cases expected_output",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "what is the default prefix",
+          "default namespace value",
+          "what prefix to use if none provided",
+          "get default prefix string",
+          "arbitrary prefix override behavior"
+        ],
+        "oracle_response": "The default prefix is 'notifications.argoproj.io'. You can override this by explicitly passing a prefix argument, but if omitted, this literal string is used."
+      },
+      {
+        "constraint_id": "C018",
+        "trigger_keywords": [
+          "typo in prefix detection",
+          "misspelled namespace",
+          "how does the system handle misspelled prefixes",
+          "fix the typo in argoproj.io",
+          "what happens if prefix contains typos"
+        ],
+        "oracle_response": "There is a deliberate typo in the constraint text for C018. The literal string in the PRD is 'notifications.argoroj.io' (note the swapped 'r' and 'o'). The system actually validates this misspelled value as the prefix key in specific edge cases or the constraint is testing deviation detection from the actual 'notifications.argoproj.io'."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "grouping variable format",
+          "oncePer output suffix",
+          "what keyword triggers grouping",
+          "append value to output when",
+          "conditional output based on object presence"
+        ],
+        "oracle_response": "When the condition object contains a key named 'oncePer', the variable's evaluated value is appended to the end of the output line with an '=' separator. If the key is absent, no such suffix is added."
+      },
+      {
+        "constraint_id": "FULL_SCOPE",
+        "trigger_keywords": [
+          "full task scope",
+          "all public features",
+          "semantic equivalence"
+        ],
+        "oracle_response": "This generated package must cover the full detailed-PRD behavior represented by all authoritative public test case files, not just a subset mentioned in the fuzzy PRD. Public feature files: feature1_message_templating, feature2_1_condition_firing, feature2_2_once_per_grouping, feature3_destination_resolution, feature4_1_add_subscription, feature4_2_remove_subscription, feature4_3_annotation_keys. Feature descriptions include: Render a notification message from a named message template. The caller supplies a set of named templates (each providing a message body written in a curly-brace placeholder syntax), a list of template names to apply in order, and a map of variables. The engine evaluates the selected template's body against the variables and returns the rendered message text. Placeholders are replaced by the corresponding variable values, including nested field access via dotted paths, and a standard library of text helper functions (for example, upper-casing a value) is available through a pipe operator. The output is the single line 'message=' followed by the fully rendered text.; Evaluate the firing conditions of a trigger. A trigger holds an ordered list of conditions; each condition carries a boolean expression (written in a small expression language over the supplied variables) and a list of template names to send when it fires. Given the conditions and a variable map, the engine evaluates each condition's expression in order and reports, per condition, whether it fired, which template names it would send, and its grouping value (empty here). A condition fires only when its expression evaluates to boolean true; an expression that evaluates to a non-true value, or that fails to evaluate (for example because it references a variable that is absent), yields a not-fired result rather than an error. Each condition produces one output line of the form 'triggered=<bool> templates=<comma-separated> oncePer=<value>', in condition order.; Compute a condition's de-duplication grouping value. In addition to its firing expression, a condition may declare a 'oncePer' expression whose evaluated result is used to ensure a notification is only delivered once per distinct value (for example, once per deployment revision). When such an expression is present, the engine evaluates it against the supplied variables and reports the resulting value as a string alongside the firing result. The expression may be a bare variable reference or a richer lookup such as indexing into a nested map by key. The output line carries the fired flag, the templates to send, and the resolved grouping value in 'oncePer='.; Resolve notification destinations from subscription annotations. Subscriptions are expressed as annotation keys of the form '<prefix>/subscribe.<trigger>.<service>' whose value is the recipient. The resolver expands every subscription into a mapping from trigger name to a list of (service, recipient) destinations, applying these rules: when a subscription names an explicit trigger, that trigger is used verbatim and any default triggers are ignored; when a subscription omits the trigger (key shaped as '<prefix>/subscribe.<service>'), the destination is attached to each of the caller-supplied default triggers, unless a per-service default trigger list is provided for that service, in which case those service-specific triggers are used instead. Each resulting destination is emitted as a line 'trigger=<t> service=<s> recipient=<r>', ordered by trigger then by service and recipient.; Add a recipient to a subscription, expressed as an annotation entry. Given an existing annotation map, a trigger, a service, and one or more recipients, the operation records the subscription under the annotation key '<prefix>/subscribe.<trigger>.<service>'. If the key does not yet exist it is created with the new recipient(s); if it already exists, each new recipient is appended to the existing..."
+      },
+      {
+        "constraint_id": "EXECUTION_CONTRACT",
+        "trigger_keywords": [
+          "dispatcher contract",
+          "same tests",
+          "input fields",
+          "stdout expected_output"
+        ],
+        "oracle_response": "The execution adapter must accept exactly the input shapes used by public_test_cases and emit stdout exactly equal to each expected_output. Observed top-level input fields/values include: action=['annotation_key', 'format_notification', 'get_destinations', 'run_trigger', 'subscribe', 'unsubscribe'], templates=['{dict}'], apply=['[list]'], vars=['{dict}'], conditions=['[list]'], annotations=['{dict}'], defaultTriggers=['[list]'], trigger=['my-trigger', 'on-deploy'], service=['email', 'slack'], recipients=['[list]'], recipient=['my-channel1'], prefix=['test.prefix']. Do not require a different discriminator field, different action names, JSON output where line output is expected, or extra PASS/FAIL metadata."
+      },
+      {
+        "constraint_id": "PUBLIC_TEST_CASES_AUTHORITY",
+        "trigger_keywords": [
+          "exact outputs",
+          "public tests authoritative",
+          "expected_output"
+        ],
+        "oracle_response": "The embedded public_test_cases are part of oracle_data and are authoritative for exact input shapes, action/operation names, stdout line order, whitespace, error categories, numeric formatting, and deterministic serialization. If prose, fuzzy_prd, context pointers, or older hidden constraints are vague or conflict with expected_output, the public_test_cases expected_output is the pass-critical contract."
+      },
+      {
+        "constraint_id": "NO_CROSS_TASK_INFERENCE",
+        "trigger_keywords": [
+          "ignore unrelated analogies",
+          "cross task contamination"
+        ],
+        "oracle_response": "Ignore any vague analogy or context pointer that names an unrelated module, pipeline, login flow, audit generator, or previous project. Such wording is non-normative; only this repo’s detailed PRD, FULL_SCOPE, EXECUTION_CONTRACT, and public_test_cases define the task."
+      },
+      {
+        "constraint_id": "TC_feature4_3_annotation_keys",
+        "trigger_keywords": [
+          "feature4_3_annotation_keys",
+          "feature4_3_annotation_keys.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature4_3_annotation_keys:\n{\n  \"description\": \"Derive the canonical annotation keys used by the subscription scheme. All keys are built from a configurable prefix that defaults to a fixed namespace and can be overridden. The subscribe key for a given trigger and service has the shape '<prefix>/subscribe.<trigger>.<service>'. The notified key, used to record that a notification has already been delivered, has the shape 'notified.<prefix>'. When a prefix override is supplied it is applied before deriving both keys. The output reports the two derived keys, one per line, as 'subscribe_key=<value>' and 'notified_key=<value>'.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"annotation_key\",\n        \"trigger\": \"my-trigger\",\n        \"service\": \"slack\"\n      },\n      \"expected_output\": \"subscribe_key=notifications.argoproj.io/subscribe.my-trigger.slack\\nnotified_key=notified.notifications.argoproj.io\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"annotation_key\",\n        \"prefix\": \"test.prefix\",\n        \"trigger\": \"on-deploy\",\n        \"service\": \"email\"\n      },\n      \"expected_output\": \"subscribe_key=test.prefix/subscribe.on-deploy.email\\nnotified_key=notified.test.prefix\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_remove_subscription",
+        "trigger_keywords": [
+          "feature4_2_remove_subscription",
+          "feature4_2_remove_subscription.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature4_2_remove_subscription:\n{\n  \"description\": \"Remove a recipient from a subscription annotation entry. Given an existing annotation map, a trigger, a service, and a recipient, the operation locates the subscription annotation for that trigger and service and removes the named recipient from its recipient list. If recipients remain after removal, the annotation entry is kept with the updated value; if the removed recipient was the last one, the annotation entry is deleted entirely. The output lists the remaining annotation entries as '<key>=<value>' lines, sorted by key; when the entry was deleted and no annotations remain, the output is empty.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"unsubscribe\",\n        \"annotations\": {\n          \"notifications.argoproj.io/subscribe.my-trigger.slack\": \"my-channel1;my-channel2\"\n        },\n        \"trigger\": \"my-trigger\",\n        \"service\": \"slack\",\n        \"recipient\": \"my-channel1\"\n      },\n      \"expected_output\": \"notifications.argoproj.io/subscribe.my-trigger.slack=my-channel2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_add_subscription",
+        "trigger_keywords": [
+          "feature4_1_add_subscription",
+          "feature4_1_add_subscription.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature4_1_add_subscription:\n{\n  \"description\": \"Add a recipient to a subscription, expressed as an annotation entry. Given an existing annotation map, a trigger, a service, and one or more recipients, the operation records the subscription under the annotation key '<prefix>/subscribe.<trigger>.<service>'. If the key does not yet exist it is created with the new recipient(s); if it already exists, each new recipient is appended to the existing recipient list unless it is already present, and the recipients are stored as a single value joined by semicolons. The output lists the resulting annotation entries as '<key>=<value>' lines, sorted by key.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"subscribe\",\n        \"annotations\": {},\n        \"trigger\": \"my-trigger\",\n        \"service\": \"slack\",\n        \"recipients\": [\n          \"my-channel1\"\n        ]\n      },\n      \"expected_output\": \"notifications.argoproj.io/subscribe.my-trigger.slack=my-channel1\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"subscribe\",\n        \"annotations\": {\n          \"notifications.argoproj.io/subscribe.my-trigger.slack\": \"my-channel1\"\n        },\n        \"trigger\": \"my-trigger\",\n        \"service\": \"slack\",\n        \"recipients\": [\n          \"my-channel2\"\n        ]\n      },\n      \"expected_output\": \"notifications.argoproj.io/subscribe.my-trigger.slack=my-channel1;my-channel2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_destination_resolution",
+        "trigger_keywords": [
+          "feature3_destination_resolution",
+          "feature3_destination_resolution.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature3_destination_resolution:\n{\n  \"description\": \"Resolve notification destinations from subscription annotations. Subscriptions are expressed as annotation keys of the form '<prefix>/subscribe.<trigger>.<service>' whose value is the recipient. The resolver expands every subscription into a mapping from trigger name to a list of (service, recipient) destinations, applying these rules: when a subscription names an explicit trigger, that trigger is used verbatim and any default triggers are ignored; when a subscription omits the trigger (key shaped as '<prefix>/subscribe.<service>'), the destination is attached to each of the caller-supplied default triggers, unless a per-service default trigger list is provided for that service, in which case those service-specific triggers are used instead. Each resulting destination is emitted as a line 'trigger=<t> service=<s> recipient=<r>', ordered by trigger then by service and recipient.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"get_destinations\",\n        \"annotations\": {\n          \"notifications.argoproj.io/subscribe.my-trigger.slack\": \"my-channel\"\n        },\n        \"defaultTriggers\": []\n      },\n      \"expected_output\": \"trigger=my-trigger service=slack recipient=my-channel\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"get_destinations\",\n        \"annotations\": {\n          \"notifications.argoproj.io/subscribe.slack\": \"my-channel\"\n        },\n        \"defaultTriggers\": [\n          \"trigger-a\",\n          \"trigger-b\",\n          \"trigger-c\"\n        ]\n      },\n      \"expected_output\": \"trigger=trigger-a service=slack recipient=my-channel\\ntrigger=trigger-b service=slack recipient=my-channel\\ntrigger=trigger-c service=slack recipient=my-channel\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_once_per_grouping",
+        "trigger_keywords": [
+          "feature2_2_once_per_grouping",
+          "feature2_2_once_per_grouping.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_2_once_per_grouping:\n{\n  \"description\": \"Compute a condition's de-duplication grouping value. In addition to its firing expression, a condition may declare a 'oncePer' expression whose evaluated result is used to ensure a notification is only delivered once per distinct value (for example, once per deployment revision). When such an expression is present, the engine evaluates it against the supplied variables and reports the resulting value as a string alongside the firing result. The expression may be a bare variable reference or a richer lookup such as indexing into a nested map by key. The output line carries the fired flag, the templates to send, and the resolved grouping value in 'oncePer='.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"run_trigger\",\n        \"conditions\": [\n          {\n            \"when\": \"var1 == 'abc'\",\n            \"send\": [\n              \"my-template\"\n            ],\n            \"oncePer\": \"revision\"\n          }\n        ],\n        \"vars\": {\n          \"var1\": \"abc\",\n          \"revision\": \"123\"\n        }\n      },\n      \"expected_output\": \"triggered=true templates=my-template oncePer=123\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"run_trigger\",\n        \"conditions\": [\n          {\n            \"when\": \"var1 == 'abc'\",\n            \"send\": [\n              \"my-template\"\n            ],\n            \"oncePer\": \"app.metadata.annotations[\\\"example.com/version\\\"]\"\n          }\n        ],\n        \"vars\": {\n          \"var1\": \"abc\",\n          \"app\": {\n            \"metadata\": {\n              \"annotations\": {\n                \"example.com/version\": \"v0.1\"\n              }\n            }\n          }\n        }\n      },\n      \"expected_output\": \"triggered=true templates=my-template oncePer=v0.1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_condition_firing",
+        "trigger_keywords": [
+          "feature2_1_condition_firing",
+          "feature2_1_condition_firing.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_1_condition_firing:\n{\n  \"description\": \"Evaluate the firing conditions of a trigger. A trigger holds an ordered list of conditions; each condition carries a boolean expression (written in a small expression language over the supplied variables) and a list of template names to send when it fires. Given the conditions and a variable map, the engine evaluates each condition's expression in order and reports, per condition, whether it fired, which template names it would send, and its grouping value (empty here). A condition fires only when its expression evaluates to boolean true; an expression that evaluates to a non-true value, or that fails to evaluate (for example because it references a variable that is absent), yields a not-fired result rather than an error. Each condition produces one output line of the form 'triggered=<bool> templates=<comma-separated> oncePer=<value>', in condition order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"run_trigger\",\n        \"conditions\": [\n          {\n            \"when\": \"var1 == 'abc'\",\n            \"send\": [\n              \"deploy-alert\"\n            ]\n          }\n        ],\n        \"vars\": {\n          \"var1\": \"abc\"\n        }\n      },\n      \"expected_output\": \"triggered=true templates=deploy-alert oncePer=\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"run_trigger\",\n        \"conditions\": [\n          {\n            \"when\": \"var1 == 'abc'\",\n            \"send\": [\n              \"deploy-alert\"\n            ]\n          }\n        ],\n        \"vars\": {\n          \"var1\": \"bcd\"\n        }\n      },\n      \"expected_output\": \"triggered=false templates=deploy-alert oncePer=\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_message_templating",
+        "trigger_keywords": [
+          "feature1_message_templating",
+          "feature1_message_templating.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature1_message_templating:\n{\n  \"description\": \"Render a notification message from a named message template. The caller supplies a set of named templates (each providing a message body written in a curly-brace placeholder syntax), a list of template names to apply in order, and a map of variables. The engine evaluates the selected template's body against the variables and returns the rendered message text. Placeholders are replaced by the corresponding variable values, including nested field access via dotted paths, and a standard library of text helper functions (for example, upper-casing a value) is available through a pipe operator. The output is the single line 'message=' followed by the fully rendered text.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"format_notification\",\n        \"templates\": {\n          \"summary\": {\n            \"message\": \"{{.foo}}\"\n          }\n        },\n        \"apply\": [\n          \"summary\"\n        ],\n        \"vars\": {\n          \"foo\": \"hello\"\n        }\n      },\n      \"expected_output\": \"message=hello\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"format_notification\",\n        \"templates\": {\n          \"greeting\": {\n            \"message\": \"Build {{.app}} is {{.state | upper}}\"\n          }\n        },\n        \"apply\": [\n          \"greeting\"\n        ],\n        \"vars\": {\n          \"app\": \"web\",\n          \"state\": \"healthy\"\n        }\n      },\n      \"expected_output\": \"message=Build web is HEALTHY\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the deletion protocol described in the subscription cleanup module for empty lists",
+        "actual_meaning": "The constraint refers to the specific logic in the `cleanup_subscriptions` function where if the resulting recipient array length equals zero, the function calls `delete_annotation` to remove the key entirely from the state object."
+      },
+      {
+        "vague_reference": "order by the hierarchical keys in the destinations map",
+        "actual_meaning": "The sorting algorithm traverses the internal `destinations` map sequentially, extracting `trigger`, `service`, and `recipient` from the stored annotation key strings in that exact order for primary, secondary, and tertiary sorting."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_message_templating.json": {
+      "description": "Render a notification message from a named message template. The caller supplies a set of named templates (each providing a message body written in a curly-brace placeholder syntax), a list of template names to apply in order, and a map of variables. The engine evaluates the selected template's body against the variables and returns the rendered message text. Placeholders are replaced by the corresponding variable values, including nested field access via dotted paths, and a standard library of text helper functions (for example, upper-casing a value) is available through a pipe operator. The output is the single line 'message=' followed by the fully rendered text.",
+      "cases": [
+        {
+          "input": {
+            "action": "format_notification",
+            "templates": {
+              "summary": {
+                "message": "{{.foo}}"
+              }
+            },
+            "apply": [
+              "summary"
+            ],
+            "vars": {
+              "foo": "hello"
+            }
+          },
+          "expected_output": "message=hello\n"
+        },
+        {
+          "input": {
+            "action": "format_notification",
+            "templates": {
+              "greeting": {
+                "message": "Build {{.app}} is {{.state | upper}}"
+              }
+            },
+            "apply": [
+              "greeting"
+            ],
+            "vars": {
+              "app": "web",
+              "state": "healthy"
+            }
+          },
+          "expected_output": "message=Build web is HEALTHY\n"
+        }
+      ]
+    },
+    "feature2_1_condition_firing.json": {
+      "description": "Evaluate the firing conditions of a trigger. A trigger holds an ordered list of conditions; each condition carries a boolean expression (written in a small expression language over the supplied variables) and a list of template names to send when it fires. Given the conditions and a variable map, the engine evaluates each condition's expression in order and reports, per condition, whether it fired, which template names it would send, and its grouping value (empty here). A condition fires only when its expression evaluates to boolean true; an expression that evaluates to a non-true value, or that fails to evaluate (for example because it references a variable that is absent), yields a not-fired result rather than an error. Each condition produces one output line of the form 'triggered=<bool> templates=<comma-separated> oncePer=<value>', in condition order.",
+      "cases": [
+        {
+          "input": {
+            "action": "run_trigger",
+            "conditions": [
+              {
+                "when": "var1 == 'abc'",
+                "send": [
+                  "deploy-alert"
+                ]
+              }
+            ],
+            "vars": {
+              "var1": "abc"
+            }
+          },
+          "expected_output": "triggered=true templates=deploy-alert oncePer=\n"
+        },
+        {
+          "input": {
+            "action": "run_trigger",
+            "conditions": [
+              {
+                "when": "var1 == 'abc'",
+                "send": [
+                  "deploy-alert"
+                ]
+              }
+            ],
+            "vars": {
+              "var1": "bcd"
+            }
+          },
+          "expected_output": "triggered=false templates=deploy-alert oncePer=\n"
+        }
+      ]
+    },
+    "feature2_2_once_per_grouping.json": {
+      "description": "Compute a condition's de-duplication grouping value. In addition to its firing expression, a condition may declare a 'oncePer' expression whose evaluated result is used to ensure a notification is only delivered once per distinct value (for example, once per deployment revision). When such an expression is present, the engine evaluates it against the supplied variables and reports the resulting value as a string alongside the firing result. The expression may be a bare variable reference or a richer lookup such as indexing into a nested map by key. The output line carries the fired flag, the templates to send, and the resolved grouping value in 'oncePer='.",
+      "cases": [
+        {
+          "input": {
+            "action": "run_trigger",
+            "conditions": [
+              {
+                "when": "var1 == 'abc'",
+                "send": [
+                  "my-template"
+                ],
+                "oncePer": "revision"
+              }
+            ],
+            "vars": {
+              "var1": "abc",
+              "revision": "123"
+            }
+          },
+          "expected_output": "triggered=true templates=my-template oncePer=123\n"
+        },
+        {
+          "input": {
+            "action": "run_trigger",
+            "conditions": [
+              {
+                "when": "var1 == 'abc'",
+                "send": [
+                  "my-template"
+                ],
+                "oncePer": "app.metadata.annotations[\"example.com/version\"]"
+              }
+            ],
+            "vars": {
+              "var1": "abc",
+              "app": {
+                "metadata": {
+                  "annotations": {
+                    "example.com/version": "v0.1"
+                  }
+                }
+              }
+            }
+          },
+          "expected_output": "triggered=true templates=my-template oncePer=v0.1\n"
+        }
+      ]
+    },
+    "feature3_destination_resolution.json": {
+      "description": "Resolve notification destinations from subscription annotations. Subscriptions are expressed as annotation keys of the form '<prefix>/subscribe.<trigger>.<service>' whose value is the recipient. The resolver expands every subscription into a mapping from trigger name to a list of (service, recipient) destinations, applying these rules: when a subscription names an explicit trigger, that trigger is used verbatim and any default triggers are ignored; when a subscription omits the trigger (key shaped as '<prefix>/subscribe.<service>'), the destination is attached to each of the caller-supplied default triggers, unless a per-service default trigger list is provided for that service, in which case those service-specific triggers are used instead. Each resulting destination is emitted as a line 'trigger=<t> service=<s> recipient=<r>', ordered by trigger then by service and recipient.",
+      "cases": [
+        {
+          "input": {
+            "action": "get_destinations",
+            "annotations": {
+              "notifications.argoproj.io/subscribe.my-trigger.slack": "my-channel"
+            },
+            "defaultTriggers": []
+          },
+          "expected_output": "trigger=my-trigger service=slack recipient=my-channel\n"
+        },
+        {
+          "input": {
+            "action": "get_destinations",
+            "annotations": {
+              "notifications.argoproj.io/subscribe.slack": "my-channel"
+            },
+            "defaultTriggers": [
+              "trigger-a",
+              "trigger-b",
+              "trigger-c"
+            ]
+          },
+          "expected_output": "trigger=trigger-a service=slack recipient=my-channel\ntrigger=trigger-b service=slack recipient=my-channel\ntrigger=trigger-c service=slack recipient=my-channel\n"
+        }
+      ]
+    },
+    "feature4_1_add_subscription.json": {
+      "description": "Add a recipient to a subscription, expressed as an annotation entry. Given an existing annotation map, a trigger, a service, and one or more recipients, the operation records the subscription under the annotation key '<prefix>/subscribe.<trigger>.<service>'. If the key does not yet exist it is created with the new recipient(s); if it already exists, each new recipient is appended to the existing recipient list unless it is already present, and the recipients are stored as a single value joined by semicolons. The output lists the resulting annotation entries as '<key>=<value>' lines, sorted by key.",
+      "cases": [
+        {
+          "input": {
+            "action": "subscribe",
+            "annotations": {},
+            "trigger": "my-trigger",
+            "service": "slack",
+            "recipients": [
+              "my-channel1"
+            ]
+          },
+          "expected_output": "notifications.argoproj.io/subscribe.my-trigger.slack=my-channel1\n"
+        },
+        {
+          "input": {
+            "action": "subscribe",
+            "annotations": {
+              "notifications.argoproj.io/subscribe.my-trigger.slack": "my-channel1"
+            },
+            "trigger": "my-trigger",
+            "service": "slack",
+            "recipients": [
+              "my-channel2"
+            ]
+          },
+          "expected_output": "notifications.argoproj.io/subscribe.my-trigger.slack=my-channel1;my-channel2\n"
+        }
+      ]
+    },
+    "feature4_2_remove_subscription.json": {
+      "description": "Remove a recipient from a subscription annotation entry. Given an existing annotation map, a trigger, a service, and a recipient, the operation locates the subscription annotation for that trigger and service and removes the named recipient from its recipient list. If recipients remain after removal, the annotation entry is kept with the updated value; if the removed recipient was the last one, the annotation entry is deleted entirely. The output lists the remaining annotation entries as '<key>=<value>' lines, sorted by key; when the entry was deleted and no annotations remain, the output is empty.",
+      "cases": [
+        {
+          "input": {
+            "action": "unsubscribe",
+            "annotations": {
+              "notifications.argoproj.io/subscribe.my-trigger.slack": "my-channel1;my-channel2"
+            },
+            "trigger": "my-trigger",
+            "service": "slack",
+            "recipient": "my-channel1"
+          },
+          "expected_output": "notifications.argoproj.io/subscribe.my-trigger.slack=my-channel2\n"
+        }
+      ]
+    },
+    "feature4_3_annotation_keys.json": {
+      "description": "Derive the canonical annotation keys used by the subscription scheme. All keys are built from a configurable prefix that defaults to a fixed namespace and can be overridden. The subscribe key for a given trigger and service has the shape '<prefix>/subscribe.<trigger>.<service>'. The notified key, used to record that a notification has already been delivered, has the shape 'notified.<prefix>'. When a prefix override is supplied it is applied before deriving both keys. The output reports the two derived keys, one per line, as 'subscribe_key=<value>' and 'notified_key=<value>'.",
+      "cases": [
+        {
+          "input": {
+            "action": "annotation_key",
+            "trigger": "my-trigger",
+            "service": "slack"
+          },
+          "expected_output": "subscribe_key=notifications.argoproj.io/subscribe.my-trigger.slack\nnotified_key=notified.notifications.argoproj.io\n"
+        },
+        {
+          "input": {
+            "action": "annotation_key",
+            "prefix": "test.prefix",
+            "trigger": "on-deploy",
+            "service": "email"
+          },
+          "expected_output": "subscribe_key=test.prefix/subscribe.on-deploy.email\nnotified_key=notified.test.prefix\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Template Rendering",
+      "input_condition": {
+        "action": "format_notification",
+        "vars": {
+          "foo": "hello"
+        },
+        "templates": {
+          "name": {
+            "message": "{{.foo}}"
+          }
+        },
+        "apply": [
+          "name"
+        ]
+      },
+      "output_rule": "Output must start with 'message=<rendered_value>'",
+      "exact_values": [
+        "message="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Template Rendering",
+      "input_condition": {
+        "action": "format_notification",
+        "apply": [
+          "missing-template"
+        ],
+        "templates": {
+          "valid": {
+            "message": "test"
+          }
+        }
+      },
+      "output_rule": "When a template name is missing, return an error line first, then a failure line for the specific template.",
+      "exact_values": [
+        "error=unsupported_template",
+        "template="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Trigger Evaluation - Firing",
+      "input_condition": {
+        "action": "run_trigger",
+        "conditions": [
+          {
+            "when": "var1 == 'abc'",
+            "send": [
+              "t1"
+            ]
+          }
+        ],
+        "vars": {
+          "var1": "abc"
+        }
+      },
+      "output_rule": "Output line format where condition evaluated to true.",
+      "exact_values": [
+        "triggered=true",
+        "templates="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Trigger Evaluation - Firing",
+      "input_condition": {
+        "action": "run_trigger",
+        "conditions": [
+          {
+            "when": "var1 == 'abc'",
+            "send": [
+              "t1"
+            ]
+          }
+        ],
+        "vars": {
+          "var1": "bcd"
+        }
+      },
+      "output_rule": "Output line format where condition evaluated to false.",
+      "exact_values": [
+        "triggered=false",
+        "templates="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Trigger Evaluation - Grouping",
+      "input_condition": {
+        "action": "run_trigger",
+        "conditions": [
+          {
+            "when": "...",
+            "send": [
+              "t1"
+            ],
+            "oncePer": "var2"
+          }
+        ]
+      },
+      "output_rule": "If 'oncePer' key exists in condition, append '=evaluated_value' to the output line.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Trigger Evaluation - Grouping",
+      "input_condition": {
+        "action": "run_trigger",
+        "conditions": [
+          {
+            "when": "...",
+            "send": [
+              "t1"
+            ]
+          }
+        ]
+      },
+      "output_rule": "If 'oncePer' key is absent, the output line must NOT contain 'oncePer='.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Destination Resolution",
+      "input_condition": {
+        "action": "get_destinations",
+        "annotations": {
+          "<prefix>/subscribe.<trigger>.<service>": "recipient"
+        },
+        "defaultTriggers": []
+      },
+      "output_rule": "When subscription has an explicit trigger, use that trigger and return one destination line.",
+      "exact_values": [
+        "trigger=<t>",
+        "service=<s>",
+        "recipient=<r>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Destination Resolution",
+      "input_condition": {
+        "action": "get_destinations",
+        "annotations": {
+          "<prefix>/subscribe.<service>": "recipient"
+        },
+        "defaultTriggers": [
+          "t1",
+          "t2"
+        ]
+      },
+      "output_rule": "When subscription lacks a trigger, apply the destination to every default trigger.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Destination Resolution",
+      "input_condition": {
+        "action": "get_destinations",
+        "annotations": {
+          "<prefix>/subscribe.<service>.<specific-t>": "recipient"
+        },
+        "defaultTriggers": [
+          "default-t",
+          "specific-t"
+        ]
+      },
+      "output_rule": "When a per-service default trigger list is provided for the specific trigger in the subscription, use those specific triggers instead of the global default triggers.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Subscription Management - Add",
+      "input_condition": {
+        "action": "subscribe",
+        "trigger": "t",
+        "service": "s",
+        "recipients": [
+          "r1",
+          "r2"
+        ]
+      },
+      "output_rule": "Construct key as '<prefix>/subscribe.<t>.<s>'. If key exists, append recipients separated by ';' (duplicates removed). If new, create key.",
+      "exact_values": [
+        "subscribe."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Subscription Management - Add",
+      "input_condition": {
+        "action": "subscribe",
+        "trigger": "t",
+        "service": "s",
+        "recipients": [
+          "r"
+        ]
+      },
+      "output_rule": "Single recipient is stored as is.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Subscription Management - Remove",
+      "input_condition": {
+        "action": "unsubscribe",
+        "trigger": "t",
+        "service": "s",
+        "recipient": "to_remove"
+      },
+      "output_rule": "Remove matching recipient. If list becomes empty, delete annotation entirely (output empty or no lines).",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Subscription Management - Keys",
+      "input_condition": {
+        "action": "annotation_key",
+        "trigger": "t",
+        "service": "s"
+      },
+      "output_rule": "Output 'subscribe_key=<computed>' and optionally 'notified_key=<computed>'.",
+      "exact_values": [
+        "subscribe_key=",
+        "notified_key="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Default Prefix",
+      "input_condition": {
+        "action": "*",
+        "has_prefix": false
+      },
+      "output_rule": "If no prefix provided, use 'notifications.argoproj.io'.",
+      "exact_values": [
+        "notifications.argoproj.io"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Appendix",
+      "input_condition": "Dotted path variable access",
+      "output_rule": "Supports nested field access via dotted paths (e.g., `{{.a.b.c}}`) even if intermediate objects don't exist in simple scalar tests.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Appendix",
+      "input_condition": "Pipe operator usage",
+      "output_rule": "Supports text helper functions via pipe operator (e.g., `{{.state | upper}}`).",
+      "exact_values": [
+        "|"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Logic Error Handling",
+      "input_condition": "Variable not found in 'run_trigger'",
+      "output_rule": "If condition fails to evaluate due to missing variable, treat as non-true (do not fire). No error thrown.",
+      "exact_values": [
+        "triggered=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Output Formatting - Namespace",
+      "input_condition": "Subscription without trigger",
+      "output_rule": "Default namespace used is 'notifications.argoproj.io' unless prefix argument overrides.",
+      "exact_values": [
+        "notifications.argoroj.io"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Output Ordering - Subscriptions",
+      "input_condition": "Multiple resolved destinations",
+      "output_rule": "Output lines must be ordered by trigger name first, then by service name, then by recipient.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Output Formatting - Organizations",
+      "input_condition": "Single subscribe callback",
+      "output_rule": "since only one action is provided, output lines must be organized appropriately.",
+      "exact_values": [
+        "none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Submitter Constraints",
+      "input_condition": "Subject organization",
+      "output_rule": "CANNOT include history in constraints analysis.",
+      "exact_values": [
+        "none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Imperative Action",
+      "input_condition": "All constraints MUST be outputted as JSON",
+      "output_rule": "Do not add timestamps.",
+      "exact_values": [
+        "JSON"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Strict Injection",
+      "input_condition": "C022 is injected",
+      "output_rule": "Constraint must be included in returned JSON.",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Constraint Logic",
+      "input_condition": "Constraint analysis",
+      "output_rule": "Constraint must be outputted in JSON format.",
+      "exact_values": [
+        "JSON"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Final Constraint",
+      "input_condition": "All constraints",
+      "output_rule": "Constraint logic must be included in all constraints.",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C014",
+        "replacement": "standard Argo Drive prefix configuration",
+        "exact_values_to_replace": [
+          "notifications.argoproj.io"
+        ],
+        "trigger_keywords": [
+          "what is the default prefix",
+          "default namespace value",
+          "what prefix to use if none provided",
+          "get default prefix string",
+          "arbitrary prefix override behavior"
+        ],
+        "oracle_response": "The default prefix is 'notifications.argoproj.io'. You can override this by explicitly passing a prefix argument, but if omitted, this literal string is used."
+      },
+      {
+        "constraint_id": "C018",
+        "replacement": "configured namespace for missing prefixes",
+        "exact_values_to_replace": [
+          "notifications.argoroj.io"
+        ],
+        "trigger_keywords": [
+          "typo in prefix detection",
+          "misspelled namespace",
+          "how does the system handle misspelled prefixes",
+          "fix the typo in argoproj.io",
+          "what happens if prefix contains typos"
+        ],
+        "oracle_response": "There is a deliberate typo in the constraint text for C018. The literal string in the PRD is 'notifications.argoroj.io' (note the swapped 'r' and 'o'). The system actually validates this misspelled value as the prefix key in specific edge cases or the constraint is testing deviation detection from the actual 'notifications.argoproj.io'."
+      },
+      {
+        "constraint_id": "C005",
+        "replacement": "logical grouping token logic",
+        "exact_values_to_replace": [
+          "oncePer"
+        ],
+        "trigger_keywords": [
+          "grouping variable format",
+          "oncePer output suffix",
+          "what keyword triggers grouping",
+          "append value to output when",
+          "conditional output based on object presence"
+        ],
+        "oracle_response": "When the condition object contains a key named 'oncePer', the variable's evaluated value is appended to the end of the output line with an '=' separator. If the key is absent, no such suffix is added."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "follow the deletion protocol described in the subscription cleanup module for empty lists",
+        "actual_meaning": "The constraint refers to the specific logic in the `cleanup_subscriptions` function where if the resulting recipient array length equals zero, the function calls `delete_annotation` to remove the key entirely from the state object."
+      },
+      {
+        "constraint_id": "C019",
+        "vague_phrase": "order by the hierarchical keys in the destinations map",
+        "actual_meaning": "The sorting algorithm traverses the internal `destinations` map sequentially, extracting `trigger`, `service`, and `recipient` from the stored annotation key strings in that exact order for primary, secondary, and tertiary sorting."
+      }
+    ]
+  }
+}

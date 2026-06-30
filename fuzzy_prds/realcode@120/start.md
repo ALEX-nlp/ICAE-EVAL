@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that declarative REST state engine we've been talking about. Basically the idea is devs should be able to just describe their API endpoints once (like a map of names to URLs) and get back everything they need to manage loading states, data, and errors automatically — no more copy-pasting fetch boilerplate across every screen. It should handle the full lifecycle from 'request started' to 'done or failed' and expose that through a store so the UI can just read flags.
+
+Some important stuff: URL templates need to support both required and optional path segments (similar to the pattern we used in the routing layer of the auth module last quarter — check how that handled the colon-prefixed segments). Also the engine needs to be smart about not re-fetching data that's already been loaded. Array params in query strings have caused us bugs before so that needs proper handling with configurable formatting.
+
+On the error side, we had that incident where raw exception messages were leaking to users — make sure errors are normalized to neutral categories. There's also a need for pre-request hooks and the ability to chain requests in sequence. Custom helper names on endpoints should fail loudly if they clash with built-in controls rather than silently misbehaving. We should also be able to configure a global root URL so teams don't repeat the base path everywhere. Global options like auth headers should merge cleanly with per-endpoint settings.

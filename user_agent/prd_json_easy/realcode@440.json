@@ -1,0 +1,703 @@
+{
+  "fuzzy_prd": "# MySQL Wire-Protocol Client Toolkit — Statement Parsing, Version & Flag Decoding, Identifier & Address Utilities\n\n## Project Goal\n\nBuild the deterministic, side-effect-free core utilities a MySQL-compatible database driver needs before it ever touches a socket: a parser that splits a parametrized SQL statement into its placeholder structure, a decoder for server version banners, an interpreter for the column-definition flag bitmap the server returns with result metadata, a column-name resolver with MySQL's case rules, an IP-literal classifier, and an identifier-quoting helper. These let a driver prepare statements, negotiate capabilities, and shape result metadata correctly without each layer re-implementing the same fiddly wire rules.\n\n---\n\n## Background & Problem\n\nA driver speaking the MySQL protocol must repeatedly perform small, exact transformations: it has to turn a user's SQL (which may use `?` positional placeholders or `?name` named placeholders) into a canonical statement plus an index map; it has to read the server's version string (which can be empty, truncated, negative, or carry a MariaDB marker) into comparable numbers; it has to decode a packed 16-bit column-definition flag word; it has to resolve a requested column name against the actual result columns using MySQL's \"case-sensitive first, case-insensitive fallback, backtick forces exact\" rule; it has to recognise IPv4 vs IPv6 host literals; and it has to safely quote identifiers.\n\nWithout a well-specified core for these, every layer hand-rolls subtly different rules — a placeholder inside a quoted literal gets mistaken for a real parameter, a `-1` version part overflows, the binary flag is misread for JSON columns, or an identifier containing a backtick breaks a statement. This toolkit provides one precise contract for each of these leaf operations so the rest of the driver can rely on them.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Parametrized SQL Statement Parser\n\n**As a developer**, I want to parse a SQL statement into its placeholder structure, so I can prepare it and bind values by position or by name.\n\n**Expected Behavior / Usage:**\n\nThe input is a request with action `parse_query` carrying a `sql` string. A placeholder is a `?` that occurs outside any quoted span or comment. A bare `?` is a positional placeholder. A `?` immediately followed by an identifier (a letter/underscore start, then identifier characters) is a named placeholder whose name is that identifier; the same name occurring more than once binds all of its positions, in order. Question marks appearing inside single-quoted (`'...'`), double-quoted (`\"...\"`) or backtick-quoted (`` `...` ``) spans — including doubled-delimiter escapes like `''` — inside block comments (`/* ... */`), and inside line comments (`-- ... <newline>`) are literal text and are NOT placeholders. The parser reports: `simple` (true when there are no placeholders at all), `formatted_sql` (the statement with every named placeholder rewritten to a bare `?`, positional placeholders left as `?`), `formatted_size` (the character length of `formatted_sql`), `parameters` (the count of placeholders), `part_size` (the number of literal text segments, which is `parameters + 1` for a non-simple statement and `0` for a simple one), and for each distinct placeholder name a line `named <name>=<positions>` where positions is a single integer for a one-shot name or a bracketed list like `[1, 3]` for a repeated name. The `named` lines are emitted in ascending name order. A simple statement emits no `named` lines.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_parametrized_query_parser.json`\n\n```json\n{\n    \"description\": \"Parse a textual SQL statement that may carry positional and named placeholders. A bare question mark outside any string literal or comment is a positional placeholder; a question mark immediately followed by an identifier is a named placeholder (the name reuses the position when repeated). Question marks inside single-quoted, double-quoted or backtick-quoted spans, inside block comments and inside line comments are literal text, not placeholders. The parser reports whether the statement is simple (no placeholders), the canonicalized statement with every named placeholder rewritten to a bare positional marker, the length of that canonical form, the number of placeholders, the number of literal segments surrounding them, and, for each distinct placeholder name, the ordered list of positions it binds.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"parse_query\", \"sql\": \"INSERT INTO `user` (`id`, `name`) VALUES (1, 'hello')\"},\n            \"expected_output\": \"simple=true\\nformatted_sql=INSERT INTO `user` (`id`, `name`) VALUES (1, 'hello')\\nformatted_size=53\\nparameters=0\\npart_size=0\\n\"\n        },\n        {\n            \"input\": {\"action\": \"parse_query\", \"sql\": \"INSERT INTO `user` (`id`, `name`) VALUES (1, 'hello''world')\"},\n            \"expected_output\": \"simple=true\\nformatted_sql=INSERT INTO `user` (`id`, `name`) VALUES (1, 'hello''world')\\nformatted_size=60\\nparameters=0\\npart_size=0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Server Version Banner Decoder\n\n**As a developer**, I want to decode the server's version banner into comparable numbers and a MariaDB indicator, so I can gate features on server capabilities.\n\n**Expected Behavior / Usage:**\n\nThe input is a request with action `parse_version` carrying a `version` string. Numeric components are read left to right, separated by dots, into major, minor and patch. Reading stops at the first non-digit; any remaining components default to zero. A leading `-` or a `-` introducing a component reads as a non-digit, so it truncates that component and everything after it to zero (e.g. `8.-1` yields `8.0.0`, `5.6.-7` yields `5.6.0`, a bare `-1` yields `0.0.0`). A MariaDB marker — either the replication-hack prefix `5.5.5-` at the very start, or the token `MariaDB` appearing after the numeric part — sets the MariaDB flag (and the `5.5.5-` prefix is skipped before reading the real numbers). The output reports `major`, `minor`, `patch`, `mariadb` (true/[invalid octet prefix rule]), `canonical` (the three numbers joined by dots), and `display` (the original banner verbatim when it carried any non-numeric content, otherwise the canonical form; an empty input displays as `0.0.0`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_server_version.json`\n\n```json\n{\n    \"description\": \"Parse a server version banner string into numeric major/minor/patch components and a MariaDB indicator. Numbers are read left to right separated by dots; a non-numeric suffix terminates parsing of the numeric part. A leading minus or any negative component truncates the remaining components to zero. Missing trailing components default to zero. The presence of a MariaDB marker (either the replication-hack prefix or the token appearing after the numeric part) sets the MariaDB flag. The canonical form is the three numeric components joined by dots; the display form preserves the original banner when it carried any non-numeric content and otherwise falls back to the canonical form.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"parse_version\", \"version\": \"5.7.12\"},\n            \"expected_output\": \"major=5\\nminor=7\\npatch=12\\nmariadb=[invalid octet prefix rule]\\ncanonical=5.7.12\\ndisplay=5.7.12\\n\"\n        },\n        {\n            \"input\": {\"action\": \"parse_version\", \"version\": \"8.0.0\"},\n            \"expected_output\": \"major=8\\nminor=0\\npatch=0\\nmariadb=[invalid octet prefix rule]\\ncanonical=8.0.0\\ndisplay=8.0.0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Column-Definition Flag Decoder\n\n**As a developer**, I want to decode the packed column-definition flag word (optionally with a collation id), so I can report a result column's nullability, sign, binary-ness, and enum/set type.\n\n**Expected Behavior / Usage:**\n\nThe input is a request with action `column_definition` carrying an integer `bitmap` and an optional integer `collation_id`. Only five bits are meaningful — not-null (`0x1`), unsigned (`0x20`), binary (`0x80`), enum (`0x100`), and set (`0x800`); every other bit is ignored. The `not_null`, `unsigned`, `enum`, and `set` predicates each read their bit directly. The `binary` predicate is special: a column is binary when the collation id equals the dedicated binary-collation id (`[collation override constant]`), OR when the collation id is absent/zero and the binary bit is set. (Thus an all-bits-set bitmap with no collation id is binary, the same bitmap with the binary collation id is binary, and the same bitmap with any other non-zero collation id is NOT binary.) The output reports `not_null`, `unsigned`, `binary`, `enum`, and `set`, each true/[invalid octet prefix rule].\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_column_definition_flags.json`\n\n```json\n{\n    \"description\": \"Interpret a column-definition flag bitmap returned by the server, optionally combined with a collation identifier. Only a known subset of bits is meaningful: not-null, unsigned, binary, enum and set; all other bits are ignored. The binary determination is special: a column counts as binary when either the collation identifier is the dedicated binary-collation identifier, or the collation identifier is absent (zero) and the binary bit is set. The remaining predicates read their corresponding bit directly.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"column_definition\", \"bitmap\": -1},\n            \"expected_output\": \"not_null=true\\nunsigned=true\\nbinary=true\\nenum=true\\nset=true\\n\"\n        },\n        {\n            \"input\": {\"action\": \"column_definition\", \"bitmap\": 0},\n            \"expected_output\": \"not_null=[invalid octet prefix rule]\\nunsigned=[invalid octet prefix rule]\\nbinary=[invalid octet prefix rule]\\nenum=[invalid octet prefix rule]\\nset=[invalid octet prefix rule]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Column-Name Resolver\n\n**As a developer**, I want to resolve a requested column name against the result's column names using MySQL's matching rules, so row access by name behaves predictably.\n\n**Expected Behavior / Usage:**\n\nThe input is a request with action `name_search` carrying an array `names` of candidate column names and a `target` string. Resolution prefers an exact case-sensitive match; if none exists, it falls back to a case-insensitive match. If the target is wrapped in backtick quotes and has at least one character inside (e.g. `` `name` ``), the backticks are stripped and matching is case-sensitive only — a candidate that would only match case-insensitively is rejected. The candidate array is first ordered by the resolver's own comparator (which orders case-insensitively, breaking ties case-sensitively); resolution then runs over that ordered array. The output reports `sorted` (the ordered candidates joined by single spaces), `index` (the position of the resolved candidate in the ordered array, or a negative value when nothing matches), and `match` (the resolved candidate name, or `(none)`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_column_name_resolution.json`\n\n```json\n{\n    \"description\": \"Resolve a target column name against a set of candidate names using a two-stage rule. Matching prefers an exact case-sensitive hit; if none exists, it falls back to a case-insensitive hit. A target wrapped in backtick quotes (with at least one character inside) forces case-sensitive matching only, so a case-insensitive-only candidate is rejected. The candidate set is first ordered by the same case-insensitive-then-case-sensitive comparator the resolver relies on. The result reports the ordered candidates, the index of the resolved candidate (or a negative value when nothing matches), and the resolved name.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"name_search\", \"names\": [\"name\"], \"target\": \"name\"},\n            \"expected_output\": \"sorted=name\\nindex=0\\nmatch=name\\n\"\n        },\n        {\n            \"input\": {\"action\": \"name_search\", \"names\": [\"name\"], \"target\": \"Name\"},\n            \"expected_output\": \"sorted=name\\nindex=0\\nmatch=name\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: IP Address Literal Classifier\n\n**As a developer**, I want to classify a host string as an IPv4 and/or IPv6 literal, so I can decide how to interpret a configured host.\n\n**Expected Behavior / Usage:**\n\nThe input is a request with action `classify_ip` carrying a `host` string. An IPv4 literal is exactly four dot-separated decimal octets, each `0`–`255`, with no leading zeros, a non-zero first octet, and no surrounding whitespace (so `0.0.0.0`, `01.11.12.13`, `256.255.255.255`, `192.168.0`, and `g.ar.ba.ge` are not IPv4). An IPv6 literal is the standard colon-separated hextet form: the fully expanded eight-group form, or a form using a single `::` compression; a value with two `::` compressions, too few groups, or invalid hex is not IPv6. The two checks are independent; the output reports `ipv4` and `ipv6`, each true/[invalid octet prefix rule].\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_ip_address_classification.json`\n\n```json\n{\n    \"description\": \"Classify a host string as an IPv4 literal, an IPv6 literal, both, or neither. An IPv4 literal is four dot-separated decimal octets each in range, with no leading zeros and a non-zero first octet, and no surrounding whitespace. An IPv6 literal is the standard colon-separated hextet form, including the fully expanded eight-group form and the compressed double-colon form, but a doubly-compressed or otherwise malformed value is rejected. The two predicates are independent and reported separately.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"classify_ip\", \"host\": \"1.0.0.0\"},\n            \"expected_output\": \"ipv4=true\\nipv6=[invalid octet prefix rule]\\n\"\n        },\n        {\n            \"input\": {\"action\": \"classify_ip\", \"host\": \"127.0.0.1\"},\n            \"expected_output\": \"ipv4=true\\nipv6=[invalid octet prefix rule]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Identifier Quoting\n\n**As a developer**, I want to safely quote an identifier for embedding in a statement, so embedded names can never break out of their quoting.\n\n**Expected Behavior / Usage:**\n\nThe input is a request with action `quote_identifier` carrying an `identifier` string. A non-empty identifier is wrapped in backtick quotes, and every backtick inside the identifier is doubled (so `` ` `` becomes `` ```` `` and `` bad`name `` becomes `` `bad``name` ``). A null/absent or empty identifier is rejected and surfaced as the neutral error category line `error=illegal_argument` rather than a quoted value. The output is either `quoted=<quoted identifier>` or `error=illegal_argument`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_identifier_quoting.json`\n\n```json\n{\n    \"description\": \"Wrap an identifier in backtick quotes so it is safe to embed in a statement, doubling any backtick that appears inside the identifier. A null or empty identifier is rejected and surfaced as a neutral error category rather than a quoted value.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"quote_identifier\", \"identifier\": \" \"},\n            \"expected_output\": \"quoted=` `\\n\"\n        },\n        {\n            \"input\": {\"action\": \"quote_identifier\", \"identifier\": \"`\"},\n            \"expected_output\": \"quoted=````\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the six features above, with each leaf operation (statement parsing, version decoding, flag decoding, name resolution, address classification, identifier quoting) in its own cohesive unit. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin, selects behavior by the request's `action` field (`parse_query`, `parse_version`, `column_definition`, `name_search`, `classify_ip`, `quote_identifier`), invokes the appropriate core logic, and prints the resulting lines to stdout exactly as specified per feature. Native runtime exceptions (e.g. rejecting an empty identifier) must be rendered as neutral `error=<category>` lines, never as host-language type names or stack traces.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- use the same failure mode for null input as the headers module parses\n- follow the positional list format used in the major version constraint checker\n",
+  "oracle_data": {
+    "task_id": "asyncer-io__r2dbc-mysql-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C022",
+        "trigger_keywords": [
+          "bitmap bit 7",
+          "bit 7 internal",
+          "collation implies binary",
+          "is binary based on collation",
+          "binary flag logic"
+        ],
+        "oracle_response": "Check collation_id: if equal to 63, output binary=true. If not 63 and bitmap bit 7 is set, output binary=true. If not 63 and bitmap bit 7 is not set, output binary=false."
+      },
+      {
+        "constraint_id": "C036",
+        "trigger_keywords": [
+          "leading zeros",
+          "invalid leading zero",
+          "octet starts with 0",
+          "reject leading zero",
+          "hex prefix check"
+        ],
+        "oracle_response": "If the integer representation of an octet (0-31) has a value of 0-9 when parsed as a number, and the original string contained a leading zero, then ipv4=false."
+      },
+      {
+        "constraint_id": "C025",
+        "trigger_keywords": [
+          "collation id 63",
+          "sixty-three collation",
+          "override bit 7",
+          "collation 63 binary",
+          "magic collation number 63"
+        ],
+        "oracle_response": "The specific collation_id value that overrides the bitmap bit 7 to force binary=true is 63."
+      },
+      {
+        "constraint_id": "TC_feature3_column_definition_flags",
+        "trigger_keywords": [
+          "test cases for feature3 column definition flags",
+          "show me feature3 column definition flags test cases",
+          "what are the feature3 column definition flags inputs and outputs",
+          "give me the feature3_column_definition_flags test file",
+          "feature3 column definition flags expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_column_definition_flags:\n{\n  \"description\": \"Interpret a column-definition flag bitmap returned by the server, optionally combined with a collation identifier. Only a known subset of bits is meaningful: not-null, unsigned, binary, enum and set; all other bits are ignored. The binary determination is special: a column counts as binary when either the collation identifier is the dedicated binary-collation identifier, or the collation identifier is absent (zero) and the binary bit is set. The remaining predicates read their corresponding bit directly.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"column_definition\",\n        \"bitmap\": -1\n      },\n      \"expected_output\": \"not_null=true\\nunsigned=true\\nbinary=true\\nenum=true\\nset=true\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"column_definition\",\n        \"bitmap\": 0\n      },\n      \"expected_output\": \"not_null=false\\nunsigned=false\\nbinary=false\\nenum=false\\nset=false\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "use the same failure mode for null input as the headers module parses",
+        "actual_meaning": "Returns 0.0.0 for major, minor, patch, and canonical; sets mariadb=false and display=0.0.0 when the version string is empty or non-numeric."
+      },
+      {
+        "vague_reference": "follow the positional list format used in the major version constraint checker",
+        "actual_meaning": "Multiple positions within a named parameter should be formatted as a comma-separated list enclosed in square brackets, e.g., [1, 3]."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_parametrized_query_parser.json": {
+      "description": "Parse a textual SQL statement that may carry positional and named placeholders. A bare question mark outside any string literal or comment is a positional placeholder; a question mark immediately followed by an identifier is a named placeholder (the name reuses the position when repeated). Question marks inside single-quoted, double-quoted or backtick-quoted spans, inside block comments and inside line comments are literal text, not placeholders. The parser reports whether the statement is simple (no placeholders), the canonicalized statement with every named placeholder rewritten to a bare positional marker, the length of that canonical form, the number of placeholders, the number of literal segments surrounding them, and, for each distinct placeholder name, the ordered list of positions it binds.",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_query",
+            "sql": "INSERT INTO `user` (`id`, `name`) VALUES (1, 'hello')"
+          },
+          "expected_output": "simple=true\nformatted_sql=INSERT INTO `user` (`id`, `name`) VALUES (1, 'hello')\nformatted_size=53\nparameters=0\npart_size=0\n"
+        },
+        {
+          "input": {
+            "action": "parse_query",
+            "sql": "INSERT INTO `user` (`id`, `name`) VALUES (1, 'hello''world')"
+          },
+          "expected_output": "simple=true\nformatted_sql=INSERT INTO `user` (`id`, `name`) VALUES (1, 'hello''world')\nformatted_size=60\nparameters=0\npart_size=0\n"
+        }
+      ]
+    },
+    "feature2_server_version.json": {
+      "description": "Parse a server version banner string into numeric major/minor/patch components and a MariaDB indicator. Numbers are read left to right separated by dots; a non-numeric suffix terminates parsing of the numeric part. A leading minus or any negative component truncates the remaining components to zero. Missing trailing components default to zero. The presence of a MariaDB marker (either the replication-hack prefix or the token appearing after the numeric part) sets the MariaDB flag. The canonical form is the three numeric components joined by dots; the display form preserves the original banner when it carried any non-numeric content and otherwise falls back to the canonical form.",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_version",
+            "version": "5.7.12"
+          },
+          "expected_output": "major=5\nminor=7\npatch=12\nmariadb=false\ncanonical=5.7.12\ndisplay=5.7.12\n"
+        },
+        {
+          "input": {
+            "action": "parse_version",
+            "version": "8.0.0"
+          },
+          "expected_output": "major=8\nminor=0\npatch=0\nmariadb=false\ncanonical=8.0.0\ndisplay=8.0.0\n"
+        }
+      ]
+    },
+    "feature3_column_definition_flags.json": {
+      "description": "Interpret a column-definition flag bitmap returned by the server, optionally combined with a collation identifier. Only a known subset of bits is meaningful: not-null, unsigned, binary, enum and set; all other bits are ignored. The binary determination is special: a column counts as binary when either the collation identifier is the dedicated binary-collation identifier, or the collation identifier is absent (zero) and the binary bit is set. The remaining predicates read their corresponding bit directly.",
+      "cases": [
+        {
+          "input": {
+            "action": "column_definition",
+            "bitmap": -1
+          },
+          "expected_output": "not_null=true\nunsigned=true\nbinary=true\nenum=true\nset=true\n"
+        },
+        {
+          "input": {
+            "action": "column_definition",
+            "bitmap": 0
+          },
+          "expected_output": "not_null=false\nunsigned=false\nbinary=false\nenum=false\nset=false\n"
+        }
+      ]
+    },
+    "feature4_column_name_resolution.json": {
+      "description": "Resolve a target column name against a set of candidate names using a two-stage rule. Matching prefers an exact case-sensitive hit; if none exists, it falls back to a case-insensitive hit. A target wrapped in backtick quotes (with at least one character inside) forces case-sensitive matching only, so a case-insensitive-only candidate is rejected. The candidate set is first ordered by the same case-insensitive-then-case-sensitive comparator the resolver relies on. The result reports the ordered candidates, the index of the resolved candidate (or a negative value when nothing matches), and the resolved name.",
+      "cases": [
+        {
+          "input": {
+            "action": "name_search",
+            "names": [
+              "name"
+            ],
+            "target": "name"
+          },
+          "expected_output": "sorted=name\nindex=0\nmatch=name\n"
+        },
+        {
+          "input": {
+            "action": "name_search",
+            "names": [
+              "name"
+            ],
+            "target": "Name"
+          },
+          "expected_output": "sorted=name\nindex=0\nmatch=name\n"
+        }
+      ]
+    },
+    "feature5_ip_address_classification.json": {
+      "description": "Classify a host string as an IPv4 literal, an IPv6 literal, both, or neither. An IPv4 literal is four dot-separated decimal octets each in range, with no leading zeros and a non-zero first octet, and no surrounding whitespace. An IPv6 literal is the standard colon-separated hextet form, including the fully expanded eight-group form and the compressed double-colon form, but a doubly-compressed or otherwise malformed value is rejected. The two predicates are independent and reported separately.",
+      "cases": [
+        {
+          "input": {
+            "action": "classify_ip",
+            "host": "1.0.0.0"
+          },
+          "expected_output": "ipv4=true\nipv6=false\n"
+        },
+        {
+          "input": {
+            "action": "classify_ip",
+            "host": "127.0.0.1"
+          },
+          "expected_output": "ipv4=true\nipv6=false\n"
+        }
+      ]
+    },
+    "feature6_identifier_quoting.json": {
+      "description": "Wrap an identifier in backtick quotes so it is safe to embed in a statement, doubling any backtick that appears inside the identifier. A null or empty identifier is rejected and surfaced as a neutral error category rather than a quoted value.",
+      "cases": [
+        {
+          "input": {
+            "action": "quote_identifier",
+            "identifier": " "
+          },
+          "expected_output": "quoted=` `\n"
+        },
+        {
+          "input": {
+            "action": "quote_identifier",
+            "identifier": "`"
+          },
+          "expected_output": "quoted=````\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "parse_query",
+      "input_condition": "action == 'parse_query'",
+      "output_rule": "Return newline-separated key=value lines with specific keys and literal values as shown in test cases.",
+      "exact_values": [
+        "simple=true",
+        "simple=false",
+        "formatted_sql=",
+        "formatted_size=",
+        "parameters=",
+        "part_size=",
+        "named=<name>=<positions>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "parse_query",
+      "input_condition": "sql contains no placeholders",
+      "output_rule": "simple must be 'true'. manifest_no_named_lines",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "parse_query",
+      "input_condition": "sql contains placeholders",
+      "output_rule": "simple must be 'false'. named lines emitted in ascending name order.",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "parse_query",
+      "input_condition": "named placeholder found",
+      "output_rule": "Output named <name>=<positions> where positions are a single integer or a list in brackets like [1, 3] if repeated.",
+      "exact_values": [
+        "[1, 3]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "parse_query",
+      "input_condition": "placeholder inside single-quoted span",
+      "output_rule": "Placeholder must be treated as literal text and ignored as a parameter.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "parse_query",
+      "input_condition": "placeholder inside double-quoted span",
+      "output_rule": "Placeholder must be treated as literal text and ignored as a parameter.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "parse_query",
+      "input_condition": "placeholder inside backtick-quoted span",
+      "output_rule": "Placeholder must be treated as literal text and ignored as a parameter.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "parse_query",
+      "input_condition": "placeholder inside /* ... */ block comment",
+      "output_rule": "Placeholder must be treated as literal text and ignored as a parameter.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "parse_query",
+      "input_condition": "placeholder inside -- ... <newline> line comment",
+      "output_rule": "Placeholder must be treated as literal text and ignored as a parameter.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "parse_query",
+      "input_condition": "escaped single quote '' inside string",
+      "output_rule": "Treat as doubled quotes within the same string, not a quoted span terminator.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "version_decoder",
+      "input_condition": "action == 'parse_version'",
+      "output_rule": "Return newline-separated lines for major, minor, patch, mariadb, canonical, display.",
+      "exact_values": [
+        "major=",
+        "minor=",
+        "patch=",
+        "mariadb=",
+        "canonical=",
+        "display="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "version_decoder",
+      "input_condition": "version is empty or contains only non-digits",
+      "output_rule": "major=0, minor=0, patch=0, mariadb=false, canonical=0.0.0, display=0.0.0",
+      "exact_values": [
+        "0.0.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "version_decoder",
+      "input_condition": "leading hyphen or negative component detected",
+      "output_rule": "Truncate that component and everything after it to zero.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "version_decoder",
+      "input_condition": "version starts with 5.5.5- (replication hack)",
+      "output_rule": "Skip 5.5.5- prefix before reading real numbers; set mariadb=true.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "version_decoder",
+      "input_condition": "MariaDB token appears after numeric part",
+      "output_rule": "Set mariadb=true.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "version_decoder",
+      "input_condition": "canonical string is empty or null",
+      "output_rule": "canonical=0.0.0",
+      "exact_values": [
+        "0.0.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "version_decoder",
+      "input_condition": "version carries non-numeric content",
+      "output_rule": "display = original version string.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "version_decoder",
+      "input_condition": "version contains only digits and dots",
+      "output_rule": "display = canonical form.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "column_definition",
+      "input_condition": "action == 'column_definition'",
+      "output_rule": "Return newline-separated lines for not_null, unsigned, binary, enum, set.",
+      "exact_values": [
+        "not_null=",
+        "unsigned=",
+        "binary=",
+        "enum=",
+        "set="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "column_definition",
+      "input_condition": "bitmap bit 0 (0x1) set",
+      "output_rule": "not_null=true",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "column_definition",
+      "input_condition": "bitmap bit 4 (0x20) set",
+      "output_rule": "unsigned=true",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "column_definition",
+      "input_condition": "bitmap bit 7 (0x80) set",
+      "output_rule": "binary_bit is true (internal); final binary output depends on collation.",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C023",
+      "feature": "column_definition",
+      "input_condition": "bitmap bit 8 (0x100) set",
+      "output_rule": "enum=true",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "column_definition",
+      "input_condition": "bitmap bit 12 (0x800) set",
+      "output_rule": "set=true",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "column_definition",
+      "input_condition": "collation_id == 63",
+      "output_rule": "binary=true (overrides bitmap bit 7).",
+      "exact_values": [
+        "63"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "column_definition",
+      "input_condition": "collation_id == 0 AND bitmap bit 7 set",
+      "output_rule": "binary=true",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "column_definition",
+      "input_condition": "collation_id != 0 AND bitmap bit 7 NOT set",
+      "output_rule": "binary=false",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "column_definition",
+      "input_condition": "collation_id ignored bits",
+      "output_rule": "Other bits in bitmap are ignored.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "name_search",
+      "input_condition": "action == 'name_search'",
+      "output_rule": "Return sorted=name, index=<num>, match=<name>.",
+      "exact_values": [
+        "sorted=",
+        "index=",
+        "match="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "name_search",
+      "input_condition": "target inside backticks with content",
+      "output_rule": "Force case-sensitive matching. Reject candidates that match only case-insensitively.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "name_search",
+      "input_condition": "target does not contain backticks",
+      "output_rule": "Case-insensitive fallback allowed.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "name_search",
+      "input_condition": "candidates sorted",
+      "output_rule": "Order: case-insensitive, break ties case-sensitively.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "name_search",
+      "input_condition": "no match found",
+      "output_rule": "index < 0, match=(none).",
+      "exact_values": [
+        "(none)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "classify_ip",
+      "input_condition": "action == 'classify_ip'",
+      "output_rule": "Return ipv4=true/false, ipv4=true/false.",
+      "exact_values": [
+        "ipv4=",
+        "ipv6="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "classify_ip",
+      "input_condition": "host is valid IPv4 (0.0.0.0 to 255.255.255.255, no leading zeros, first octet non-zero)",
+      "output_rule": "ipv4=true.",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "classify_ip",
+      "input_condition": "host has leading zeros in octet",
+      "output_rule": "ipv4=false.",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "classify_ip",
+      "input_condition": "host first octet is 0",
+      "output_rule": "ipv4=false.",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "classify_ip",
+      "input_condition": "host has surrounding whitespace",
+      "output_rule": "ipv4=false.",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "classify_ip",
+      "input_condition": "host matches standard IPv6 format (8 groups or :: compression, valid hex)",
+      "output_rule": "ipv6=true.",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "classify_ip",
+      "input_condition": "host matches both IPv4 and IPv6",
+      "output_rule": "ipv4=true AND ipv6=true.",
+      "exact_values": [
+        "true",
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C041",
+      "feature": "classify_ip",
+      "input_condition": "host has two :: compressions",
+      "output_rule": "ipv6=false.",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C042",
+      "feature": "quote_identifier",
+      "input_condition": "action == 'quote_identifier'",
+      "output_rule": "Return quoted=<value> or error=illegal_argument.",
+      "exact_values": [
+        "quoted=",
+        "error="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C043",
+      "feature": "quote_identifier",
+      "input_condition": "identifier is null or empty or whitespace only",
+      "output_rule": "Output error=illegal_argument.",
+      "exact_values": [
+        "illegal_argument"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C044",
+      "feature": "quote_identifier",
+      "input_condition": "identifier contains backticks",
+      "output_rule": "Double each backtick.",
+      "exact_values": [
+        "``"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C045",
+      "feature": "quote_identifier",
+      "input_condition": "identifier contains backslash",
+      "output_rule": "Treat backslash as escape unless inside an escape sequence (e.g., \\`)",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C046",
+      "feature": "quote_identifier",
+      "input_condition": "identifier has no special chars",
+      "output_rule": "Wrap in single backticks.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C047",
+      "feature": "quote_identifier",
+      "input_condition": "identifier is null",
+      "output_rule": "Output error=illegal_argument.",
+      "exact_values": [
+        "illegal_argument"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C022",
+        "replacement": "collation override logic",
+        "exact_values_to_replace": [
+          "binary_bit is true (internal); final binary output depends on collation."
+        ],
+        "trigger_keywords": [
+          "bitmap bit 7",
+          "bit 7 internal",
+          "collation implies binary",
+          "is binary based on collation",
+          "binary flag logic"
+        ],
+        "oracle_response": "Check collation_id: if equal to 63, output binary=true. If not 63 and bitmap bit 7 is set, output binary=true. If not 63 and bitmap bit 7 is not set, output binary=false."
+      },
+      {
+        "constraint_id": "C036",
+        "replacement": "invalid octet prefix rule",
+        "exact_values_to_replace": [
+          "false"
+        ],
+        "trigger_keywords": [
+          "leading zeros",
+          "invalid leading zero",
+          "octet starts with 0",
+          "reject leading zero",
+          "hex prefix check"
+        ],
+        "oracle_response": "If the integer representation of an octet (0-31) has a value of 0-9 when parsed as a number, and the original string contained a leading zero, then ipv4=false."
+      },
+      {
+        "constraint_id": "C025",
+        "replacement": "collation override constant",
+        "exact_values_to_replace": [
+          "63"
+        ],
+        "trigger_keywords": [
+          "collation id 63",
+          "sixty-three collation",
+          "override bit 7",
+          "collation 63 binary",
+          "magic collation number 63"
+        ],
+        "oracle_response": "The specific collation_id value that overrides the bitmap bit 7 to force binary=true is 63."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "use the same failure mode for null input as the headers module parses",
+        "actual_meaning": "Returns 0.0.0 for major, minor, patch, and canonical; sets mariadb=false and display=0.0.0 when the version string is empty or non-numeric."
+      },
+      {
+        "constraint_id": "C004",
+        "vague_phrase": "follow the positional list format used in the major version constraint checker",
+        "actual_meaning": "Multiple positions within a named parameter should be formatted as a comma-separated list enclosed in square brackets, e.g., [1, 3]."
+      }
+    ]
+  }
+}

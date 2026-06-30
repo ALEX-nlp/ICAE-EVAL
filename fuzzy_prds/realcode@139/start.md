@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that payload parsing library we've been talking about for the CI bot. The bot runs against multiple hosting environments and right now every automation script has to do its own messy JSON wrangling — it's a nightmare to maintain and keeps breaking when upstream shapes change. We want one clean library that reads in whatever the bot receives and spits out a normalized, typed model that scripts can just use directly without digging into nested JSON themselves.
+
+The library needs to handle all three of our hosting environments (you know the ones — the two cloud ones and the self-hosted server product we support). Each has its own payload shape, different casing conventions, different timestamp formats, etc. We also need it to handle things like diff statistics, file change lists, and platform detection.
+
+For the output side, think about how we did the formatting in that old shell-report module — flat key=value lines, one per field, with dotted paths for nested stuff. Timestamps should come out as numbers not strings. Missing optional fields should come out as null not blow up. The stdin/stdout adapter piece should stay completely separate from the actual parsing logic — same idea as that separation we did on the login module integration. Make sure it's properly split into multiple files, not one giant blob.

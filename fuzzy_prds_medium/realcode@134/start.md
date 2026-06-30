@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to ship the modeltyper client-contract generator. The basic idea is: given a server-side data model, spit out TypeScript definitions that frontend devs can actually use without hand-writing interfaces. We've been burned too many times by stale types on the client side.
+
+The tool needs to handle the usual stuff — columns, computed attributes (both the old-style and new accessor style), relationships, and those backed string constant sets we use for roles and similar things. There should be a way to wrap everything in a global namespace for projects that need it, and also a raw JSON metadata mode for tooling integrations.
+
+For the constant sets specifically, remember we had that escaping issue in the auth module last time — make sure backslash-heavy values don't get mangled. Also the enum output style should be switchable between two modes (the new one uses a different type alias pattern).
+
+We also need the discovery and inspection endpoints so downstream tooling knows which models are even valid targets — abstract or missing models should fail gracefully with a normalized error token, not a stack trace.
+
+One thing I'm not 100% sure about: the fillable subset feature — I think it generates a Pick<> type but I forget the exact suffix convention. Check how we handled optional/hidden fields in the previous field-rendering spike. Four concrete sample models should be enough to exercise all the paths.
+
+Just to close the loop on the questions that came back: discovery should return exactly 4 concrete models, in this order: Complex, Pivot, User, Team. The format is 'count=4' on the first line and then one 'model=<Name>' line for each of those. If somebody asks for an abstract or missing subject, that should come back as 'result=null' instead of anything noisy. And if we inspect the 'user' subject, the response is result=inspected, table=users, attributes=12, relations=1. That attributes total of 12 includes both real persisted columns and computed mutators.
+
+On the type side, the mapping rules should stay literal: integer/bigInteger/decimal/double/float/mediumInteger/smallInteger/year → number; char/string/text/longText/mediumText/enum/ipAddress/macAddress/date/dateTime/immutableDateTime/immutableCustomDateTime/immutableDate/time/timestamp/uuid/ulid → string; boolean → boolean; json/jsonb → Record<string, unknown>; binary and any unrecognized type → unknown. Custom casts that don't match a known category also map to unknown. Type token lookup is case-insensitive too, so the token 'B' matches the mapping key 'b' and returns 'type=2\n'. The adapter normalizes the incoming token to lowercase before performing the lookup.
+
+For the generated interface layout, the body is split into three commented sections in this order: '// columns', '// mutators', '// relations'. Those map to persisted database columns, computed attributes / accessors, and relationship fields. Each section header only shows up if that section actually has at least one field, and if a model has no relationships then '// relations' is just omitted. Also, hidden or guarded fields need the '?' suffix on the field name, like 'password?: string', while nullable fields append '| null' to the type. A field can be both at once, like 'remember_token?: string | null'. For the User model specifically, 'password' and 'remember_token' are the optional fields.
+
+Also confirming the enum output behavior because that was one of the spots people wanted exact wording on. Default, with no use_enums, emits a 'const Roles = { ... } as const;' object followed by 'export type Roles = typeof Roles[keyof typeof Roles]'. . With use_enums=true: emits 'export const enum Roles { ... }' followed by 'export type RolesEnum = `${Roles}`'. The interface field type changes with that too: default uses 'Roles', use_enums=true: use 'RolesEnum'. And for the escaping issue, the USERCLASS enum constant value 'App\Models\User' has to become 'App\\Models\\User' in the TypeScript string literal output.
+
+Last thing: we do need to keep probing both computed attribute paths, not just one. That means legacy PHP-style getMutatorAttribute methods and modern Attribute accessor objects both count, and both are part of that attributes=12 total for User.

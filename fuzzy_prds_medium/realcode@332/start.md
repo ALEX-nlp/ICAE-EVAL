@@ -1,0 +1,25 @@
+## Product Requirement Document
+
+Hey team, we need to build out that component enhancement toolkit we've been talking about. The idea is basically that devs shouldn't have to write boilerplate wrapper components every time they want to do something simple like inject a prop, rename a key, or hold some local state. We want a composable pipeline approach — similar to what we did with the auth flow transformers last quarter, just refer to that pattern for how we chain things together.
+
+The toolkit should handle property reshaping (things like overriding values, providing fallbacks, keeping/dropping specific keys, moving values around, spreading nested objects, and computing new values from existing ones). It also needs to cover local state management so components can track values and respond to updates without being rewritten. On top of that we want conditional rendering behavior, nesting helpers, re-render optimization, and some kind of event broadcasting utility.
+
+One thing that kept coming up in the retro: when developers misuse the handler wiring incorrectly, they get cryptic runtime crashes instead of a clear message. That needs to be a proper normalized failure mode.
+
+The whole thing must be broken into focused modules — no monolithic files. Each concern lives in its own unit. We also want the composition entry point to support chaining any number of enhancers cleanly. Output formatting for the test harness should emit sorted key=value lines with JSON-literal values. Coordinate with backend on the reducer pattern — they already have a counter schema we should reuse.
+
+Quick follow-up from the questions that came in: the composition behavior should match the usual right-to-left flow. The rightmost function in the list is applied first, and its output feeds the next one to the left. If there are no functions, the seed just passes through unchanged. Also, that seed is provided as an argument list, so if the rightmost transformer takes multiple arguments, it can consume several seed values there. For the composition core specifically, the compose utility is a right-to-left function composer that takes an ordered list of enhancers (Component => Component functions) and returns a single composed enhancer, matching the signature compose(...enhancers)(BaseComponent).
+
+For labels, the precedence should be explicit and predictable: explicit display label wins first, then the declared type name, then for an unnamed/anonymous inline component the literal string 'Component' is used as the fallback, and a raw markup tag string (like 'div') is returned verbatim.
+
+A couple specifics on the branching pieces too. The branch_transform enhancer checks whether a named property is truthy. If it is, the when_true transformation (a merge descriptor) gets applied to the props; if not, the when_false transformation gets applied instead. Important part: the test property itself stays in the output alongside the merged result. And for branch_render, if when_false or when_true is set to 'render_nothing', the rendered output should be the literal string 'null' on a single line, which is how we represent an empty/null render rather than a markup tag.
+
+On render output, the tree should print as an indented node listing. Each nesting level is indented by two spaces relative to its parent. Every line starts with the tag name followed by its props as key=value pairs, and the same props are passed to every level. If there are children, they show up as a plain string at the innermost level.
+
+For memoization, we’ve got two strategies. The 'all' strategy compares every property shallowly and skips re-rendering when nothing has changed. The 'keys' strategy compares only the named subset of properties, so changes to anything else are ignored. The render count only increments when a watched property changes, and output should emit the cumulative render count after the initial render and after each property update.
+
+For the event stream piece, think of it as pairing a push handler with an observable stream. Values pushed through the handler are delivered in order to every active subscriber, and each subscriber receives all emitted values. The output for that should list each subscriber's received sequence as subscriberN=[value1,value2,...] lines sorted by subscriber index.
+
+Also, on the bad handler wiring case we called out before: when a handler factory does not return a function, meaning it is not a higher-order function, we should normalize that to 'invalid_handler_factory'. In output that should surface as error=invalid_handler_factory instead of exposing raw runtime exception details.
+
+Last formatting note just to remove ambiguity: property output is emitted as key=value lines sorted alphabetically by key. Values are rendered as their JSON literals: strings are double-quoted, numbers are bare (no quotes), booleans are bare, and objects/arrays are compact JSON (no extra spaces). Each line ends with a newline character.

@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up that synthetic data generator library we've been building. The core engine is mostly spec'd out but I want to make sure the adapter layer is wired up correctly before we ship. Basically the idea is that devs can feed in a JSON blob with a seed and some params, and get back a formatted string they can use in fixtures, test forms, API mocks, etc.
+
+There are roughly 20 different generation scenarios we need to cover — things like names, credentials, network stuff, addresses, banking IDs, commerce fields, and so on. A few edge cases I'm worried about: the error handling story needs to be clean and language-neutral (remember how we handled that in the login module compatibility layer?), and there are a couple of identifier types that require embedded checksum logic — make sure those actually validate, don't just generate noise.
+
+Also the slug/URL feature should strip punctuation properly (we had a bug with this in the old pipeline), and the placeholder text feature needs to support multiple sizing modes — exact counts, ranges, and pick-lists — not just one.
+
+Architecturally, please don't dump everything in one file. The I/O routing, core logic, and formatting need to be separate concerns. SOLID principles apply. We want this extensible without touching the engine every time someone adds a new generator. Seed-based determinism is a hard requirement for all features.
+
+One quick follow-up from the questions that came in: for error handling, the output needs to stay fully machine-readable and language-neutral, always as exactly three lines: `error=<category>`, `field=<field_name>`, and `value=<offending_value>`. So if somebody sends an oversized username min_length of 10000000, the output should be `error=argument_too_large\nfield=min_length\nvalue=10000000\n`. We should not emit exception stack traces or natural-language messages there.
+
+Also, on the identifier side, French SIREN and SIRET need to actually pass a Luhn checksum validation, and the output needs to include `_luhn_valid=true`. Norwegian organisation numbers need to pass their modulo-11 check digit algorithm and emit `norwegian_check_valid=true`. Brazilian company numbers (CNPJ) are 14 digits. Polish register numbers need to match the caller-supplied length. Any validity signal we emit here should be a boolean string, so `true`/`false`.
+
+On structure, just reinforcing that this cannot be a single-file solution. We need a multi-file directory structure, for example `src/`, `tests/`, with the JSON I/O adapter handling parsing input and formatting output, the core domain engine holding generation logic, and separate routing/dispatch logic. The core business logic should have zero dependency on stdin/stdout or JSON parsing, and the design should stay open for extension without modification.
+
+A couple more specifics on generators too. The password generator takes `min_length`, `max_length`, `mixed_case`, and `special_chars`, and the output includes `password`, `length`, `contains_uppercase`, and `contains_symbol`. Generated length has to land within `[min_length, max_length]` inclusive. If `mixed_case=true`, there needs to be at least one uppercase letter, and if `special_chars=true`, there needs to be at least one symbol.
+
+For placeholder text, each of the four dimensions — characters, words, sentences, paragraphs — needs to support all three input styles: exact integer like `"words": 3`, inclusive range object like `"words": {"min": 2, "max": 5}`, and choice list like `"words": [2, 4, 7]`. For output formatting, words should use a pipe `|` between items, while characters should emit the raw string, and the count/length verification lines should always be present.
+
+And on slugs/URLs, the slugger should lowercase all input text, strip all punctuation characters including dots, commas, and other non-alphanumeric characters, split on whitespace, and rejoin with whatever glue the caller supplied. So `"Foo.. bAr., baZ,,"` with glue `"-"` becomes `foo-bar-baz`. For URL assembly, it’s just `{scheme}://{domain}{path}` with no extra transformation.

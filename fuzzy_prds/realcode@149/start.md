@@ -1,0 +1,9 @@
+## Product Requirement Document
+
+We need a command-line argument parsing utility that allows developers to declare each program input as a typed field, and have all the tedious work of converting, validating, defaulting, and required-checking happen automatically. Right now, our engineering teams are hand-writing verbose, error-prone setup code every time they build a CLI tool, and there is no single object whose fields describe the whole input surface.
+
+The new utility must support scalar types (integers, floats, strings, booleans, file paths), collection types (ordered lists, unique sets, fixed-length tuples with per-position types, and variable-length homogeneous tuples), optional fields that default to a null-like absent value, and choice-restricted fields. Booleans should work both as bare toggle flags and as explicit true/false value flags, controlled by a constructor option. Another constructor option should allow flag names with underscores to be accepted on the command line using dashes instead.
+
+Arguments can also be loaded from configuration files (one or more, later files take precedence over earlier ones, and command-line values override everything). There should be a way to populate the parsed state from a dictionary instead of from the command line. A partial-parse mode must collect unrecognized tokens into a separate list rather than failing. Subcommands must be supported, each with their own argument declarations.
+
+All error conditions should map to a small set of neutral categories: a standard parse failure, a missing file, an unsupported type configuration, and a lifecycle misuse. The output format should follow the same conventions as the existing error-reporting module so the calling system can process results uniformly. Results should be rendered sorted alphabetically by field name, with each collection type rendered in the same deterministic style we already use for set output in our metrics pipeline.

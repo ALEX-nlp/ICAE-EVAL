@@ -1,0 +1,3 @@
+## Product Requirement Document
+
+We need the full particle-system analysis toolkit surface covered by the tests, not just mean-squared displacement. Implement deterministic utilities for lattice generation, box geometry and coordinate transforms, periodic wrapping, neighbor queries and neighbor-list tables, radial distribution functions, density, cluster identification, nematic and hexatic order, Steinhardt order, and MSD/trajectory analysis. The JSON adapter should route each public feature input to the corresponding analysis and print the exact numeric/list summaries expected by the tests.

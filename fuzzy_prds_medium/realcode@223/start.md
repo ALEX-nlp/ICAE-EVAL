@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need to build out that lightweight inference runner we've been talking about. The idea is that our data science folks export a trained model once, and then any production service can just run it without needing the whole training framework installed. We had a similar portability story with that config-loading module from the auth service — same vibe here, just for neural nets.
+
+The runner needs to handle a few different evaluation styles: the standard layered one, a sequence-folding one for time-series stuff, and a more flexible graph-based one for complex routing. Each style reads a self-contained model description and spits out named results as plain text.
+
+One thing that came up in ops review: some of our input pipelines occasionally produce bad values (missing sensors, overflow, that kind of thing) and we need the runner to handle those gracefully rather than blowing up. Also, the output formatting needs to be totally consistent across environments — our diff-based monitoring will flag any whitespace or precision drift as an incident.
+
+Architecture-wise, please don't make this a single giant file — last time that happened with the analytics batch job it was a nightmare to maintain. Keep the parsing, math, evaluation strategies, and I/O handling clearly separated.
+
+Errors should come out in a normalized text format, not raw stack traces or framework exceptions, since downstream log parsers don't know how to handle those.
+
+A couple extra details from the questions that came back. On formatting, the text output really does need to be locked down: render values with roughly six significant figures, trim trailing zeros and any unnecessary decimal point, and if the result is an integer just print it as `2`, `-3`, `0`. For non-integers, use the minimal representation like `0.880797` or `-4.06896e-05`. That exact textual rendering is part of the contract and needs to stay stable across environments.
+
+Also, on the input path, every variable has an `offset` and a `scale`, and before anything hits the first layer we apply `(value + offset) * scale`. That’s true in all three modes: `feed_forward`, `recurrent`, and `graph`. If an incoming value is non-finite and shows up as the string tokens `nan`, `inf`, or `-inf`, then if there’s a default for that variable in the `defaults` map of the config, we swap in that default first, before any preprocessing or layer math. If there’s no default declared, the non-finite value just propagates as-is. Important detail there: the substitution happens before the `(value + offset) * scale` affine normalization step. This is the same config-loading and input-preprocessing pipeline we called out already, specifically the per-variable `offset`/`scale` affine transform and the `defaults`-based non-finite substitution logic described in Feature 2 (feature2_1_input_scaling.json and feature2_2_default_substitution.json).
+
+On errors, keep them single-line and language-neutral on stdout, with normalized categories only. For malformed JSON, emit `error=invalid_command` then `detail=malformed_json`. For an unrecognized mode, emit `error=unknown_mode` then `mode=<value>`. For an invalid network description, emit `error=invalid_configuration`. For a runtime evaluation failure, emit `error=evaluation_failed`. For an output-rank mismatch, emit `error=output_rank_mismatch`. And never emit a host-runtime stack trace.
+
+Last bit is output shape by mode. In graph mode, output starts with a header line `<output-node-name>:` and then the value lines. With `op=compute`, each value line is `<label> <value>`. With `op=scan`, each value line is `<label> <v1> <v2> ...` with one value per sequence step. In `feed_forward` and `recurrent`, there’s no header, just one line per named output as `<name> <value>`.

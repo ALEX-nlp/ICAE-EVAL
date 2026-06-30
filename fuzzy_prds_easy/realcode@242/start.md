@@ -1,0 +1,379 @@
+## Product Requirement Document
+
+# Local PHP Environment Manager — A Thin Orchestration Layer over a System Package Manager
+
+## Project Goal
+
+Build a reusable management layer that drives a system package manager (Homebrew, whose command-line program is `brew`) to install packages, register external repositories, manage background services, and detect/resolve the PHP runtime that is currently linked, so a developer tool can manage its own PHP installation and dependent services through one clean, well-defined interface instead of hand-assembling shell commands everywhere.
+
+---
+
+## Background & Problem
+
+A local development tool needs to install and control a handful of operating-system packages (a PHP runtime, a DNS resolver, a web server, etc.) and the long-running services some of them provide. The only way to do this on the target platform is to shell out to a package manager (`brew`) and its service supervisor (`brew services`), parse their text/JSON output, and reason about which PHP version is linked. Doing this ad-hoc scatters fragile shell strings throughout the codebase, makes failures hard to handle uniformly, and couples every caller to the exact command syntax.
+
+With this layer, callers ask for high-level operations — "is this package installed?", "install this package (registering these repositories first)", "restart this service", "which PHP version is linked?" — and the layer issues the correct package-manager commands, interprets their output, and surfaces clean results or normalized errors.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.
+   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.
+   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single "god file". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.
+   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain. In particular, the two external boundaries the core touches — the system shell (the thing that runs `brew ...` commands and returns their stdout / exit status) and the filesystem (symlink inspection) — MUST be expressed as injectable abstractions so they can be substituted with in-memory test doubles.
+
+3. **Adherence to SOLID Design Principles:**
+   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):
+   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.
+   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.
+
+---
+
+## Conventions used throughout
+
+The package manager is invoked through a shell boundary with three observable channels: a user-context channel (commands transparently run as the invoking non-root user), a privileged channel (commands run with elevated privilege, conventionally written with a `sudo ` prefix), and a fire-and-forget channel (silenced commands whose output is discarded). Several operations also pass an error callback that the shell boundary invokes when a command exits non-zero.
+
+In the contracts below, the adapter renders a line `cmd=<command>` for every command the core issues to the shell boundary, in the exact order issued and using the exact command string the core passes (these are the package manager's own wire commands). Domain results follow as keyed lines. Errors are normalized to a neutral `error=<category>` line (never leaking host-language runtime details), sometimes with an extra field such as `formula=<name>`. The invoking user name is a fixed deterministic value (`testuser`) in this environment, so a user-context wrapper appears as `sudo -u "testuser" ...`.
+
+---
+
+## Core Features
+
+### Feature 1: Package Installation Check
+
+**As a developer**, I want to ask whether a named package is installed, so I can decide whether to install it.
+
+**Expected Behavior / Usage:**
+
+The adapter issues the package manager's metadata query for the given package — `brew info <package> --json` — on the user-context channel, then interprets the returned text. The query returns a JSON array describing the package; the package counts as installed only when the first entry reports a non-empty list of installed versions. Two cases mean "not installed": empty output, or output that begins with the manager's not-found error text (`[the specific error prefix to trigger the false installation state]`). The output echoes the issued query command, then `installed=true` or `installed=false`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_installed_check.json`
+
+```json
+{
+    "description": "Determine whether a named package is currently installed by the system package manager. The adapter issues the manager's metadata query for the given package and inspects the result: a successful query returns a JSON document describing the package, and the package counts as installed only when its document reports a non-empty set of installed versions. A query that yields empty output, or whose output begins with the manager's 'no such formula' error text, means the package is not installed. The emitted output echoes the exact query command that was issued, then a flag reporting the installed status.",
+    "cases": [
+        {
+            "input": {"action": "check_installed", "formula": "php@7.4", "info_response": "[{\"name\":\"php@7.4\",\"full_name\":\"php@7.4\",\"aliases\":[],\"versioned_formulae\":[],\"versions\":{\"stable\":\"7.4.5\"},\"installed\":[{\"version\":\"7.4.5\"}]}]"},
+            "expected_output": "cmd=brew info php@7.4 --json\ninstalled=true\n"
+        },
+        {
+            "input": {"action": "check_installed", "formula": "php@7.4", "info_response": "Error: No formula found"},
+            "expected_output": "cmd=brew info php@7.4 --json\ninstalled=false\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Supported PHP Runtime Present
+
+**As a developer**, I want to know whether any PHP version this tool supports is installed, so I can prompt the user to install one if not.
+
+**Expected Behavior / Usage:**
+
+The adapter queries the manager for the installed PHP packages — `brew list --formula | grep php` on the user-context channel — and splits the multi-line result into individual package names. It then checks whether any of those names belongs to the fixed supported set, which contains both the dotted style (the bare `php`, plus `php@5.6`, `php@7.0`, `php@7.1`, `php@7.2`, `php@7.3`, `php@7.4`, `php@8.0`, `php@8.1`) and the legacy compact style (`php56`, `php70`, `php71`, `php72`, `php73`). The output echoes the issued listing command, then `has_supported_php=true` if at least one supported version is found, otherwise `false`. An installed but unsupported version (such as an old `php@5.5`) yields `false`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_supported_php_present.json`
+
+```json
+{
+    "description": "Decide whether any supported PHP runtime is present among the PHP-related packages the system package manager currently has installed. The adapter queries the manager for the installed PHP package list (one package name per line) and checks whether at least one of those names appears in the fixed set of PHP versions this tool supports. The supported set covers both the dotted naming style (the bare 'php' plus 'php@5.6' through 'php@8.1') and the legacy compact style ('php56', 'php70', 'php71', 'php72', 'php73'). The output echoes the issued listing command, then a flag that is true when a supported PHP version is found and false otherwise (for example an unsupported version like an old 'php@5.5' yields false).",
+    "cases": [
+        {"input": {"action": "has_supported_php", "installed_list": "php@5.5"}, "expected_output": "cmd=brew list --formula | grep php\nhas_supported_php=false\n"},
+        {"input": {"action": "has_supported_php", "installed_list": "php@7.2\nphp72"}, "expected_output": "cmd=brew list --formula | grep php\nhas_supported_php=true\n"}
+    ]
+}
+```
+
+---
+
+### Feature 3: Register External Repositories
+
+**As a developer**, I want to register one or more external package repositories, so packages hosted outside the default index become installable.
+
+**Expected Behavior / Usage:**
+
+Given an ordered list of repository identifiers, the adapter issues one `brew tap <identifier>` command per identifier, in the supplied order, each run on the user-context channel (rendered as `sudo -u "testuser" brew tap <identifier>`). The output lists each issued command verbatim, preserving order.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_tap_repositories.json`
+
+```json
+{
+    "description": "Register one or more external package repositories ('taps') with the system package manager. Given an ordered list of repository identifiers, the adapter issues one tap command per identifier, in the order supplied, each run as the invoking (non-root) user via a sudo-as-user wrapper. The output lists each issued command verbatim, preserving order; the invoking user name is a fixed deterministic value in this environment.",
+    "cases": [
+        {
+            "input": {"action": "tap", "formulas": ["php@7.1", "php@7.0", "php@5.6"]},
+            "expected_output": "cmd=sudo -u \"testuser\" brew tap php@7.1\ncmd=sudo -u \"testuser\" brew tap php@7.0\ncmd=sudo -u \"testuser\" brew tap php@5.6\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: Background Service Control
+
+**As a developer**, I want to start, restart and stop the package manager's background services, so dependent daemons run correctly under root.
+
+**Expected Behavior / Usage:**
+
+Both operations first confirm the service's package is installed using the same logic as Feature 1 (issuing `brew info <service> --json` and checking for a non-empty installed set); only when installed do they proceed. All supervisor commands are issued on the fire-and-forget (silenced) channel. The output echoes the installed-check query followed by the supervisor commands in the exact order issued.
+
+*4.1 Restart a service — issue a plain stop, a privileged stop, then a privileged start.*
+
+When the package is installed, three supervisor commands are issued in order: `brew services stop <service>` (clearing any wrongly non-root instance), `sudo brew services stop <service>`, and `sudo brew services start <service>`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_1_restart_service.json`
+
+```json
+{
+    "description": "Restart a background service managed by the package manager's service supervisor. The adapter first confirms the service's package is installed (issuing the metadata query and seeing a non-empty installed set). When installed, it issues three supervisor commands in order: a plain stop (clearing any incorrectly non-root instance), a privileged stop, and a privileged start. The output echoes the installed-check query followed by the three supervisor commands in the exact order issued.",
+    "cases": [
+        {
+            "input": {"action": "restart_service", "service": "dnsmasq", "info_response": "[{\"name\":\"dnsmasq\",\"full_name\":\"dnsmasq\",\"aliases\":[],\"versioned_formulae\":[],\"versions\":{\"stable\":\"1\"},\"installed\":[{\"version\":\"1\"}]}]"},
+            "expected_output": "cmd=brew info dnsmasq --json\ncmd=brew services stop dnsmasq\ncmd=sudo brew services stop dnsmasq\ncmd=sudo brew services start dnsmasq\n"
+        }
+    ]
+}
+```
+
+*4.2 Stop a service — issue a plain stop then a privileged stop.*
+
+When the package is installed, two supervisor commands are issued in order: `brew services stop <service>` followed by `sudo brew services stop <service>`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_2_stop_service.json`
+
+```json
+{
+    "description": "Stop a background service managed by the package manager's service supervisor. The adapter first confirms the service's package is installed (issuing the metadata query and seeing a non-empty installed set). When installed, it issues two supervisor commands in order: a plain stop (clearing any incorrectly non-root instance) followed by a privileged stop. The output echoes the installed-check query followed by the two supervisor commands in the exact order issued.",
+    "cases": [
+        {
+            "input": {"action": "stop_service", "service": "dnsmasq", "info_response": "[{\"name\":\"dnsmasq\",\"full_name\":\"dnsmasq\",\"aliases\":[],\"versioned_formulae\":[],\"versions\":{\"stable\":\"1\"},\"installed\":[{\"version\":\"1\"}]}]"},
+            "expected_output": "cmd=brew info dnsmasq --json\ncmd=brew services stop dnsmasq\ncmd=sudo brew services stop dnsmasq\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 5: Install A Package (Fail Loudly)
+
+**As a developer**, I want to install a package — optionally registering repositories first — and have a clear failure when the manager errors, so installation problems are not silently ignored.
+
+**Expected Behavior / Usage:**
+
+If a non-empty list of repositories is supplied, they are registered first (one tap command each, exactly as in Feature 3). The install command is then issued on the user-context channel; it is the manager's install verb followed by the package name and any extra options joined by spaces, with surrounding whitespace trimmed (no options → `brew install <package>`). The install runs with an error callback: if the command exits non-zero, the operation is a failure. On success only the issued commands are reported (`cmd=...` lines). On failure the output is the issued command line(s) followed by a normalized `error=install_failed` plus `formula=<package>`. Host-language exception identity must never appear.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_install_formula.json`
+
+```json
+{
+    "description": "Install a package via the system package manager, optionally registering external repositories first, and fail loudly if the manager reports an error. When taps are supplied they are registered (one tap command per repository) before the install command is issued. The install command is the manager's install verb followed by the package name and any extra options, with surrounding whitespace trimmed. If the install command exits with an error, the operation is reported as a normalized install failure that names the affected package; on success only the issued commands are reported. The output echoes each issued command verbatim and, on failure, a neutral error category plus the package name.",
+    "cases": [
+        {
+            "input": {"action": "install", "formula": "dnsmasq"},
+            "expected_output": "cmd=brew install dnsmasq\n"
+        },
+        {
+            "input": {"action": "install", "formula": "dnsmasq", "fail": true, "error_output": "test error ouput"},
+            "expected_output": "cmd=brew install dnsmasq\nerror=install_failed\nformula=dnsmasq\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 6: Link A Package
+
+**As a developer**, I want to link a package's binaries into the active environment, optionally forcing, so its executables become available on the path.
+
+**Expected Behavior / Usage:**
+
+The adapter issues `brew link <package>` on the user-context channel, appending ` --force` when forcing is requested. The command runs with an error callback. On success the manager's raw stdout is returned to the caller verbatim and rendered as `result=<text>`. On a non-zero exit the operation is a normalized `error=link_failed` plus `formula=<package>`. The output echoes the issued command first.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature6_link_formula.json`
+
+```json
+{
+    "description": "Link a package's binaries into the active environment via the system package manager. The adapter issues the manager's link verb followed by the package name, appending a force flag when forcing is requested. On success the manager's raw stdout is returned to the caller unchanged. If the link command exits with an error, the operation is reported as a normalized link failure naming the affected package. The output echoes the issued command and then either the manager's returned text or a neutral error category plus the package name.",
+    "cases": [
+        {
+            "input": {"action": "link", "formula": "aformula", "response": "Some output"},
+            "expected_output": "cmd=brew link aformula\nresult=Some output\n"
+        },
+        {
+            "input": {"action": "link", "formula": "aformula", "force": true, "response": "Some output forced"},
+            "expected_output": "cmd=brew link aformula --force\nresult=Some output forced\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 7: Unlink A Package
+
+**As a developer**, I want to unlink a package's binaries, so I can switch away from a linked version.
+
+**Expected Behavior / Usage:**
+
+The adapter issues `brew unlink <package>` on the user-context channel with an error callback. On success the manager's raw stdout is returned verbatim and rendered as `result=<text>`. On a non-zero exit the operation is a normalized `error=unlink_failed` plus `formula=<package>`. The output echoes the issued command first.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature7_unlink_formula.json`
+
+```json
+{
+    "description": "Unlink a package's binaries from the active environment via the system package manager. The adapter issues the manager's unlink verb followed by the package name. On success the manager's raw stdout is returned to the caller unchanged. If the unlink command exits with an error, the operation is reported as a normalized unlink failure naming the affected package. The output echoes the issued command and then either the manager's returned text or a neutral error category plus the package name.",
+    "cases": [
+        {
+            "input": {"action": "unlink", "formula": "aformula", "response": "Some output"},
+            "expected_output": "cmd=brew unlink aformula\nresult=Some output\n"
+        },
+        {
+            "input": {"action": "unlink", "formula": "aformula", "fail": true, "error_output": "test error output"},
+            "expected_output": "cmd=brew unlink aformula\nerror=unlink_failed\nformula=aformula\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 8: Linked PHP Detection & Resolution
+
+**As a developer**, I want to detect whether PHP is linked and resolve what is linked, so I can manage the active PHP runtime.
+
+**Expected Behavior / Usage:**
+
+These operations inspect the package manager's `php` binary path via the filesystem boundary: whether that path is a symlink, and what it points to. None of them issue shell commands.
+
+*8.1 Is PHP linked — report whether the php binary path is a symlink.*
+
+The output is `linked=true` or `linked=false`, reflecting whether the path is a symbolic link.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_1_has_linked_php.json`
+
+```json
+{
+    "description": "Report whether the package manager currently has PHP linked, by testing whether the manager's php binary path is a symbolic link. The input states whether that path is a link; the output is a flag reflecting that fact.",
+    "cases": [
+        {"input": {"action": "has_linked_php", "is_link": false}, "expected_output": "linked=false\n"},
+        {"input": {"action": "has_linked_php", "is_link": true}, "expected_output": "linked=true\n"}
+    ]
+}
+```
+
+*8.2 Resolve linked PHP version — map the symlink target to a supported version identifier.*
+
+When linked, the symlink target is read; it embeds a PHP version somewhere in its path in either the dotted style (e.g. `.../php@7.2/7.2.13/...` or `.../php/7.4.0/...`) or the legacy compact style (e.g. `.../php72/...`, `.../php56/...`). The embedded version is extracted and matched, by its digits only, against the supported set, returning the canonical dotted identifier as `version=<id>` (so `7.2.x` paths all resolve to `php@7.2`, and a bare `php56` path resolves to `php@5.6`). If nothing is linked, the result is the normalized `error=php_not_linked`. If a version is linked but does not match any supported version (e.g. an old `5.4`), the result is the normalized `error=unsupported_php_version`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_2_linked_php_version.json`
+
+```json
+{
+    "description": "Determine which supported PHP version is currently linked, by reading the target of the package manager's php symlink and normalizing it to one of the supported version identifiers. The symlink target embeds a PHP version somewhere in its path (in either the dotted or legacy compact naming style); the version is extracted and matched, by its digits, against the supported set, and the canonical dotted identifier (for example 'php@7.4') is returned. If nothing is linked, a neutral 'not linked' error is reported. If a version is linked but it is not among the supported versions, a neutral 'unsupported version' error is reported. The output is the resolved version identifier, or a neutral error category line.",
+    "cases": [
+        {"input": {"action": "linked_php_version", "is_link": true, "link_target": "/test/path/php/7.4.0/test"}, "expected_output": "version=php@7.4\n"},
+        {"input": {"action": "linked_php_version", "is_link": false}, "expected_output": "error=php_not_linked\n"},
+        {"input": {"action": "linked_php_version", "is_link": true, "link_target": "/test/path/php/5.4.14/test"}, "expected_output": "error=unsupported_php_version\n"}
+    ]
+}
+```
+
+*8.3 Resolve linked PHP package name — extract the linked package's own directory name.*
+
+This reads the same symlink target but returns the linked package's own name exactly as it appears in the path, rather than mapping it to a supported version. The result, rendered as `formula=<name>`, may be the bare `php` (when the path segment is just `php` followed by a numeric version), a dotted name like `php@7.4`, or a legacy compact name like `php74`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature8_3_linked_php_formula.json`
+
+```json
+{
+    "description": "Determine the package directory name of the currently linked PHP, by reading the target of the package manager's php symlink and extracting the linked package's own name as it appears in the path. Unlike the canonical-version resolution, this returns the raw linked name (which may be the bare 'php', a dotted name like 'php@7.4', or a legacy compact name like 'php74') rather than mapping it to a supported version identifier. The output is that package directory name.",
+    "cases": [
+        {"input": {"action": "linked_php_formula", "link_target": "/test/path/php/7.4.0/test"}, "expected_output": "formula=php\n"},
+        {"input": {"action": "linked_php_formula", "link_target": "/test/path/php74/7.4.9_2/test"}, "expected_output": "formula=php74\n"}
+    ]
+}
+```
+
+---
+
+### Feature 9: List Running Services
+
+**As a developer**, I want to list which package-manager services are currently running, so I can report and manage them.
+
+**Expected Behavior / Usage:**
+
+The service listing is obtained by running `brew services list | grep started | awk '{ print $1; }'` (filter to started services and project their names). The raw multi-line result is split into names, with blank lines dropped. Each listing command is issued with an error callback; a non-zero exit is reported as the normalized `error=services_check_failed`.
+
+*9.1 Running services for the invoking user — query on the user-context channel.*
+
+Issues the listing command on the user-context channel, splits the result, and renders one `service=<name>` line per running service in order (blank entries omitted). On error, renders the issued command then `error=services_check_failed`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature9_1_user_running_services.json`
+
+```json
+{
+    "description": "List the package manager's currently running services as seen by the invoking (non-root) user. The adapter issues the service-listing command (filtering to started services and projecting their names), splits the raw multi-line output into individual service names, and drops blank lines. If the listing command exits with an error, a neutral 'services check failed' error is reported. The output echoes the issued listing command followed by one line per running service, in order; blank entries are omitted.",
+    "cases": [
+        {
+            "input": {"action": "user_running_services", "response": "service1\nservice2\n\nservice3\n"},
+            "expected_output": "cmd=brew services list | grep started | awk '{ print $1; }'\nservice=service1\nservice=service2\nservice=service3\n"
+        },
+        {
+            "input": {"action": "user_running_services", "fail": true, "error_output": "test error output"},
+            "expected_output": "cmd=brew services list | grep started | awk '{ print $1; }'\nerror=services_check_failed\n"
+        }
+    ]
+}
+```
+
+*9.2 All running services — combine root-level and user-level listings, de-duplicated.*
+
+Runs the listing on the privileged channel (services started at boot; the command is rendered with a `sudo ` prefix) and on the user-context channel (services started at login), in that order. Each result is split and blank-filtered, the two lists are concatenated, and duplicates are removed while preserving first-seen order. The output echoes both issued commands (privileged first, then user) followed by one `service=<name>` line per unique running service.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature9_2_all_running_services.json`
+
+```json
+{
+    "description": "List all running package-manager services by combining the root-level listing (services started at boot, queried with privilege) with the user-level listing (services started at login, queried as the invoking user), de-duplicated while preserving first-seen order. The adapter issues two listing commands: the privileged one (prefixed for root) and the user one. Each result is split into names and blank lines dropped; the two lists are concatenated and duplicates removed. The output echoes both issued commands (privileged first, then user) followed by one line per unique running service, in first-seen order.",
+    "cases": [
+        {
+            "input": {"action": "all_running_services", "root_response": "service1\nservice2\nservice1\n", "user_response": "service3\nservice4\nservice2\n"},
+            "expected_output": "cmd=sudo brew services list | grep started | awk '{ print $1; }'\ncmd=brew services list | grep started | awk '{ print $1; }'\nservice=service1\nservice=service2\nservice=service3\nservice=service4\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing the features described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the "Scale-Driven Code Organization" constraint, ensuring high maintainability without over-engineering. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing, and must depend on injectable abstractions for the shell boundary (runs commands on the user / privileged / silenced channels, returning stdout and invoking an error callback on non-zero exit) and the filesystem boundary (symlink test and target read).
+
+2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin, selects behavior by the request's `action`, invokes the appropriate core logic against in-memory test doubles for the shell/filesystem boundaries (configured from the request fields), and prints the result (or normalized error) to stdout, matching the per-feature contracts above. It must render every command issued to the shell boundary as a `cmd=<command>` line in issue order, render domain results as keyed lines, and translate any native exception thrown by the core into a neutral `error=<category>` line (with extra keyed fields where specified) — never leaking host-language runtime identity.
+
+3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- parse the response according to the same structure as the standard formula output

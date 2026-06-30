@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+We need a small cross-platform image asset metadata utility that helps build tooling answer a handful of recurring questions when packaging visual resources for multiple deployment targets. The tool should accept a single request at a time via a structured input channel and return a plain-text answer on the output channel.
+
+The utility must support five capabilities. First, it should tell a developer whether a proposed image file name forms a legal identifier for the target packaging system — the validation rules are embedded in the naming checker module. Second, it should convert a textual color annotation (either a hex code or a recognizable English color name) into a normalized eight-digit color value suitable for tinting; the color resolution logic lives in the color lookup subsystem. Third, it should parse a dimension annotation expressed as one or two numbers separated by a standard delimiter into explicit width and height values. Fourth, given a short deployment-target label, it should return the folder path and the base scaling multiplier where the unscaled copy of the image should be placed; the per-target mapping is maintained in the destination-path registry. Fifth, it should determine from the file extension alone whether an image is a scalable vector or a pixel-based raster.
+
+The program must remain robust against empty or missing inputs, returning a clearly marked absence value instead of crashing. The solution should follow clean separation between the command-routing layer and the core domain rules.

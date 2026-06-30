@@ -1,0 +1,894 @@
+{
+  "fuzzy_prd": "# Delegated Authorization Endpoint - Grant-Code Issuance Contract\n\n## Project Goal\n\nBuild the server-side authorization endpoint of a delegated-authorization protocol (the \"authorization request\" leg of the standard authorization-code flow) that lets a third-party client obtain a short-lived grant code on a resource owner's behalf without ever handling the resource owner's credentials. The endpoint validates an incoming authorization request, decides whether it must answer with a direct error or by redirecting the user agent back to the client, and — on success and approval — issues a one-time grant code that the client can later redeem for tokens.\n\n---\n\n## Background & Problem\n\nWithout such an endpoint, every application that wants to act on a user's behalf would have to collect that user's password directly, store it, and replay it — a fragile and dangerous pattern. The delegated-authorization flow replaces that with a redirect-based handshake: the client sends the user agent to this endpoint with a set of request parameters; the endpoint authenticates the request against a registry of pre-registered clients, lets the resource owner approve or deny, and hands back a single-use grant code through a redirect. The subtlety is in *where* failures surface: some failures (the client cannot be identified, or no safe redirect target exists) must be reported as a direct error page because redirecting would be unsafe, while other failures (a bad [two output keys for rendering typed responses] type, a missing anti-forgery value, a denied request) must be reported by redirecting back to the already-validated target with the error encoded in the URL, so the client can react. Getting this split right, plus faithful reconstruction of the redirect target and correct issuance/binding of the grant code, is the whole contract.\n\nWith this endpoint, a client integration becomes: redirect to the endpoint, receive a code (or a structured error), and redeem the code. The reader of this document must be able to reproduce the exact observable behavior — HTTP status, redirect target, query parameters, and error codes — from the contract below alone.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility domain (request parsing, client/redirect-URI resolution, [two output keys for rendering typed responses]-type and scope policy, the approve/deny decision, grant-code issuance and identity binding, and two distinct [two output keys for rendering typed responses] renderings — direct error vs. redirect). It MUST NOT be a single \"god file\"; output a clear multi-file tree (e.g. `src/`, plus the execution adapter and `rcb_tests/`) reflecting a production-grade repository. Do not over-engineer, but do separate these concerns.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases below are a **black-box contract** for an execution adapter, NOT the internal data model. The core authorization logic must be decoupled from stdin/stdout and JSON parsing. A thin execution adapter reads one JSON request from stdin, drives the core endpoint, and renders the normalized stdout described under \"Execution Contract\". The adapter is the only place that translates between JSON/stdout and core method calls, and the only place that maps native runtime exceptions to neutral error lines.\n\n3. **Adherence to SOLID Design Principles:** Separate parsing, client/redirect resolution, validation, grant-code issuance, and output formatting into distinct cohesive units; keep the core open for extension (new [two output keys for rendering typed responses] types, new scope policies) but closed for modification; depend on storage abstractions, not concrete I/O.\n\n4. **Robustness & Interface Design:** The public interface of the core endpoint must be idiomatic for the target language and hide internal complexity. Edge cases (unknown client, fragment in redirect, multiple registered targets, denied request) must be modeled explicitly, not as generic faults.\n\n---\n\n## Execution Contract\n\nThis section defines the exact stdin → stdout contract that every case below obeys. The execution adapter reads **one** JSON object from stdin and writes the rendered result to stdout.\n\n**Input object:**\n\n- `config` *(optional object)* — endpoint configuration toggles. Recognized keys: `enforce_state` (bool — require an anti-forgery `state` value on grant-code requests), `require_exact_redirect_uri` (bool — require a supplied redirect target to match a registered one exactly, vs. prefix-match), `allow_implicit` (bool), `use_openid_connect` (bool — enable identity-connect features), `issuer` (string — identity-token issuer label). **Defaults when omitted:** state IS enforced, exact redirect-URI matching IS required, implicit is NOT allowed, identity-connect is OFF.\n- `scope_util` *(optional object)* — a scope policy backed by storage: `supported_scopes` (array of accepted scope strings) and `default_scope` (a default scope string, or `false` for \"no default — a scope must be supplied\").\n- `steps` *(array)* — an ordered list of requests against the endpoint. Each step:\n  - `action` — `\"authorize\"` (default) for an authorization request, or `\"token\"` for a grant-code redemption at the token endpoint.\n  - `is_authorized` *(bool, authorize only, default true)* — the resource owner's decision: `true` = approve, `false` = decline (or not-yet-approved).\n  - `request` *(object)* — the request parameters (e.g. `client_id`, `redirect_uri`, `[two output keys for rendering typed responses]_type`, `state`, `scope`; for token redemption: `grant_type`, `code`, `client_secret`).\n  - **Chaining:** any `request` value equal to the literal `\"@AUTH_[four specific placeholder strings for sensitive data]@\"` is replaced, at run time, by the real grant code issued in a preceding `authorize` step — letting a `token` step redeem the code that an earlier step produced.\n\n**Output (stdout):** one block per step, blocks separated by one blank line, the stream ending with a trailing newline. Each block begins with `[two output keys for rendering typed responses]=<step_index>` then `status=<http_status>`, followed by exactly one of:\n\n- **Redirect rendering** (emitted when the [two output keys for rendering typed responses] carries a redirect/`Location`): the line `type=redirect`; then the components of the redirect target, each present even when empty — `redirect.scheme=`, `redirect.user=`, `redirect.host=`, `redirect.port=`, `redirect.path=`, `redirect.fragment=`; then every query parameter of the redirect, **sorted by key**, as `query.<key>=<value>` (a multi-valued parameter is comma-joined); and, whenever a grant code is present in the redirect, the line `issued.identity_token=present` or `issued.identity_token=absent` reporting whether an identity assertion was bound to that code.\n- **Body rendering** (emitted for a direct, non-redirect [two output keys for rendering typed responses]): the line `type=[two output keys for rendering typed responses]`; then every [two output keys for rendering typed responses] parameter, **sorted by key**, as `[two output keys for rendering typed responses].<key>=<value>` (null → empty string, boolean → `true`/`false`, array → comma-joined).\n\n**Normalization (mandatory):** server-issued secrets are replaced by stable placeholders so output is deterministic and leaks no per-run value — a grant code renders as `[four specific placeholder strings for sensitive data]`, an access token as `[four specific placeholder strings for sensitive data]`, a refresh token as `[four specific placeholder strings for sensitive data]`, an identity token as `[four specific placeholder strings for sensitive data]`. The caller's `state` value and all protocol error codes / descriptions / reference URIs are domain wire-format and are preserved verbatim.\n\n**Error normalization:** protocol-level rejections (e.g. `invalid_client`, `invalid_uri`, `invalid_request`, `redirect_uri_mismatch`, `invalid_scope`, `access_denied`) are part of the domain contract and appear as `[two output keys for rendering typed responses].error=…` / `query.error=…` fields, never as exceptions. If the core instead throws a native runtime exception, the adapter renders a single neutral category line in place of the block [two output keys for rendering typed responses]: `error=invalid_argument`, `error=invalid_configuration`, or `error=internal`. No host-language exception class name or runtime artifact ever appears in stdout.\n\n---\n\n## Fixture Preconditions — Registered Client Catalog\n\nThe endpoint resolves clients against a fixed pre-registered catalog. The cases below reference these registrations (client identifier → secret, registered redirect target(s)):\n\n- **\"Test Client ID\"** — secret `TestSecret`; **no** registered redirect target (so a request must supply one).\n- **\"Test Client ID with Redirect Uri\"** — secret `TestSecret2`; one registered target `http://brentertainment.com`.\n- **\"Test Client ID with Multiple Redirect Uris\"** — secret `TestSecret3`; two registered targets `http://brentertainment.com` and `http://morehazards.com`.\n- **\"Test Client ID with Redirect Uri Parts\"** — secret `TestSecret4`; one registered target `http://user:pass@brentertainment.com:2222/authorize/cb?auth_type=oauth&test=true`.\n\nAny client identifier not in the catalog is treated as unregistered.\n\n---\n\n## Core Features\n\n### Feature 1: Client Identification Precedes Everything\n\n**As a developer**, I want the endpoint to identify and validate the requesting client before any other processing, so that a request from an unknown or unnamed client is rejected directly and never triggers a redirect.\n\n**Expected Behavior / Usage:**\n\nBefore validating the redirect target or anything else, the endpoint must establish which registered client is making the request. If the request carries no client identifier, or carries one that is not in the catalog, the endpoint cannot trust any redirect target and therefore answers with a **direct** (non-redirect) error: a `4xx` client-error status and a stable error code. The two situations are distinguished only by the human-readable description (\"no client supplied\" vs. \"supplied client is invalid\"). The decision is independent of the resource owner's approval.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_client_identification.json`\n\n```json\n{\n    \"description\": \"An authorization request is rejected before any redirect can occur when the client cannot be identified. Submitting a request with no client identifier, or with an identifier that is not registered, yields a direct (non-redirect) error [two output keys for rendering typed responses] carrying an HTTP client-error status and a stable error code distinguishing the two situations by description.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": false, \"request\": {}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=400\\ntype=[two output keys for rendering typed responses]\\n[two output keys for rendering typed responses].error=invalid_client\\n[two output keys for rendering typed responses].error_description=No client id supplied\\n\"\n        },\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": false, \"request\": {\"client_id\": \"Fake Client ID\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=400\\ntype=[two output keys for rendering typed responses]\\n[two output keys for rendering typed responses].error=invalid_client\\n[two output keys for rendering typed responses].error_description=The client id supplied is invalid\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Redirect-Target Resolution & Validation\n\n**As a developer**, I want the endpoint to determine a single safe redirect target — combining the request's supplied target with the client's registered target(s) under a configurable matching policy — so that the grant code can only ever be delivered to a pre-approved destination, and any failure to do so safely is reported directly.\n\n**Expected Behavior / Usage:**\n\n*2.1 No redirect target available — direct error*\n\nWhen the named (registered) client has no stored redirect target and the request supplies none, the endpoint has nowhere safe to redirect and answers with a direct client-error [two output keys for rendering typed responses] carrying an invalid-URI error code.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_no_redirect_uri.json`\n\n```json\n{\n    \"description\": \"When a request names a registered client that has no stored redirect target and supplies none in the request, the endpoint cannot safely redirect and returns a direct error [two output keys for rendering typed responses] with a client-error status and an invalid-URI error code.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": false, \"request\": {\"client_id\": \"Test Client ID\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=400\\ntype=[two output keys for rendering typed responses]\\n[two output keys for rendering typed responses].error=invalid_uri\\n[two output keys for rendering typed responses].error_description=No redirect URI was supplied or stored\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Supplied target containing a fragment — direct error*\n\nA supplied redirect target that contains a URL fragment component is rejected directly, because authorization parameters must be appended as query parameters and can never be attached to a fragment.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_fragment_rejected.json`\n\n```json\n{\n    \"description\": \"A supplied redirect target that contains a URL fragment component is rejected with a direct error [two output keys for rendering typed responses] (client-error status, invalid-URI error code), because authorization parameters may not be appended to a fragment.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com#fragment\", \"[two output keys for rendering typed responses]_type\": \"code\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=400\\ntype=[two output keys for rendering typed responses]\\n[two output keys for rendering typed responses].error=invalid_uri\\n[two output keys for rendering typed responses].error_description=The redirect URI must not contain a fragment\\n\"\n        }\n    ]\n}\n```\n\n*2.3 Supplied target does not match the single registered target — direct mismatch*\n\nWhen a client has exactly one registered redirect target and the request supplies a different one, the request is rejected directly with a mismatch error code and a reference link to the relevant specification section.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_3_mismatch.json`\n\n```json\n{\n    \"description\": \"When a client has exactly one registered redirect target and the request supplies a different one, the request is rejected with a direct error [two output keys for rendering typed responses] carrying a client-error status, a mismatch error code, and a reference link to the relevant specification section.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID with Redirect Uri\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"code\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=400\\ntype=[two output keys for rendering typed responses]\\n[two output keys for rendering typed responses].error=redirect_uri_mismatch\\n[two output keys for rendering typed responses].error_description=The redirect URI provided is missing or does not match\\n[two output keys for rendering typed responses].error_uri=http://tools.ietf.org/html/rfc6749#section-3.1.2\\n\"\n        }\n    ]\n}\n```\n\n*2.4 Multiple registered targets but none chosen — direct error*\n\nWhen a client registers more than one redirect target and the request omits the redirect parameter, the endpoint cannot pick one automatically and returns a direct error (invalid-URI code, spec reference) requiring the caller to specify which registered target to use.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_4_multiple_requires_selection.json`\n\n```json\n{\n    \"description\": \"When a client registers more than one redirect target and the request omits the redirect parameter, the endpoint cannot choose one automatically and returns a direct error [two output keys for rendering typed responses] (client-error status, invalid-URI error code, spec reference) requiring the caller to specify which registered target to use.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID with Multiple Redirect Uris\", \"[two output keys for rendering typed responses]_type\": \"code\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=400\\ntype=[two output keys for rendering typed responses]\\n[two output keys for rendering typed responses].error=invalid_uri\\n[two output keys for rendering typed responses].error_description=A redirect URI must be supplied when multiple redirect URIs are registered\\n[two output keys for rendering typed responses].error_uri=http://tools.ietf.org/html/rfc6749#section-3.1.2.3\\n\"\n        }\n    ]\n}\n```\n\n*2.5 Exact-match policy rejects a query-string difference — direct mismatch*\n\nUnder a strict exact-match policy, a supplied target whose query string differs from the registered one (even when scheme/host/path match) is rejected directly as a mismatch with a spec reference.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_5_exact_match_required.json`\n\n```json\n{\n    \"description\": \"Under a strict exact-match policy, a supplied redirect target whose query string differs from the registered one (even if the scheme/host/path match) is rejected with a direct mismatch error [two output keys for rendering typed responses] and a spec reference.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID with Redirect Uri Parts\", \"[two output keys for rendering typed responses]_type\": \"code\", \"redirect_uri\": \"http://user:pass@brentertainment.com:2222/authorize/cb?auth_type=oauth&test=true&hereisa=querystring\"}}], \"config\": {\"require_exact_redirect_uri\": true}}],\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=400\\ntype=[two output keys for rendering typed responses]\\n[two output keys for rendering typed responses].error=redirect_uri_mismatch\\n[two output keys for rendering typed responses].error_description=The redirect URI provided is missing or does not match\\n[two output keys for rendering typed responses].error_uri=http://tools.ietf.org/html/rfc6749#section-3.1.2\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Response-Type Validation (Reported via Redirect)\n\n**As a developer**, I want a missing or unrecognized [two output keys for rendering typed responses]-type selector to be reported by redirecting back to the validated target with the error in the query string, so the client receives it programmatically rather than as a dead-end error page.\n\n**Expected Behavior / Usage:**\n\nOnce the client and redirect target are valid, the endpoint inspects the [two output keys for rendering typed responses]-type selector. If it is omitted or names an unsupported type, the failure is **not** a direct error — instead the user agent is redirected (`302`) back to the now-validated target, with `error` and `error_description` encoded in the query string. Both the \"omitted\" and the \"unrecognized value\" cases produce the same error contract.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_[two output keys for rendering typed responses]_type.json`\n\n```json\n{\n    \"description\": \"Once the client and redirect target are valid, a request that omits the [two output keys for rendering typed responses]-type selector, or supplies an unrecognized one, is reported by REDIRECTING the user agent back to the validated redirect target with an error code and description encoded in the query string, rather than as a direct error [two output keys for rendering typed responses].\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": false, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.error=invalid_request\\nquery.error_description=Invalid or missing [two output keys for rendering typed responses] type\\n\"\n        },\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": false, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"invalid\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.error=invalid_request\\nquery.error_description=Invalid or missing [two output keys for rendering typed responses] type\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Anti-Forgery State Enforcement\n\n**As a developer**, I want the endpoint to optionally require an anti-forgery `state` value on grant-code requests, so I can enable CSRF protection by configuration and fall back to lenient behavior when disabled.\n\n**Expected Behavior / Usage:**\n\n*4.1 State required and missing — redirect error*\n\nWhen configured to require state, a grant-code request that omits `state` is reported by redirecting back to the validated target with an `invalid_request` error and a description stating the state parameter is required.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_enforce_state.json`\n\n```json\n{\n    \"description\": \"When the endpoint is configured to require an anti-forgery state value, a request for a grant code that omits it is reported by redirecting back to the validated target with an error code and description in the query string.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"code\"}}], \"config\": {\"enforce_state\": true}}],\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.error=invalid_request\\nquery.error_description=The state parameter is required\\n\"\n        }\n    ]\n}\n```\n\n*4.2 State not required — success without state*\n\nWhen state is not required, the same request that omits `state` succeeds: a `302` redirect back to the target carries a freshly issued grant code (no error), and no identity assertion is bound to the code.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_no_enforce_state.json`\n\n```json\n{\n    \"description\": \"When state is NOT required, the same request that omits the state value succeeds: the user agent is redirected back to the target with a freshly issued grant code and no error, and no identity assertion is bound to the code.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"code\"}}], \"config\": {\"enforce_state\": false}}],\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.code=[four specific placeholder strings for sensitive data]\\nissued.identity_token=absent\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Scope Enforcement Under a Supported-Scope Policy\n\n**As a developer**, I want the endpoint to enforce a configured scope policy, so that when the deployment defines a set of supported scopes with no default, a request must name a supported scope and is otherwise reported via redirect.\n\n**Expected Behavior / Usage:**\n\nGiven a policy that lists supported scopes and declares no default scope, a grant-code request that omits the scope is redirected back with an `invalid_scope` error (and the echoed state); the same request that names a supported scope succeeds with a redirect carrying a freshly issued grant code (and the echoed state).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_scope_enforcement.json`\n\n```json\n{\n    \"description\": \"When the deployment defines a set of supported scopes and no default scope, a grant-code request that omits the scope parameter is redirected back with a scope error, while the same request that names a supported scope succeeds with a redirect carrying a freshly issued grant code.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"code\", \"state\": \"xyz\"}}], \"scope_util\": {\"default_scope\": false, \"supported_scopes\": [\"testscope\"]}}],\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.error=invalid_scope\\nquery.error_description=This application requires you specify a scope parameter\\nquery.state=xyz\\n\"\n        },\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"code\", \"state\": \"xyz\", \"scope\": \"testscope\"}}], \"scope_util\": {\"default_scope\": false, \"supported_scopes\": [\"testscope\"]}}],\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.code=[four specific placeholder strings for sensitive data]\\nquery.state=xyz\\nissued.identity_token=absent\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Successful Issuance & Faithful Redirect Construction\n\n**As a developer**, I want a successful, approved request to reconstruct the redirect target faithfully and append the issued grant code, so the client receives the code at exactly the destination it expects with all original URL components intact.\n\n**Expected Behavior / Usage:**\n\n*6.1 Full URL-component preservation*\n\nOn success the endpoint reconstructs the redirect target preserving every component of the supplied absolute URL — userinfo, host, port, path, and pre-existing query parameters — while appending the issued grant code and echoing the state value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_redirect_reconstruction.json`\n\n```json\n{\n    \"description\": \"On success the endpoint reconstructs the redirect target faithfully, preserving every component of the supplied absolute URL (userinfo, host, port, path, and pre-existing query parameters) while appending the issued grant code and echoing the state value.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID with Redirect Uri Parts\", \"[two output keys for rendering typed responses]_type\": \"code\", \"redirect_uri\": \"http://user:pass@brentertainment.com:2222/authorize/cb?auth_type=oauth&test=true\", \"state\": \"xyz\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=user\\nredirect.host=brentertainment.com\\nredirect.port=2222\\nredirect.path=/authorize/cb\\nredirect.fragment=\\nquery.auth_type=oauth\\nquery.code=[four specific placeholder strings for sensitive data]\\nquery.state=xyz\\nquery.test=true\\nissued.identity_token=absent\\n\"\n        }\n    ]\n}\n```\n\n*6.2 Relaxed matching accepts extra query parameters*\n\nUnder a relaxed (non-exact) matching policy, a supplied target that shares the registered prefix but adds extra query parameters is accepted; the success redirect preserves both the registered and the extra query parameters together with the appended grant code and echoed state.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_non_exact_extra_query.json`\n\n```json\n{\n    \"description\": \"Under a relaxed (non-exact) redirect-matching policy, a supplied target that shares the registered prefix but adds extra query parameters is accepted; the success redirect preserves the registered and extra query parameters together with the appended grant code and echoed state.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID with Redirect Uri Parts\", \"[two output keys for rendering typed responses]_type\": \"code\", \"redirect_uri\": \"http://user:pass@brentertainment.com:2222/authorize/cb?auth_type=oauth&test=true&hereisa=querystring\", \"state\": \"xyz\"}}], \"config\": {\"require_exact_redirect_uri\": false}}],\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=user\\nredirect.host=brentertainment.com\\nredirect.port=2222\\nredirect.path=/authorize/cb\\nredirect.fragment=\\nquery.auth_type=oauth\\nquery.code=[four specific placeholder strings for sensitive data]\\nquery.hereisa=querystring\\nquery.state=xyz\\nquery.test=true\\nissued.identity_token=absent\\n\"\n        }\n    ]\n}\n```\n\n*6.3 Selecting one of several registered targets*\n\nWhen a client registers several redirect targets, the endpoint accepts a request that selects any one of them and redirects back to exactly that chosen target with the issued code and echoed state.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_multiple_redirect_uris.json`\n\n```json\n{\n    \"description\": \"When a client registers several redirect targets, the endpoint accepts a request that selects any one of the registered targets, redirecting back to exactly that chosen target with an issued grant code and echoed state.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID with Multiple Redirect Uris\", \"redirect_uri\": \"http://brentertainment.com\", \"[two output keys for rendering typed responses]_type\": \"code\", \"state\": \"xyz\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=brentertainment.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.code=[four specific placeholder strings for sensitive data]\\nquery.state=xyz\\nissued.identity_token=absent\\n\"\n        },\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID with Multiple Redirect Uris\", \"redirect_uri\": \"http://morehazards.com\", \"[two output keys for rendering typed responses]_type\": \"code\", \"state\": \"xyz\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=morehazards.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.code=[four specific placeholder strings for sensitive data]\\nquery.state=xyz\\nissued.identity_token=absent\\n\"\n        }\n    ]\n}\n```\n\n*6.4 Success [two output keys for rendering typed responses] shape — state echoed, extras stripped, no identity binding*\n\nA successful grant-code authorization redirects back with a `code` query parameter present, echoes the caller's state unchanged, strips any unknown extra request parameters from the outgoing redirect, and binds no identity assertion when no identity scope was requested.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_4_successful_[two output keys for rendering typed responses]_shape.json`\n\n```json\n{\n    \"description\": \"A successful grant-code authorization redirects back to the target with a code query parameter present, echoes the caller's state value unchanged, strips any unknown extra request parameters from the outgoing redirect, and binds no identity assertion to the issued code when no identity scope was requested.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"code\", \"state\": \"xyz\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.code=[four specific placeholder strings for sensitive data]\\nquery.state=xyz\\nissued.identity_token=absent\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Resource-Owner Denial\n\n**As a developer**, I want an explicit denial by the resource owner to be reported via redirect with an access-denied error, so the client learns the request was refused rather than approved.\n\n**Expected Behavior / Usage:**\n\nWhen the resource owner declines an otherwise-valid request, no grant is issued; instead the user agent is redirected back to the validated target with an `access_denied` error code, description, and the echoed state value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_user_denies_access.json`\n\n```json\n{\n    \"description\": \"When the resource owner declines the request, a valid authorization request does not issue a grant; instead the user agent is redirected back to the validated target with an access-denied error code, description, and the echoed state value.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": false, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"code\", \"state\": \"xyz\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.error=access_denied\\nquery.error_description=The user denied access to your application\\nquery.state=xyz\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Issued Code Is Redeemable at the Token Endpoint\n\n**As a developer**, I want a grant code issued for a client that relies on its single registered redirect target to be redeemable at the token endpoint without re-supplying the redirect target, so the two-leg flow composes end to end.\n\n**Expected Behavior / Usage:**\n\nA first `authorize` step issues a grant code for a client whose single registered redirect target is used implicitly (the request omits the redirect parameter), producing the usual success redirect. A second `token` step then redeems that exact code (referenced via the chaining placeholder) with the client's secret and the authorization-code grant type, **without** re-supplying the redirect target, and receives a `200` with a token payload (access token, expiry, refresh token, scope, token type) — all secrets normalized to placeholders.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_code_redeemable_at_token_endpoint.json`\n\n```json\n{\n    \"description\": \"A grant code issued for a client that relies on its single registered redirect target (omitting the redirect parameter in the authorization step) can subsequently be redeemed at the token endpoint WITHOUT re-supplying a redirect target; the redemption returns a success status and a token payload. The second step references the code issued by the first step.\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID with Redirect Uri\", \"[two output keys for rendering typed responses]_type\": \"code\", \"state\": \"xyz\"}}, {\"action\": \"token\", \"request\": {\"client_id\": \"Test Client ID with Redirect Uri\", \"client_secret\": \"TestSecret2\", \"grant_type\": \"authorization_code\", \"code\": \"@AUTH_[four specific placeholder strings for sensitive data]@\"}}]},\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=brentertainment.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.code=[four specific placeholder strings for sensitive data]\\nquery.state=xyz\\nissued.identity_token=absent\\n\\n[two output keys for rendering typed responses]=1\\nstatus=200\\ntype=[two output keys for rendering typed responses]\\n[two output keys for rendering typed responses].access_token=[four specific placeholder strings for sensitive data]\\n[two output keys for rendering typed responses].expires_in=3600\\n[two output keys for rendering typed responses].refresh_token=[four specific placeholder strings for sensitive data]\\n[two output keys for rendering typed responses].scope=\\n[two output keys for rendering typed responses].token_type=Bearer\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 9: Identity-Assertion Binding Under Identity-Connect\n\n**As a developer**, I want a successful grant code to additionally carry a bound identity assertion when identity-connect is enabled and the identity scope is requested, so that an identity-aware client can later obtain the asserted identity alongside its tokens.\n\n**Expected Behavior / Usage:**\n\nWhen identity-connect features are enabled (with an issuer label configured) and the request asks for the identity scope, a successful grant-code authorization behaves like the default success flow **except** that an identity assertion is bound to the issued code — observable as `issued.identity_token=present` (in contrast to the default flow's `absent`). The redirect shape, code, and echoed state are otherwise unchanged.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_identity_token_binding.json`\n\n```json\n{\n    \"description\": \"When the deployment enables identity-connect features and the request asks for the identity scope, a successful grant-code authorization additionally binds an identity assertion to the issued code, observable as the code carrying an attached identity token (in contrast to the default flow, where none is attached).\",\n    \"cases\": [\n        {\n            \"input\": {\"steps\": [{\"action\": \"authorize\", \"is_authorized\": true, \"request\": {\"client_id\": \"Test Client ID\", \"redirect_uri\": \"http://adobe.com\", \"[two output keys for rendering typed responses]_type\": \"code\", \"state\": \"xyz\", \"scope\": \"openid\"}}], \"config\": {\"use_openid_connect\": true, \"issuer\": \"bojanz\"}}],\n            \"expected_output\": \"[two output keys for rendering typed responses]=0\\nstatus=302\\ntype=redirect\\nredirect.scheme=http\\nredirect.user=\\nredirect.host=adobe.com\\nredirect.port=\\nredirect.path=\\nredirect.fragment=\\nquery.code=[four specific placeholder strings for sensitive data]\\nquery.state=xyz\\nissued.identity_token=present\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the authorization endpoint and grant-code issuance described above, decoupled from stdin/stdout and JSON, backed by a pluggable storage abstraction that holds the registered-client catalog, scope policy, and issued codes.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON request object from stdin (the schema under \"Execution Contract\"), drives the core endpoint step by step (including authorize → token chaining via the `@AUTH_[four specific placeholder strings for sensitive data]@` placeholder), and prints the normalized stdout contract exactly as specified — including secret normalization to stable placeholders and translation of native runtime exceptions to neutral error category lines. This adapter must be logically separated from the core domain.\n\n3. **Automated test harness:** The cases embedded above live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `public_test_cases`). For each case it writes one file `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` containing **only** the raw program stdout (no PASS/FAIL or metadata) so it can be compared directly against `expected_output`. Output is namespaced by `<cases-dir>` so different case directories never overwrite each other.\n\n\n---\n**Implementation notes:**\n- replace the placeholder found in request.code with the result of the prior authorize action\n- reconstruct the redirect URL following the same pattern used for C026\n",
+  "oracle_data": {
+    "task_id": "bshaffer__oauth2-server-php-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "secret placeholder",
+          "token mask string",
+          "AUTH_CODE replacement",
+          "access token stub",
+          "ID token value"
+        ],
+        "oracle_response": "The values to be replaced are: CODE, ACCESS_TOKEN, REFRESH_TOKEN, and ID_TOKEN."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "response type header",
+          "output key for response",
+          "body rendering keys",
+          "render response structure",
+          "output prefix for values"
+        ],
+        "oracle_response": "The exact keys are 'response' and 'body'."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "replace the placeholder found in request.code with the result of the prior authorize action",
+        "actual_meaning": "The actual code previously substituted into the @AUTH_CODE@ template by the logic defined in constraint C031 (authorize)"
+      },
+      {
+        "vague_reference": "reconstruct the redirect URL following the same pattern used for C026",
+        "actual_meaning": "The redirect URL assembly defined in C025 utilizes the alphabetical sorting logic explicitly enforced in constraint C026 for all query parameters"
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_client_identification.json": {
+      "description": "An authorization request is rejected before any redirect can occur when the client cannot be identified. Submitting a request with no client identifier, or with an identifier that is not registered, yields a direct (non-redirect) error response carrying an HTTP client-error status and a stable error code distinguishing the two situations by description.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": false,
+                "request": {}
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=400\ntype=response\nbody.error=invalid_client\nbody.error_description=No client id supplied\n"
+        },
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": false,
+                "request": {
+                  "client_id": "Fake Client ID"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=400\ntype=response\nbody.error=invalid_client\nbody.error_description=The client id supplied is invalid\n"
+        }
+      ]
+    },
+    "feature2_1_no_redirect_uri.json": {
+      "description": "When a request names a registered client that has no stored redirect target and supplies none in the request, the endpoint cannot safely redirect and returns a direct error response with a client-error status and an invalid-URI error code.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": false,
+                "request": {
+                  "client_id": "Test Client ID"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=400\ntype=response\nbody.error=invalid_uri\nbody.error_description=No redirect URI was supplied or stored\n"
+        }
+      ]
+    },
+    "feature2_2_fragment_rejected.json": {
+      "description": "A supplied redirect target that contains a URL fragment component is rejected with a direct error response (client-error status, invalid-URI error code), because authorization parameters may not be appended to a fragment.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com#fragment",
+                  "response_type": "code"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=400\ntype=response\nbody.error=invalid_uri\nbody.error_description=The redirect URI must not contain a fragment\n"
+        }
+      ]
+    },
+    "feature2_3_mismatch.json": {
+      "description": "When a client has exactly one registered redirect target and the request supplies a different one, the request is rejected with a direct error response carrying a client-error status, a mismatch error code, and a reference link to the relevant specification section.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID with Redirect Uri",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "code"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=400\ntype=response\nbody.error=redirect_uri_mismatch\nbody.error_description=The redirect URI provided is missing or does not match\nbody.error_uri=http://tools.ietf.org/html/rfc6749#section-3.1.2\n"
+        }
+      ]
+    },
+    "feature2_4_multiple_requires_selection.json": {
+      "description": "When a client registers more than one redirect target and the request omits the redirect parameter, the endpoint cannot choose one automatically and returns a direct error response (client-error status, invalid-URI error code, spec reference) requiring the caller to specify which registered target to use.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID with Multiple Redirect Uris",
+                  "response_type": "code"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=400\ntype=response\nbody.error=invalid_uri\nbody.error_description=A redirect URI must be supplied when multiple redirect URIs are registered\nbody.error_uri=http://tools.ietf.org/html/rfc6749#section-3.1.2.3\n"
+        }
+      ]
+    },
+    "feature2_5_exact_match_required.json": {
+      "description": "Under a strict exact-match policy, a supplied redirect target whose query string differs from the registered one (even if the scheme/host/path match) is rejected with a direct mismatch error response and a spec reference.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID with Redirect Uri Parts",
+                  "response_type": "code",
+                  "redirect_uri": "http://user:pass@brentertainment.com:2222/authorize/cb?auth_type=oauth&test=true&hereisa=querystring"
+                }
+              }
+            ],
+            "config": {
+              "require_exact_redirect_uri": true
+            }
+          },
+          "expected_output": "response=0\nstatus=400\ntype=response\nbody.error=redirect_uri_mismatch\nbody.error_description=The redirect URI provided is missing or does not match\nbody.error_uri=http://tools.ietf.org/html/rfc6749#section-3.1.2\n"
+        }
+      ]
+    },
+    "feature3_response_type.json": {
+      "description": "Once the client and redirect target are valid, a request that omits the response-type selector, or supplies an unrecognized one, is reported by REDIRECTING the user agent back to the validated redirect target with an error code and description encoded in the query string, rather than as a direct error body.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": false,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.error=invalid_request\nquery.error_description=Invalid or missing response type\n"
+        },
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": false,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "invalid"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.error=invalid_request\nquery.error_description=Invalid or missing response type\n"
+        }
+      ]
+    },
+    "feature4_1_enforce_state.json": {
+      "description": "When the endpoint is configured to require an anti-forgery state value, a request for a grant code that omits it is reported by redirecting back to the validated target with an error code and description in the query string.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "code"
+                }
+              }
+            ],
+            "config": {
+              "enforce_state": true
+            }
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.error=invalid_request\nquery.error_description=The state parameter is required\n"
+        }
+      ]
+    },
+    "feature4_2_no_enforce_state.json": {
+      "description": "When state is NOT required, the same request that omits the state value succeeds: the user agent is redirected back to the target with a freshly issued grant code and no error, and no identity assertion is bound to the code.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "code"
+                }
+              }
+            ],
+            "config": {
+              "enforce_state": false
+            }
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.code=CODE\nissued.identity_token=absent\n"
+        }
+      ]
+    },
+    "feature5_scope_enforcement.json": {
+      "description": "When the deployment defines a set of supported scopes and no default scope, a grant-code request that omits the scope parameter is redirected back with a scope error, while the same request that names a supported scope succeeds with a redirect carrying a freshly issued grant code.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "code",
+                  "state": "xyz"
+                }
+              }
+            ],
+            "scope_util": {
+              "default_scope": false,
+              "supported_scopes": [
+                "testscope"
+              ]
+            }
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.error=invalid_scope\nquery.error_description=This application requires you specify a scope parameter\nquery.state=xyz\n"
+        },
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "code",
+                  "state": "xyz",
+                  "scope": "testscope"
+                }
+              }
+            ],
+            "scope_util": {
+              "default_scope": false,
+              "supported_scopes": [
+                "testscope"
+              ]
+            }
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.code=CODE\nquery.state=xyz\nissued.identity_token=absent\n"
+        }
+      ]
+    },
+    "feature6_1_redirect_reconstruction.json": {
+      "description": "On success the endpoint reconstructs the redirect target faithfully, preserving every component of the supplied absolute URL (userinfo, host, port, path, and pre-existing query parameters) while appending the issued grant code and echoing the state value.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID with Redirect Uri Parts",
+                  "response_type": "code",
+                  "redirect_uri": "http://user:pass@brentertainment.com:2222/authorize/cb?auth_type=oauth&test=true",
+                  "state": "xyz"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=user\nredirect.host=brentertainment.com\nredirect.port=2222\nredirect.path=/authorize/cb\nredirect.fragment=\nquery.auth_type=oauth\nquery.code=CODE\nquery.state=xyz\nquery.test=true\nissued.identity_token=absent\n"
+        }
+      ]
+    },
+    "feature6_2_non_exact_extra_query.json": {
+      "description": "Under a relaxed (non-exact) redirect-matching policy, a supplied target that shares the registered prefix but adds extra query parameters is accepted; the success redirect preserves the registered and extra query parameters together with the appended grant code and echoed state.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID with Redirect Uri Parts",
+                  "response_type": "code",
+                  "redirect_uri": "http://user:pass@brentertainment.com:2222/authorize/cb?auth_type=oauth&test=true&hereisa=querystring",
+                  "state": "xyz"
+                }
+              }
+            ],
+            "config": {
+              "require_exact_redirect_uri": false
+            }
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=user\nredirect.host=brentertainment.com\nredirect.port=2222\nredirect.path=/authorize/cb\nredirect.fragment=\nquery.auth_type=oauth\nquery.code=CODE\nquery.hereisa=querystring\nquery.state=xyz\nquery.test=true\nissued.identity_token=absent\n"
+        }
+      ]
+    },
+    "feature6_3_multiple_redirect_uris.json": {
+      "description": "When a client registers several redirect targets, the endpoint accepts a request that selects any one of the registered targets, redirecting back to exactly that chosen target with an issued grant code and echoed state.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID with Multiple Redirect Uris",
+                  "redirect_uri": "http://brentertainment.com",
+                  "response_type": "code",
+                  "state": "xyz"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=brentertainment.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.code=CODE\nquery.state=xyz\nissued.identity_token=absent\n"
+        },
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID with Multiple Redirect Uris",
+                  "redirect_uri": "http://morehazards.com",
+                  "response_type": "code",
+                  "state": "xyz"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=morehazards.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.code=CODE\nquery.state=xyz\nissued.identity_token=absent\n"
+        }
+      ]
+    },
+    "feature6_4_successful_response_shape.json": {
+      "description": "A successful grant-code authorization redirects back to the target with a code query parameter present, echoes the caller's state value unchanged, strips any unknown extra request parameters from the outgoing redirect, and binds no identity assertion to the issued code when no identity scope was requested.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "code",
+                  "state": "xyz"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.code=CODE\nquery.state=xyz\nissued.identity_token=absent\n"
+        }
+      ]
+    },
+    "feature7_user_denies_access.json": {
+      "description": "When the resource owner declines the request, a valid authorization request does not issue a grant; instead the user agent is redirected back to the validated target with an access-denied error code, description, and the echoed state value.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": false,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "code",
+                  "state": "xyz"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.error=access_denied\nquery.error_description=The user denied access to your application\nquery.state=xyz\n"
+        }
+      ]
+    },
+    "feature8_code_redeemable_at_token_endpoint.json": {
+      "description": "A grant code issued for a client that relies on its single registered redirect target (omitting the redirect parameter in the authorization step) can subsequently be redeemed at the token endpoint WITHOUT re-supplying a redirect target; the redemption returns a success status and a token payload. The second step references the code issued by the first step.",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID with Redirect Uri",
+                  "response_type": "code",
+                  "state": "xyz"
+                }
+              },
+              {
+                "action": "token",
+                "request": {
+                  "client_id": "Test Client ID with Redirect Uri",
+                  "client_secret": "TestSecret2",
+                  "grant_type": "authorization_code",
+                  "code": "@AUTH_CODE@"
+                }
+              }
+            ]
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=brentertainment.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.code=CODE\nquery.state=xyz\nissued.identity_token=absent\n\nresponse=1\nstatus=200\ntype=response\nbody.access_token=ACCESS_TOKEN\nbody.expires_in=3600\nbody.refresh_token=REFRESH_TOKEN\nbody.scope=\nbody.token_type=Bearer\n"
+        }
+      ]
+    },
+    "feature9_identity_token_binding.json": {
+      "description": "When the deployment enables identity-connect features and the request asks for the identity scope, a successful grant-code authorization additionally binds an identity assertion to the issued code, observable as the code carrying an attached identity token (in contrast to the default flow, where none is attached).",
+      "cases": [
+        {
+          "input": {
+            "steps": [
+              {
+                "action": "authorize",
+                "is_authorized": true,
+                "request": {
+                  "client_id": "Test Client ID",
+                  "redirect_uri": "http://adobe.com",
+                  "response_type": "code",
+                  "state": "xyz",
+                  "scope": "openid"
+                }
+              }
+            ],
+            "config": {
+              "use_openid_connect": true,
+              "issuer": "bojanz"
+            }
+          },
+          "expected_output": "response=0\nstatus=302\ntype=redirect\nredirect.scheme=http\nredirect.user=\nredirect.host=adobe.com\nredirect.port=\nredirect.path=\nredirect.fragment=\nquery.code=CODE\nquery.state=xyz\nissued.identity_token=present\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Input Parsing",
+      "input_condition": "Input JSON object is provided via stdin",
+      "output_rule": "Output stream consists of blocks corresponding to each step in the 'steps' array, separated by exactly one blank line, ending with a trailing newline",
+      "exact_values": [
+        "steps",
+        "action",
+        "is_authorized",
+        "request",
+        "config",
+        "scope_util"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Default Configuration Values",
+      "input_condition": "Optional 'config' object is omitted from input",
+      "output_rule": "Defaults are applied: state enforcement enabled, exact redirect URI matching required, implicit grants disabled, OpenID Connect disabled",
+      "exact_values": [
+        true
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Default Configuration Values",
+      "input_condition": "Optional 'config' object exists but keys are not specified",
+      "output_rule": "Same defaults as C002 apply",
+      "exact_values": [
+        true
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Step Ordering",
+      "input_condition": "Steps are provided in the 'steps' array",
+      "output_rule": "Output blocks appear in the exact index order of the input steps array (0 for first, 1 for second, etc.)",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Block Order & Separation",
+      "input_condition": "Multiple steps are present",
+      "output_rule": "Each step's output block must be separated from the previous and next block by exactly one blank line",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Block Header Format",
+      "input_condition": "Every output block is written",
+      "output_rule": "Block starts with exactly two lines: `response=<step_index>` and `status=<http_status_code>`, followed by the value lines",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Response Type Rendering",
+      "input_condition": "Resource owner denies access (is_authorized=false) or direct validation fails",
+      "output_rule": "Use `type=response` and `body.<key>=<value>` lines. Null values render as empty strings, booleans as `true`/`false`, arrays as comma-joined strings",
+      "exact_values": [
+        "response",
+        "body"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Redirect Rendering",
+      "input_condition": "Validation succeeds and the endpoint performs a redirect",
+      "output_rule": "Use `type=redirect` followed by URI components (`redirect.scheme`, `redirect.user`, `redirect.host`, `redirect.port`, `redirect.path`, `redirect.fragment`) and query parameters (`query.<key>`) sorted alphabetically by key",
+      "exact_values": [
+        "redirect",
+        "query"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Identity Token Rendering",
+      "input_condition": "A grant code is issued and OpenID Connect is configured or identity scope requested",
+      "output_rule": "Include exactly one of `issued.identity_token=present` or `issued.identity_token=absent` in the redirect block",
+      "exact_values": [
+        "present",
+        "absent"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Value Normalization (Secrets)",
+      "input_condition": "Internal secrets like grant codes are generated or stored",
+      "output_rule": "Secrets must be replaced with placeholders: `CODE`, `ACCESS_TOKEN`, `REFRESH_TOKEN`, `ID_TOKEN`",
+      "exact_values": [
+        "CODE",
+        "ACCESS_TOKEN",
+        "REFRESH_TOKEN",
+        "ID_TOKEN"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Value Normalization (State)",
+      "input_condition": "State parameter is present or echoed",
+      "output_rule": "The caller's `state` value must be preserved verbatim in the output, never normalized",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Value Normalization (Protocol Errors)",
+      "input_condition": "A standard OAuth error occurs",
+      "output_rule": "Protocol error codes and descriptions must be preserved verbatim in the output",
+      "exact_values": [
+        "invalid_client",
+        "invalid_uri",
+        "redirect_uri_mismatch",
+        "invalid_request",
+        "access_denied",
+        "invalid_scope"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Value Normalization (Runtime Exceptions)",
+      "input_condition": "Core endpoint throws a native runtime exception",
+      "output_rule": "Map native exception to one of three specific lines: `error=invalid_argument`, `error=invalid_configuration`, or `error=internal`",
+      "exact_values": [
+        "invalid_argument",
+        "invalid_configuration",
+        "internal"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Client Identification / No Client",
+      "input_condition": "Client ID is empty/missing in the request",
+      "output_rule": "Return 400 status with `body.error=invalid_client` and `body.error_description=No client id supplied` (Direct response, no redirect)",
+      "exact_values": [
+        "invalid_client",
+        "No client id supplied"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Client Identification / Unknown Client",
+      "input_condition": "Client ID is missing OR matches a non-registered identifier",
+      "output_rule": "Return 400 status with `body.error=invalid_client` and `body.error_description=The client id supplied is invalid` (Direct response, no redirect)",
+      "exact_values": [
+        "invalid_client",
+        "The client id supplied is invalid"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Redirect Target Missing / Direct Error",
+      "input_condition": "Client has no stored redirect URI AND request does not supply one",
+      "output_rule": "Return 400 status with `body.error=invalid_uri` and `body.error_description=No redirect URI was supplied or stored` (Direct response, no redirect)",
+      "exact_values": [
+        "invalid_uri",
+        "No redirect URI was supplied or stored"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Redirect URI Fragment Check (Direct Error)",
+      "input_condition": "Supplied redirect URI contains a URL fragment component",
+      "output_rule": "Return 400 status with `body.error=invalid_uri` and `body.error_description=The redirect URI must not contain a fragment` (Direct response, no redirect)",
+      "exact_values": [
+        "invalid_uri",
+        "The redirect URI must not contain a fragment"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Single Registered Target Mismatch (Direct Error)",
+      "input_condition": "Client has exactly one registered target AND supplied target differs from it",
+      "output_rule": "Return 400 status with `body.error=redirect_uri_mismatch`, description, and `body.error_uri=http://tools.ietf.org/html/rfc6749#section-3.1.2`",
+      "exact_values": [
+        "redirect_uri_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Multi-Targe St Register / Missing Selection (Direct Error)",
+      "input_condition": "Client has multiple registered targets AND request does not supply a `redirect_uri`",
+      "output_rule": "Return 400 status with `body.error=invalid_uri`, description, and `body.error_uri=http://tools.ietf.org/html/rfc6749#section-3.1.2.3`",
+      "exact_values": [
+        "invalid_uri"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Strict Exact-Match Policy",
+      "input_condition": "Config `require_exact_redirect_uri` is true AND supplied URI query string differs from registered one",
+      "output_rule": "Return 400 status with `body.error=redirect_uri_mismatch` and spec URI (Direct response, no redirect)",
+      "exact_values": [
+        "redirect_uri_mismatch"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Missing Response Type (Redirect)",
+      "input_condition": "Request has valid client/redirect but lacks `response_type`",
+      "output_rule": "Return 302 redirect to validated target with `query.error=invalid_request` and description `Invalid or missing response type`",
+      "exact_values": [
+        "invalid_request",
+        "Invalid or missing response type"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Invalid Response Type (Redirect)",
+      "input_condition": "Request has valid client/redirect but `response_type` is unsupported",
+      "output_rule": "Return 302 redirect to validated target with `query.error=invalid_request` and description `Invalid or missing response type`",
+      "exact_values": [
+        "invalid_request"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "State Enforcement (Redirect)",
+      "input_condition": "Config `enforce_state` is true AND request lacks `state`",
+      "output_rule": "Return 302 redirect to validated target with `query.error=invalid_request` and description `The state parameter is required`",
+      "exact_values": [
+        "invalid_request",
+        "The state parameter is required"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Scope Enforcement (Redirect)",
+      "input_condition": "Config `supported_scopes` is not empty, `default_scope` is false, and request lacks valid `scope`",
+      "output_rule": "Return 302 redirect to validated target with `query.error=invalid_scope` and description `This application requires you specify a scope parameter`",
+      "exact_values": [
+        "invalid_scope"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Redirect Reconstruction",
+      "input_condition": "Authorization succeeds (is_authorized=true)",
+      "output_rule": "Reconstruct the URL exactly: preserve userinfo, host, port, path. Parse existing query params. Append `code=CODE`. Echo `state`. Sort final query params alphabetically. Append fragment if present (empty string if none)",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "Redirect Query Param Sorting",
+      "input_condition": "Outputting a redirect block",
+      "output_rule": "All `query.` lines must be sorted alphabetically by the key name",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Identity Binding (OpenID)",
+      "input_condition": "Config `use_openid_connect` is true AND `scope` includes `openid`",
+      "output_rule": "Include `issued.identity_token=present` in the redirect output",
+      "exact_values": [
+        "present"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Identity Binding (Default)",
+      "input_condition": "Authorization succeeds but no identity scope requested",
+      "output_rule": "Include `issued.identity_token=absent` in the redirect output",
+      "exact_values": [
+        "absent"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "User Denial (Redirect)",
+      "input_condition": "Resource owner declines (`is_authorized=false`) but client/validation is valid",
+      "output_rule": "Return 302 redirect to validated target with `query.error=access_denied` and description `The user denied access to your application`. Echo state.",
+      "exact_values": [
+        "access_denied",
+        "The user denied access to your application"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Code Chaining for Token Endpoints",
+      "input_condition": "Action is `token` AND `request.code` is `@AUTH_CODE@`",
+      "output_rule": "Replace `@AUTH_CODE@` with the actual code generated by a preceding `authorize` action with `action=authorize`",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "Action Dispatch",
+      "input_condition": "Input step specifies `action=authorize`",
+      "output_rule": "Execute authorization logic (client lookup, redirect validation, grant issuance)",
+      "exact_values": [
+        "authorize"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "Action Dispatch",
+      "input_condition": "Input step specifies `action=token`",
+      "output_rule": "Execute token redemption logic (validate code params, return access/refresh tokens)",
+      "exact_values": [
+        "token"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "Redirect Multi-Value Query Params",
+      "input_condition": "Outputting a redirect block with multi-valued query param",
+      "output_rule": "Multi-valued keys must have values joined by commas (e.g. `query.key=val1,val2`)",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C010",
+        "replacement": "four specific placeholder strings for sensitive data",
+        "exact_values_to_replace": [
+          "CODE",
+          "ACCESS_TOKEN",
+          "REFRESH_TOKEN",
+          "ID_TOKEN"
+        ],
+        "trigger_keywords": [
+          "secret placeholder",
+          "token mask string",
+          "AUTH_CODE replacement",
+          "access token stub",
+          "ID token value"
+        ],
+        "oracle_response": "The values to be replaced are: CODE, ACCESS_TOKEN, REFRESH_TOKEN, and ID_TOKEN."
+      },
+      {
+        "constraint_id": "C007",
+        "replacement": "two output keys for rendering typed responses",
+        "exact_values_to_replace": [
+          "response",
+          "body"
+        ],
+        "trigger_keywords": [
+          "response type header",
+          "output key for response",
+          "body rendering keys",
+          "render response structure",
+          "output prefix for values"
+        ],
+        "oracle_response": "The exact keys are 'response' and 'body'."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C031",
+        "vague_phrase": "replace the placeholder found in request.code with the result of the prior authorize action",
+        "actual_meaning": "The actual code previously substituted into the @AUTH_CODE@ template by the logic defined in constraint C031 (authorize)"
+      },
+      {
+        "constraint_id": "C026",
+        "vague_phrase": "reconstruct the redirect URL following the same pattern used for C026",
+        "actual_meaning": "The redirect URL assembly defined in C025 utilizes the alphabetical sorting logic explicitly enforced in constraint C026 for all query parameters"
+      }
+    ]
+  }
+}

@@ -1,0 +1,994 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out that proxy config generation engine we talked about in the last planning session. Basically the idea is that each service instance sends us some metadata about itself (what it talks to, how it wants to receive traffic, health check stuff, etc.) and we need to spit out all the right config artifacts for it deterministically. Think of it like what we did for the login module's compatibility layer but for sidecar proxies.\n\nRight now operators are hand-writing all these route tables and cluster references and it's a total mess — every small policy change means touching dozens of files and there's no consistent way to tell proxies their config changed. We want a clean engine that takes instance metadata + server policy and derives everything: the routing labels, dependency descriptors, which traffic group an instance belongs to, the ingress/egress route configs, and some kind of versioning so connected proxies know when to reload.\n\nA few things I'm not 100% sure on: there's apparently some special handling needed when services request access to everything vs a specific list, and some tag combinations are allowed per-service but not globally. Also the versioning piece — I know we discussed stable labels so tests aren't brittle but I don't remember the exact scheme. The code should be organized sensibly across multiple files, not one giant blob. Errors should come out as clean category strings, never raw exceptions. Let's keep it extensible for new policy fields down the road.",
+  "oracle_data": {
+    "task_id": "envoy-control-proxy-config-engine-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "how should tags be filtered",
+          "which tags get removed from routing",
+          "tag blacklist behavior"
+        ],
+        "oracle_response": "Tags are filtered using full-match regular expressions from the excludedTags list. A tag is discarded if it matches ANY pattern in the blacklist (full match, not substring). After filtering, if no tags remain, emit exactly one line: `tags=none`. Surviving single tags are always kept. Combination expansion only applies per-service rules that match exactly the service name in the request."
+      },
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "how are tag combinations expanded",
+          "two tag combinations vs three tag combinations",
+          "what combinations are emitted for multi-tag rules"
+        ],
+        "oracle_response": "For a service with two-tag combination rules: emit a joined value `a,b` for every surviving pair of tags where one matches the first pattern and one matches the second. The two members inside a joined value are ordered ascending (lexicographic). For three-tag combination rules: additionally emit the joined two-tag sub-pairs for every matching sub-pair AND the joined three-tag value for each matching triple. All output lines are sorted ascending, one `tag=<value>` per line."
+      },
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "default timeout value",
+          "what happens when timeout is omitted",
+          "fallback idle or request timeout"
+        ],
+        "oracle_response": "When a service dependency omits idleTimeout or requestTimeout, both fall back to a default of `120s`. Each field is independently defaulted — supplying one does not affect the other's default."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "how is the cluster name derived for a domain",
+          "domain cluster naming rule",
+          "underscore cluster name format"
+        ],
+        "oracle_response": "The cluster name for a domain dependency is derived by joining the host and effective port with an underscore, then replacing every dot (`.`) and colon (`:`) in the combined string with an underscore. For example `domain.pl` port `80` yields cluster name `domain_pl_80`."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "what schemes are allowed for domain dependencies",
+          "supported protocols for outgoing domain",
+          "what happens with ftp or other schemes"
+        ],
+        "oracle_response": "Only `http` and `https` schemes are accepted for domain dependencies. Any other scheme (e.g. `ftp`) must be rejected with error line `error=unsupported_domain_protocol` followed by `domain=<original_url>`. Declaring neither a service nor a domain, or declaring both, must be rejected with `error=invalid_dependency_target`."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "routeDomain with and without explicit port",
+          "when should port appear in route domain",
+          "explicit vs implicit port in domain dependency"
+        ],
+        "oracle_response": "The `routeDomain` field includes the port ONLY when the port was explicitly present in the original URL. If the URL uses the scheme default port implicitly (e.g. `http://domain.pl` with no port), routeDomain is just the host. If the port is explicitly written (e.g. `http://domain.pl:80`), routeDomain is `domain.pl:80`."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "null path vs absent path in endpoint",
+          "how is explicit null treated in path fields",
+          "path conflict vs path missing rules"
+        ],
+        "oracle_response": "A field present with an explicit null value is treated as absent. So: null path + real prefix = valid (PATH_PREFIX match). Real path + null prefix = valid (PATH match). Both non-null = `error=path_conflict`. Both absent or both null = `error=path_missing`. The `includeNullFields` flag in the test input signals that null fields are serialized and present in the JSON, testing this exact null-as-absent behavior."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "health check custom flag logic",
+          "when is a health check considered custom",
+          "default cluster name for health check"
+        ],
+        "oracle_response": "A health check is `custom=true` only when a non-blank (non-empty) path is configured. An absent or empty healthCheckPath yields `path=` (empty) and `custom=false`. The cluster name defaults to `local_service_health_check` when no healthCheckClusterName is supplied."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "when is incoming settings stripped",
+          "incoming permissions gating behavior",
+          "service name cleared without incoming permissions"
+        ],
+        "oracle_response": "Incoming settings (service name, endpoints, permissions flag) are included in the resolved group ONLY when incoming permissions are enabled (`incomingPermissions: true`). When disabled, the service name is cleared to empty string and the incoming section is reset to empty defaults regardless of what the node supplied. The permissionsEnabled flag in output reflects the policy, not just whether the node supplied settings."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "all services group vs services group assignment",
+          "when does wildcard trigger all services group",
+          "outgoing permissions disabled group type"
+        ],
+        "oracle_response": "A node is assigned to `AllServicesGroup` when it requests the wildcard `*` dependency OR when outgoing permissions are disabled (policy-level override). Without `*` and with outgoing permissions enabled, it is assigned to `ServicesGroup`. Even when `*` is present, all explicitly listed dependencies are retained in the deps list alongside `*`."
+      },
+      {
+        "constraint_id": "C011",
+        "trigger_keywords": [
+          "wildcard authorization allow list",
+          "which services can use the star dependency",
+          "wildcard not allowed error format"
+        ],
+        "oracle_response": "When outgoing permissions are enabled and a service requests the `*` wildcard, it must be in the `servicesAllowedToUseWildcard` list. If not, emit `error=wildcard_not_allowed` followed by `service=<serviceName>`. If the service is in the allow list, emit `result=accepted`."
+      },
+      {
+        "constraint_id": "C012",
+        "trigger_keywords": [
+          "snapshot version labeling scheme",
+          "how are version identifiers assigned to groups",
+          "stable version labels for change detection"
+        ],
+        "oracle_response": "Versions are tracked per group. Cluster versions are labeled `c0`, `c1`, etc. and endpoint versions are labeled `e0`, `e1`, etc., each incrementing only when the respective content actually changes for that group. An endpoint-only change bumps the endpoint label but leaves the cluster label unchanged. If the same group receives the same content again, both labels remain unchanged. Output per step: `step=<N> clusters=c<X> endpoints=e<Y>`."
+      },
+      {
+        "constraint_id": "C013",
+        "trigger_keywords": [
+          "egress route headers configuration",
+          "when is x-service-name header added",
+          "upstream address header condition"
+        ],
+        "oracle_response": "The `x-service-name` request header (with the caller's service name as value) is added ONLY when incoming permissions are enabled for that instance. The `x-envoy-upstream-remote-address` response header is added ONLY when `addUpstreamAddressHeader` is explicitly true. These are independent conditions. Output format: `requestHeaders=[...]` and `responseHeaders=[...]` as bracket-enclosed comma-separated `key=value` pairs."
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "ingress route ordering",
+          "what order are ingress routes emitted",
+          "secured paths vs public admin route ordering"
+        ],
+        "oracle_response": "Ingress routes are emitted in a fixed order: (1) token-gated secured path routes (with 401 fallback per secured path+method), (2) public admin routes (POST, then catch-all method), (3) redirect route for the status path without trailing slash, (4) per-HTTP-method retry routes for enabled methods, (5) catch-all local route. Virtual clusters are listed as `status,endpoints` when createVirtualCluster is true. Total route count is reported as `routes=N`."
+      },
+      {
+        "constraint_id": "C015",
+        "trigger_keywords": [
+          "communication mode validation error",
+          "what happens when ads not supported by server",
+          "mode not supported error format"
+        ],
+        "oracle_response": "If the instance requests ADS mode (`ads: true`) but the server does not support it (`adsSupported: false`), emit `error=mode_not_supported` followed by `mode=ADS`. If the instance requests XDS mode (`ads: false`) but `xdsSupported: false`, emit `error=mode_not_supported` followed by `mode=XDS`. The mode name in the error is the uppercase label of the requested mode."
+      },
+      {
+        "constraint_id": "C016",
+        "trigger_keywords": [
+          "endpoint rendering format in group output",
+          "how are incoming endpoints serialized in group",
+          "endpoint sort order in node group output"
+        ],
+        "oracle_response": "Endpoints in the incoming section summary are rendered as `path|matchingType|methods=[...]|clients=[...]` where methods and clients are bracket-enclosed comma-separated lists. Endpoints are sorted ascending. The full incoming endpoints line is `incoming.endpoints=[ep1,ep2,...]` with each rendered endpoint as described above."
+      },
+      {
+        "constraint_id": "C017",
+        "trigger_keywords": [
+          "duration string formatting in timeout output",
+          "how are decimal timeouts printed",
+          "13.33s vs 13.330s formatting"
+        ],
+        "oracle_response": "Duration strings in output are rendered with exactly 3 decimal places when the input has a fractional component (e.g. `13.33s` input becomes `13.330s` in output). Whole-second durations are rendered as-is (e.g. `777s` stays `777s`). When no timeout is configured, the output is `none`."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid op field values",
+          "what values can op take",
+          "list all supported op values",
+          "what actions does the dispatcher handle",
+          "which op strings does the adapter support",
+          "what are the possible op inputs",
+          "tell me all the op names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'op' field. Valid values are: 'ingress_routes', 'tag_routing', 'outgoing_dependency', 'contains_dependency', 'incoming_endpoint', 'health_check', 'node_group', 'wildcard_auth', 'communication_mode', 'snapshot_versions', 'egress_routes'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature10_ingress_route_config",
+        "trigger_keywords": [
+          "test cases for feature10 ingress route config",
+          "show me feature10 ingress route config test cases",
+          "what are the feature10 ingress route config test inputs",
+          "give me the feature10_ingress_route_config test file",
+          "test cases for feature 10",
+          "feature10 ingress route config expected output",
+          "what does feature10 ingress route config expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_ingress_route_config:\n{\n  \"description\": \"Build secured ingress route config: status virtual clusters, token-gated admin routes with 401 fallbacks, public admin routes, per-method retry routes, and a catch-all local route, in a fixed order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"ingress_routes\",\n        \"statusEnabled\": true,\n        \"createVirtualCluster\": true,\n        \"adminPublicAccess\": true,\n        \"adminToken\": \"test_token\",\n        \"securedPaths\": [\n          {\n            \"pathPrefix\": \"/config_dump\",\n            \"method\": \"GET\"\n          }\n        ],\n        \"healthCheckPath\": \"\",\n        \"healthCheckCluster\": \"health_check_cluster\",\n        \"responseTimeout\": \"777s\",\n        \"idleTimeout\": \"61s\",\n        \"connectionIdleTimeout\": \"120s\",\n        \"defaultRetryPolicy\": {\n          \"enabled\": true,\n          \"retryOn\": [\n            \"connection-failure\"\n          ],\n          \"numRetries\": 3\n        },\n        \"perHttpMethod\": {\n          \"GET\": {\n            \"enabled\": true,\n            \"retryOn\": [\n              \"reset\",\n              \"connection-failure\"\n            ],\n            \"numRetries\": 1,\n            \"perTryTimeoutSeconds\": 1,\n            \"hostSelectionRetryMaxAttempts\": 3\n          },\n          \"HEAD\": {\n            \"enabled\": true,\n            \"retryOn\": [\n              \"connection-failure\"\n            ],\n            \"numRetries\": 6\n          },\n          \"POST\": {\n            \"enabled\": false,\n            \"retryOn\": [\n              \"connection-failure\"\n            ],\n            \"numRetries\": 6\n          }\n        }\n      },\n      \"expected_output\": \"routeConfigName=ingress_secured_routes\\nvhost.name=secured_local_service\\nvhost.domains=[*]\\nvhost.virtualClusters=[status,endpoints]\\nvhost.retryPolicy.retryOn=connection-failure\\nvhost.retryPolicy.numRetries=3\\nroutes=9\\nroute[0] prefix=/status/envoy/config_dump method=[GET] cluster=this_admin retry=false\\nroute[1] prefix=/status/envoy/config_dump method=[GET] directResponse=401 retry=false\\nroute[2] prefix=/status/envoy/ method=[POST] cluster=this_admin retry=false\\nroute[3] prefix=/status/envoy/ method=[POST] directResponse=401 retry=false\\nroute[4] prefix=/status/envoy/ method=[] cluster=this_admin retry=false\\nroute[5] prefix=/status/envoy method=[GET] redirect retry=false\\nroute[6] prefix=/ method=[GET] cluster=local_service retry=true\\nroute[7] prefix=/ method=[HEAD] cluster=local_service retry=true\\nroute[8] prefix=/ method=[] cluster=local_service retry=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_tag_routing",
+        "trigger_keywords": [
+          "test cases for feature1 tag routing",
+          "show me feature1 tag routing test cases",
+          "what are the feature1 tag routing test inputs",
+          "give me the feature1_tag_routing test file",
+          "test cases for feature 1",
+          "feature1 tag routing expected output",
+          "what does feature1 tag routing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_tag_routing:\n{\n  \"description\": \"Tag routing transformation: blacklist filtering of raw tags, plus per-service two/three-tag combination expansion; emits sorted 'tag=<value>' lines or 'tags=none' when nothing survives.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"tag_routing\",\n        \"serviceName\": \"regular-service\",\n        \"excludedTags\": [\n          \".*id.*\",\n          \"port:.*\",\n          \"envoy\"\n        ],\n        \"allowedCombinations\": [],\n        \"tags\": [\n          \"id:332\",\n          \"hardware:c32\",\n          \"stage:dev\",\n          \"version:v0.9\",\n          \"env12\",\n          \"port:1244\",\n          \"gport:1245\",\n          \"envoy\",\n          \"envoy-test\"\n        ]\n      },\n      \"expected_output\": \"tag=env12\\ntag=envoy-test\\ntag=gport:1245\\ntag=hardware:c32\\ntag=stage:dev\\ntag=version:v0.9\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"tag_routing\",\n        \"serviceName\": \"two-tags-allowed-service\",\n        \"excludedTags\": [\n          \".*id.*\",\n          \"port:.*\",\n          \"envoy\"\n        ],\n        \"allowedCombinations\": [\n          {\n            \"serviceName\": \"two-tags-allowed-service\",\n            \"tags\": [\n              \"hardware:.*\",\n              \"version:.*\"\n            ]\n          },\n          {\n            \"serviceName\": \"two-tags-allowed-service\",\n            \"tags\": [\n              \"stage:.*\",\n              \"version:.*\"\n            ]\n          },\n          {\n            \"serviceName\": \"three-tags-allowed-service\",\n            \"tags\": [\n              \"stage:.*\",\n              \"version:.*\",\n              \"hardware:.*\"\n            ]\n          }\n        ],\n        \"tags\": [\n          \"service-id:332\",\n          \"hardware:c32\",\n          \"stage:dev\",\n          \"version:v0.9\",\n          \"env12\"\n        ]\n      },\n      \"expected_output\": \"tag=env12\\ntag=hardware:c32\\ntag=hardware:c32,version:v0.9\\ntag=stage:dev\\ntag=stage:dev,version:v0.9\\ntag=version:v0.9\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_outgoing_service_dependency",
+        "trigger_keywords": [
+          "test cases for feature2 1 outgoing service dependency",
+          "show me feature2 1 outgoing service dependency test cases",
+          "what are the feature2 1 outgoing service dependency test inputs",
+          "give me the feature2_1_outgoing_service_dependency test file",
+          "test cases for feature 2",
+          "feature2 1 outgoing service dependency expected output",
+          "what does feature2 1 outgoing service dependency expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_outgoing_service_dependency:\n{\n  \"description\": \"Parse an outgoing service dependency into name + redirect flag + idle/request timeouts (omitted timeouts fall back to a default).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"outgoing_dependency\",\n        \"service\": \"my-service\"\n      },\n      \"expected_output\": \"type=service\\nservice=my-service\\nhandleInternalRedirect=false\\nidleTimeout=120s\\nrequestTimeout=120s\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"outgoing_dependency\",\n        \"service\": \"service-1\",\n        \"idleTimeout\": \"10s\"\n      },\n      \"expected_output\": \"type=service\\nservice=service-1\\nhandleInternalRedirect=false\\nidleTimeout=10s\\nrequestTimeout=120s\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_outgoing_domain_dependency",
+        "trigger_keywords": [
+          "test cases for feature2 2 outgoing domain dependency",
+          "show me feature2 2 outgoing domain dependency test cases",
+          "what are the feature2 2 outgoing domain dependency test inputs",
+          "give me the feature2_2_outgoing_domain_dependency test file",
+          "test cases for feature 2",
+          "feature2 2 outgoing domain dependency expected output",
+          "what does feature2 2 outgoing domain dependency expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_outgoing_domain_dependency:\n{\n  \"description\": \"Parse an outgoing domain dependency into host, effective port, underscore-joined cluster name, and route domain (port shown only if explicit).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"outgoing_dependency\",\n        \"domain\": \"http://domain.pl\"\n      },\n      \"expected_output\": \"type=domain\\ndomain=http://domain.pl\\nhost=domain.pl\\nport=80\\ncluster=domain_pl_80\\nrouteDomain=domain.pl\\nhandleInternalRedirect=false\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"outgoing_dependency\",\n        \"domain\": \"http://domain.pl:80\"\n      },\n      \"expected_output\": \"type=domain\\ndomain=http://domain.pl:80\\nhost=domain.pl\\nport=80\\ncluster=domain_pl_80\\nrouteDomain=domain.pl:80\\nhandleInternalRedirect=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_outgoing_dependency_validation",
+        "trigger_keywords": [
+          "test cases for feature2 3 outgoing dependency validation",
+          "show me feature2 3 outgoing dependency validation test cases",
+          "what are the feature2 3 outgoing dependency validation test inputs",
+          "give me the feature2_3_outgoing_dependency_validation test file",
+          "test cases for feature 2",
+          "feature2 3 outgoing dependency validation expected output",
+          "what does feature2 3 outgoing dependency validation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_outgoing_dependency_validation:\n{\n  \"description\": \"Reject dependencies that declare neither/both target kinds, or a domain with an unsupported scheme; emit neutral error category lines.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"outgoing_dependency\"\n      },\n      \"expected_output\": \"error=invalid_dependency_target\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"outgoing_dependency\",\n        \"domain\": \"ftp://domain\"\n      },\n      \"expected_output\": \"error=unsupported_domain_protocol\\ndomain=ftp://domain\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_4_dependency_membership",
+        "trigger_keywords": [
+          "test cases for feature2 4 dependency membership",
+          "show me feature2 4 dependency membership test cases",
+          "what are the feature2 4 dependency membership test inputs",
+          "give me the feature2_4_dependency_membership test file",
+          "test cases for feature 2",
+          "feature2 4 dependency membership expected output",
+          "what does feature2 4 dependency membership expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_4_dependency_membership:\n{\n  \"description\": \"Report presence/absence of a service dependency by name over the declared dependency set.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"contains_dependency\",\n        \"dependencies\": [\n          {\n            \"service\": \"service-first\",\n            \"handleInternalRedirect\": true\n          }\n        ],\n        \"queries\": [\n          \"service-first\",\n          \"service-second\"\n        ]\n      },\n      \"expected_output\": \"service-first=true\\nservice-second=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_incoming_endpoint_path",
+        "trigger_keywords": [
+          "test cases for feature3 incoming endpoint path",
+          "show me feature3 incoming endpoint path test cases",
+          "what are the feature3 incoming endpoint path test inputs",
+          "give me the feature3_incoming_endpoint_path test file",
+          "test cases for feature 3",
+          "feature3 incoming endpoint path expected output",
+          "what does feature3 incoming endpoint path expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_incoming_endpoint_path:\n{\n  \"description\": \"Validate incoming endpoint path vs pathPrefix (exactly one required; explicit null treated as absent); report resolved path and matching type or a neutral error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"incoming_endpoint\",\n        \"path\": \"/path\",\n        \"pathPrefix\": \"/prefix\"\n      },\n      \"expected_output\": \"error=path_conflict\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"incoming_endpoint\",\n        \"pathPrefix\": \"/prefix\",\n        \"includeNullFields\": true\n      },\n      \"expected_output\": \"path=/prefix\\nmatchingType=PATH_PREFIX\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_health_check_settings",
+        "trigger_keywords": [
+          "test cases for feature4 health check settings",
+          "show me feature4 health check settings test cases",
+          "what are the feature4 health check settings test inputs",
+          "give me the feature4_health_check_settings test file",
+          "test cases for feature 4",
+          "feature4 health check settings expected output",
+          "what does feature4 health check settings expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_health_check_settings:\n{\n  \"description\": \"Parse incoming health-check path + cluster (cluster name defaulted); 'custom' is true only for a non-blank path.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"health_check\",\n        \"path\": \"/path\",\n        \"healthCheckPath\": \"/status/ping\",\n        \"healthCheckClusterName\": \"local_service_health_check\"\n      },\n      \"expected_output\": \"clusterName=local_service_health_check\\npath=/status/ping\\ncustom=true\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"health_check\",\n        \"path\": \"/path\"\n      },\n      \"expected_output\": \"clusterName=local_service_health_check\\npath=\\ncustom=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_group_assignment_by_dependencies",
+        "trigger_keywords": [
+          "test cases for feature5 1 group assignment by dependencies",
+          "show me feature5 1 group assignment by dependencies test cases",
+          "what are the feature5 1 group assignment by dependencies test inputs",
+          "give me the feature5_1_group_assignment_by_dependencies test file",
+          "test cases for feature 5",
+          "feature5 1 group assignment by dependencies expected output",
+          "what does feature5 1 group assignment by dependencies expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_group_assignment_by_dependencies:\n{\n  \"description\": \"Assign node to all-services vs listed-services group from its dependencies and the outgoing-permissions policy; preserve mode and retain all listed dependencies.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"node_group\",\n        \"outgoingPermissions\": true,\n        \"serviceDependencies\": [\n          \"*\",\n          \"a\",\n          \"b\",\n          \"c\"\n        ],\n        \"ads\": false\n      },\n      \"expected_output\": \"type=AllServicesGroup\\nmode=XDS\\nserviceName=\\ndeps=[*,a,b,c]\\nincoming.permissionsEnabled=false\\nincoming.endpoints=[]\\nincoming.healthCheck.path=\\nincoming.healthCheck.cluster=local_service_health_check\\nincoming.timeout.response=none\\nincoming.timeout.idle=none\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"node_group\",\n        \"outgoingPermissions\": true,\n        \"serviceDependencies\": [\n          \"a\",\n          \"b\",\n          \"c\"\n        ],\n        \"ads\": false\n      },\n      \"expected_output\": \"type=ServicesGroup\\nmode=XDS\\nserviceName=\\ndeps=[a,b,c]\\nincoming.permissionsEnabled=false\\nincoming.endpoints=[]\\nincoming.healthCheck.path=\\nincoming.healthCheck.cluster=local_service_health_check\\nincoming.timeout.response=none\\nincoming.timeout.idle=none\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_group_incoming_permissions_gating",
+        "trigger_keywords": [
+          "test cases for feature5 2 group incoming permissions gating",
+          "show me feature5 2 group incoming permissions gating test cases",
+          "what are the feature5 2 group incoming permissions gating test inputs",
+          "give me the feature5_2_group_incoming_permissions_gating test file",
+          "test cases for feature 5",
+          "feature5 2 group incoming permissions gating expected output",
+          "what does feature5 2 group incoming permissions gating expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_group_incoming_permissions_gating:\n{\n  \"description\": \"Include incoming settings (service name, endpoints) only when incoming permissions are enabled; otherwise strip them to defaults.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"node_group\",\n        \"outgoingPermissions\": true,\n        \"serviceDependencies\": [\n          \"a\",\n          \"b\",\n          \"c\"\n        ],\n        \"ads\": false,\n        \"serviceName\": \"app1\",\n        \"incomingSettings\": true\n      },\n      \"expected_output\": \"type=ServicesGroup\\nmode=XDS\\nserviceName=\\ndeps=[a,b,c]\\nincoming.permissionsEnabled=false\\nincoming.endpoints=[]\\nincoming.healthCheck.path=\\nincoming.healthCheck.cluster=local_service_health_check\\nincoming.timeout.response=none\\nincoming.timeout.idle=none\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"node_group\",\n        \"outgoingPermissions\": true,\n        \"incomingPermissions\": true,\n        \"serviceDependencies\": [\n          \"a\",\n          \"b\"\n        ],\n        \"ads\": true,\n        \"serviceName\": \"app1\",\n        \"incomingSettings\": true\n      },\n      \"expected_output\": \"type=ServicesGroup\\nmode=ADS\\nserviceName=app1\\ndeps=[a,b]\\nincoming.permissionsEnabled=true\\nincoming.endpoints=[/endpoint|PATH|methods=[]|clients=[client1]]\\nincoming.healthCheck.path=\\nincoming.healthCheck.cluster=local_service_health_check\\nincoming.timeout.response=none\\nincoming.timeout.idle=none\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_3_group_timeout_and_healthcheck_parsing",
+        "trigger_keywords": [
+          "test cases for feature5 3 group timeout and healthcheck parsing",
+          "show me feature5 3 group timeout and healthcheck parsing test cases",
+          "what are the feature5 3 group timeout and healthcheck parsing test inputs",
+          "give me the feature5_3_group_timeout_and_healthcheck_parsing test file",
+          "test cases for feature 5",
+          "feature5 3 group timeout and healthcheck parsing expected output",
+          "what does feature5 3 group timeout and healthcheck parsing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_group_timeout_and_healthcheck_parsing:\n{\n  \"description\": \"Parse incoming response/idle timeouts (duration strings) during group resolution.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"node_group\",\n        \"outgoingPermissions\": true,\n        \"serviceDependencies\": [\n          \"*\"\n        ],\n        \"ads\": true,\n        \"incomingSettings\": true,\n        \"responseTimeout\": \"777s\",\n        \"idleTimeout\": \"13.33s\"\n      },\n      \"expected_output\": \"type=AllServicesGroup\\nmode=ADS\\nserviceName=\\ndeps=[*]\\nincoming.permissionsEnabled=false\\nincoming.endpoints=[]\\nincoming.healthCheck.path=\\nincoming.healthCheck.cluster=local_service_health_check\\nincoming.timeout.response=777s\\nincoming.timeout.idle=13.330s\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_wildcard_authorization",
+        "trigger_keywords": [
+          "test cases for feature6 wildcard authorization",
+          "show me feature6 wildcard authorization test cases",
+          "what are the feature6 wildcard authorization test inputs",
+          "give me the feature6_wildcard_authorization test file",
+          "test cases for feature 6",
+          "feature6 wildcard authorization expected output",
+          "what does feature6 wildcard authorization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_wildcard_authorization:\n{\n  \"description\": \"Allow the all-dependencies wildcard only for allow-listed services when outgoing permissions are enabled; emit neutral accept/reject decisions.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"wildcard_auth\",\n        \"outgoingPermissions\": true,\n        \"servicesAllowedToUseWildcard\": [\n          \"vis-1\",\n          \"vis-2\"\n        ],\n        \"serviceDependencies\": [\n          \"*\",\n          \"a\",\n          \"b\",\n          \"c\"\n        ],\n        \"serviceName\": \"regular-1\"\n      },\n      \"expected_output\": \"error=wildcard_not_allowed\\nservice=regular-1\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"wildcard_auth\",\n        \"outgoingPermissions\": true,\n        \"servicesAllowedToUseWildcard\": [\n          \"vis-1\",\n          \"vis-2\"\n        ],\n        \"serviceDependencies\": [\n          \"*\",\n          \"a\",\n          \"b\",\n          \"c\"\n        ],\n        \"serviceName\": \"vis-1\"\n      },\n      \"expected_output\": \"result=accepted\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_communication_mode_validation",
+        "trigger_keywords": [
+          "test cases for feature7 communication mode validation",
+          "show me feature7 communication mode validation test cases",
+          "what are the feature7 communication mode validation test inputs",
+          "give me the feature7_communication_mode_validation test file",
+          "test cases for feature 7",
+          "feature7 communication mode validation expected output",
+          "what does feature7 communication mode validation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_communication_mode_validation:\n{\n  \"description\": \"Reject an instance requesting a streaming mode not supported by the server, naming the mode; accept otherwise.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"communication_mode\",\n        \"adsSupported\": false,\n        \"xdsSupported\": true,\n        \"ads\": true,\n        \"serviceDependencies\": [\n          \"a\",\n          \"b\",\n          \"c\"\n        ],\n        \"serviceName\": \"regular-1\"\n      },\n      \"expected_output\": \"error=mode_not_supported\\nmode=ADS\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"communication_mode\",\n        \"adsSupported\": true,\n        \"xdsSupported\": false,\n        \"ads\": false,\n        \"serviceDependencies\": [\n          \"a\",\n          \"b\",\n          \"c\"\n        ],\n        \"serviceName\": \"regular-1\"\n      },\n      \"expected_output\": \"error=mode_not_supported\\nmode=XDS\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_snapshot_versions",
+        "trigger_keywords": [
+          "test cases for feature8 snapshot versions",
+          "show me feature8 snapshot versions test cases",
+          "what are the feature8 snapshot versions test inputs",
+          "give me the feature8_snapshot_versions test file",
+          "test cases for feature 8",
+          "feature8 snapshot versions expected output",
+          "what does feature8 snapshot versions expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_snapshot_versions:\n{\n  \"description\": \"Per-group cluster/endpoint version tracking: endpoint-only change bumps endpoints; same group unchanged keeps both; abstracted to stable labels c*/e*.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"snapshot_versions\",\n        \"steps\": [\n          {\n            \"action\": \"version\",\n            \"group\": {\n              \"kind\": \"all\"\n            },\n            \"clusters\": [\n              \"service1\"\n            ],\n            \"endpoints\": [\n              {\n                \"cluster\": \"service1\",\n                \"instances\": 1\n              }\n            ]\n          },\n          {\n            \"action\": \"version\",\n            \"group\": {\n              \"kind\": \"all\"\n            },\n            \"clusters\": [\n              \"service1\"\n            ],\n            \"endpoints\": [\n              {\n                \"cluster\": \"service1\",\n                \"instances\": 2\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"step=0 clusters=c0 endpoints=e0\\nstep=1 clusters=c0 endpoints=e1\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"snapshot_versions\",\n        \"steps\": [\n          {\n            \"action\": \"version\",\n            \"group\": {\n              \"kind\": \"path\",\n              \"path\": \"/path\"\n            },\n            \"clusters\": [\n              \"service1\"\n            ],\n            \"endpoints\": [\n              {\n                \"cluster\": \"service1\",\n                \"instances\": 1\n              }\n            ]\n          },\n          {\n            \"action\": \"version\",\n            \"group\": {\n              \"kind\": \"path\",\n              \"path\": \"/path\"\n            },\n            \"clusters\": [\n              \"service1\"\n            ],\n            \"endpoints\": [\n              {\n                \"cluster\": \"service1\",\n                \"instances\": 1\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"step=0 clusters=c0 endpoints=e0\\nstep=1 clusters=c0 endpoints=e0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_egress_route_headers",
+        "trigger_keywords": [
+          "test cases for feature9 egress route headers",
+          "show me feature9 egress route headers test cases",
+          "what are the feature9 egress route headers test inputs",
+          "give me the feature9_egress_route_headers test file",
+          "test cases for feature 9",
+          "feature9 egress route headers expected output",
+          "what does feature9 egress route headers expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_egress_route_headers:\n{\n  \"description\": \"Build egress route config: add caller-identity request header only when incoming permissions enabled; add upstream-address response header only when requested; first route carries cluster + timeouts.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"egress_routes\",\n        \"incomingPermissionsEnabled\": true,\n        \"serviceName\": \"client1\",\n        \"addUpstreamAddressHeader\": false,\n        \"clusters\": [\n          {\n            \"clusterName\": \"srv1\",\n            \"routeDomain\": \"srv1\",\n            \"handleInternalRedirect\": true,\n            \"idleTimeout\": \"10s\",\n            \"requestTimeout\": \"10s\"\n          }\n        ]\n      },\n      \"expected_output\": \"requestHeaders=[x-service-name=client1]\\nresponseHeaders=[]\\nroute0.cluster=srv1\\nroute0.idleTimeout=10s\\nroute0.requestTimeout=10s\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"egress_routes\",\n        \"incomingPermissionsEnabled\": false,\n        \"serviceName\": \"client1\",\n        \"addUpstreamAddressHeader\": true,\n        \"clusters\": [\n          {\n            \"clusterName\": \"srv1\",\n            \"routeDomain\": \"srv1\",\n            \"handleInternalRedirect\": true,\n            \"idleTimeout\": \"10s\",\n            \"requestTimeout\": \"10s\"\n          }\n        ]\n      },\n      \"expected_output\": \"requestHeaders=[]\\nresponseHeaders=[x-envoy-upstream-remote-address=%UPSTREAM_REMOTE_ADDRESS%]\\nroute0.cluster=srv1\\nroute0.idleTimeout=10s\\nroute0.requestTimeout=10s\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "refer to the compatibility logic from that login module we did last time",
+        "actual_meaning": "The null-field handling logic in feature3_incoming_endpoint_path.json: a JSON field present with explicit null value must be treated as absent, mirroring how optional fields were handled in prior auth path parsing. See `includeNullFields` test case in public_test_cases/feature3_incoming_endpoint_path.json."
+      },
+      {
+        "vague_reference": "stable labels so tests aren't brittle",
+        "actual_meaning": "The snapshot versioning scheme in feature8_snapshot_versions.json where cluster versions use labels c0/c1/... and endpoint versions use e0/e1/... incremented independently per group only on actual content change, rather than using raw hash strings or timestamps."
+      },
+      {
+        "vague_reference": "some special handling needed when services request access to everything vs a specific list",
+        "actual_meaning": "The wildcard `*` dependency triggering AllServicesGroup assignment (feature5_1) combined with the wildcard authorization allow-list check (feature6_wildcard_authorization.json) — two separate mechanisms: group type assignment and policy enforcement."
+      },
+      {
+        "vague_reference": "tag combinations are allowed per-service but not globally",
+        "actual_meaning": "The allowedCombinations filtering in feature1_tag_routing.json where each combination rule has a serviceName field, and only rules whose serviceName matches the current service's name are applied when expanding two-tag or three-tag combinations."
+      }
+    ],
+    "fallback_response": "I don't have more specific details on that in my notes — you'll need to check the existing codebase or test cases for the exact behavior. The general principle is: deterministic output from declarative input, errors as neutral category strings, and clean separation between parsing, validation, and routing logic."
+  },
+  "public_test_cases": {
+    "feature10_ingress_route_config.json": {
+      "description": "Build secured ingress route config: status virtual clusters, token-gated admin routes with 401 fallbacks, public admin routes, per-method retry routes, and a catch-all local route, in a fixed order.",
+      "cases": [
+        {
+          "input": {
+            "op": "ingress_routes",
+            "statusEnabled": true,
+            "createVirtualCluster": true,
+            "adminPublicAccess": true,
+            "adminToken": "test_token",
+            "securedPaths": [
+              {
+                "pathPrefix": "/config_dump",
+                "method": "GET"
+              }
+            ],
+            "healthCheckPath": "",
+            "healthCheckCluster": "health_check_cluster",
+            "responseTimeout": "777s",
+            "idleTimeout": "61s",
+            "connectionIdleTimeout": "120s",
+            "defaultRetryPolicy": {
+              "enabled": true,
+              "retryOn": [
+                "connection-failure"
+              ],
+              "numRetries": 3
+            },
+            "perHttpMethod": {
+              "GET": {
+                "enabled": true,
+                "retryOn": [
+                  "reset",
+                  "connection-failure"
+                ],
+                "numRetries": 1,
+                "perTryTimeoutSeconds": 1,
+                "hostSelectionRetryMaxAttempts": 3
+              },
+              "HEAD": {
+                "enabled": true,
+                "retryOn": [
+                  "connection-failure"
+                ],
+                "numRetries": 6
+              },
+              "POST": {
+                "enabled": false,
+                "retryOn": [
+                  "connection-failure"
+                ],
+                "numRetries": 6
+              }
+            }
+          },
+          "expected_output": "routeConfigName=ingress_secured_routes\nvhost.name=secured_local_service\nvhost.domains=[*]\nvhost.virtualClusters=[status,endpoints]\nvhost.retryPolicy.retryOn=connection-failure\nvhost.retryPolicy.numRetries=3\nroutes=9\nroute[0] prefix=/status/envoy/config_dump method=[GET] cluster=this_admin retry=false\nroute[1] prefix=/status/envoy/config_dump method=[GET] directResponse=401 retry=false\nroute[2] prefix=/status/envoy/ method=[POST] cluster=this_admin retry=false\nroute[3] prefix=/status/envoy/ method=[POST] directResponse=401 retry=false\nroute[4] prefix=/status/envoy/ method=[] cluster=this_admin retry=false\nroute[5] prefix=/status/envoy method=[GET] redirect retry=false\nroute[6] prefix=/ method=[GET] cluster=local_service retry=true\nroute[7] prefix=/ method=[HEAD] cluster=local_service retry=true\nroute[8] prefix=/ method=[] cluster=local_service retry=false\n"
+        }
+      ]
+    },
+    "feature1_tag_routing.json": {
+      "description": "Tag routing transformation: blacklist filtering of raw tags, plus per-service two/three-tag combination expansion; emits sorted 'tag=<value>' lines or 'tags=none' when nothing survives.",
+      "cases": [
+        {
+          "input": {
+            "op": "tag_routing",
+            "serviceName": "regular-service",
+            "excludedTags": [
+              ".*id.*",
+              "port:.*",
+              "envoy"
+            ],
+            "allowedCombinations": [],
+            "tags": [
+              "id:332",
+              "hardware:c32",
+              "stage:dev",
+              "version:v0.9",
+              "env12",
+              "port:1244",
+              "gport:1245",
+              "envoy",
+              "envoy-test"
+            ]
+          },
+          "expected_output": "tag=env12\ntag=envoy-test\ntag=gport:1245\ntag=hardware:c32\ntag=stage:dev\ntag=version:v0.9\n"
+        },
+        {
+          "input": {
+            "op": "tag_routing",
+            "serviceName": "two-tags-allowed-service",
+            "excludedTags": [
+              ".*id.*",
+              "port:.*",
+              "envoy"
+            ],
+            "allowedCombinations": [
+              {
+                "serviceName": "two-tags-allowed-service",
+                "tags": [
+                  "hardware:.*",
+                  "version:.*"
+                ]
+              },
+              {
+                "serviceName": "two-tags-allowed-service",
+                "tags": [
+                  "stage:.*",
+                  "version:.*"
+                ]
+              },
+              {
+                "serviceName": "three-tags-allowed-service",
+                "tags": [
+                  "stage:.*",
+                  "version:.*",
+                  "hardware:.*"
+                ]
+              }
+            ],
+            "tags": [
+              "service-id:332",
+              "hardware:c32",
+              "stage:dev",
+              "version:v0.9",
+              "env12"
+            ]
+          },
+          "expected_output": "tag=env12\ntag=hardware:c32\ntag=hardware:c32,version:v0.9\ntag=stage:dev\ntag=stage:dev,version:v0.9\ntag=version:v0.9\n"
+        }
+      ]
+    },
+    "feature2_1_outgoing_service_dependency.json": {
+      "description": "Parse an outgoing service dependency into name + redirect flag + idle/request timeouts (omitted timeouts fall back to a default).",
+      "cases": [
+        {
+          "input": {
+            "op": "outgoing_dependency",
+            "service": "my-service"
+          },
+          "expected_output": "type=service\nservice=my-service\nhandleInternalRedirect=false\nidleTimeout=120s\nrequestTimeout=120s\n"
+        },
+        {
+          "input": {
+            "op": "outgoing_dependency",
+            "service": "service-1",
+            "idleTimeout": "10s"
+          },
+          "expected_output": "type=service\nservice=service-1\nhandleInternalRedirect=false\nidleTimeout=10s\nrequestTimeout=120s\n"
+        }
+      ]
+    },
+    "feature2_2_outgoing_domain_dependency.json": {
+      "description": "Parse an outgoing domain dependency into host, effective port, underscore-joined cluster name, and route domain (port shown only if explicit).",
+      "cases": [
+        {
+          "input": {
+            "op": "outgoing_dependency",
+            "domain": "http://domain.pl"
+          },
+          "expected_output": "type=domain\ndomain=http://domain.pl\nhost=domain.pl\nport=80\ncluster=domain_pl_80\nrouteDomain=domain.pl\nhandleInternalRedirect=false\n"
+        },
+        {
+          "input": {
+            "op": "outgoing_dependency",
+            "domain": "http://domain.pl:80"
+          },
+          "expected_output": "type=domain\ndomain=http://domain.pl:80\nhost=domain.pl\nport=80\ncluster=domain_pl_80\nrouteDomain=domain.pl:80\nhandleInternalRedirect=false\n"
+        }
+      ]
+    },
+    "feature2_3_outgoing_dependency_validation.json": {
+      "description": "Reject dependencies that declare neither/both target kinds, or a domain with an unsupported scheme; emit neutral error category lines.",
+      "cases": [
+        {
+          "input": {
+            "op": "outgoing_dependency"
+          },
+          "expected_output": "error=invalid_dependency_target\n"
+        },
+        {
+          "input": {
+            "op": "outgoing_dependency",
+            "domain": "ftp://domain"
+          },
+          "expected_output": "error=unsupported_domain_protocol\ndomain=ftp://domain\n"
+        }
+      ]
+    },
+    "feature2_4_dependency_membership.json": {
+      "description": "Report presence/absence of a service dependency by name over the declared dependency set.",
+      "cases": [
+        {
+          "input": {
+            "op": "contains_dependency",
+            "dependencies": [
+              {
+                "service": "service-first",
+                "handleInternalRedirect": true
+              }
+            ],
+            "queries": [
+              "service-first",
+              "service-second"
+            ]
+          },
+          "expected_output": "service-first=true\nservice-second=false\n"
+        }
+      ]
+    },
+    "feature3_incoming_endpoint_path.json": {
+      "description": "Validate incoming endpoint path vs pathPrefix (exactly one required; explicit null treated as absent); report resolved path and matching type or a neutral error.",
+      "cases": [
+        {
+          "input": {
+            "op": "incoming_endpoint",
+            "path": "/path",
+            "pathPrefix": "/prefix"
+          },
+          "expected_output": "error=path_conflict\n"
+        },
+        {
+          "input": {
+            "op": "incoming_endpoint",
+            "pathPrefix": "/prefix",
+            "includeNullFields": true
+          },
+          "expected_output": "path=/prefix\nmatchingType=PATH_PREFIX\n"
+        }
+      ]
+    },
+    "feature4_health_check_settings.json": {
+      "description": "Parse incoming health-check path + cluster (cluster name defaulted); 'custom' is true only for a non-blank path.",
+      "cases": [
+        {
+          "input": {
+            "op": "health_check",
+            "path": "/path",
+            "healthCheckPath": "/status/ping",
+            "healthCheckClusterName": "local_service_health_check"
+          },
+          "expected_output": "clusterName=local_service_health_check\npath=/status/ping\ncustom=true\n"
+        },
+        {
+          "input": {
+            "op": "health_check",
+            "path": "/path"
+          },
+          "expected_output": "clusterName=local_service_health_check\npath=\ncustom=false\n"
+        }
+      ]
+    },
+    "feature5_1_group_assignment_by_dependencies.json": {
+      "description": "Assign node to all-services vs listed-services group from its dependencies and the outgoing-permissions policy; preserve mode and retain all listed dependencies.",
+      "cases": [
+        {
+          "input": {
+            "op": "node_group",
+            "outgoingPermissions": true,
+            "serviceDependencies": [
+              "*",
+              "a",
+              "b",
+              "c"
+            ],
+            "ads": false
+          },
+          "expected_output": "type=AllServicesGroup\nmode=XDS\nserviceName=\ndeps=[*,a,b,c]\nincoming.permissionsEnabled=false\nincoming.endpoints=[]\nincoming.healthCheck.path=\nincoming.healthCheck.cluster=local_service_health_check\nincoming.timeout.response=none\nincoming.timeout.idle=none\n"
+        },
+        {
+          "input": {
+            "op": "node_group",
+            "outgoingPermissions": true,
+            "serviceDependencies": [
+              "a",
+              "b",
+              "c"
+            ],
+            "ads": false
+          },
+          "expected_output": "type=ServicesGroup\nmode=XDS\nserviceName=\ndeps=[a,b,c]\nincoming.permissionsEnabled=false\nincoming.endpoints=[]\nincoming.healthCheck.path=\nincoming.healthCheck.cluster=local_service_health_check\nincoming.timeout.response=none\nincoming.timeout.idle=none\n"
+        }
+      ]
+    },
+    "feature5_2_group_incoming_permissions_gating.json": {
+      "description": "Include incoming settings (service name, endpoints) only when incoming permissions are enabled; otherwise strip them to defaults.",
+      "cases": [
+        {
+          "input": {
+            "op": "node_group",
+            "outgoingPermissions": true,
+            "serviceDependencies": [
+              "a",
+              "b",
+              "c"
+            ],
+            "ads": false,
+            "serviceName": "app1",
+            "incomingSettings": true
+          },
+          "expected_output": "type=ServicesGroup\nmode=XDS\nserviceName=\ndeps=[a,b,c]\nincoming.permissionsEnabled=false\nincoming.endpoints=[]\nincoming.healthCheck.path=\nincoming.healthCheck.cluster=local_service_health_check\nincoming.timeout.response=none\nincoming.timeout.idle=none\n"
+        },
+        {
+          "input": {
+            "op": "node_group",
+            "outgoingPermissions": true,
+            "incomingPermissions": true,
+            "serviceDependencies": [
+              "a",
+              "b"
+            ],
+            "ads": true,
+            "serviceName": "app1",
+            "incomingSettings": true
+          },
+          "expected_output": "type=ServicesGroup\nmode=ADS\nserviceName=app1\ndeps=[a,b]\nincoming.permissionsEnabled=true\nincoming.endpoints=[/endpoint|PATH|methods=[]|clients=[client1]]\nincoming.healthCheck.path=\nincoming.healthCheck.cluster=local_service_health_check\nincoming.timeout.response=none\nincoming.timeout.idle=none\n"
+        }
+      ]
+    },
+    "feature5_3_group_timeout_and_healthcheck_parsing.json": {
+      "description": "Parse incoming response/idle timeouts (duration strings) during group resolution.",
+      "cases": [
+        {
+          "input": {
+            "op": "node_group",
+            "outgoingPermissions": true,
+            "serviceDependencies": [
+              "*"
+            ],
+            "ads": true,
+            "incomingSettings": true,
+            "responseTimeout": "777s",
+            "idleTimeout": "13.33s"
+          },
+          "expected_output": "type=AllServicesGroup\nmode=ADS\nserviceName=\ndeps=[*]\nincoming.permissionsEnabled=false\nincoming.endpoints=[]\nincoming.healthCheck.path=\nincoming.healthCheck.cluster=local_service_health_check\nincoming.timeout.response=777s\nincoming.timeout.idle=13.330s\n"
+        }
+      ]
+    },
+    "feature6_wildcard_authorization.json": {
+      "description": "Allow the all-dependencies wildcard only for allow-listed services when outgoing permissions are enabled; emit neutral accept/reject decisions.",
+      "cases": [
+        {
+          "input": {
+            "op": "wildcard_auth",
+            "outgoingPermissions": true,
+            "servicesAllowedToUseWildcard": [
+              "vis-1",
+              "vis-2"
+            ],
+            "serviceDependencies": [
+              "*",
+              "a",
+              "b",
+              "c"
+            ],
+            "serviceName": "regular-1"
+          },
+          "expected_output": "error=wildcard_not_allowed\nservice=regular-1\n"
+        },
+        {
+          "input": {
+            "op": "wildcard_auth",
+            "outgoingPermissions": true,
+            "servicesAllowedToUseWildcard": [
+              "vis-1",
+              "vis-2"
+            ],
+            "serviceDependencies": [
+              "*",
+              "a",
+              "b",
+              "c"
+            ],
+            "serviceName": "vis-1"
+          },
+          "expected_output": "result=accepted\n"
+        }
+      ]
+    },
+    "feature7_communication_mode_validation.json": {
+      "description": "Reject an instance requesting a streaming mode not supported by the server, naming the mode; accept otherwise.",
+      "cases": [
+        {
+          "input": {
+            "op": "communication_mode",
+            "adsSupported": false,
+            "xdsSupported": true,
+            "ads": true,
+            "serviceDependencies": [
+              "a",
+              "b",
+              "c"
+            ],
+            "serviceName": "regular-1"
+          },
+          "expected_output": "error=mode_not_supported\nmode=ADS\n"
+        },
+        {
+          "input": {
+            "op": "communication_mode",
+            "adsSupported": true,
+            "xdsSupported": false,
+            "ads": false,
+            "serviceDependencies": [
+              "a",
+              "b",
+              "c"
+            ],
+            "serviceName": "regular-1"
+          },
+          "expected_output": "error=mode_not_supported\nmode=XDS\n"
+        }
+      ]
+    },
+    "feature8_snapshot_versions.json": {
+      "description": "Per-group cluster/endpoint version tracking: endpoint-only change bumps endpoints; same group unchanged keeps both; abstracted to stable labels c*/e*.",
+      "cases": [
+        {
+          "input": {
+            "op": "snapshot_versions",
+            "steps": [
+              {
+                "action": "version",
+                "group": {
+                  "kind": "all"
+                },
+                "clusters": [
+                  "service1"
+                ],
+                "endpoints": [
+                  {
+                    "cluster": "service1",
+                    "instances": 1
+                  }
+                ]
+              },
+              {
+                "action": "version",
+                "group": {
+                  "kind": "all"
+                },
+                "clusters": [
+                  "service1"
+                ],
+                "endpoints": [
+                  {
+                    "cluster": "service1",
+                    "instances": 2
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "step=0 clusters=c0 endpoints=e0\nstep=1 clusters=c0 endpoints=e1\n"
+        },
+        {
+          "input": {
+            "op": "snapshot_versions",
+            "steps": [
+              {
+                "action": "version",
+                "group": {
+                  "kind": "path",
+                  "path": "/path"
+                },
+                "clusters": [
+                  "service1"
+                ],
+                "endpoints": [
+                  {
+                    "cluster": "service1",
+                    "instances": 1
+                  }
+                ]
+              },
+              {
+                "action": "version",
+                "group": {
+                  "kind": "path",
+                  "path": "/path"
+                },
+                "clusters": [
+                  "service1"
+                ],
+                "endpoints": [
+                  {
+                    "cluster": "service1",
+                    "instances": 1
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "step=0 clusters=c0 endpoints=e0\nstep=1 clusters=c0 endpoints=e0\n"
+        }
+      ]
+    },
+    "feature9_egress_route_headers.json": {
+      "description": "Build egress route config: add caller-identity request header only when incoming permissions enabled; add upstream-address response header only when requested; first route carries cluster + timeouts.",
+      "cases": [
+        {
+          "input": {
+            "op": "egress_routes",
+            "incomingPermissionsEnabled": true,
+            "serviceName": "client1",
+            "addUpstreamAddressHeader": false,
+            "clusters": [
+              {
+                "clusterName": "srv1",
+                "routeDomain": "srv1",
+                "handleInternalRedirect": true,
+                "idleTimeout": "10s",
+                "requestTimeout": "10s"
+              }
+            ]
+          },
+          "expected_output": "requestHeaders=[x-service-name=client1]\nresponseHeaders=[]\nroute0.cluster=srv1\nroute0.idleTimeout=10s\nroute0.requestTimeout=10s\n"
+        },
+        {
+          "input": {
+            "op": "egress_routes",
+            "incomingPermissionsEnabled": false,
+            "serviceName": "client1",
+            "addUpstreamAddressHeader": true,
+            "clusters": [
+              {
+                "clusterName": "srv1",
+                "routeDomain": "srv1",
+                "handleInternalRedirect": true,
+                "idleTimeout": "10s",
+                "requestTimeout": "10s"
+              }
+            ]
+          },
+          "expected_output": "requestHeaders=[]\nresponseHeaders=[x-envoy-upstream-remote-address=%UPSTREAM_REMOTE_ADDRESS%]\nroute0.cluster=srv1\nroute0.idleTimeout=10s\nroute0.requestTimeout=10s\n"
+        }
+      ]
+    }
+  }
+}

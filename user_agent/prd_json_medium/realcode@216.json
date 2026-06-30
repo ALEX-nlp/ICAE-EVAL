@@ -1,0 +1,882 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out this security header middleware engine we've been talking about. The basic idea is that you give it a config describing what protections you want on your HTTP responses, and it spits out the right headers automatically. No more hand-rolling these things and getting the formatting wrong.\n\nA few things I know we need: there should be a 'batteries included' mode that just turns on everything sensible at once for teams that don't want to think about it. Individual headers should also be toggleable separately. Some of the headers have dependencies on each other — refer back to how we handled the cross-origin isolation stuff in the embedder policy discussion, the same gating logic applies here. We also need path-based rules so the data-clearing header only fires on specific routes like logout pages.\n\nThe engine reads a JSON blob on stdin and writes headers to stdout, one per line, sorted alphabetically. If something is misconfigured it should spit out a neutral error token — no stack traces, no runtime garbage, just clean error codes the frontend team can parse.\n\nEdge cases to handle: what if someone passes in no config at all? What if they want certain paths completely ignored? The CSP stuff has some tricky quoting and deduplication rules too that we need to get right. Output should be totally deterministic.\n\nCan someone scope this out? I think the public test cases folder has examples of expected outputs we can validate against.\n\nOne extra pass on details the team asked about: if `with_config` is false, or the engine is invoked with no configuration, the output must be exactly `error=missing_configuration\\n`. No headers, no additional lines. Same deal on the cross-origin gating we talked about before: `Cross-Origin-Embedder-Policy` may only be emitted when `cross_origin_resource_policy` is also present in the same configuration. If embedder policy is requested without resource policy, the engine must reject the configuration and output exactly: `error=embedder_policy_requires_resource_policy\\n` and nothing else.\n\nAlso, when the `preset` field is set to `default`, the `headers` object is completely ignored. The preset applies its own fixed opinionated configuration regardless of what is specified in the headers field, so these are mutually exclusive modes. That default preset emits exactly 11 headers in alphabetical order: `Cache-Control: max-age=0,no-store | Content-Security-Policy: script-src 'self';object-src 'self';block-all-mixed-content;upgrade-insecure-requests; | Cross-Origin-Embedder-Policy: require-corp | Cross-Origin-Opener-Policy: same-origin | Cross-Origin-Resource-Policy: same-origin | Referrer-Policy: no-referrer | Strict-Transport-Security: max-age=31536000;includeSubDomains | X-Content-Type-Options: nosniff | X-Frame-Options: deny | X-Permitted-Cross-Domain-Policies: none | X-XSS-Protection: 0`.\n\nA couple formatting specifics too. For `x_frame_options.directive`, when it is `'allowfrom'`, the emitted header value is exactly `allow-from: (<domain>)`, including the colon-space after `allow-from` and the parentheses around the domain. Example: `X-Frame-Options: allow-from: (https://example.com)`. For `Expect-CT`, the value always starts with `max-age=<n>` with default `86400`. If `enforce` is true, append `, enforce`. If `report_uri` is non-empty, append `, report-uri=\"<uri>\"`. If `report_uri` is an empty string, just ignore it silently. Example: `max-age=86400, enforce, report-uri=\"https://ex.com/r\"`.\n\nFor HSTS, defaults are `max_age=31536000, include_subdomains=true`. When `include_subdomains` is true the value is `max-age=<n>;includeSubDomains` with no space around the semicolon. When `include_subdomains` is false the value is just `max-age=<n>`. And for CSP legacy support, when `content_security_policy.legacy_compat` is true, the policy value is mirrored into an additional `X-Content-Security-Policy` header with the same value as the `Content-Security-Policy` header, and both still need to land in the final output in alphabetical order with everything else.\n\nLast thing, the path-based clearing config the team asked about is the `clear_site_data_paths` and `clear_site_data_add_paths` shapes under `headers`, and the matching should use longest-prefix path matching logic. That should line up with the route-specific behavior we wanted for logout-style pages while still keeping output deterministic.",
+  "oracle_data": {
+    "task_id": "OWASP-HEADERS-ENGINE-001",
+    "golden_api_signature": "ProcessSecurityHeaders(inputJson string) string",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "output ordering rule",
+          "how are headers sorted in output",
+          "header line order determinism",
+          "alphabetical sort headers"
+        ],
+        "oracle_response": "All emitted headers must be sorted in ascending ordinal (lexicographic) order by header name, regardless of the order they were configured. This applies to every mode including the default preset and custom header combinations. When no headers are produced, the output is exactly: <no-headers>\\n"
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "cache control precedence rules",
+          "which cache directive wins",
+          "cache control value priority order",
+          "no-cache vs private vs must-revalidate"
+        ],
+        "oracle_response": "Cache-Control value follows strict precedence: (1) if no_cache is true → emit 'no-cache'; (2) else if private is true → emit 'private'; (3) else if must_revalidate is true → emit 'must-revalidate'; (4) otherwise emit 'max-age=<n>' and if no_store is true append ',no-store'. Default values: private=false, max_age=0, no_cache=false, no_store=true, must_revalidate=false."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "CSP keyword token quoting",
+          "how are CSP source tokens formatted",
+          "CSP directive uri vs keyword difference",
+          "content security policy token format rules"
+        ],
+        "oracle_response": "In CSP directives, tokens of type 'keyword' are wrapped in single quotes (e.g. 'self', 'unsafe-inline'), while tokens of type 'uri' are emitted unquoted (e.g. data:, https://cdn.example.com). Exactly one space separates tokens with no leading or trailing spaces. Each source list ends with exactly one semicolon. Duplicate URI tokens must not be repeated."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "report only mode CSP requirement",
+          "what is required for report only header",
+          "missing report_uri error",
+          "CSP report only validation rule"
+        ],
+        "oracle_response": "When content_security_policy.report_only is true, report_uri is required and must be non-empty. If report_uri is absent or empty in report-only mode, the engine rejects the configuration with: error=missing_required_value\\nfield=report_uri\\n. The emitted header name changes to Content-Security-Policy-Report-Only and the value ends with report-uri <uri>;"
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "clear site data wildcard behavior",
+          "what does star directive do in clear-site-data",
+          "wildcard token collapses clear site data",
+          "clear site data default directives"
+        ],
+        "oracle_response": "For Clear-Site-Data: if any token in the directives array is '*', the entire value collapses to \"*\" (a single quoted wildcard), ignoring all other tokens. Duplicate tokens are removed. When directives is omitted or empty, the default is [\"cache\",\"cookies\",\"storage\"]. Each token is emitted quoted and comma-separated with no spaces, e.g.: \"cache\",\"cookies\",\"storage\""
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "path scoped clear site data longest match",
+          "which path wins when multiple prefixes match",
+          "most specific path rule",
+          "clear site data path matching algorithm"
+        ],
+        "oracle_response": "When multiple configured paths are prefixes of the request path, the most specific (longest) match wins. For example if /account and /account/logout are both configured and the request is /account/logout, the /account/logout entry is used. An empty path string is rejected with error=missing_required_value\\nfield=path\\n. An empty directives array in add_paths is rejected with error=missing_required_value\\nfield=directives\\n."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "ignore paths behavior",
+          "what happens when request path is in ignore list",
+          "ignored path emits what",
+          "suppress all headers for certain routes"
+        ],
+        "oracle_response": "When a request_path appears in the ignore_paths array, the engine emits no headers at all for that request, outputting: <no-headers>\\n. Other paths not in the ignore list are processed normally with the full configured or preset header set."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature10_cross_origin_resource_policy",
+        "trigger_keywords": [
+          "test cases for feature10 cross origin resource policy",
+          "show me feature10 cross origin resource policy test cases",
+          "what are the feature10 cross origin resource policy test inputs",
+          "give me the feature10_cross_origin_resource_policy test file",
+          "test cases for feature 10",
+          "feature10 cross origin resource policy expected output",
+          "what does feature10 cross origin resource policy expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_cross_origin_resource_policy:\n{\n  \"description\": \"The Cross-Origin-Resource-Policy header carries the selected policy token (defaulting to same-origin) and is absent when the feature is not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"cross_origin_resource_policy\": {}\n        }\n      },\n      \"expected_output\": \"Cross-Origin-Resource-Policy: same-origin\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_cross_origin_opener_policy",
+        "trigger_keywords": [
+          "test cases for feature11 cross origin opener policy",
+          "show me feature11 cross origin opener policy test cases",
+          "what are the feature11 cross origin opener policy test inputs",
+          "give me the feature11_cross_origin_opener_policy test file",
+          "test cases for feature 11",
+          "feature11 cross origin opener policy expected output",
+          "what does feature11 cross origin opener policy expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_cross_origin_opener_policy:\n{\n  \"description\": \"The Cross-Origin-Opener-Policy header carries the selected policy token (defaulting to same-origin) and is absent when the feature is not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"cross_origin_opener_policy\": {\n            \"value\": \"same-origin-allow-popups\"\n          }\n        }\n      },\n      \"expected_output\": \"Cross-Origin-Opener-Policy: same-origin-allow-popups\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature12_cross_origin_embedder_policy",
+        "trigger_keywords": [
+          "test cases for feature12 cross origin embedder policy",
+          "show me feature12 cross origin embedder policy test cases",
+          "what are the feature12 cross origin embedder policy test inputs",
+          "give me the feature12_cross_origin_embedder_policy test file",
+          "test cases for feature 12",
+          "feature12 cross origin embedder policy expected output",
+          "what does feature12 cross origin embedder policy expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_cross_origin_embedder_policy:\n{\n  \"description\": \"The Cross-Origin-Embedder-Policy header may only be emitted alongside an enabled Cross-Origin-Resource-Policy. With the resource policy present both headers are emitted; requesting the embedder policy alone is rejected as an invalid configuration; the header is absent when not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"cross_origin_resource_policy\": {},\n          \"cross_origin_embedder_policy\": {}\n        }\n      },\n      \"expected_output\": \"Cross-Origin-Embedder-Policy: require-corp\\nCross-Origin-Resource-Policy: same-origin\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"cross_origin_embedder_policy\": {}\n        }\n      },\n      \"expected_output\": \"error=embedder_policy_requires_resource_policy\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature13_content_security_policy",
+        "trigger_keywords": [
+          "test cases for feature13 content security policy",
+          "show me feature13 content security policy test cases",
+          "what are the feature13 content security policy test inputs",
+          "give me the feature13_content_security_policy test file",
+          "test cases for feature 13",
+          "feature13 content security policy expected output",
+          "what does feature13 content security policy expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature13_content_security_policy:\n{\n  \"description\": \"The Content-Security-Policy family: a plain enabled policy emits the block/upgrade directives; a sandbox prepends a sandbox directive; legacy-compatibility mode mirrors the policy into the X-Content-Security-Policy header; report-only mode emits a separate report-only header carrying a report-uri; and no header is emitted when the policy is not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"content_security_policy\": {\n            \"sandbox\": [\n              \"allow-forms\",\n              \"allow-scripts\",\n              \"allow-same-origin\"\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"Content-Security-Policy: sandbox allow-forms allow-scripts allow-same-origin;block-all-mixed-content;upgrade-insecure-requests;\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"content_security_policy\": {\n            \"report_only\": true,\n            \"report_uri\": \"https://localhost:5001/report-uri\"\n          }\n        }\n      },\n      \"expected_output\": \"Content-Security-Policy-Report-Only: block-all-mixed-content;upgrade-insecure-requests;report-uri https://localhost:5001/report-uri;\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature14_csp_directive_formatting",
+        "trigger_keywords": [
+          "test cases for feature14 csp directive formatting",
+          "show me feature14 csp directive formatting test cases",
+          "what are the feature14 csp directive formatting test inputs",
+          "give me the feature14_csp_directive_formatting test file",
+          "test cases for feature 14",
+          "feature14 csp directive formatting expected output",
+          "what does feature14 csp directive formatting expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature14_csp_directive_formatting:\n{\n  \"description\": \"Content-Security-Policy directive formatting rules: keyword tokens are wrapped in single quotes, URI tokens are left unquoted, exactly one space separates tokens (no leading, trailing or double spaces), each source list ends with a single semicolon, and a repeated URI is not duplicated.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"content_security_policy\": {\n            \"block_all_mixed_content\": false,\n            \"upgrade_insecure_requests\": false,\n            \"directives\": {\n              \"script-src\": [\n                {\n                  \"keyword\": \"self\"\n                },\n                {\n                  \"keyword\": \"unsafe-inline\"\n                },\n                {\n                  \"keyword\": \"none\"\n                }\n              ]\n            }\n          }\n        }\n      },\n      \"expected_output\": \"Content-Security-Policy: script-src 'self' 'unsafe-inline' 'none';\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"content_security_policy\": {\n            \"block_all_mixed_content\": false,\n            \"upgrade_insecure_requests\": false,\n            \"directives\": {\n              \"img-src\": [\n                {\n                  \"keyword\": \"self\"\n                },\n                {\n                  \"uri\": \"data:\"\n                },\n                {\n                  \"uri\": \"https://cdn.abc.net\"\n                },\n                {\n                  \"uri\": \"https://cdn.abc.org\"\n                }\n              ]\n            }\n          }\n        }\n      },\n      \"expected_output\": \"Content-Security-Policy: img-src 'self' data: https://cdn.abc.net https://cdn.abc.org;\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature15_clear_site_data_global",
+        "trigger_keywords": [
+          "test cases for feature15 clear site data global",
+          "show me feature15 clear site data global test cases",
+          "what are the feature15 clear site data global test inputs",
+          "give me the feature15_clear_site_data_global test file",
+          "test cases for feature 15",
+          "feature15 clear site data global expected output",
+          "what does feature15 clear site data global expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature15_clear_site_data_global:\n{\n  \"description\": \"When Clear-Site-Data is enabled for all responses the header lists each requested data type as a quoted token; a wildcard collapses the whole value to \\\"*\\\" and takes precedence over any other token; duplicate tokens are removed; and the header is absent when not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"clear_site_data\": {}\n        }\n      },\n      \"expected_output\": \"Clear-Site-Data: \\\"cache\\\",\\\"cookies\\\",\\\"storage\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"clear_site_data\": {\n            \"directives\": [\n              \"cache\",\n              \"*\",\n              \"cookies\"\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"Clear-Site-Data: \\\"*\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature16_clear_site_data_paths",
+        "trigger_keywords": [
+          "test cases for feature16 clear site data paths",
+          "show me feature16 clear site data paths test cases",
+          "what are the feature16 clear site data paths test inputs",
+          "give me the feature16_clear_site_data_paths test file",
+          "test cases for feature 16",
+          "feature16 clear site data paths expected output",
+          "what does feature16 clear site data paths expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature16_clear_site_data_paths:\n{\n  \"description\": \"Path-scoped Clear-Site-Data emits the header only for requests whose path matches a configured entry; when several configured paths are prefixes of the request the most specific (longest) match wins; and configuring an entry with an empty path or an empty token list is rejected as an invalid configuration.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"request_path\": \"/logout\",\n        \"headers\": {\n          \"clear_site_data_paths\": {\n            \"paths\": {\n              \"/logout\": [\n                \"*\"\n              ]\n            }\n          }\n        }\n      },\n      \"expected_output\": \"Clear-Site-Data: \\\"*\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"request_path\": \"/account/logout\",\n        \"headers\": {\n          \"clear_site_data_paths\": {\n            \"paths\": {\n              \"/account\": [\n                \"cache\"\n              ],\n              \"/account/logout\": [\n                \"*\"\n              ]\n            }\n          }\n        }\n      },\n      \"expected_output\": \"Clear-Site-Data: \\\"*\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"clear_site_data_add_paths\": [\n            {\n              \"path\": \"\",\n              \"directives\": [\n                \"cache\"\n              ]\n            }\n          ]\n        }\n      },\n      \"expected_output\": \"error=missing_required_value\\nfield=path\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature17_middleware_contract",
+        "trigger_keywords": [
+          "test cases for feature17 middleware contract",
+          "show me feature17 middleware contract test cases",
+          "what are the feature17 middleware contract test inputs",
+          "give me the feature17_middleware_contract test file",
+          "test cases for feature 17",
+          "feature17 middleware contract expected output",
+          "what does feature17 middleware contract expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature17_middleware_contract:\n{\n  \"description\": \"Operational request-handling contract: invoking the engine without any configuration is rejected; and when an ignore list is in effect the engine emits no headers for an ignored request path while still applying the full bundle to a non-ignored path.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"with_config\": false\n      },\n      \"expected_output\": \"error=missing_configuration\\n\"\n    },\n    {\n      \"input\": {\n        \"preset\": \"default\",\n        \"request_path\": \"/ignore-me\",\n        \"ignore_paths\": [\n          \"/ignore-me\"\n        ]\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_default_bundle",
+        "trigger_keywords": [
+          "test cases for feature1 default bundle",
+          "show me feature1 default bundle test cases",
+          "what are the feature1 default bundle test inputs",
+          "give me the feature1_default_bundle test file",
+          "test cases for feature 1",
+          "feature1 default bundle expected output",
+          "what does feature1 default bundle expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_default_bundle:\n{\n  \"description\": \"Applying the recommended default security-header bundle to a normal request emits the complete, opinionated set of OWASP response headers with their canonical wire values.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"preset\": \"default\",\n        \"request_path\": \"/hello\"\n      },\n      \"expected_output\": \"Cache-Control: max-age=0,no-store\\nContent-Security-Policy: script-src 'self';object-src 'self';block-all-mixed-content;upgrade-insecure-requests;\\nCross-Origin-Embedder-Policy: require-corp\\nCross-Origin-Opener-Policy: same-origin\\nCross-Origin-Resource-Policy: same-origin\\nReferrer-Policy: no-referrer\\nStrict-Transport-Security: max-age=31536000;includeSubDomains\\nX-Content-Type-Options: nosniff\\nX-Frame-Options: deny\\nX-Permitted-Cross-Domain-Policies: none\\nX-XSS-Protection: 0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_strict_transport_security",
+        "trigger_keywords": [
+          "test cases for feature2 strict transport security",
+          "show me feature2 strict transport security test cases",
+          "what are the feature2 strict transport security test inputs",
+          "give me the feature2_strict_transport_security test file",
+          "test cases for feature 2",
+          "feature2 strict transport security expected output",
+          "what does feature2 strict transport security expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_strict_transport_security:\n{\n  \"description\": \"The Strict-Transport-Security header is emitted only when HSTS is enabled; its value encodes the configured max-age and whether sub-domains are included.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"strict_transport_security\": {}\n        }\n      },\n      \"expected_output\": \"Strict-Transport-Security: max-age=31536000;includeSubDomains\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"strict_transport_security\": {\n            \"max_age\": 12345,\n            \"include_subdomains\": false\n          }\n        }\n      },\n      \"expected_output\": \"Strict-Transport-Security: max-age=12345\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_x_frame_options",
+        "trigger_keywords": [
+          "test cases for feature3 x frame options",
+          "show me feature3 x frame options test cases",
+          "what are the feature3 x frame options test inputs",
+          "give me the feature3_x_frame_options test file",
+          "test cases for feature 3",
+          "feature3 x frame options expected output",
+          "what does feature3 x frame options expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_x_frame_options:\n{\n  \"description\": \"The X-Frame-Options header reflects the chosen framing directive; the allow-from directive additionally carries the permitted origin, and the header is absent when the feature is not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"x_frame_options\": {\n            \"directive\": \"deny\"\n          }\n        }\n      },\n      \"expected_output\": \"X-Frame-Options: deny\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"x_frame_options\": {\n            \"directive\": \"allowfrom\",\n            \"domain\": \"https://example.com\"\n          }\n        }\n      },\n      \"expected_output\": \"X-Frame-Options: allow-from: (https://example.com)\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_content_type_options",
+        "trigger_keywords": [
+          "test cases for feature4 content type options",
+          "show me feature4 content type options test cases",
+          "what are the feature4 content type options test inputs",
+          "give me the feature4_content_type_options test file",
+          "test cases for feature 4",
+          "feature4 content type options expected output",
+          "what does feature4 content type options expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_content_type_options:\n{\n  \"description\": \"The X-Content-Type-Options header emits the fixed nosniff token when enabled and is absent otherwise.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"content_type_options\": {}\n        }\n      },\n      \"expected_output\": \"X-Content-Type-Options: nosniff\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_xss_protection",
+        "trigger_keywords": [
+          "test cases for feature5 xss protection",
+          "show me feature5 xss protection test cases",
+          "what are the feature5 xss protection test inputs",
+          "give me the feature5_xss_protection test file",
+          "test cases for feature 5",
+          "feature5 xss protection expected output",
+          "what does feature5 xss protection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_xss_protection:\n{\n  \"description\": \"The X-XSS-Protection header emits the value 0 (disabling the legacy browser auditor, per current guidance) when enabled and is absent otherwise.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"xss_protection\": {}\n        }\n      },\n      \"expected_output\": \"X-XSS-Protection: 0\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_referrer_policy",
+        "trigger_keywords": [
+          "test cases for feature6 referrer policy",
+          "show me feature6 referrer policy test cases",
+          "what are the feature6 referrer policy test inputs",
+          "give me the feature6_referrer_policy test file",
+          "test cases for feature 6",
+          "feature6 referrer policy expected output",
+          "what does feature6 referrer policy expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_referrer_policy:\n{\n  \"description\": \"The Referrer-Policy header carries the selected policy token (defaulting to no-referrer) and is absent when the feature is not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"referrer_policy\": {}\n        }\n      },\n      \"expected_output\": \"Referrer-Policy: no-referrer\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"referrer_policy\": {\n            \"value\": \"strict-origin-when-cross-origin\"\n          }\n        }\n      },\n      \"expected_output\": \"Referrer-Policy: strict-origin-when-cross-origin\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_permitted_cross_domain_policies",
+        "trigger_keywords": [
+          "test cases for feature7 permitted cross domain policies",
+          "show me feature7 permitted cross domain policies test cases",
+          "what are the feature7 permitted cross domain policies test inputs",
+          "give me the feature7_permitted_cross_domain_policies test file",
+          "test cases for feature 7",
+          "feature7 permitted cross domain policies expected output",
+          "what does feature7 permitted cross domain policies expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_permitted_cross_domain_policies:\n{\n  \"description\": \"The X-Permitted-Cross-Domain-Policies header carries the selected policy token (defaulting to none) and is absent when the feature is not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"permitted_cross_domain_policies\": {\n            \"value\": \"master-only\"\n          }\n        }\n      },\n      \"expected_output\": \"X-Permitted-Cross-Domain-Policies: master-only\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_cache_control",
+        "trigger_keywords": [
+          "test cases for feature8 cache control",
+          "show me feature8 cache control test cases",
+          "what are the feature8 cache control test inputs",
+          "give me the feature8_cache_control test file",
+          "test cases for feature 8",
+          "feature8 cache control expected output",
+          "what does feature8 cache control expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_cache_control:\n{\n  \"description\": \"The Cache-Control header value is produced by a strict precedence among the requested directives: no-cache wins over private, which wins over must-revalidate, which wins over the max-age/no-store pair.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"cache_control\": {}\n        }\n      },\n      \"expected_output\": \"Cache-Control: max-age=0,no-store\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"cache_control\": {\n            \"private\": true\n          }\n        }\n      },\n      \"expected_output\": \"Cache-Control: private\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"cache_control\": {\n            \"no_cache\": true,\n            \"no_store\": false\n          }\n        }\n      },\n      \"expected_output\": \"Cache-Control: no-cache\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_expect_ct",
+        "trigger_keywords": [
+          "test cases for feature9 expect ct",
+          "show me feature9 expect ct test cases",
+          "what are the feature9 expect ct test inputs",
+          "give me the feature9_expect_ct test file",
+          "test cases for feature 9",
+          "feature9 expect ct expected output",
+          "what does feature9 expect ct expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_expect_ct:\n{\n  \"description\": \"The Expect-CT header always carries max-age, optionally appends enforce, and appends a quoted report-uri only when one is supplied; the header is absent when the feature is not enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"headers\": {\n          \"expect_ct\": {\n            \"report_uri\": \"https://ex.com/r\",\n            \"enforce\": true\n          }\n        }\n      },\n      \"expected_output\": \"Expect-CT: max-age=86400, enforce, report-uri=\\\"https://ex.com/r\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {\n          \"expect_ct\": {\n            \"report_uri\": \"\"\n          }\n        }\n      },\n      \"expected_output\": \"Expect-CT: max-age=86400\\n\"\n    },\n    {\n      \"input\": {\n        \"headers\": {}\n      },\n      \"expected_output\": \"<no-headers>\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "neutral error token — no stack traces, no runtime garbage",
+        "actual_meaning": "The Errors section of the Architecture constraints in start.md: only four specific error= tokens are permitted in output; no host-language type names, stack traces or runtime message fragments"
+      },
+      {
+        "vague_reference": "the CSP stuff has some tricky quoting and deduplication rules",
+        "actual_meaning": "Feature 14 in start.md: keyword tokens wrapped in single quotes vs uri tokens unquoted, one-space separation, single trailing semicolon per directive, duplicate URI removal"
+      },
+      {
+        "vague_reference": "public test cases folder has examples of expected outputs",
+        "actual_meaning": "rcb_tests/public_test_cases/ directory containing feature1 through feature17 JSON files with input/expected_output pairs for all engine behaviors"
+      }
+    ],
+    "fallback_response": "That detail isn't something I have clear visibility on from the business side — you'd want to dig into the test cases in the public_test_cases folder or the spec doc to confirm the exact behavior expected there."
+  },
+  "public_test_cases": {
+    "feature10_cross_origin_resource_policy.json": {
+      "description": "The Cross-Origin-Resource-Policy header carries the selected policy token (defaulting to same-origin) and is absent when the feature is not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "cross_origin_resource_policy": {}
+            }
+          },
+          "expected_output": "Cross-Origin-Resource-Policy: same-origin\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature11_cross_origin_opener_policy.json": {
+      "description": "The Cross-Origin-Opener-Policy header carries the selected policy token (defaulting to same-origin) and is absent when the feature is not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "cross_origin_opener_policy": {
+                "value": "same-origin-allow-popups"
+              }
+            }
+          },
+          "expected_output": "Cross-Origin-Opener-Policy: same-origin-allow-popups\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature12_cross_origin_embedder_policy.json": {
+      "description": "The Cross-Origin-Embedder-Policy header may only be emitted alongside an enabled Cross-Origin-Resource-Policy. With the resource policy present both headers are emitted; requesting the embedder policy alone is rejected as an invalid configuration; the header is absent when not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "cross_origin_resource_policy": {},
+              "cross_origin_embedder_policy": {}
+            }
+          },
+          "expected_output": "Cross-Origin-Embedder-Policy: require-corp\nCross-Origin-Resource-Policy: same-origin\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "cross_origin_embedder_policy": {}
+            }
+          },
+          "expected_output": "error=embedder_policy_requires_resource_policy\n"
+        }
+      ]
+    },
+    "feature13_content_security_policy.json": {
+      "description": "The Content-Security-Policy family: a plain enabled policy emits the block/upgrade directives; a sandbox prepends a sandbox directive; legacy-compatibility mode mirrors the policy into the X-Content-Security-Policy header; report-only mode emits a separate report-only header carrying a report-uri; and no header is emitted when the policy is not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "content_security_policy": {
+                "sandbox": [
+                  "allow-forms",
+                  "allow-scripts",
+                  "allow-same-origin"
+                ]
+              }
+            }
+          },
+          "expected_output": "Content-Security-Policy: sandbox allow-forms allow-scripts allow-same-origin;block-all-mixed-content;upgrade-insecure-requests;\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "content_security_policy": {
+                "report_only": true,
+                "report_uri": "https://localhost:5001/report-uri"
+              }
+            }
+          },
+          "expected_output": "Content-Security-Policy-Report-Only: block-all-mixed-content;upgrade-insecure-requests;report-uri https://localhost:5001/report-uri;\n"
+        }
+      ]
+    },
+    "feature14_csp_directive_formatting.json": {
+      "description": "Content-Security-Policy directive formatting rules: keyword tokens are wrapped in single quotes, URI tokens are left unquoted, exactly one space separates tokens (no leading, trailing or double spaces), each source list ends with a single semicolon, and a repeated URI is not duplicated.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "content_security_policy": {
+                "block_all_mixed_content": false,
+                "upgrade_insecure_requests": false,
+                "directives": {
+                  "script-src": [
+                    {
+                      "keyword": "self"
+                    },
+                    {
+                      "keyword": "unsafe-inline"
+                    },
+                    {
+                      "keyword": "none"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "expected_output": "Content-Security-Policy: script-src 'self' 'unsafe-inline' 'none';\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "content_security_policy": {
+                "block_all_mixed_content": false,
+                "upgrade_insecure_requests": false,
+                "directives": {
+                  "img-src": [
+                    {
+                      "keyword": "self"
+                    },
+                    {
+                      "uri": "data:"
+                    },
+                    {
+                      "uri": "https://cdn.abc.net"
+                    },
+                    {
+                      "uri": "https://cdn.abc.org"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "expected_output": "Content-Security-Policy: img-src 'self' data: https://cdn.abc.net https://cdn.abc.org;\n"
+        }
+      ]
+    },
+    "feature15_clear_site_data_global.json": {
+      "description": "When Clear-Site-Data is enabled for all responses the header lists each requested data type as a quoted token; a wildcard collapses the whole value to \"*\" and takes precedence over any other token; duplicate tokens are removed; and the header is absent when not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "clear_site_data": {}
+            }
+          },
+          "expected_output": "Clear-Site-Data: \"cache\",\"cookies\",\"storage\"\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "clear_site_data": {
+                "directives": [
+                  "cache",
+                  "*",
+                  "cookies"
+                ]
+              }
+            }
+          },
+          "expected_output": "Clear-Site-Data: \"*\"\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature16_clear_site_data_paths.json": {
+      "description": "Path-scoped Clear-Site-Data emits the header only for requests whose path matches a configured entry; when several configured paths are prefixes of the request the most specific (longest) match wins; and configuring an entry with an empty path or an empty token list is rejected as an invalid configuration.",
+      "cases": [
+        {
+          "input": {
+            "request_path": "/logout",
+            "headers": {
+              "clear_site_data_paths": {
+                "paths": {
+                  "/logout": [
+                    "*"
+                  ]
+                }
+              }
+            }
+          },
+          "expected_output": "Clear-Site-Data: \"*\"\n"
+        },
+        {
+          "input": {
+            "request_path": "/account/logout",
+            "headers": {
+              "clear_site_data_paths": {
+                "paths": {
+                  "/account": [
+                    "cache"
+                  ],
+                  "/account/logout": [
+                    "*"
+                  ]
+                }
+              }
+            }
+          },
+          "expected_output": "Clear-Site-Data: \"*\"\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "clear_site_data_add_paths": [
+                {
+                  "path": "",
+                  "directives": [
+                    "cache"
+                  ]
+                }
+              ]
+            }
+          },
+          "expected_output": "error=missing_required_value\nfield=path\n"
+        }
+      ]
+    },
+    "feature17_middleware_contract.json": {
+      "description": "Operational request-handling contract: invoking the engine without any configuration is rejected; and when an ignore list is in effect the engine emits no headers for an ignored request path while still applying the full bundle to a non-ignored path.",
+      "cases": [
+        {
+          "input": {
+            "with_config": false
+          },
+          "expected_output": "error=missing_configuration\n"
+        },
+        {
+          "input": {
+            "preset": "default",
+            "request_path": "/ignore-me",
+            "ignore_paths": [
+              "/ignore-me"
+            ]
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature1_default_bundle.json": {
+      "description": "Applying the recommended default security-header bundle to a normal request emits the complete, opinionated set of OWASP response headers with their canonical wire values.",
+      "cases": [
+        {
+          "input": {
+            "preset": "default",
+            "request_path": "/hello"
+          },
+          "expected_output": "Cache-Control: max-age=0,no-store\nContent-Security-Policy: script-src 'self';object-src 'self';block-all-mixed-content;upgrade-insecure-requests;\nCross-Origin-Embedder-Policy: require-corp\nCross-Origin-Opener-Policy: same-origin\nCross-Origin-Resource-Policy: same-origin\nReferrer-Policy: no-referrer\nStrict-Transport-Security: max-age=31536000;includeSubDomains\nX-Content-Type-Options: nosniff\nX-Frame-Options: deny\nX-Permitted-Cross-Domain-Policies: none\nX-XSS-Protection: 0\n"
+        }
+      ]
+    },
+    "feature2_strict_transport_security.json": {
+      "description": "The Strict-Transport-Security header is emitted only when HSTS is enabled; its value encodes the configured max-age and whether sub-domains are included.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "strict_transport_security": {}
+            }
+          },
+          "expected_output": "Strict-Transport-Security: max-age=31536000;includeSubDomains\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "strict_transport_security": {
+                "max_age": 12345,
+                "include_subdomains": false
+              }
+            }
+          },
+          "expected_output": "Strict-Transport-Security: max-age=12345\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature3_x_frame_options.json": {
+      "description": "The X-Frame-Options header reflects the chosen framing directive; the allow-from directive additionally carries the permitted origin, and the header is absent when the feature is not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "x_frame_options": {
+                "directive": "deny"
+              }
+            }
+          },
+          "expected_output": "X-Frame-Options: deny\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "x_frame_options": {
+                "directive": "allowfrom",
+                "domain": "https://example.com"
+              }
+            }
+          },
+          "expected_output": "X-Frame-Options: allow-from: (https://example.com)\n"
+        }
+      ]
+    },
+    "feature4_content_type_options.json": {
+      "description": "The X-Content-Type-Options header emits the fixed nosniff token when enabled and is absent otherwise.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "content_type_options": {}
+            }
+          },
+          "expected_output": "X-Content-Type-Options: nosniff\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature5_xss_protection.json": {
+      "description": "The X-XSS-Protection header emits the value 0 (disabling the legacy browser auditor, per current guidance) when enabled and is absent otherwise.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "xss_protection": {}
+            }
+          },
+          "expected_output": "X-XSS-Protection: 0\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature6_referrer_policy.json": {
+      "description": "The Referrer-Policy header carries the selected policy token (defaulting to no-referrer) and is absent when the feature is not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "referrer_policy": {}
+            }
+          },
+          "expected_output": "Referrer-Policy: no-referrer\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "referrer_policy": {
+                "value": "strict-origin-when-cross-origin"
+              }
+            }
+          },
+          "expected_output": "Referrer-Policy: strict-origin-when-cross-origin\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature7_permitted_cross_domain_policies.json": {
+      "description": "The X-Permitted-Cross-Domain-Policies header carries the selected policy token (defaulting to none) and is absent when the feature is not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "permitted_cross_domain_policies": {
+                "value": "master-only"
+              }
+            }
+          },
+          "expected_output": "X-Permitted-Cross-Domain-Policies: master-only\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    },
+    "feature8_cache_control.json": {
+      "description": "The Cache-Control header value is produced by a strict precedence among the requested directives: no-cache wins over private, which wins over must-revalidate, which wins over the max-age/no-store pair.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "cache_control": {}
+            }
+          },
+          "expected_output": "Cache-Control: max-age=0,no-store\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "cache_control": {
+                "private": true
+              }
+            }
+          },
+          "expected_output": "Cache-Control: private\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "cache_control": {
+                "no_cache": true,
+                "no_store": false
+              }
+            }
+          },
+          "expected_output": "Cache-Control: no-cache\n"
+        }
+      ]
+    },
+    "feature9_expect_ct.json": {
+      "description": "The Expect-CT header always carries max-age, optionally appends enforce, and appends a quoted report-uri only when one is supplied; the header is absent when the feature is not enabled.",
+      "cases": [
+        {
+          "input": {
+            "headers": {
+              "expect_ct": {
+                "report_uri": "https://ex.com/r",
+                "enforce": true
+              }
+            }
+          },
+          "expected_output": "Expect-CT: max-age=86400, enforce, report-uri=\"https://ex.com/r\"\n"
+        },
+        {
+          "input": {
+            "headers": {
+              "expect_ct": {
+                "report_uri": ""
+              }
+            }
+          },
+          "expected_output": "Expect-CT: max-age=86400\n"
+        },
+        {
+          "input": {
+            "headers": {}
+          },
+          "expected_output": "<no-headers>\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 3
+  }
+}

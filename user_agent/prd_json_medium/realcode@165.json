@@ -1,0 +1,669 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out that actor concurrency library we've been talking about. The core idea is that developers should be able to spin up isolated 'systems', put named workers inside them, and have those workers talk to each other via messages without worrying about the plumbing underneath. Think of it like the pattern we used in the notification service refactor last quarter — same isolation idea, but generalized.\n\nA few things I know are important from the stakeholder side: naming has to be strict (we had bugs before from weird characters sneaking into identifiers), parents should know about their kids but not their grandkids, and if something crashes it shouldn't take down the whole world — there should be ways to configure recovery. Also someone mentioned we need a way to 'ask' an actor something and wait for an answer, but it can't wait forever, and the error messages that come back need to be clean, nothing internal leaking out.\n\nWe also need lifecycle stuff — actors should be stoppable, stopping a parent should clean up everything below it, and there's some ask about actors that shut themselves down if they've been sitting idle too long. The after-stop situation also needs a callback of some kind so you can inspect what was still pending.\n\nPlease make sure the code isn't one giant file — it got messy last time. Reference the structure notes in start.md for how to split things up.\n\nOne quick follow-up from the questions that came in. On naming, we do need to be really strict here. A valid actor address segment must be a non-empty string composed solely of letters, digits, and the following URI-safe extra characters: hyphen (-), underscore (_), period (.), dollar sign ($), plus (+), exclamation mark (!), asterisk (*), single quote ('), open parenthesis ((), close parenthesis ()), and comma (,). Any whitespace (leading, trailing, or interior), path separators, reserved query/fragment characters (e.g. ?, #, &, =), and escape characters (e.g. %) make a name invalid. Non-text values and empty strings are also rejected. This needs to be enforced the same way anywhere we build addresses and anywhere we do spawn or routing, same as the Feature 1 segment validation rules in start.md, and Feature 3 (Actor System Identity and Isolation) in start.md still stands too.\n\nAlso, on system boundaries, each actor system owns its own isolated namespace. Two systems may each contain an actor with the same local name without any collision. A request-response interaction addressed within one system resolves only against that system's registry and never crosses into another system's namespace. That’s the same isolation expectation we called out before, just spelling it out more directly.\n\nFor ask/query behavior, if a query is issued without supplying a timeout value, the system must output the normalized error category 'error=missing_timeout' on its own line. No runtime exception class name, stack trace, or internal message suffix may appear in the output. And if a query times out, the output must be two lines: 'error=query_timeout' followed by 'timeout_ms=<value>' where <value> is the timeout that was supplied. Same deal there: no exception class names or stack traces should leak out.\n\nA couple more runtime details to lock in: mailbox ordering is strictly preserved, so one message is fully processed (including any asynchronous work within its handler) before the next message begins processing. A message delayed by async work inside its handler cannot be overtaken by a later message. The listener's final recorded sequence must always equal the original send order. Also, an actor's initial state can be computed from a template string containing the placeholder '{name}'. At startup, before any message is processed, the runtime replaces '{name}' with the actor's configured name to produce the seed state. Subsequent messages extend from that computed seed.\n\nOn failure behavior, the defaults depend on actor kind when no explicit supervision policy is configured. A stateful actor stops automatically after a handler failure, while a stateless actor resumes (continues processing) after a handler failure. Initialization failures can be observed via a crash handler that stops the actor.\n\nAnd just reinforcing the implementation shape because this came up again: a single-file solution is explicitly prohibited. The codebase must use a multi-file directory structure (e.g. src/, tests/) that separates addressing/validation, mailbox scheduling, lifecycle, supervision, and the JSON I/O adapter into distinct logical modules. The core business logic must be fully decoupled from stdin/stdout and JSON parsing.",
+  "oracle_data": {
+    "task_id": "ACTOR-RUNTIME-001",
+    "golden_api_signature": "ActorSystem.start(name: str) -> SystemRef",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "what error if I query a stopped actor",
+          "querying a non-existent actor",
+          "stopped reference query failure"
+        ],
+        "oracle_response": "Querying a stopped or never-existing actor reference must produce the normalized output 'error=stopped_reference'. The output must never contain runtime exception types, internal message text, or stack traces."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "does stopping a parent also stop children",
+          "stop cascade behavior",
+          "what happens to grandchildren when a child is stopped"
+        ],
+        "oracle_response": "Stopping an actor cascades the stop to every descendant of that actor (children, grandchildren, etc.), while sibling actors remain alive. Stopping the root system stops every remaining actor in the entire tree. After a reference is stopped, any attempt to spawn a child below it must be rejected with 'error=stopped_reference', and any message dispatched to a stopped actor is silently ignored."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what children does a parent see",
+          "does a parent see grandchildren",
+          "child visibility in parent context"
+        ],
+        "oracle_response": "A parent actor's context exposes only its direct children (depth 1), not deeper descendants. Child names are reported in sorted order. The system registry also exposes direct children of the system root in sorted order, without surfacing deeper levels of the hierarchy."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "duplicate child name error",
+          "what happens if I spawn two children with the same name",
+          "sibling name collision"
+        ],
+        "oracle_response": "Spawning a child with a name already used by a sibling under the same parent must be rejected with a two-line output: 'error=duplicate_child_name' followed by 'child_name=<name>'. The error must not expose runtime internals."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "idle shutdown timer",
+          "actor auto-stop on inactivity",
+          "how does the idle timeout work"
+        ],
+        "oracle_response": "An actor configured with an idle shutdown period stops automatically once that period elapses with no message activity. Receiving any message before the deadline renews (resets) the idle timer, keeping the actor alive. After the idle period expires the actor is marked stopped and follows the same stopped-reference rules as an explicitly stopped actor."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "after-stop callback",
+          "what context is available when an actor stops",
+          "queued messages after stop"
+        ],
+        "oracle_response": "When an actor stops, an after-stop callback is invoked with access to: the count of messages still queued behind the in-flight message, the content of the first such queued message, and the parent reference (from which the owning system identity can be read). The parent system name is reported as 'parent_system=<name>'."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "supervision policy options",
+          "what recovery actions are available for a faulted actor",
+          "self supervision vs parent supervision"
+        ],
+        "oracle_response": "Self (actor-level) supervision policies include: resume (keep current state, continue processing), reset (reinitialize state from scratch), stop (mark actor stopped), and escalate (delegate fault decision to parent). Parent-level supervision policies triggered by escalation include: stop_all_children (stop every child under the parent), reset_all_children (reset every child's state), and reset_faulted_child (reset only the child that faulted while leaving peers untouched). The parent itself must remain alive under all parent-level policies."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid action field values",
+          "what values can action take",
+          "list all supported action values",
+          "what actions does the dispatcher handle",
+          "which action strings does the adapter support",
+          "what are the possible action inputs",
+          "tell me all the action names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'action' field. Valid values are: 'stop-cascade', 'default-fault-behavior', 'supervision-self', 'supervision-parent-policy', 'supervision-stop-all', 'after-stop', 'validate-name-list', 'create-child-path', 'start-systems', 'stateful-append', 'initial-state-from-name', 'promise-order', 'query', 'missing-query-timeout', 'child-registration'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature10_stop_and_idle_lifecycle",
+        "trigger_keywords": [
+          "test cases for feature10 stop and idle lifecycle",
+          "show me feature10 stop and idle lifecycle test cases",
+          "what are the feature10 stop and idle lifecycle test inputs",
+          "give me the feature10_stop_and_idle_lifecycle test file",
+          "test cases for feature 10",
+          "feature10 stop and idle lifecycle expected output",
+          "what does feature10 stop and idle lifecycle expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_stop_and_idle_lifecycle:\n{\n  \"description\": \"Stop actors and systems safely, cascade stops to descendants, reject spawning below stopped references, ignore later dispatches, and stop idle actors after a configured inactivity period while allowing message activity to renew the timer.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"stop-cascade\",\n        \"system\": \"cascade\",\n        \"parent_name\": \"parent\",\n        \"child_names\": [\n          \"child1\",\n          \"child2\"\n        ],\n        \"grandchild_names\": [\n          \"grandchild1\",\n          \"grandchild2\"\n        ]\n      },\n      \"expected_output\": \"after_child_stop=child1=true,grandchild1=true,grandchild2=true,child2=false\\nparent=true\\nchild2=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_default_fault_handling",
+        "trigger_keywords": [
+          "test cases for feature11 default fault handling",
+          "show me feature11 default fault handling test cases",
+          "what are the feature11 default fault handling test inputs",
+          "give me the feature11_default_fault_handling test file",
+          "test cases for feature 11",
+          "feature11 default fault handling expected output",
+          "what does feature11 default fault handling expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_default_fault_handling:\n{\n  \"description\": \"Apply the default fault behavior: stateful actors stop after handler failure, stateless actors resume after handler failure, and initialization failures can be observed by a crash handler that stops the actor.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"default-fault-behavior\",\n        \"system\": \"fault-a\",\n        \"actor_name\": \"stateful\",\n        \"actor_kind\": \"stateful\",\n        \"check_after_ms\": 80\n      },\n      \"expected_output\": \"actor_stopped=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature12_self_supervision_actions",
+        "trigger_keywords": [
+          "test cases for feature12 self supervision actions",
+          "show me feature12 self supervision actions test cases",
+          "what are the feature12 self supervision actions test inputs",
+          "give me the feature12_self_supervision_actions test file",
+          "test cases for feature 12",
+          "feature12 self supervision actions expected output",
+          "what does feature12 self supervision actions expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_self_supervision_actions:\n{\n  \"description\": \"Let an actor-specific crash policy resume, reset, stop, or escalate a faulted actor and expose the resulting actor state and liveness.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"supervision-self\",\n        \"system\": \"sup-resume\",\n        \"parent_name\": \"parent\",\n        \"child_name\": \"child\",\n        \"policy\": \"resume\",\n        \"fail_on_count\": 3,\n        \"pre_messages\": [\n          \"msg0\",\n          \"msg1\",\n          \"msg2\"\n        ],\n        \"recovery_message\": \"msg3\",\n        \"query_after\": \"msg3\"\n      },\n      \"expected_output\": \"child_stopped=false\\nparent_stopped=false\\nquery_result=3\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature13_parent_supervision_actions",
+        "trigger_keywords": [
+          "test cases for feature13 parent supervision actions",
+          "show me feature13 parent supervision actions test cases",
+          "what are the feature13 parent supervision actions test inputs",
+          "give me the feature13_parent_supervision_actions test file",
+          "test cases for feature 13",
+          "feature13 parent supervision actions expected output",
+          "what does feature13 parent supervision actions expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature13_parent_supervision_actions:\n{\n  \"description\": \"Let a parent crash policy respond to an escalated child failure by stopping all children, resetting all children, or resetting only the faulted child while leaving unaffected actors according to the selected action.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"supervision-parent-policy\",\n        \"system\": \"par-stop-children\",\n        \"parent_name\": \"parent\",\n        \"parent_policy\": \"stop_all_children\",\n        \"faulting_child_name\": \"faulty\",\n        \"other_child_name\": \"peer\",\n        \"fail_on_count\": 3,\n        \"pre_messages\": [\n          \"msg0\",\n          \"msg1\",\n          \"msg2\"\n        ],\n        \"recovery_message\": \"msg3\"\n      },\n      \"expected_output\": \"parent_stopped=false\\nfaulty_stopped=true\\npeer_stopped=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature14_peer_and_descendant_supervision",
+        "trigger_keywords": [
+          "test cases for feature14 peer and descendant supervision",
+          "show me feature14 peer and descendant supervision test cases",
+          "what are the feature14 peer and descendant supervision test inputs",
+          "give me the feature14_peer_and_descendant_supervision test file",
+          "test cases for feature 14",
+          "feature14 peer and descendant supervision expected output",
+          "what does feature14 peer and descendant supervision expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature14_peer_and_descendant_supervision:\n{\n  \"description\": \"Apply a self crash policy that stops the faulted actor, its peers, and descendants while keeping the parent alive.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"supervision-stop-all\",\n        \"system\": \"sup-stop-all\",\n        \"parent_name\": \"parent\",\n        \"faulting_child_name\": \"faulty\",\n        \"peer_child_name\": \"peer\",\n        \"grandchild_names\": [\n          \"faulty-child\",\n          \"peer-child\"\n        ],\n        \"fail_on_count\": 3,\n        \"pre_messages\": [\n          \"msg0\",\n          \"msg1\",\n          \"msg2\"\n        ]\n      },\n      \"expected_output\": \"parent_stopped=false\\nfaulty_stopped=true\\npeer_stopped=true\\nfaulty-child_stopped=true\\npeer-child_stopped=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature15_after_stop_context",
+        "trigger_keywords": [
+          "test cases for feature15 after stop context",
+          "show me feature15 after stop context test cases",
+          "what are the feature15 after stop context test inputs",
+          "give me the feature15_after_stop_context test file",
+          "test cases for feature 15",
+          "feature15 after stop context expected output",
+          "what does feature15 after stop context expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature15_after_stop_context:\n{\n  \"description\": \"Run an after-stop callback with access to the parent reference and any messages still queued behind an in-flight message.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"after-stop\",\n        \"system\": \"after-stop\",\n        \"actor_name\": \"worker\",\n        \"processing_delay_ms\": 80,\n        \"messages\": [\n          1,\n          2\n        ]\n      },\n      \"expected_output\": \"queued_messages=1\\nfirst_queued=2\\nparent_system=after-stop\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_path_name_validation",
+        "trigger_keywords": [
+          "test cases for feature1 path name validation",
+          "show me feature1 path name validation test cases",
+          "what are the feature1 path name validation test inputs",
+          "give me the feature1_path_name_validation test file",
+          "test cases for feature 1",
+          "feature1 path name validation expected output",
+          "what does feature1 path name validation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_path_name_validation:\n{\n  \"description\": \"Validate actor address segment names against the accepted character set and reject empty, non-text, whitespace, reserved, escape, and fragment/query characters.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"validate-name-list\",\n        \"names\": [\n          \"frog\",\n          \"123-abc\",\n          \"frog.path\",\n          \"frog(path)\"\n        ]\n      },\n      \"expected_output\": \"name=\\\"frog\\\"\\nvalid=yes\\nname=\\\"123-abc\\\"\\nvalid=yes\\nname=\\\"frog.path\\\"\\nvalid=yes\\nname=\\\"frog(path)\\\"\\nvalid=yes\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_child_path_creation",
+        "trigger_keywords": [
+          "test cases for feature2 child path creation",
+          "show me feature2 child path creation test cases",
+          "what are the feature2 child path creation test inputs",
+          "give me the feature2_child_path_creation test file",
+          "test cases for feature 2",
+          "feature2 child path creation expected output",
+          "what does feature2 child path creation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_child_path_creation:\n{\n  \"description\": \"Build a child address path by appending valid child segments to a root system path, and report invalid child segments as normalized contract errors.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"create-child-path\",\n        \"system\": \"root\",\n        \"child_names\": [\n          \"a\",\n          \"b\",\n          \"c1234-d4\"\n        ]\n      },\n      \"expected_output\": \"system=root\\nparts=a/b/c1234-d4\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_system_identity_and_isolation",
+        "trigger_keywords": [
+          "test cases for feature3 system identity and isolation",
+          "show me feature3 system identity and isolation test cases",
+          "what are the feature3 system identity and isolation test inputs",
+          "give me the feature3_system_identity_and_isolation test file",
+          "test cases for feature 3",
+          "feature3 system identity and isolation expected output",
+          "what does feature3 system identity and isolation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_system_identity_and_isolation:\n{\n  \"description\": \"Start named actor systems and keep actors with identical local names isolated by their owning system.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"start-systems\",\n        \"systems\": [\n          {\n            \"name\": \"henry\"\n          }\n        ]\n      },\n      \"expected_output\": \"system1=henry\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_stateful_message_processing",
+        "trigger_keywords": [
+          "test cases for feature4 stateful message processing",
+          "show me feature4 stateful message processing test cases",
+          "what are the feature4 stateful message processing test inputs",
+          "give me the feature4_stateful_message_processing test file",
+          "test cases for feature 4",
+          "feature4 stateful message processing expected output",
+          "what does feature4 stateful message processing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_stateful_message_processing:\n{\n  \"description\": \"Process append messages through a stateful actor and return the accumulated state, including when the actor starts from an explicit initial state.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"stateful-append\",\n        \"system\": \"stateful-a\",\n        \"actor_name\": \"writer\",\n        \"appends\": [\n          \"Hello \",\n          \"World. \",\n          \"The time has come!!\"\n        ]\n      },\n      \"expected_output\": \"state=Hello World. The time has come!!\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_context_based_initial_state",
+        "trigger_keywords": [
+          "test cases for feature5 context based initial state",
+          "show me feature5 context based initial state test cases",
+          "what are the feature5 context based initial state test inputs",
+          "give me the feature5_context_based_initial_state test file",
+          "test cases for feature 5",
+          "feature5 context based initial state expected output",
+          "what does feature5 context based initial state expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_context_based_initial_state:\n{\n  \"description\": \"Create the initial state from the actor context so that the actor name can be reflected in subsequent stateful message handling.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"initial-state-from-name\",\n        \"system\": \"ctx-init\",\n        \"actor_name\": \"NamedActor\",\n        \"template\": \"Hello {name}! Is today not a joyous occasion?\",\n        \"appends\": [\n          \" It is indeed\"\n        ]\n      },\n      \"expected_output\": \"state=Hello NamedActor! Is today not a joyous occasion? It is indeed\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_async_sequential_processing",
+        "trigger_keywords": [
+          "test cases for feature6 async sequential processing",
+          "show me feature6 async sequential processing test cases",
+          "what are the feature6 async sequential processing test inputs",
+          "give me the feature6_async_sequential_processing test file",
+          "test cases for feature 6",
+          "feature6 async sequential processing expected output",
+          "what does feature6 async sequential processing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_async_sequential_processing:\n{\n  \"description\": \"Preserve mailbox order for asynchronous stateful message handlers even when an earlier message takes longer to complete.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"promise-order\",\n        \"system\": \"ordering\",\n        \"worker_name\": \"worker\",\n        \"listener_name\": \"listener\",\n        \"messages\": [\n          {\n            \"number\": 1\n          },\n          {\n            \"number\": 2,\n            \"delay_ms\": 30\n          },\n          {\n            \"number\": 3\n          }\n        ]\n      },\n      \"expected_output\": \"received=1,2,3\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_query_request_response",
+        "trigger_keywords": [
+          "test cases for feature7 query request response",
+          "show me feature7 query request response test cases",
+          "what are the feature7 query request response test inputs",
+          "give me the feature7_query_request_response test file",
+          "test cases for feature 7",
+          "feature7 query request response expected output",
+          "what does feature7 query request response expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_query_request_response:\n{\n  \"description\": \"Send a request that includes a temporary reply address and resolve with the response when the actor replies before the timeout.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"query\",\n        \"system\": \"query-ok\",\n        \"actor_name\": \"responder\",\n        \"response\": \"done\",\n        \"response_delay_ms\": 10,\n        \"timeout_ms\": 80,\n        \"message_shape\": \"object_with_sender\"\n      },\n      \"expected_output\": \"response=done\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_query_error_contracts",
+        "trigger_keywords": [
+          "test cases for feature8 query error contracts",
+          "show me feature8 query error contracts test cases",
+          "what are the feature8 query error contracts test inputs",
+          "give me the feature8_query_error_contracts test file",
+          "test cases for feature 8",
+          "feature8 query error contracts expected output",
+          "what does feature8 query error contracts expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_query_error_contracts:\n{\n  \"description\": \"Normalize request-response failures when no timeout is supplied, the target is stopped, or no response arrives before the timeout window.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"missing-query-timeout\",\n        \"system\": \"query-missing\",\n        \"actor_name\": \"silent\"\n      },\n      \"expected_output\": \"error=missing_timeout\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_child_registration_and_duplicates",
+        "trigger_keywords": [
+          "test cases for feature9 child registration and duplicates",
+          "show me feature9 child registration and duplicates test cases",
+          "what are the feature9 child registration and duplicates test inputs",
+          "give me the feature9_child_registration_and_duplicates test file",
+          "test cases for feature 9",
+          "feature9 child registration and duplicates expected output",
+          "what does feature9 child registration and duplicates expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_child_registration_and_duplicates:\n{\n  \"description\": \"Register children under their parent, expose child names through the parent context, allow children to be created from within message handling, and reject duplicate sibling names.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"child-registration\",\n        \"system\": \"children\",\n        \"parent_name\": \"parent\",\n        \"child_names\": [\n          \"testGrandchildActor\",\n          \"testGrandchildActor2\"\n        ]\n      },\n      \"expected_output\": \"before=\\nafter=testGrandchildActor,testGrandchildActor2\\nsystem_children=parent\\nparent_children=testGrandchildActor,testGrandchildActor2\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the structure notes in start.md for how to split things up",
+        "actual_meaning": "Architecture & Engineering Constraints section of start.md, specifically constraint #1 (Scale-Driven Code Organization) and constraint #2 (Strict Separation of Concerns): the adapter layer must be separate from core domain logic, and responsibilities must be split into distinct modules"
+      },
+      {
+        "vague_reference": "there's some ask about actors that shut themselves down if they've been sitting idle too long",
+        "actual_meaning": "Feature 10 (Stop and Idle Lifecycle) idle shutdown behavior in start.md and feature10_stop_and_idle_lifecycle.json: actors configured with an idle_timeout_ms stop automatically on inactivity, but receiving a message renews the timer"
+      },
+      {
+        "vague_reference": "the after-stop situation also needs a callback of some kind so you can inspect what was still pending",
+        "actual_meaning": "Feature 15 (After-Stop Context) in start.md and feature15_after_stop_context.json: the after-stop callback receives queued_messages count, first_queued message content, and parent reference exposing parent_system name"
+      }
+    ],
+    "fallback_response": "That's a bit outside what I can clarify from the business side — you'd want to dig into the start.md PRD and the test case files under rcb_tests/public_test_cases/ for the precise contract. Is there a specific behavior or error scenario I can help translate into business terms?"
+  },
+  "public_test_cases": {
+    "feature10_stop_and_idle_lifecycle.json": {
+      "description": "Stop actors and systems safely, cascade stops to descendants, reject spawning below stopped references, ignore later dispatches, and stop idle actors after a configured inactivity period while allowing message activity to renew the timer.",
+      "cases": [
+        {
+          "input": {
+            "action": "stop-cascade",
+            "system": "cascade",
+            "parent_name": "parent",
+            "child_names": [
+              "child1",
+              "child2"
+            ],
+            "grandchild_names": [
+              "grandchild1",
+              "grandchild2"
+            ]
+          },
+          "expected_output": "after_child_stop=child1=true,grandchild1=true,grandchild2=true,child2=false\nparent=true\nchild2=true\n"
+        }
+      ]
+    },
+    "feature11_default_fault_handling.json": {
+      "description": "Apply the default fault behavior: stateful actors stop after handler failure, stateless actors resume after handler failure, and initialization failures can be observed by a crash handler that stops the actor.",
+      "cases": [
+        {
+          "input": {
+            "action": "default-fault-behavior",
+            "system": "fault-a",
+            "actor_name": "stateful",
+            "actor_kind": "stateful",
+            "check_after_ms": 80
+          },
+          "expected_output": "actor_stopped=true\n"
+        }
+      ]
+    },
+    "feature12_self_supervision_actions.json": {
+      "description": "Let an actor-specific crash policy resume, reset, stop, or escalate a faulted actor and expose the resulting actor state and liveness.",
+      "cases": [
+        {
+          "input": {
+            "action": "supervision-self",
+            "system": "sup-resume",
+            "parent_name": "parent",
+            "child_name": "child",
+            "policy": "resume",
+            "fail_on_count": 3,
+            "pre_messages": [
+              "msg0",
+              "msg1",
+              "msg2"
+            ],
+            "recovery_message": "msg3",
+            "query_after": "msg3"
+          },
+          "expected_output": "child_stopped=false\nparent_stopped=false\nquery_result=3\n"
+        }
+      ]
+    },
+    "feature13_parent_supervision_actions.json": {
+      "description": "Let a parent crash policy respond to an escalated child failure by stopping all children, resetting all children, or resetting only the faulted child while leaving unaffected actors according to the selected action.",
+      "cases": [
+        {
+          "input": {
+            "action": "supervision-parent-policy",
+            "system": "par-stop-children",
+            "parent_name": "parent",
+            "parent_policy": "stop_all_children",
+            "faulting_child_name": "faulty",
+            "other_child_name": "peer",
+            "fail_on_count": 3,
+            "pre_messages": [
+              "msg0",
+              "msg1",
+              "msg2"
+            ],
+            "recovery_message": "msg3"
+          },
+          "expected_output": "parent_stopped=false\nfaulty_stopped=true\npeer_stopped=true\n"
+        }
+      ]
+    },
+    "feature14_peer_and_descendant_supervision.json": {
+      "description": "Apply a self crash policy that stops the faulted actor, its peers, and descendants while keeping the parent alive.",
+      "cases": [
+        {
+          "input": {
+            "action": "supervision-stop-all",
+            "system": "sup-stop-all",
+            "parent_name": "parent",
+            "faulting_child_name": "faulty",
+            "peer_child_name": "peer",
+            "grandchild_names": [
+              "faulty-child",
+              "peer-child"
+            ],
+            "fail_on_count": 3,
+            "pre_messages": [
+              "msg0",
+              "msg1",
+              "msg2"
+            ]
+          },
+          "expected_output": "parent_stopped=false\nfaulty_stopped=true\npeer_stopped=true\nfaulty-child_stopped=true\npeer-child_stopped=true\n"
+        }
+      ]
+    },
+    "feature15_after_stop_context.json": {
+      "description": "Run an after-stop callback with access to the parent reference and any messages still queued behind an in-flight message.",
+      "cases": [
+        {
+          "input": {
+            "action": "after-stop",
+            "system": "after-stop",
+            "actor_name": "worker",
+            "processing_delay_ms": 80,
+            "messages": [
+              1,
+              2
+            ]
+          },
+          "expected_output": "queued_messages=1\nfirst_queued=2\nparent_system=after-stop\n"
+        }
+      ]
+    },
+    "feature1_path_name_validation.json": {
+      "description": "Validate actor address segment names against the accepted character set and reject empty, non-text, whitespace, reserved, escape, and fragment/query characters.",
+      "cases": [
+        {
+          "input": {
+            "action": "validate-name-list",
+            "names": [
+              "frog",
+              "123-abc",
+              "frog.path",
+              "frog(path)"
+            ]
+          },
+          "expected_output": "name=\"frog\"\nvalid=yes\nname=\"123-abc\"\nvalid=yes\nname=\"frog.path\"\nvalid=yes\nname=\"frog(path)\"\nvalid=yes\n"
+        }
+      ]
+    },
+    "feature2_child_path_creation.json": {
+      "description": "Build a child address path by appending valid child segments to a root system path, and report invalid child segments as normalized contract errors.",
+      "cases": [
+        {
+          "input": {
+            "action": "create-child-path",
+            "system": "root",
+            "child_names": [
+              "a",
+              "b",
+              "c1234-d4"
+            ]
+          },
+          "expected_output": "system=root\nparts=a/b/c1234-d4\n"
+        }
+      ]
+    },
+    "feature3_system_identity_and_isolation.json": {
+      "description": "Start named actor systems and keep actors with identical local names isolated by their owning system.",
+      "cases": [
+        {
+          "input": {
+            "action": "start-systems",
+            "systems": [
+              {
+                "name": "henry"
+              }
+            ]
+          },
+          "expected_output": "system1=henry\n"
+        }
+      ]
+    },
+    "feature4_stateful_message_processing.json": {
+      "description": "Process append messages through a stateful actor and return the accumulated state, including when the actor starts from an explicit initial state.",
+      "cases": [
+        {
+          "input": {
+            "action": "stateful-append",
+            "system": "stateful-a",
+            "actor_name": "writer",
+            "appends": [
+              "Hello ",
+              "World. ",
+              "The time has come!!"
+            ]
+          },
+          "expected_output": "state=Hello World. The time has come!!\n"
+        }
+      ]
+    },
+    "feature5_context_based_initial_state.json": {
+      "description": "Create the initial state from the actor context so that the actor name can be reflected in subsequent stateful message handling.",
+      "cases": [
+        {
+          "input": {
+            "action": "initial-state-from-name",
+            "system": "ctx-init",
+            "actor_name": "NamedActor",
+            "template": "Hello {name}! Is today not a joyous occasion?",
+            "appends": [
+              " It is indeed"
+            ]
+          },
+          "expected_output": "state=Hello NamedActor! Is today not a joyous occasion? It is indeed\n"
+        }
+      ]
+    },
+    "feature6_async_sequential_processing.json": {
+      "description": "Preserve mailbox order for asynchronous stateful message handlers even when an earlier message takes longer to complete.",
+      "cases": [
+        {
+          "input": {
+            "action": "promise-order",
+            "system": "ordering",
+            "worker_name": "worker",
+            "listener_name": "listener",
+            "messages": [
+              {
+                "number": 1
+              },
+              {
+                "number": 2,
+                "delay_ms": 30
+              },
+              {
+                "number": 3
+              }
+            ]
+          },
+          "expected_output": "received=1,2,3\n"
+        }
+      ]
+    },
+    "feature7_query_request_response.json": {
+      "description": "Send a request that includes a temporary reply address and resolve with the response when the actor replies before the timeout.",
+      "cases": [
+        {
+          "input": {
+            "action": "query",
+            "system": "query-ok",
+            "actor_name": "responder",
+            "response": "done",
+            "response_delay_ms": 10,
+            "timeout_ms": 80,
+            "message_shape": "object_with_sender"
+          },
+          "expected_output": "response=done\n"
+        }
+      ]
+    },
+    "feature8_query_error_contracts.json": {
+      "description": "Normalize request-response failures when no timeout is supplied, the target is stopped, or no response arrives before the timeout window.",
+      "cases": [
+        {
+          "input": {
+            "action": "missing-query-timeout",
+            "system": "query-missing",
+            "actor_name": "silent"
+          },
+          "expected_output": "error=missing_timeout\n"
+        }
+      ]
+    },
+    "feature9_child_registration_and_duplicates.json": {
+      "description": "Register children under their parent, expose child names through the parent context, allow children to be created from within message handling, and reject duplicate sibling names.",
+      "cases": [
+        {
+          "input": {
+            "action": "child-registration",
+            "system": "children",
+            "parent_name": "parent",
+            "child_names": [
+              "testGrandchildActor",
+              "testGrandchildActor2"
+            ]
+          },
+          "expected_output": "before=\nafter=testGrandchildActor,testGrandchildActor2\nsystem_children=parent\nparent_children=testGrandchildActor,testGrandchildActor2\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 3
+  }
+}

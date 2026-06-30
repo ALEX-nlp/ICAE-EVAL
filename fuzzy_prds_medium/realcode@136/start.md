@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to build out that result wrapper library we've been talking about. Basically the idea is that whenever a service method runs, instead of throwing exceptions or returning nulls all over the place, it returns one of these envelope objects that tells the caller what happened. Think of it like that pattern we used in the payments module — same vibe but more generalized.
+
+The envelope needs to cover the usual outcomes: things went fine and here's your data, things went fine but there's no data to return, something blew up with error messages, the input was bad and we have field-level details, the thing wasn't found, or the caller doesn't have permission. We also need a paged variant for list endpoints.
+
+One thing product keeps asking about is being able to chain these results without writing a bunch of if-statements — like if the first step succeeds you automatically flow into the next transformation, but if it already failed you just pass the failure along untouched.
+
+Also, ops has been complaining that when a void operation fails (like a fire-and-forget write that errors out) we can't easily bubble that failure up through a method that's supposed to return actual data. Need to handle that case cleanly.
+
+The library should expose a consistent snapshot of any result for debugging — something uniform we can log. Validation failures in particular need to carry enough detail to be useful (field name, message, and a few other bits). Let me know if you have questions, I'll try to dig up the old spec doc.
+
+Quick follow-up after the questions that came in: the status set is fixed and there are exactly six of them: Ok, Error, Forbidden, Unauthorized, Invalid, and NotFound. isSuccess is true only when the status is Ok; every other status reports isSuccess as false. This is the same Result/Operation-Result envelope pattern described in start.md, covering OperationResult<T>, OperationResult (void), and PagedResult<T> with status codes Ok, Error, Invalid, NotFound, Forbidden, Unauthorized.
+
+On the logging/debug snapshot piece, the standard snapshot is exactly seven lines and the order matters: status=<value>, isSuccess=<true|false>, value=<rendered value>, successMessage=<text or empty>, correlationId=<text or empty>, errors=<messages joined by '|' or empty>, validationErrors=<failures joined by '|' or empty>. If it’s paged, it appends four more lines: pageNumber, pageSize, totalPages, totalRecords. If there isn’t a value, render the literal 'null'. And if it’s just the operation that extracts the carried value, that output is only a single 'value=<rendered value>' line.
+
+For validation details, each failure should render as 'identifier=<id>;message=<text>;code=<code>;severity=<Error|Warning|Info>'. If something is empty, leave it blank, like code=. If severity isn’t provided, default it to Error.
+
+On the void failure bubbling case, yes, we do want the failed no-value result to widen into a value-carrying result of any type. The conversion preserves the failure status and copies the full failure payload: error messages for Error status, validation failures for Invalid status, and the bare status for NotFound, Forbidden, and Unauthorized. The converted result always carries no value (null). Important caveat here: only failed no-value results support this widening — a successful void result does not convert this way. That’s the same behavior called out in Feature 6 (void_to_typed): implicit widening conversion from a failed no-value OperationResult to a value-carrying OperationResult<T>, as specified in feature6_void_to_typed.json.
+
+And for chaining/projections, applying a projection (map) to a result only executes the projection when the source status is Ok. For any failure state (Error, Invalid, NotFound, Forbidden, Unauthorized), the projection is skipped entirely, and the failure is propagated unchanged — status, error messages, and validation failures all carry over; the new result carries no value. This applies to both value-carrying results (typed_map) and no-value results (void_map).

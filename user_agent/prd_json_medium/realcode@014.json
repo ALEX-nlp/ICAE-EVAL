@@ -1,0 +1,975 @@
+{
+  "fuzzy_prd": "Hey team, we need to build that database read-routing thing we've been talking about for ages. The basic idea is: we have primary and replica DB nodes, and right now everything hits the primary which is getting hammered. We want a way to wrap chunks of code so reads inside that wrapper go to the replica instead. Pretty similar to how we handled the connection-scoping stuff in the old session middleware, if you remember that pattern.\n\nThere should also be a global 'just distribute everything by default' toggle for apps that want to go all-in. Key thing though — after someone does a write, we can't serve their next read from a stale replica, that's caused support tickets before.\n\nWe also need some kind of staleness protection — if the replica is too far behind, we should either blow up loudly or quietly fall back to primary depending on config. Same deal if there are no replicas at all. Background jobs should also play nicely with this.\n\nOne thing I keep forgetting to mention: there's a lazy query issue where people return unexecuted query objects from the wrapper and then wonder why the replica isn't being used — we should warn about that.\n\nEdge cases like calling the wrapper without actually passing it a block of work, or passing in option keys we don't recognize, should produce clear errors. Let me know if anything's unclear, I'll be around.\n\nOne quick follow-up with the extra specifics people asked for. If the distribution entry point gets called without a block, it should raise the missing-block case and the output needs to be exactly two lines: `error=missing_block` and then `message=Missing block`. Same idea for bad option keys: if someone opens the distribution scope with keys we don’t recognize, raise the unknown-keywords case and return `error=unknown_keywords` followed by `message=Unknown keywords: <key1>, <key2>`, with the offending keys listed in the same order they were passed in.\n\nOn routing behavior, a scope opened with `replica: true` should send reads in that scope to the replica even if default-distribution mode is off, and reads outside that scope should still use the primary. Also, SQL comment prefixes, meaning the `prefix` field on a read op, should not influence routing at all. On the flip side, when default-distribution mode is on, a scope opened with `primary: true` should override that default and keep all reads in that scope on the primary.\n\nFor lag reporting, the `replication_lag` operation should return the current replica lag as a numeric value and render it as `replication_lag=<value>`, for example `replication_lag=2`.\n\nOne subtle but important bit on the stale-read protection: in default-distribution mode (`by_default: true`), if a write happens outside any explicit scope, then every later top-level read needs to stay pinned to the primary, not the replica. But inside an explicit distribution scope, a write does not pin later reads in that same scope; those reads still go to the replica. Then when that scope ends, any write that happened before the scope was entered starts mattering again for top-level reads.\n\nAlso, any read inside a transaction block must always go to the primary, even if that transaction is nested inside a distribution scope. Transactional work needs to stay on the writable node. And to make all of this work consistently, we do need the distribution scope/context-state piece that keeps track of whether a scope is active, whether a write has happened, and whether a transaction is currently open, basically the same kind of thread-local or stack-style context tracking we’ve used before in the core domain.",
+  "oracle_data": {
+    "task_id": "distribute_reads_routing_library",
+    "golden_api_signature": "reading_from_replica(options = {}, &block)",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "replica lag threshold",
+          "max lag exceeded",
+          "lag over limit error",
+          "replication lag too high"
+        ],
+        "oracle_response": "When a `max_lag` threshold is set and the measured lag exceeds it, the scope must raise before any read runs. Output: `error=too_much_lag` then `message=Replica lag over <N> seconds`. If the lag cannot be determined (null/nil), the message is instead `Replica lag is nil on <connection_name>` where the default connection renders as `default`."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "lag failover behavior",
+          "fall back on high lag",
+          "lag_failover option",
+          "log instead of raise on lag"
+        ],
+        "oracle_response": "When `lag_failover: true` is set and the lag exceeds the threshold (or is unknown), the scope must NOT raise. Instead it logs a message as `log=Replica lag over <N> seconds. Falling back to master pool.` (or `log=Replica lag is nil on <connection>. Falling back to master pool.` for unknown lag) and then routes all reads in that scope to the primary."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "named connection lag check",
+          "lag_on option",
+          "check lag for specific connection",
+          "lag on User connection"
+        ],
+        "oracle_response": "The lag check can be targeted at a named connection via `lag_on: \"<Name>\"` (or a list). When that connection's lag exceeds the threshold, the error message must name the connection: `Replica lag over <N> seconds on <Name> connection`."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "no replicas available",
+          "all replicas blacklisted",
+          "failover to primary when no replicas",
+          "replica unavailable behavior"
+        ],
+        "oracle_response": "When no replicas are available (blacklist_replicas scenario), the default behavior is to log `log=No replicas available. Falling back to master pool.` and route reads to the primary. If `failover: false` is explicitly set in the scope options, instead raise: `error=no_replicas_available` with `message=No replicas available`."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "background job routing",
+          "job context reset",
+          "job distribution mode",
+          "read_only job replica"
+        ],
+        "oracle_response": "Background jobs declared with a `read_only` role route their reads to the replica, rendering as `job=replica`. In default-distribution mode, a job with a `read_write` role also runs its read on the replica on each invocation because job context is reset between runs — a write in one job run does not pin reads in the next run."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "lazy query warning",
+          "unexecuted query object returned from scope",
+          "to_a warning",
+          "relation not executed inside block"
+        ],
+        "oracle_response": "When a distribution scope body contains a `lazy_read` operation (a query object that has not been executed yet is returned), the library must log a warning: `log=Call \\`to_a\\` inside block to execute query on replica`. This advises the caller to force execution inside the scope."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature10_1_missing_block",
+        "trigger_keywords": [
+          "test cases for feature10 1 missing block",
+          "show me feature10 1 missing block test cases",
+          "what are the feature10 1 missing block test inputs",
+          "give me the feature10_1_missing_block test file",
+          "test cases for feature 10",
+          "feature10 1 missing block expected output",
+          "what does feature10 1 missing block expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_1_missing_block:\n{\n  \"description\": \"Invoking the distribution entry point without a block raises a missing-block error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"program\": [\n          {\n            \"op\": \"scope_without_block\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=missing_block\\nmessage=Missing block\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_2_unknown_keywords",
+        "trigger_keywords": [
+          "test cases for feature10 2 unknown keywords",
+          "show me feature10 2 unknown keywords test cases",
+          "what are the feature10 2 unknown keywords test inputs",
+          "give me the feature10_2_unknown_keywords test file",
+          "test cases for feature 10",
+          "feature10 2 unknown keywords expected output",
+          "what does feature10 2 unknown keywords expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_2_unknown_keywords:\n{\n  \"description\": \"Invoking the distribution entry point with options it does not recognize raises an unknown-keywords error listing the offending keys in order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"hi\": 1,\n              \"bye\": 2\n            },\n            \"body\": []\n          }\n        ]\n      },\n      \"expected_output\": \"error=unknown_keywords\\nmessage=Unknown keywords: hi, bye\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_default_routing",
+        "trigger_keywords": [
+          "test cases for feature1 default routing",
+          "show me feature1 default routing test cases",
+          "what are the feature1 default routing test inputs",
+          "give me the feature1_default_routing test file",
+          "test cases for feature 1",
+          "feature1 default routing expected output",
+          "what does feature1 default routing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_default_routing:\n{\n  \"description\": \"With no distribution scope active and default mode off, a read is served by the primary database.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"program\": [\n          {\n            \"op\": \"read\"\n          }\n        ]\n      },\n      \"expected_output\": \"read=primary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_block_reads_replica",
+        "trigger_keywords": [
+          "test cases for feature2 1 block reads replica",
+          "show me feature2 1 block reads replica test cases",
+          "what are the feature2 1 block reads replica test inputs",
+          "give me the feature2_1_block_reads_replica test file",
+          "test cases for feature 2",
+          "feature2 1 block reads replica expected output",
+          "what does feature2 1 block reads replica expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_block_reads_replica:\n{\n  \"description\": \"A read executed outside any scope uses the primary; inside a distribution scope reads use the replica, and a write performed inside the scope does not pin later reads back to the primary.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"program\": [\n          {\n            \"op\": \"write\"\n          },\n          {\n            \"op\": \"read\"\n          },\n          {\n            \"op\": \"scope\",\n            \"options\": {},\n            \"body\": [\n              {\n                \"op\": \"read\"\n              },\n              {\n                \"op\": \"write\"\n              },\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"read=primary\\nread=replica\\nread=replica\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_transaction_primary",
+        "trigger_keywords": [
+          "test cases for feature2 2 transaction primary",
+          "show me feature2 2 transaction primary test cases",
+          "what are the feature2 2 transaction primary test inputs",
+          "give me the feature2_2_transaction_primary test file",
+          "test cases for feature 2",
+          "feature2 2 transaction primary expected output",
+          "what does feature2 2 transaction primary expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_transaction_primary:\n{\n  \"description\": \"A read wrapped in a transaction inside a distribution scope is served by the primary, because transactional work must stay on the writable node.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {},\n            \"body\": [\n              {\n                \"op\": \"transaction\",\n                \"body\": [\n                  {\n                    \"op\": \"read\"\n                  }\n                ]\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"read=primary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_by_default_sticky",
+        "trigger_keywords": [
+          "test cases for feature3 1 by default sticky",
+          "show me feature3 1 by default sticky test cases",
+          "what are the feature3 1 by default sticky test inputs",
+          "give me the feature3_1_by_default_sticky test file",
+          "test cases for feature 3",
+          "feature3 1 by default sticky expected output",
+          "what does feature3 1 by default sticky expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_by_default_sticky:\n{\n  \"description\": \"When default-distribution mode is on, a plain read uses the replica; after a write, subsequent reads are pinned to the primary for consistency.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"by_default\": true,\n        \"program\": [\n          {\n            \"op\": \"read\"\n          },\n          {\n            \"op\": \"write\"\n          },\n          {\n            \"op\": \"read\"\n          }\n        ]\n      },\n      \"expected_output\": \"read=replica\\nread=primary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_block_inside_default",
+        "trigger_keywords": [
+          "test cases for feature3 2 block inside default",
+          "show me feature3 2 block inside default test cases",
+          "what are the feature3 2 block inside default test inputs",
+          "give me the feature3_2_block_inside_default test file",
+          "test cases for feature 3",
+          "feature3 2 block inside default expected output",
+          "what does feature3 2 block inside default expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_block_inside_default:\n{\n  \"description\": \"With default-distribution mode on, reads inside a distribution scope stay on the replica even after a write within the scope; once the scope exits, an earlier write pins the next read to the primary.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"by_default\": true,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {},\n            \"body\": [\n              {\n                \"op\": \"read\"\n              },\n              {\n                \"op\": \"write\"\n              },\n              {\n                \"op\": \"read\"\n              }\n            ]\n          },\n          {\n            \"op\": \"read\"\n          }\n        ]\n      },\n      \"expected_output\": \"read=replica\\nread=replica\\nread=primary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_primary_override",
+        "trigger_keywords": [
+          "test cases for feature3 3 primary override",
+          "show me feature3 3 primary override test cases",
+          "what are the feature3 3 primary override test inputs",
+          "give me the feature3_3_primary_override test file",
+          "test cases for feature 3",
+          "feature3 3 primary override expected output",
+          "what does feature3 3 primary override expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_primary_override:\n{\n  \"description\": \"With default-distribution mode on, opening a scope that forces the primary routes its reads back to the primary.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"by_default\": true,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"primary\": true\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"read=primary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_max_lag_exceeded",
+        "trigger_keywords": [
+          "test cases for feature4 1 max lag exceeded",
+          "show me feature4 1 max lag exceeded test cases",
+          "what are the feature4 1 max lag exceeded test inputs",
+          "give me the feature4_1_max_lag_exceeded test file",
+          "test cases for feature 4",
+          "feature4 1 max lag exceeded expected output",
+          "what does feature4 1 max lag exceeded expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_max_lag_exceeded:\n{\n  \"description\": \"When a maximum replica-lag threshold is set and the measured lag exceeds it, opening the scope raises a lag-exceeded error before any read runs. The threshold may be supplied per scope or via global defaults.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"lag\": 2,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"max_lag\": 1\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"error=too_much_lag\\nmessage=Replica lag over 1 seconds\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_max_lag_under",
+        "trigger_keywords": [
+          "test cases for feature4 2 max lag under",
+          "show me feature4 2 max lag under test cases",
+          "what are the feature4 2 max lag under test inputs",
+          "give me the feature4_2_max_lag_under test file",
+          "test cases for feature 4",
+          "feature4 2 max lag under expected output",
+          "what does feature4 2 max lag under expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_2_max_lag_under:\n{\n  \"description\": \"When a maximum replica-lag threshold is set and the measured lag is at or below it (whether stubbed low or measured live), reads proceed on the replica.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"lag\": 0,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"max_lag\": 1\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"read=replica\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_3_lag_unknown",
+        "trigger_keywords": [
+          "test cases for feature4 3 lag unknown",
+          "show me feature4 3 lag unknown test cases",
+          "what are the feature4 3 lag unknown test inputs",
+          "give me the feature4_3_lag_unknown test file",
+          "test cases for feature 4",
+          "feature4 3 lag unknown expected output",
+          "what does feature4 3 lag unknown expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_3_lag_unknown:\n{\n  \"description\": \"When the replica lag cannot be determined (unknown/nil) and a lag threshold is set, opening the scope raises a lag-exceeded error naming the connection.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"lag\": null,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"max_lag\": 1\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"error=too_much_lag\\nmessage=Replica lag is nil on default\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_4_lag_failover",
+        "trigger_keywords": [
+          "test cases for feature4 4 lag failover",
+          "show me feature4 4 lag failover test cases",
+          "what are the feature4 4 lag failover test inputs",
+          "give me the feature4_4_lag_failover test file",
+          "test cases for feature 4",
+          "feature4 4 lag failover expected output",
+          "what does feature4 4 lag failover expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_4_lag_failover:\n{\n  \"description\": \"When lag failover is enabled, exceeding the lag threshold (or being unable to measure lag) does not raise; instead a message is logged and reads fall back to the primary.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"lag\": 2,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"max_lag\": 1,\n              \"lag_failover\": true\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"log=Replica lag over 1 seconds. Falling back to master pool.\\nread=primary\\n\"\n    },\n    {\n      \"input\": {\n        \"lag\": null,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"max_lag\": 1,\n              \"lag_failover\": true\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"log=Replica lag is nil on default. Falling back to master pool.\\nread=primary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_5_lag_on_connection",
+        "trigger_keywords": [
+          "test cases for feature4 5 lag on connection",
+          "show me feature4 5 lag on connection test cases",
+          "what are the feature4 5 lag on connection test inputs",
+          "give me the feature4_5_lag_on_connection test file",
+          "test cases for feature 4",
+          "feature4 5 lag on connection expected output",
+          "what does feature4 5 lag on connection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_5_lag_on_connection:\n{\n  \"description\": \"When the lag threshold is checked against a named connection (supplied singly or as a list) and that connection's lag exceeds the threshold, the raised error names that connection.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"lag\": 2,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"max_lag\": 1,\n              \"lag_on\": \"User\"\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"error=too_much_lag\\nmessage=Replica lag over 1 seconds on User connection\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_replication_lag",
+        "trigger_keywords": [
+          "test cases for feature5 replication lag",
+          "show me feature5 replication lag test cases",
+          "what are the feature5 replication lag test inputs",
+          "give me the feature5_replication_lag test file",
+          "test cases for feature 5",
+          "feature5 replication lag expected output",
+          "what does feature5 replication lag expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_replication_lag:\n{\n  \"description\": \"The current replica replication lag can be read as a numeric value.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"lag\": 2,\n        \"program\": [\n          {\n            \"op\": \"replication_lag\"\n          }\n        ]\n      },\n      \"expected_output\": \"replication_lag=2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_failover_to_primary",
+        "trigger_keywords": [
+          "test cases for feature6 1 failover to primary",
+          "show me feature6 1 failover to primary test cases",
+          "what are the feature6 1 failover to primary test inputs",
+          "give me the feature6_1_failover_to_primary test file",
+          "test cases for feature 6",
+          "feature6 1 failover to primary expected output",
+          "what does feature6 1 failover to primary expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_failover_to_primary:\n{\n  \"description\": \"When no replicas are available, a distribution scope logs the situation and falls back to the primary. This holds whether or not default-distribution mode is on.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"blacklist_replicas\": true,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {},\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"log=No replicas available. Falling back to master pool.\\nread=primary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_2_failover_disabled",
+        "trigger_keywords": [
+          "test cases for feature6 2 failover disabled",
+          "show me feature6 2 failover disabled test cases",
+          "what are the feature6 2 failover disabled test inputs",
+          "give me the feature6_2_failover_disabled test file",
+          "test cases for feature 6",
+          "feature6 2 failover disabled expected output",
+          "what does feature6 2 failover disabled expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_2_failover_disabled:\n{\n  \"description\": \"When no replicas are available and failover is disabled, opening the scope raises a no-replicas-available error. This holds whether or not default-distribution mode is on.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"blacklist_replicas\": true,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"failover\": false\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"error=no_replicas_available\\nmessage=No replicas available\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_1_force_replica",
+        "trigger_keywords": [
+          "test cases for feature7 1 force replica",
+          "show me feature7 1 force replica test cases",
+          "what are the feature7 1 force replica test inputs",
+          "give me the feature7_1_force_replica test file",
+          "test cases for feature 7",
+          "feature7 1 force replica expected output",
+          "what does feature7 1 force replica expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_1_force_replica:\n{\n  \"description\": \"Forcing replica use for a scope routes its reads to the replica even when default-distribution mode is off; reads outside the scope still use the primary. SQL comment prefixes do not change routing.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"program\": [\n          {\n            \"op\": \"read\",\n            \"prefix\": \"/*hi*/\"\n          },\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"replica\": true\n            },\n            \"body\": [\n              {\n                \"op\": \"read\",\n                \"prefix\": \"/*hi*/\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"read=primary\\nread=replica\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_2_force_replica_failover",
+        "trigger_keywords": [
+          "test cases for feature7 2 force replica failover",
+          "show me feature7 2 force replica failover test cases",
+          "what are the feature7 2 force replica failover test inputs",
+          "give me the feature7_2_force_replica_failover test file",
+          "test cases for feature 7",
+          "feature7 2 force replica failover expected output",
+          "what does feature7 2 force replica failover expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_2_force_replica_failover:\n{\n  \"description\": \"Forcing replica use when no replicas are available logs the situation and falls back to the primary.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"blacklist_replicas\": true,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"replica\": true\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"log=No replicas available. Falling back to master pool.\\nread=primary\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_3_force_replica_failover_disabled",
+        "trigger_keywords": [
+          "test cases for feature7 3 force replica failover disabled",
+          "show me feature7 3 force replica failover disabled test cases",
+          "what are the feature7 3 force replica failover disabled test inputs",
+          "give me the feature7_3_force_replica_failover_disabled test file",
+          "test cases for feature 7",
+          "feature7 3 force replica failover disabled expected output",
+          "what does feature7 3 force replica failover disabled expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_3_force_replica_failover_disabled:\n{\n  \"description\": \"Forcing replica use when no replicas are available and failover is disabled raises a no-replicas-available error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"blacklist_replicas\": true,\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {\n              \"replica\": true,\n              \"failover\": false\n            },\n            \"body\": [\n              {\n                \"op\": \"read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"error=no_replicas_available\\nmessage=No replicas available\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_1_job_distribution",
+        "trigger_keywords": [
+          "test cases for feature8 1 job distribution",
+          "show me feature8 1 job distribution test cases",
+          "what are the feature8 1 job distribution test inputs",
+          "give me the feature8_1_job_distribution test file",
+          "test cases for feature 8",
+          "feature8 1 job distribution expected output",
+          "what does feature8 1 job distribution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_1_job_distribution:\n{\n  \"description\": \"A background job declared to distribute its reads runs its reads on the replica.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"program\": [\n          {\n            \"op\": \"job\",\n            \"role\": \"read_only\"\n          }\n        ]\n      },\n      \"expected_output\": \"job=replica\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_2_job_by_default",
+        "trigger_keywords": [
+          "test cases for feature8 2 job by default",
+          "show me feature8 2 job by default test cases",
+          "what are the feature8 2 job by default test inputs",
+          "give me the feature8_2_job_by_default test file",
+          "test cases for feature 8",
+          "feature8 2 job by default expected output",
+          "what does feature8 2 job by default expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_2_job_by_default:\n{\n  \"description\": \"With default-distribution mode on, a background job that both reads and writes runs its read on the replica on each invocation, because job context is reset between runs.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"by_default\": true,\n        \"program\": [\n          {\n            \"op\": \"job\",\n            \"role\": \"read_write\"\n          },\n          {\n            \"op\": \"job\",\n            \"role\": \"read_write\"\n          }\n        ]\n      },\n      \"expected_output\": \"job=replica\\njob=replica\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_lazy_relation_warning",
+        "trigger_keywords": [
+          "test cases for feature9 lazy relation warning",
+          "show me feature9 lazy relation warning test cases",
+          "what are the feature9 lazy relation warning test inputs",
+          "give me the feature9_lazy_relation_warning test file",
+          "test cases for feature 9",
+          "feature9 lazy relation warning expected output",
+          "what does feature9 lazy relation warning expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_lazy_relation_warning:\n{\n  \"description\": \"When a distribution scope returns a query object that has not been executed yet, a warning is logged advising the caller to force execution inside the scope.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"program\": [\n          {\n            \"op\": \"scope\",\n            \"options\": {},\n            \"body\": [\n              {\n                \"op\": \"lazy_read\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"log=Call `to_a` inside block to execute query on replica\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "after someone does a write, we can't serve their next read from a stale replica, that's caused support tickets before",
+        "actual_meaning": "The write-pinning behavior in default-distribution mode (by_default: true): a write at the top level sets a sticky flag that routes subsequent reads to the primary; this flag is scoped so it does not bleed into explicit distribution scopes (feature3_1 and feature3_2 test cases)."
+      }
+    ],
+    "fallback_response": "That's a good question but I don't have the specific detail on that right now — could you check the existing test case files under `rcb_tests/public_test_cases/` or the PRD in `start.md`? Those should have the exact behavior defined. If something still seems ambiguous after checking, flag it and we can discuss."
+  },
+  "public_test_cases": {
+    "feature10_1_missing_block.json": {
+      "description": "Invoking the distribution entry point without a block raises a missing-block error.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "scope_without_block"
+              }
+            ]
+          },
+          "expected_output": "error=missing_block\nmessage=Missing block\n"
+        }
+      ]
+    },
+    "feature10_2_unknown_keywords.json": {
+      "description": "Invoking the distribution entry point with options it does not recognize raises an unknown-keywords error listing the offending keys in order.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "hi": 1,
+                  "bye": 2
+                },
+                "body": []
+              }
+            ]
+          },
+          "expected_output": "error=unknown_keywords\nmessage=Unknown keywords: hi, bye\n"
+        }
+      ]
+    },
+    "feature1_default_routing.json": {
+      "description": "With no distribution scope active and default mode off, a read is served by the primary database.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "read"
+              }
+            ]
+          },
+          "expected_output": "read=primary\n"
+        }
+      ]
+    },
+    "feature2_1_block_reads_replica.json": {
+      "description": "A read executed outside any scope uses the primary; inside a distribution scope reads use the replica, and a write performed inside the scope does not pin later reads back to the primary.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "write"
+              },
+              {
+                "op": "read"
+              },
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "read"
+                  },
+                  {
+                    "op": "write"
+                  },
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=primary\nread=replica\nread=replica\n"
+        }
+      ]
+    },
+    "feature2_2_transaction_primary.json": {
+      "description": "A read wrapped in a transaction inside a distribution scope is served by the primary, because transactional work must stay on the writable node.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "transaction",
+                    "body": [
+                      {
+                        "op": "read"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=primary\n"
+        }
+      ]
+    },
+    "feature3_1_by_default_sticky.json": {
+      "description": "When default-distribution mode is on, a plain read uses the replica; after a write, subsequent reads are pinned to the primary for consistency.",
+      "cases": [
+        {
+          "input": {
+            "by_default": true,
+            "program": [
+              {
+                "op": "read"
+              },
+              {
+                "op": "write"
+              },
+              {
+                "op": "read"
+              }
+            ]
+          },
+          "expected_output": "read=replica\nread=primary\n"
+        }
+      ]
+    },
+    "feature3_2_block_inside_default.json": {
+      "description": "With default-distribution mode on, reads inside a distribution scope stay on the replica even after a write within the scope; once the scope exits, an earlier write pins the next read to the primary.",
+      "cases": [
+        {
+          "input": {
+            "by_default": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "read"
+                  },
+                  {
+                    "op": "write"
+                  },
+                  {
+                    "op": "read"
+                  }
+                ]
+              },
+              {
+                "op": "read"
+              }
+            ]
+          },
+          "expected_output": "read=replica\nread=replica\nread=primary\n"
+        }
+      ]
+    },
+    "feature3_3_primary_override.json": {
+      "description": "With default-distribution mode on, opening a scope that forces the primary routes its reads back to the primary.",
+      "cases": [
+        {
+          "input": {
+            "by_default": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "primary": true
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=primary\n"
+        }
+      ]
+    },
+    "feature4_1_max_lag_exceeded.json": {
+      "description": "When a maximum replica-lag threshold is set and the measured lag exceeds it, opening the scope raises a lag-exceeded error before any read runs. The threshold may be supplied per scope or via global defaults.",
+      "cases": [
+        {
+          "input": {
+            "lag": 2,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=too_much_lag\nmessage=Replica lag over 1 seconds\n"
+        }
+      ]
+    },
+    "feature4_2_max_lag_under.json": {
+      "description": "When a maximum replica-lag threshold is set and the measured lag is at or below it (whether stubbed low or measured live), reads proceed on the replica.",
+      "cases": [
+        {
+          "input": {
+            "lag": 0,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=replica\n"
+        }
+      ]
+    },
+    "feature4_3_lag_unknown.json": {
+      "description": "When the replica lag cannot be determined (unknown/nil) and a lag threshold is set, opening the scope raises a lag-exceeded error naming the connection.",
+      "cases": [
+        {
+          "input": {
+            "lag": null,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=too_much_lag\nmessage=Replica lag is nil on default\n"
+        }
+      ]
+    },
+    "feature4_4_lag_failover.json": {
+      "description": "When lag failover is enabled, exceeding the lag threshold (or being unable to measure lag) does not raise; instead a message is logged and reads fall back to the primary.",
+      "cases": [
+        {
+          "input": {
+            "lag": 2,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1,
+                  "lag_failover": true
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=Replica lag over 1 seconds. Falling back to master pool.\nread=primary\n"
+        },
+        {
+          "input": {
+            "lag": null,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1,
+                  "lag_failover": true
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=Replica lag is nil on default. Falling back to master pool.\nread=primary\n"
+        }
+      ]
+    },
+    "feature4_5_lag_on_connection.json": {
+      "description": "When the lag threshold is checked against a named connection (supplied singly or as a list) and that connection's lag exceeds the threshold, the raised error names that connection.",
+      "cases": [
+        {
+          "input": {
+            "lag": 2,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1,
+                  "lag_on": "User"
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=too_much_lag\nmessage=Replica lag over 1 seconds on User connection\n"
+        }
+      ]
+    },
+    "feature5_replication_lag.json": {
+      "description": "The current replica replication lag can be read as a numeric value.",
+      "cases": [
+        {
+          "input": {
+            "lag": 2,
+            "program": [
+              {
+                "op": "replication_lag"
+              }
+            ]
+          },
+          "expected_output": "replication_lag=2\n"
+        }
+      ]
+    },
+    "feature6_1_failover_to_primary.json": {
+      "description": "When no replicas are available, a distribution scope logs the situation and falls back to the primary. This holds whether or not default-distribution mode is on.",
+      "cases": [
+        {
+          "input": {
+            "blacklist_replicas": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=No replicas available. Falling back to master pool.\nread=primary\n"
+        }
+      ]
+    },
+    "feature6_2_failover_disabled.json": {
+      "description": "When no replicas are available and failover is disabled, opening the scope raises a no-replicas-available error. This holds whether or not default-distribution mode is on.",
+      "cases": [
+        {
+          "input": {
+            "blacklist_replicas": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "failover": false
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=no_replicas_available\nmessage=No replicas available\n"
+        }
+      ]
+    },
+    "feature7_1_force_replica.json": {
+      "description": "Forcing replica use for a scope routes its reads to the replica even when default-distribution mode is off; reads outside the scope still use the primary. SQL comment prefixes do not change routing.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "read",
+                "prefix": "/*hi*/"
+              },
+              {
+                "op": "scope",
+                "options": {
+                  "replica": true
+                },
+                "body": [
+                  {
+                    "op": "read",
+                    "prefix": "/*hi*/"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=primary\nread=replica\n"
+        }
+      ]
+    },
+    "feature7_2_force_replica_failover.json": {
+      "description": "Forcing replica use when no replicas are available logs the situation and falls back to the primary.",
+      "cases": [
+        {
+          "input": {
+            "blacklist_replicas": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "replica": true
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=No replicas available. Falling back to master pool.\nread=primary\n"
+        }
+      ]
+    },
+    "feature7_3_force_replica_failover_disabled.json": {
+      "description": "Forcing replica use when no replicas are available and failover is disabled raises a no-replicas-available error.",
+      "cases": [
+        {
+          "input": {
+            "blacklist_replicas": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "replica": true,
+                  "failover": false
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=no_replicas_available\nmessage=No replicas available\n"
+        }
+      ]
+    },
+    "feature8_1_job_distribution.json": {
+      "description": "A background job declared to distribute its reads runs its reads on the replica.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "job",
+                "role": "read_only"
+              }
+            ]
+          },
+          "expected_output": "job=replica\n"
+        }
+      ]
+    },
+    "feature8_2_job_by_default.json": {
+      "description": "With default-distribution mode on, a background job that both reads and writes runs its read on the replica on each invocation, because job context is reset between runs.",
+      "cases": [
+        {
+          "input": {
+            "by_default": true,
+            "program": [
+              {
+                "op": "job",
+                "role": "read_write"
+              },
+              {
+                "op": "job",
+                "role": "read_write"
+              }
+            ]
+          },
+          "expected_output": "job=replica\njob=replica\n"
+        }
+      ]
+    },
+    "feature9_lazy_relation_warning.json": {
+      "description": "When a distribution scope returns a query object that has not been executed yet, a warning is logged advising the caller to force execution inside the scope.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "lazy_read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=Call `to_a` inside block to execute query on replica\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C003",
+      "C004"
+    ],
+    "kept_c": [
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 1,
+    "kept_cp": 1
+  }
+}

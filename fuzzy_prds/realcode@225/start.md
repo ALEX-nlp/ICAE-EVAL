@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from platform folks that hand-authoring all these ingress gateway configs is a nightmare — people keep shipping broken setups where traffic just disappears into a black hole, TLS stuff silently fails, or streaming connections drop because someone forgot a flag somewhere. We need a config builder toolkit that lets devs snap together the different pieces (backends, routing rules, host groupings, listeners, the connection handler thingy, etc.) without having to know all the safe defaults by heart.
+
+The outputs need to be consistent — like, if you ask for HTTP/2 it should say so, if you don't it should still say something. Same deal with the websocket situation we always forget about (remember how we fixed that in the login module proxy config? do something like that). TLS material should come back out exactly as it went in, no funny business.
+
+Also need something that reads the operator settings map and turns it into a typed config — there's one boolean setting for logging that has a default, and bad values should give back a clean error rather than blowing up. The whole thing should be split up sensibly, not one giant file. The JSON test harness stuff is just for black-box testing the adapter layer, the actual builder logic should stay decoupled from all that stdin/stdout wiring.

@@ -1,0 +1,647 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out that async coordination library we've been talking about. Basically, we're getting a lot of complaints from devs that they keep writing the same boilerplate state-tracking code every time they need to wait on something async — it's messy, buggy, and nobody wants to maintain it. Think of it like what we did with the deferred pattern on the payments flow, but more general-purpose.\n\nCore stuff we need: some kind of result object that can be pending, done, or failed. Once it's settled it shouldn't be changeable (but repeating the same settlement should probably just be fine). Devs should be able to chain work off these results, recover from failures, and cancel things that are still in-flight. Cancellation should ripple upstream through any dependency chain.\n\nWe also want batch helpers — wait for all of them, wait for just enough of them, or just get a full report of what happened without blowing up. Plus some iterator-style helpers for processing lists with optional concurrency limits.\n\nThere's also a queue thing — tasks should run in the order they were added, and we should be able to schedule a thunk and get a result object back. Oh and generator-style async sequencing would be great, similar to how we wired up the step-runner in the old pipeline module.\n\nFinally some simple state-check helpers so you don't have to poke at internals. Timeline is flexible but let's not gold-plate it.\n\nOne small follow-up from the questions that came in: on settlement, we're being strict about outcome changes but relaxed about exact repeats. Repeating the exact same settlement action with the exact same value on an already-settled result is silently accepted and leaves the state unchanged. But if somebody tries to change the outcome after the fact, like rejecting something already fulfilled or fulfilling something already rejected, that needs to raise a `state_change_forbidden` error, and the final state and stored value stay whatever they were from the first settlement. This is all in line with the core `Result` / `Deferred` object lifecycle described in Feature 1 of start.md, specifically the pending → fulfilled/rejected state machine with single-settlement guarantees and producer callback pattern.\n\nAlso, a little more color on waiting and errors: when waiting on a rejected result with unwrapping enabled, the output must include `error=result_rejected` and `reason=<original reason>`, and after that the state still remains `rejected`. If unwrapping is disabled, the wait should still drive the state transition, but it should NOT emit those error/reason lines. Separate case here: if the producer callback itself throws, the reported error must be `callback_error`, not `result_rejected`, and it should use the callback's exception message.\n\nOn cancellation, cancelling a pending result rejects it and invokes its cancellation hook exactly once. If you cancel an intermediate node in a dependency chain, that cancellation propagates upstream, so all ancestor pending nodes are also rejected. But nodes downstream of the cancelled node don't immediately flip; they remain pending until somebody explicitly waits on them. At that point, the output must include `result_cancelled`, and then that child ends up in the `rejected` state.\n\nFor the batch helpers, the main nuance is ordering. The all-required batch can have items settle in whatever order they happen to settle, but the final fulfilled value list MUST preserve the original input order, not the resolution order. And if even one input rejects, the whole batch rejects immediately with that item's reason. For the count-based competitive version, if it becomes impossible to reach the requested number of fulfilled results because too many have already rejected, it must reject with the error key `not_enough_fulfilled` and include a list of all rejection reasons collected so far. Also, `batch_any` should fulfill with the single winning value directly, NOT wrapped in a list, whereas `batch_some` returns the winning values in completion order as a list.",
+  "oracle_data": {
+    "task_id": "ASYNC-COORD-LIB-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what does settle-and-inspect return for each item",
+          "per-item record format for batch settlement report",
+          "does the settle batch ever reject"
+        ],
+        "oracle_response": "The settle-and-report batch ALWAYS fulfills (never rejects), regardless of individual item outcomes. Its fulfillment value is an array of per-item records in original input order. Each record must use `{\"state\":\"fulfilled\",\"value\":\"<v>\"}` for successes and `{\"state\":\"rejected\",\"reason\":\"<r>\"}` for failures. The batch-level result state is always `fulfilled`."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "does the iterator aggregate reject if one item fails",
+          "what happens to the aggregate when iterate_all hits a rejected item",
+          "fail-fast behavior in iteration"
+        ],
+        "oracle_response": "The unbounded `iterate_all` operation always fulfills the aggregate, even if per-item rejections occur — rejection callbacks handle those inline and the aggregate continues. The limited iteration variant has a separate fail-fast mode: when enabled, it emits fulfillment events for earlier successes but rejects the aggregate with the first rejection reason encountered. The aggregate state and events array are the two output lines."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "what state is a scheduled task before the queue runs",
+          "is a scheduled thunk pending before drain",
+          "what happens if a scheduled task throws"
+        ],
+        "oracle_response": "A scheduled thunk creates a result object that starts in `pending` state before the queue is drained. After draining, if the thunk returns normally it fulfills with the return value. If the thunk throws, the result rejects with a normalized `callback_error` containing the thrown message. The queue itself tracks empty state — it must report empty before tasks are added and empty again after draining."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "how does generator sequencing work",
+          "what does the generator yield and what does it get back",
+          "generator rejection catch and resume behavior"
+        ],
+        "oracle_response": "Generator-style sequencing drives a generator function step by step: each yielded value is a result object, and the generator receives the fulfilled value back to continue. The final result fulfills with whatever the generator's last expression produces (e.g., concatenating received values). For the rejection-catch variant, when a yielded result is rejected, the generator catches the reason inside a try/catch block, uses it, and can yield a fulfilled replacement — allowing the sequence to continue and the aggregate to fulfill."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "what are the state predicate helpers",
+          "how do I check if a result is fulfilled or settled",
+          "is_fulfilled is_rejected is_settled flags"
+        ],
+        "oracle_response": "The library must expose three boolean predicate helpers per result: `is_fulfilled`, `is_rejected`, and `is_settled`. `is_settled` is true for both fulfilled and rejected states, false for pending. A fulfilled result: `is_fulfilled=true`, `is_rejected=false`, `is_settled=true`. A rejected result: `is_fulfilled=false`, `is_rejected=true`, `is_settled=true`. A pending result: all three are false."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_1_pre_settled_promises",
+        "trigger_keywords": [
+          "test cases for feature1 1 pre settled promises",
+          "show me feature1 1 pre settled promises test cases",
+          "what are the feature1 1 pre settled promises test inputs",
+          "give me the feature1_1_pre_settled_promises test file",
+          "test cases for feature 1",
+          "feature1 1 pre settled promises expected output",
+          "what does feature1 1 pre settled promises expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_pre_settled_promises:\n{\n  \"description\": \"Pre-settled success and failure objects expose their state, waiting behavior, and cancellation stability.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"fulfilled_wait_cancel\",\n        \"value\": \"foo\"\n      },\n      \"expected_output\": \"state_before=fulfilled\\nstate_after_cancel=fulfilled\\nwait_value=foo\\n\"\n    },\n    {\n      \"input\": {\n        \"operation\": \"rejected_wait\",\n        \"reason\": \"foo\"\n      },\n      \"expected_output\": \"state_before=rejected\\nerror=result_rejected\\nreason=foo\\nstate_after=rejected\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_single_settlement",
+        "trigger_keywords": [
+          "test cases for feature1 2 single settlement",
+          "show me feature1 2 single settlement test cases",
+          "what are the feature1 2 single settlement test inputs",
+          "give me the feature1_2_single_settlement test file",
+          "test cases for feature 1",
+          "feature1 2 single settlement expected output",
+          "what does feature1 2 single settlement expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_single_settlement:\n{\n  \"description\": \"A pending asynchronous result may settle once; identical repeat settlement is ignored, but changing an already settled outcome is rejected.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"settle_once\",\n        \"first_action\": \"resolve\",\n        \"first_value\": \"foo\",\n        \"second_action\": \"resolve\",\n        \"second_value\": \"foo\"\n      },\n      \"expected_output\": \"state_after_first=fulfilled\\nsecond_action=accepted\\nfinal_state=fulfilled\\nwait_value=foo\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_waiting_and_unwrapping",
+        "trigger_keywords": [
+          "test cases for feature1 3 waiting and unwrapping",
+          "show me feature1 3 waiting and unwrapping test cases",
+          "what are the feature1 3 waiting and unwrapping test inputs",
+          "give me the feature1_3_waiting_and_unwrapping test file",
+          "test cases for feature 1",
+          "feature1 3 waiting and unwrapping expected output",
+          "what does feature1 3 waiting and unwrapping expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_waiting_and_unwrapping:\n{\n  \"description\": \"Waiting triggers the producer callback, reports fulfilled values, and normalizes rejection or callback failure as data.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"wait_callback\",\n        \"mode\": \"resolve\",\n        \"value\": \"10\"\n      },\n      \"expected_output\": \"state=fulfilled\\nwait_value=10\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_4_chaining_and_recovery",
+        "trigger_keywords": [
+          "test cases for feature1 4 chaining and recovery",
+          "show me feature1 4 chaining and recovery test cases",
+          "what are the feature1 4 chaining and recovery test inputs",
+          "give me the feature1_4_chaining_and_recovery test file",
+          "test cases for feature 1",
+          "feature1 4 chaining and recovery expected output",
+          "what does feature1 4 chaining and recovery expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_4_chaining_and_recovery:\n{\n  \"description\": \"Callbacks attached to asynchronous results run through the queue, transform fulfillment values, and allow rejection recovery through later fulfillment.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"chain_transform\",\n        \"start\": \"a\",\n        \"append\": [\n          \"-1-\",\n          \"2\"\n        ]\n      },\n      \"expected_output\": \"wait_value=a-1-2\\nstate=fulfilled\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_5_cancellation",
+        "trigger_keywords": [
+          "test cases for feature1 5 cancellation",
+          "show me feature1 5 cancellation test cases",
+          "what are the feature1 5 cancellation test inputs",
+          "give me the feature1_5_cancellation test file",
+          "test cases for feature 1",
+          "feature1 5 cancellation expected output",
+          "what does feature1 5 cancellation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_5_cancellation:\n{\n  \"description\": \"Cancellation rejects pending work, invokes cancellation hooks, and propagates cancellation to ancestor chain nodes while later children settle when waited on.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"cancel_pending\"\n      },\n      \"expected_output\": \"state=rejected\\ncancel_callback_called=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_all_and_unwrap",
+        "trigger_keywords": [
+          "test cases for feature2 1 all and unwrap",
+          "show me feature2 1 all and unwrap test cases",
+          "what are the feature2 1 all and unwrap test inputs",
+          "give me the feature2_1_all_and_unwrap test file",
+          "test cases for feature 2",
+          "feature2 1 all and unwrap expected output",
+          "what does feature2 1 all and unwrap expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_all_and_unwrap:\n{\n  \"description\": \"Batch waiting preserves input keys and order for all fulfilled items, while the first rejected item rejects the aggregate or unwrap operation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"batch_all_required\",\n        \"values\": [\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"a\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"b\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"c\"\n          }\n        ],\n        \"resolution_order\": [\n          1,\n          0,\n          2\n        ]\n      },\n      \"expected_output\": \"result_state=fulfilled\\nresult_value=[\\\"a\\\",\\\"b\\\",\\\"c\\\"]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_some_and_any",
+        "trigger_keywords": [
+          "test cases for feature2 2 some and any",
+          "show me feature2 2 some and any test cases",
+          "what are the feature2 2 some and any test inputs",
+          "give me the feature2_2_some_and_any test file",
+          "test cases for feature 2",
+          "feature2 2 some and any expected output",
+          "what does feature2 2 some and any expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_some_and_any:\n{\n  \"description\": \"Competitive aggregation fulfills when enough inputs have fulfilled in resolution order, or rejects with normalized aggregate failure when the requested count is impossible.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"batch_some_required\",\n        \"count\": 2,\n        \"values\": [\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"a\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"b\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"c\"\n          }\n        ],\n        \"resolution_order\": [\n          1,\n          2,\n          0\n        ]\n      },\n      \"expected_output\": \"result_state=fulfilled\\nresult_value=[\\\"b\\\",\\\"c\\\"]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_settle_and_inspect",
+        "trigger_keywords": [
+          "test cases for feature2 3 settle and inspect",
+          "show me feature2 3 settle and inspect test cases",
+          "what are the feature2 3 settle and inspect test inputs",
+          "give me the feature2_3_settle_and_inspect test file",
+          "test cases for feature 2",
+          "feature2 3 settle and inspect expected output",
+          "what does feature2 3 settle and inspect expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_settle_and_inspect:\n{\n  \"description\": \"Inspection reports fulfilled values and rejected reasons without throwing, and settling a batch always fulfills with per-item inspection records.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"batch_settle_report\",\n        \"values\": [\n          {\n            \"state\": \"rejected\",\n            \"reason\": \"a\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"b\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"c\"\n          }\n        ],\n        \"resolution_order\": [\n          1,\n          2,\n          0\n        ]\n      },\n      \"expected_output\": \"result_state=fulfilled\\nresult_value=[{\\\"state\\\":\\\"rejected\\\",\\\"reason\\\":\\\"a\\\"},{\\\"state\\\":\\\"fulfilled\\\",\\\"value\\\":\\\"b\\\"},{\\\"state\\\":\\\"fulfilled\\\",\\\"value\\\":\\\"c\\\"}]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_each_iteration",
+        "trigger_keywords": [
+          "test cases for feature3 1 each iteration",
+          "show me feature3 1 each iteration test cases",
+          "what are the feature3 1 each iteration test inputs",
+          "give me the feature3_1_each_iteration test file",
+          "test cases for feature 3",
+          "feature3 1 each iteration expected output",
+          "what does feature3 1 each iteration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_each_iteration:\n{\n  \"description\": \"Iterator-style processing invokes success and failure callbacks for each item and fulfills the aggregate once the iterable is consumed.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"iterate_all\",\n        \"items\": [\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"a\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"c\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"b\"\n          }\n        ]\n      },\n      \"expected_output\": \"aggregate_state=fulfilled\\nevents=[\\\"fulfilled:0:a\\\",\\\"fulfilled:1:c\\\",\\\"fulfilled:2:b\\\"]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_limited_iteration",
+        "trigger_keywords": [
+          "test cases for feature3 2 limited iteration",
+          "show me feature3 2 limited iteration test cases",
+          "what are the feature3 2 limited iteration test inputs",
+          "give me the feature3_2_limited_iteration test file",
+          "test cases for feature 3",
+          "feature3 2 limited iteration expected output",
+          "what does feature3 2 limited iteration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_limited_iteration:\n{\n  \"description\": \"Limited iterator processing caps concurrent pending work while preserving callback indexes and completion events.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"iterate_limited\",\n        \"concurrency\": 2,\n        \"values\": [\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"a\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"b\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"c\"\n          },\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"d\"\n          }\n        ],\n        \"resolution_order\": [\n          0,\n          1,\n          2,\n          3\n        ]\n      },\n      \"expected_output\": \"aggregate_state=fulfilled\\nevents=[\\\"fulfilled:0:a\\\",\\\"fulfilled:1:b\\\",\\\"fulfilled:2:c\\\",\\\"fulfilled:3:d\\\"]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_task_queue",
+        "trigger_keywords": [
+          "test cases for feature4 1 task queue",
+          "show me feature4 1 task queue test cases",
+          "what are the feature4 1 task queue test inputs",
+          "give me the feature4_1_task_queue test file",
+          "test cases for feature 4",
+          "feature4 1 task queue expected output",
+          "what does feature4 1 task queue expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_task_queue:\n{\n  \"description\": \"A FIFO task queue reports emptiness, executes scheduled tasks in insertion order, and is empty after draining.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"fifo_queue\",\n        \"tasks\": [\n          \"a\",\n          \"b\",\n          \"c\"\n        ]\n      },\n      \"expected_output\": \"empty_before=true\\nempty_after_add=false\\nevents=[\\\"a\\\",\\\"b\\\",\\\"c\\\"]\\nempty_after_run=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_scheduled_tasks",
+        "trigger_keywords": [
+          "test cases for feature4 2 scheduled tasks",
+          "show me feature4 2 scheduled tasks test cases",
+          "what are the feature4 2 scheduled tasks test inputs",
+          "give me the feature4_2_scheduled_tasks test file",
+          "test cases for feature 4",
+          "feature4 2 scheduled tasks expected output",
+          "what does feature4 2 scheduled tasks expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_2_scheduled_tasks:\n{\n  \"description\": \"A scheduled thunk starts pending, then fulfills with the return value or rejects with a normalized callback error when the queue runs.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"schedule_task\",\n        \"mode\": \"return\",\n        \"value\": \"Hi!\"\n      },\n      \"expected_output\": \"state_before_run=pending\\nresult_state=fulfilled\\nresult_value=Hi!\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_generator_sequences",
+        "trigger_keywords": [
+          "test cases for feature5 1 generator sequences",
+          "show me feature5 1 generator sequences test cases",
+          "what are the feature5 1 generator sequences test inputs",
+          "give me the feature5_1_generator_sequences test file",
+          "test cases for feature 5",
+          "feature5 1 generator sequences expected output",
+          "what does feature5 1 generator sequences expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_generator_sequences:\n{\n  \"description\": \"Generator-style generators consume yielded asynchronous results in sequence and fulfill with the final yielded value.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"generator_sequence\",\n        \"yields\": [\n          {\n            \"state\": \"fulfilled\",\n            \"value\": \"a\"\n          }\n        ],\n        \"append\": \"b\"\n      },\n      \"expected_output\": \"result_state=fulfilled\\nresult_value=ab\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_generator_rejection_handling",
+        "trigger_keywords": [
+          "test cases for feature5 2 generator rejection handling",
+          "show me feature5 2 generator rejection handling test cases",
+          "what are the feature5 2 generator rejection handling test inputs",
+          "give me the feature5_2_generator_rejection_handling test file",
+          "test cases for feature 5",
+          "feature5 2 generator rejection handling expected output",
+          "what does feature5 2 generator rejection handling expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_generator_rejection_handling:\n{\n  \"description\": \"Generator-style generators can catch a rejected yielded result, inspect the rejection reason, and continue by yielding a fulfilled replacement.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"generator_catch\",\n        \"reason\": \"a\",\n        \"append\": \"b\"\n      },\n      \"expected_output\": \"result_state=fulfilled\\nresult_value=ab\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_state_predicates",
+        "trigger_keywords": [
+          "test cases for feature6 state predicates",
+          "show me feature6 state predicates test cases",
+          "what are the feature6 state predicates test inputs",
+          "give me the feature6_state_predicates test file",
+          "test cases for feature 6",
+          "feature6 state predicates expected output",
+          "what does feature6 state predicates expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_state_predicates:\n{\n  \"description\": \"State predicate helpers report whether asynchronous results are fulfilled, rejected, or generally settled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"state_flags\",\n        \"states\": {\n          \"ready\": \"fulfilled\",\n          \"failed\": \"rejected\",\n          \"later\": \"pending\"\n        }\n      },\n      \"expected_output\": \"ready_is_fulfilled=true\\nready_is_rejected=false\\nready_is_settled=true\\nfailed_is_fulfilled=false\\nfailed_is_rejected=true\\nfailed_is_settled=true\\nlater_is_fulfilled=false\\nlater_is_rejected=false\\nlater_is_settled=false\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "similar to how we wired up the step-runner in the old pipeline module",
+        "actual_meaning": "The generator-style async sequencing described in Feature 5 of start.md — specifically `feature5_1_generator_sequences.json` and `feature5_2_generator_rejection_handling.json`, where a generator yields result objects and receives fulfilled values back step by step."
+      },
+      {
+        "vague_reference": "refer to the compatibility logic from that login module we did last time",
+        "actual_meaning": "The normalized error type system used across the library: `result_rejected`, `state_change_forbidden`, `callback_error`, `not_enough_fulfilled`, and `result_cancelled` — these are the specific string keys used in error/output lines, as seen across all feature test cases."
+      }
+    ],
+    "fallback_response": "That's a good question but I don't have the exact spec detail on hand right now. I'd suggest checking the test case files under `rcb_tests/public_test_cases/` — the expected output strings there should clarify the exact format and behavior. If it's still ambiguous after that, make a reasonable call and flag it in the PR for review."
+  },
+  "public_test_cases": {
+    "feature1_1_pre_settled_promises.json": {
+      "description": "Pre-settled success and failure objects expose their state, waiting behavior, and cancellation stability.",
+      "cases": [
+        {
+          "input": {
+            "operation": "fulfilled_wait_cancel",
+            "value": "foo"
+          },
+          "expected_output": "state_before=fulfilled\nstate_after_cancel=fulfilled\nwait_value=foo\n"
+        },
+        {
+          "input": {
+            "operation": "rejected_wait",
+            "reason": "foo"
+          },
+          "expected_output": "state_before=rejected\nerror=result_rejected\nreason=foo\nstate_after=rejected\n"
+        }
+      ]
+    },
+    "feature1_2_single_settlement.json": {
+      "description": "A pending asynchronous result may settle once; identical repeat settlement is ignored, but changing an already settled outcome is rejected.",
+      "cases": [
+        {
+          "input": {
+            "operation": "settle_once",
+            "first_action": "resolve",
+            "first_value": "foo",
+            "second_action": "resolve",
+            "second_value": "foo"
+          },
+          "expected_output": "state_after_first=fulfilled\nsecond_action=accepted\nfinal_state=fulfilled\nwait_value=foo\n"
+        }
+      ]
+    },
+    "feature1_3_waiting_and_unwrapping.json": {
+      "description": "Waiting triggers the producer callback, reports fulfilled values, and normalizes rejection or callback failure as data.",
+      "cases": [
+        {
+          "input": {
+            "operation": "wait_callback",
+            "mode": "resolve",
+            "value": "10"
+          },
+          "expected_output": "state=fulfilled\nwait_value=10\n"
+        }
+      ]
+    },
+    "feature1_4_chaining_and_recovery.json": {
+      "description": "Callbacks attached to asynchronous results run through the queue, transform fulfillment values, and allow rejection recovery through later fulfillment.",
+      "cases": [
+        {
+          "input": {
+            "operation": "chain_transform",
+            "start": "a",
+            "append": [
+              "-1-",
+              "2"
+            ]
+          },
+          "expected_output": "wait_value=a-1-2\nstate=fulfilled\n"
+        }
+      ]
+    },
+    "feature1_5_cancellation.json": {
+      "description": "Cancellation rejects pending work, invokes cancellation hooks, and propagates cancellation to ancestor chain nodes while later children settle when waited on.",
+      "cases": [
+        {
+          "input": {
+            "operation": "cancel_pending"
+          },
+          "expected_output": "state=rejected\ncancel_callback_called=true\n"
+        }
+      ]
+    },
+    "feature2_1_all_and_unwrap.json": {
+      "description": "Batch waiting preserves input keys and order for all fulfilled items, while the first rejected item rejects the aggregate or unwrap operation.",
+      "cases": [
+        {
+          "input": {
+            "operation": "batch_all_required",
+            "values": [
+              {
+                "state": "fulfilled",
+                "value": "a"
+              },
+              {
+                "state": "fulfilled",
+                "value": "b"
+              },
+              {
+                "state": "fulfilled",
+                "value": "c"
+              }
+            ],
+            "resolution_order": [
+              1,
+              0,
+              2
+            ]
+          },
+          "expected_output": "result_state=fulfilled\nresult_value=[\"a\",\"b\",\"c\"]\n"
+        }
+      ]
+    },
+    "feature2_2_some_and_any.json": {
+      "description": "Competitive aggregation fulfills when enough inputs have fulfilled in resolution order, or rejects with normalized aggregate failure when the requested count is impossible.",
+      "cases": [
+        {
+          "input": {
+            "operation": "batch_some_required",
+            "count": 2,
+            "values": [
+              {
+                "state": "fulfilled",
+                "value": "a"
+              },
+              {
+                "state": "fulfilled",
+                "value": "b"
+              },
+              {
+                "state": "fulfilled",
+                "value": "c"
+              }
+            ],
+            "resolution_order": [
+              1,
+              2,
+              0
+            ]
+          },
+          "expected_output": "result_state=fulfilled\nresult_value=[\"b\",\"c\"]\n"
+        }
+      ]
+    },
+    "feature2_3_settle_and_inspect.json": {
+      "description": "Inspection reports fulfilled values and rejected reasons without throwing, and settling a batch always fulfills with per-item inspection records.",
+      "cases": [
+        {
+          "input": {
+            "operation": "batch_settle_report",
+            "values": [
+              {
+                "state": "rejected",
+                "reason": "a"
+              },
+              {
+                "state": "fulfilled",
+                "value": "b"
+              },
+              {
+                "state": "fulfilled",
+                "value": "c"
+              }
+            ],
+            "resolution_order": [
+              1,
+              2,
+              0
+            ]
+          },
+          "expected_output": "result_state=fulfilled\nresult_value=[{\"state\":\"rejected\",\"reason\":\"a\"},{\"state\":\"fulfilled\",\"value\":\"b\"},{\"state\":\"fulfilled\",\"value\":\"c\"}]\n"
+        }
+      ]
+    },
+    "feature3_1_each_iteration.json": {
+      "description": "Iterator-style processing invokes success and failure callbacks for each item and fulfills the aggregate once the iterable is consumed.",
+      "cases": [
+        {
+          "input": {
+            "operation": "iterate_all",
+            "items": [
+              {
+                "state": "fulfilled",
+                "value": "a"
+              },
+              {
+                "state": "fulfilled",
+                "value": "c"
+              },
+              {
+                "state": "fulfilled",
+                "value": "b"
+              }
+            ]
+          },
+          "expected_output": "aggregate_state=fulfilled\nevents=[\"fulfilled:0:a\",\"fulfilled:1:c\",\"fulfilled:2:b\"]\n"
+        }
+      ]
+    },
+    "feature3_2_limited_iteration.json": {
+      "description": "Limited iterator processing caps concurrent pending work while preserving callback indexes and completion events.",
+      "cases": [
+        {
+          "input": {
+            "operation": "iterate_limited",
+            "concurrency": 2,
+            "values": [
+              {
+                "state": "fulfilled",
+                "value": "a"
+              },
+              {
+                "state": "fulfilled",
+                "value": "b"
+              },
+              {
+                "state": "fulfilled",
+                "value": "c"
+              },
+              {
+                "state": "fulfilled",
+                "value": "d"
+              }
+            ],
+            "resolution_order": [
+              0,
+              1,
+              2,
+              3
+            ]
+          },
+          "expected_output": "aggregate_state=fulfilled\nevents=[\"fulfilled:0:a\",\"fulfilled:1:b\",\"fulfilled:2:c\",\"fulfilled:3:d\"]\n"
+        }
+      ]
+    },
+    "feature4_1_task_queue.json": {
+      "description": "A FIFO task queue reports emptiness, executes scheduled tasks in insertion order, and is empty after draining.",
+      "cases": [
+        {
+          "input": {
+            "operation": "fifo_queue",
+            "tasks": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "expected_output": "empty_before=true\nempty_after_add=false\nevents=[\"a\",\"b\",\"c\"]\nempty_after_run=true\n"
+        }
+      ]
+    },
+    "feature4_2_scheduled_tasks.json": {
+      "description": "A scheduled thunk starts pending, then fulfills with the return value or rejects with a normalized callback error when the queue runs.",
+      "cases": [
+        {
+          "input": {
+            "operation": "schedule_task",
+            "mode": "return",
+            "value": "Hi!"
+          },
+          "expected_output": "state_before_run=pending\nresult_state=fulfilled\nresult_value=Hi!\n"
+        }
+      ]
+    },
+    "feature5_1_generator_sequences.json": {
+      "description": "Generator-style generators consume yielded asynchronous results in sequence and fulfill with the final yielded value.",
+      "cases": [
+        {
+          "input": {
+            "operation": "generator_sequence",
+            "yields": [
+              {
+                "state": "fulfilled",
+                "value": "a"
+              }
+            ],
+            "append": "b"
+          },
+          "expected_output": "result_state=fulfilled\nresult_value=ab\n"
+        }
+      ]
+    },
+    "feature5_2_generator_rejection_handling.json": {
+      "description": "Generator-style generators can catch a rejected yielded result, inspect the rejection reason, and continue by yielding a fulfilled replacement.",
+      "cases": [
+        {
+          "input": {
+            "operation": "generator_catch",
+            "reason": "a",
+            "append": "b"
+          },
+          "expected_output": "result_state=fulfilled\nresult_value=ab\n"
+        }
+      ]
+    },
+    "feature6_state_predicates.json": {
+      "description": "State predicate helpers report whether asynchronous results are fulfilled, rejected, or generally settled.",
+      "cases": [
+        {
+          "input": {
+            "operation": "state_flags",
+            "states": {
+              "ready": "fulfilled",
+              "failed": "rejected",
+              "later": "pending"
+            }
+          },
+          "expected_output": "ready_is_fulfilled=true\nready_is_rejected=false\nready_is_settled=true\nfailed_is_fulfilled=false\nfailed_is_rejected=true\nfailed_is_settled=true\nlater_is_fulfilled=false\nlater_is_rejected=false\nlater_is_settled=false\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C003",
+      "C004",
+      "C005"
+    ],
+    "kept_c": [
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 1,
+    "kept_cp": 2
+  }
+}

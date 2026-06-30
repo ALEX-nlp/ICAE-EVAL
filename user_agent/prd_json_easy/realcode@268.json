@@ -1,0 +1,726 @@
+{
+  "fuzzy_prd": "# Subspace-Scoped Reactive Side-Effects for State Containers - Product Requirements\n\n## Project Goal\n\nBuild a library that lets developers run reactive side-effect handlers (\"epics\" — long-lived functions that observe a stream of dispatched actions and emit new actions in response) against an isolated *slice* of a single global state container. Each handler sees only the portion of state it cares about, reacts only to the actions addressed to its region, and automatically tags the actions it emits so they land back in the correct region — all without the developer manually slicing state or rewriting action types.\n\n---\n\n## Background & Problem\n\nA common architecture uses one central state container fed by dispatched action objects, with reactive handlers that watch the action stream and dispatch follow-up actions (for async work, derived effects, coordination, etc.). As an application grows, multiple independent features share that one container. Without isolation, every handler receives the *entire* state tree and the *entire* action stream, so developers must hand-write boilerplate in each handler to: pick out the relevant sub-tree of state, ignore actions meant for other features, and re-prefix emitted actions so they update the right sub-tree. This is repetitive, error-prone, and couples each feature to the global shape of the tree.\n\nWith this library, a developer wraps a handler in a *scope* defined by (a) a selector that picks a slice of state and (b) an optional namespace. The wrapped handler then transparently observes a store whose state is the slice, receives only actions tagged with its namespace (plus actions explicitly marked global), and has every action it emits automatically prefixed with the namespace. Scopes nest, so features compose hierarchically. A dedicated middleware wires these scoped handlers into the container and forwards a shared dependency bag into each one.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain has a small number of distinct responsibilities (scope construction, the middleware that injects the parent store, namespace/global tagging rules, and store-derivation). Organize these into clearly separated logical units; do not collapse everything into one opaque file, but do not over-engineer a small surface area either.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases in \"Core Features\" are a **black-box contract for an execution adapter**, not the internal data model of the core system. The core logic must remain decoupled from stdin/stdout and JSON parsing. A thin execution adapter is solely responsible for translating JSON scenarios into idiomatic calls against the core library and rendering results to stdout.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Keep scope construction, store injection, action filtering/tagging, and output formatting in distinct units.\n   - **Open/Closed Principle (OCP):** New scoping behaviors should extend the core without modifying it.\n   - **Liskov Substitution Principle (LSP):** A scoped store must be substitutable wherever an ordinary store is expected.\n   - **Interface Segregation Principle (ISP):** Keep the public surface small and cohesive.\n   - **Dependency Inversion Principle (DIP):** Core logic depends on abstractions, not on I/O details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface must read naturally in the target language and hide internal wiring.\n   - **Resilience:** Misuse (e.g. running a scoped handler without the required middleware, or passing an invalid dependency bag) must surface as well-modeled errors, normalized to language-neutral categories, never as leaked runtime fault details.\n\n---\n\n## Core Features\n\n### Feature 1: Reactive-Handler Middleware with Validated Dependencies\n\n**As a developer**, I want a middleware that installs my reactive handlers into the state container and lets me register a shared bag of dependencies, so I can inject services (config, clients, etc.) into every handler while being protected against passing a malformed bag.\n\n**Expected Behavior / Usage:**\n\nThe middleware is constructed from a root reactive handler and an optional options object. Within those options the developer may register a `dependencies` value that will be made available to every handler. The dependencies value is validated: a plain key/value object is the only acceptable shape. Constructing the middleware with no options, with an empty options object, with the dependencies entry explicitly absent/undefined, with an explicit null, or with a plain object are ALL valid and succeed. Constructing it with a dependencies value that is not a plain object — a boolean, a number, a string, or an array — is rejected. The successful path produces a single acceptance signal; the rejected path produces a single normalized `[a specific error category string — verify with the validation service team]` category line with no host-language exception identity.\n\n*1.1 Accepting valid dependency bags — the permissive successful path*\n\nA registered dependency bag of any plain-object shape (including absent, undefined, or null, which mean \"no dependencies\") is accepted and the middleware is built successfully. Output is the single line `dependencies=accepted`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_accepts_object_dependencies.json`\n\n```json\n{\n    \"description\": \"The epic middleware accepts an optional dependencies bag that is later injected into epics. Supplying no options, an empty options object, an explicit undefined dependencies, an explicit null dependencies, or a plain object of dependencies are all valid and the middleware is created without error. The contract emits a single acceptance line.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"epic_middleware_dependencies\", \"options\": \"absent\"},\n            \"expected_output\": \"dependencies=accepted\\n\"\n        },\n        {\n            \"input\": {\"scenario\": \"epic_middleware_dependencies\", \"options\": {\"dependencies\": {\"foo\": \"bar\"}}},\n            \"expected_output\": \"dependencies=accepted\\n\"\n        }\n    ]\n}\n```\n\n*1.2 Rejecting non-object dependency bags — the validation failure path*\n\nA registered dependency bag that is not a plain object (boolean, number, string, or array) is rejected. The error is normalized to a language-neutral category line `[a specific error category string — verify with the validation service team]`; no runtime exception class name or message suffix is exposed.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_2_rejects_non_object_dependencies.json`\n\n```json\n{\n    \"description\": \"When a non-object value is supplied as the dependencies bag, the middleware rejects it. Booleans, numbers, strings, and arrays are all invalid (arrays are objects technically but are explicitly disallowed). The contract emits a single normalized invalid-dependencies error line, with no host-language exception identity leaked.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"epic_middleware_dependencies\", \"options\": {\"dependencies\": 5}},\n            \"expected_output\": \"[a specific error category string — verify with the validation service team]\\n\"\n        },\n        {\n            \"input\": {\"scenario\": \"epic_middleware_dependencies\", \"options\": {\"dependencies\": [\"foo\", \"bar\"]}},\n            \"expected_output\": \"[a specific error category string — verify with the validation service team]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Scoped Handler Requires the Provided Middleware\n\n**As a developer**, I want a scoped handler to fail loudly if it is run outside the dedicated middleware, so I am not silently left with a handler that cannot locate the parent state container.\n\n**Expected Behavior / Usage:**\n\nA scoped handler depends on the dedicated middleware to supply the parent store through its runtime context. If a scoped handler is invoked when that context does not carry the parent store, it must fail immediately with a normalized `error=missing_store` category line rather than running with no store or producing partial output. This guards against the common misconfiguration of installing handlers with a generic middleware instead of the scope-aware one.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_missing_store_error.json`\n\n```json\n{\n    \"description\": \"A scoped epic must run inside the subspace-aware epic middleware so it can locate the parent store. If the scoped epic factory is invoked without that middleware providing the store in the dependency context, it fails with a normalized missing-store error rather than silently producing output.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"scoped_epic_missing_store\", \"selector\": {\"identity\": true}, \"epic\": {\"on\": \"PING\", \"emit\": {\"type\": \"PONG\"}}},\n            \"expected_output\": \"error=missing_store\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Scoping a Reactive Handler to a Slice and Namespace\n\n**As a developer**, I want to wrap a reactive handler in a scope so it sees only its slice of state, reacts only to actions addressed to it, and has its emitted actions routed back to its region automatically, so each feature stays decoupled from the global tree shape.\n\n**Expected Behavior / Usage:**\n\nA scope is built from a state selector and an optional namespace, then applied to a handler. The scoped handler observes a store whose `getState()` returns the selected slice; it reacts to incoming actions according to the namespace rules below; and it tags the actions it emits according to the namespace rules below. The action stream observed by the test always shows the dispatched trigger first, followed by the action the handler emits, each rendered as a compact JSON object. The cases below isolate each rule. Across all of them, the input describes the root state, the handler's reaction (which incoming type it listens for and which action it emits, optionally reading a value from its scoped state or from an injected dependency, and optionally marking its emission global), the chain of scopes applied, and how the dispatched action is tagged.\n\n*3.1 Reading from the scoped slice — state isolation*\n\nWith a selector that picks a named child slice and no namespace, the scoped handler's store reports the slice as its state. A handler that copies a value out of its store's state reads the slice's value (the intended one), not a same-named value sitting at the top of the tree. Output: the trigger action, then the emitted action carrying the slice's value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_substate_for_epic.json`\n\n```json\n{\n    \"description\": \"A scoped epic receives a store whose getState() returns the selected slice of the root state rather than the whole state. Given a selector that picks a named child slice, the epic reacting to an incoming action reads the value from the scoped slice (the correct value) and not from the conflicting top-level value. The dispatched trigger and the resulting verify action both appear in order.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"scoped_epic\", \"state\": {\"subState\": {\"value\": \"expected\"}, \"value\": \"wrong\"}, \"epic\": {\"on\": \"TEST\", \"emit\": {\"type\": \"VERIFY\", \"valueFrom\": \"state.value\"}}, \"scopes\": [{\"selector\": {\"prop\": \"subState\"}}], \"dispatch\": {\"action\": {\"type\": \"TEST\"}}},\n            \"expected_output\": \"{\\\"type\\\":\\\"TEST\\\"}\\n{\\\"type\\\":\\\"VERIFY\\\",\\\"value\\\":\\\"expected\\\"}\\n\"\n        }\n    ]\n}\n```\n\n*3.2 Namespaced reaction and emission — action routing*\n\nWith a selector AND a namespace, the handler reacts only to actions tagged with that namespace, and every action it emits is automatically prefixed with `<namespace>/`. A trigger tagged into the namespace arrives prefixed and the emitted result is prefixed too. Output: the prefixed trigger, then the prefixed result.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_namespace_actions_for_epic.json`\n\n```json\n{\n    \"description\": \"When a scope is created with both a state selector and a namespace, the epic only reacts to actions tagged with that namespace, and every action it emits is automatically prefixed with the namespace. An action tagged with the namespace arrives, is observed by the scoped epic, and the emitted verify action is namespace-prefixed too. Both the namespaced trigger and namespaced result appear in order.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"scoped_epic\", \"state\": {\"subState\": {\"value\": \"expected\"}, \"value\": \"wrong\"}, \"epic\": {\"on\": \"TEST\", \"emit\": {\"type\": \"VERIFY\", \"valueFrom\": \"state.value\"}}, \"scopes\": [{\"selector\": {\"prop\": \"subState\"}, \"namespace\": \"test\"}], \"dispatch\": {\"action\": {\"type\": \"TEST\"}, \"tag\": \"namespace:test\"}},\n            \"expected_output\": \"{\\\"type\\\":\\\"test/TEST\\\"}\\n{\\\"type\\\":\\\"test/VERIFY\\\",\\\"value\\\":\\\"expected\\\"}\\n\"\n        }\n    ]\n}\n```\n\n*3.3 Single string defines both slice and namespace — the shorthand*\n\nA scope may be created from a single string. That one string serves simultaneously as the name of the state slice to select and as the action namespace. A trigger tagged into that namespace is observed by the handler reading from the same-named slice, and the emitted action is prefixed with that string. Output: the prefixed trigger, then the prefixed result.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_string_scope_as_namespace_and_slice.json`\n\n```json\n{\n    \"description\": \"A scope can be created from a single string argument that serves simultaneously as both the name of the state slice to select and the action namespace. Given that string, an action tagged with that namespace is observed by the epic which reads from the same-named slice, and the emitted action is prefixed with that namespace. Both the tagged trigger and tagged result appear in order.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"scoped_epic\", \"state\": {\"subState\": {\"value\": \"expected\"}, \"value\": \"wrong\"}, \"epic\": {\"on\": \"TEST\", \"emit\": {\"type\": \"VERIFY\", \"valueFrom\": \"state.value\"}}, \"scopes\": [{\"selector\": {\"key\": \"subState\"}}], \"dispatch\": {\"action\": {\"type\": \"TEST\"}, \"tag\": \"namespace:subState\"}},\n            \"expected_output\": \"{\\\"type\\\":\\\"subState/TEST\\\"}\\n{\\\"type\\\":\\\"subState/VERIFY\\\",\\\"value\\\":\\\"expected\\\"}\\n\"\n        }\n    ]\n}\n```\n\n*3.4 Global incoming actions bypass namespace filtering*\n\nAn action explicitly marked global is observed by a namespaced scoped handler even though it is not tagged into that namespace; it keeps its global marker and its original un-prefixed type. The handler still prefixes the action it emits in response. Output: the global trigger (with its global marker, un-prefixed type), then the prefixed result.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_4_accepts_global_actions.json`\n\n```json\n{\n    \"description\": \"A globally-tagged action bypasses namespace filtering: even though the scope is namespaced, an action explicitly marked as global is still observed by the scoped epic. The global action retains its global marker and original (un-prefixed) type, while the action the epic emits in response is namespace-prefixed as usual. The global trigger and namespaced result appear in order.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"scoped_epic\", \"state\": {\"subState\": {\"value\": \"expected\"}, \"value\": \"wrong\"}, \"epic\": {\"on\": \"TEST\", \"emit\": {\"type\": \"VERIFY\", \"valueFrom\": \"state.value\"}}, \"scopes\": [{\"selector\": {\"prop\": \"subState\"}, \"namespace\": \"test\"}], \"dispatch\": {\"action\": {\"type\": \"TEST\"}, \"tag\": \"global\"}},\n            \"expected_output\": \"{\\\"globalAction\\\":true,\\\"type\\\":\\\"TEST\\\"}\\n{\\\"type\\\":\\\"test/VERIFY\\\",\\\"value\\\":\\\"expected\\\"}\\n\"\n        }\n    ]\n}\n```\n\n*3.5 Global outgoing actions escape namespace prefixing*\n\nWhen the handler marks the action it emits as global, that emission is published with its plain type and global marker instead of being prefixed, so it can be seen across the whole container. The incoming namespaced trigger is still prefixed. Output: the prefixed trigger, then the global (un-prefixed) result.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_5_does_not_namespace_global_emit.json`\n\n```json\n{\n    \"description\": \"When a scoped epic emits an action that it explicitly marks as global, that emitted action escapes namespace prefixing while keeping its global marker. The incoming namespace-tagged trigger is still prefixed, but the global result is published with its plain type and global marker so it can be seen across the whole store. Both appear in order.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"scoped_epic\", \"state\": {\"subState\": {\"value\": \"expected\"}, \"value\": \"wrong\"}, \"epic\": {\"on\": \"TEST\", \"emit\": {\"type\": \"VERIFY\", \"valueFrom\": \"state.value\", \"global\": true}}, \"scopes\": [{\"selector\": {\"prop\": \"subState\"}, \"namespace\": \"test\"}], \"dispatch\": {\"action\": {\"type\": \"TEST\"}, \"tag\": \"namespace:test\"}},\n            \"expected_output\": \"{\\\"type\\\":\\\"test/TEST\\\"}\\n{\\\"globalAction\\\":true,\\\"type\\\":\\\"VERIFY\\\",\\\"value\\\":\\\"expected\\\"}\\n\"\n        }\n    ]\n}\n```\n\n*3.6 Injected dependencies reach the scoped handler*\n\nDependencies registered with the middleware are forwarded into every scoped handler. With the scoped slice value deliberately wrong, a handler that reads from the injected dependency instead produces the correct value, proving dependencies flow through the scope. Output: the trigger, then the result carrying the dependency value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_6_passes_dependencies_to_epic.json`\n\n```json\n{\n    \"description\": \"Dependencies registered with the epic middleware are forwarded into each scoped epic. Here the scoped slice value is intentionally wrong; the epic instead reads from the injected dependency value, proving dependencies flow through the scope. The trigger and the resulting verify action carrying the dependency value appear in order.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"scoped_epic\", \"state\": {\"subState\": {\"value\": \"wrong\"}, \"value\": \"wrong\"}, \"epic\": {\"on\": \"TEST\", \"emit\": {\"type\": \"VERIFY\", \"valueFrom\": \"dependency.value\"}}, \"scopes\": [{\"selector\": {\"prop\": \"subState\"}}], \"dependencies\": {\"value\": \"expected\"}, \"dispatch\": {\"action\": {\"type\": \"TEST\"}}},\n            \"expected_output\": \"{\\\"type\\\":\\\"TEST\\\"}\\n{\\\"type\\\":\\\"VERIFY\\\",\\\"value\\\":\\\"expected\\\"}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: End-to-End Routing Through a Live State Container\n\n**As a developer**, I want scoped handlers and derived stores to work together over a real container with a nested reducer tree, so dispatching a trigger from any level updates exactly the right region and leaves all other regions untouched.\n\n**Expected Behavior / Usage:**\n\nThese cases drive a real container built from a two-level reducer tree: a root with two branches, each branch having two children; one child of each branch and one whole branch are bound to fixed namespaces in the reducer tree. A relay handler turns an incoming trigger action into a state-updating action. A *derived store* can be obtained by selecting a branch (optionally with a namespace) from the root, and derived stores nest. Each case dispatches one or more triggers — some from the root, some from a derived store — and emits a full snapshot of the root container state after each dispatch. The snapshots prove that the update lands only in the targeted region: unscoped dispatch hits the first branch's first child; a derived store relocates the effect into its region; namespaced scoping confines effects to the namespaced branch/child while every other slice keeps its initial value.\n\n*4.1 No derivation — update lands in the default region*\n\nA single trigger dispatched at the root, with a plain relay handler and no scoping, updates the first branch's first child only; all other slices keep their initial value. Output: one full-state snapshot.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_no_subspaces.json`\n\n```json\n{\n    \"description\": \"With a real store wired through the epic middleware and a relay epic that turns a trigger action into a state-updating action, dispatching the trigger at the root updates exactly the slice that matches the relay's effect. No scoping is applied, so the update lands in the first top-level branch's first child while every other slice keeps its initial value. The output is the full resulting store state.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"store_integration\", \"reducer\": {\"combine\": {\"parent1\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}, \"parent2\": {\"namespace\": \"parentNamespace\", \"inner\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}}}}, \"epic\": {\"relay\": {}}, \"dispatches\": [{\"path\": [], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"root value\"}}]},\n            \"expected_output\": \"{\\\"parent1\\\":{\\\"child1\\\":\\\"root value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"initial value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n\"\n        }\n    ]\n}\n```\n\n*4.2 Single derived store without namespace — relocating the effect*\n\nDispatching from the root, then from a branch-derived store (no namespace), shows the second update routed into the derived branch rather than the default region. Output: two full-state snapshots, one per dispatch.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_single_subspace_no_namespace.json`\n\n```json\n{\n    \"description\": \"A child store can be derived from the root store by selecting a top-level branch with no namespace. Dispatching the trigger from the root updates the root-visible slice; dispatching the same trigger from the derived branch store routes the update into that branch instead. Two snapshots of the full root state are emitted, one after each dispatch, demonstrating the relocation of the effect.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"store_integration\", \"reducer\": {\"combine\": {\"parent1\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}, \"parent2\": {\"namespace\": \"parentNamespace\", \"inner\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}}}}, \"epic\": {\"relay\": {}}, \"dispatches\": [{\"path\": [], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"root value\"}}, {\"path\": [{\"selector\": {\"prop\": \"parent1\"}}], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"parent value\"}}]},\n            \"expected_output\": \"{\\\"parent1\\\":{\\\"child1\\\":\\\"root value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"initial value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n{\\\"parent1\\\":{\\\"child1\\\":\\\"parent value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"initial value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n\"\n        }\n    ]\n}\n```\n\n*4.3 Nested derived stores without namespace — drilling deeper*\n\nA branch-derived store yields a further child-derived store. Dispatching from root, branch, then nested child routes each update progressively deeper inside the same branch. Output: three full-state snapshots.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_nested_subspaces_no_namespace.json`\n\n```json\n{\n    \"description\": \"Derived stores can be nested without namespaces: a branch store is selected from the root, then a deeper child store is selected from that branch by picking its first child slice. Dispatching the trigger from the root, then the branch store, then the nested child store, routes each update progressively deeper within the same top-level branch. Three full-state snapshots are emitted, one after each dispatch.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"store_integration\", \"reducer\": {\"combine\": {\"parent1\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}, \"parent2\": {\"namespace\": \"parentNamespace\", \"inner\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}}}}, \"epic\": {\"relay\": {}}, \"dispatches\": [{\"path\": [], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"root value\"}}, {\"path\": [{\"selector\": {\"prop\": \"parent1\"}}], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"parent value\"}}, {\"path\": [{\"selector\": {\"prop\": \"parent1\"}}, {\"selector\": {\"prop\": \"child1\"}}], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"child value\"}}]},\n            \"expected_output\": \"{\\\"parent1\\\":{\\\"child1\\\":\\\"root value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"initial value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n{\\\"parent1\\\":{\\\"child1\\\":\\\"parent value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"initial value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n{\\\"parent1\\\":{\\\"child1\\\":\\\"child value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"initial value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n\"\n        }\n    ]\n}\n```\n\n*4.4 Namespaced single scope — confining to a namespaced branch*\n\nThe root handler combines a plain relay with a relay scoped to a namespaced branch. A root dispatch only affects the unscoped branch; a dispatch from the namespaced branch store routes the update into that namespaced branch, leaving the unscoped branch untouched. Output: two full-state snapshots.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_4_namespaced_single_subspace.json`\n\n```json\n{\n    \"description\": \"When the root epic combines a plain relay epic with a relay epic scoped to a namespaced branch, the two react to namespace-tagged and untagged actions independently. Dispatching the trigger at the root only affects the unscoped branch; dispatching from the namespaced branch store routes the update into that namespaced branch via the scoped epic, leaving the unscoped branch untouched. Two full-state snapshots are emitted.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"store_integration\", \"reducer\": {\"combine\": {\"parent1\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}, \"parent2\": {\"namespace\": \"parentNamespace\", \"inner\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}}}}, \"epic\": {\"combine\": [{\"relay\": {}}, {\"scope\": {\"selector\": {\"prop\": \"parent2\"}, \"namespace\": \"parentNamespace\", \"inner\": {\"relay\": {}}}}]}, \"dispatches\": [{\"path\": [], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"root value\"}}, {\"path\": [{\"selector\": {\"prop\": \"parent2\"}, \"namespace\": \"parentNamespace\"}], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"parent value\"}}]},\n            \"expected_output\": \"{\\\"parent1\\\":{\\\"child1\\\":\\\"root value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"initial value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n{\\\"parent1\\\":{\\\"child1\\\":\\\"root value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"parent value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n\"\n        }\n    ]\n}\n```\n\n*4.5 Namespaced nested scopes — confining to a deep namespaced child*\n\nScopes nest with namespaces: the root handler combines a relay with a branch-scoped handler that itself combines a relay with a deeper child-scoped handler. Root dispatch hits the unscoped branch; namespaced branch dispatch hits that branch's first child; doubly-nested namespaced child dispatch hits the deepest namespaced child slice — each leaving the others intact. Output: three full-state snapshots.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_5_namespaced_nested_subspaces.json`\n\n```json\n{\n    \"description\": \"Scoped epics nest with namespaces: the root epic combines a relay with a branch-scoped epic that itself combines a relay with a further child-scoped epic. Dispatching the trigger at the root updates only the unscoped branch; dispatching from the namespaced branch store updates that branch's first child; dispatching from the doubly-nested namespaced child store updates the deepest namespaced child slice. Each scope leaves the other branches intact. Three full-state snapshots are emitted.\",\n    \"cases\": [\n        {\n            \"input\": {\"scenario\": \"store_integration\", \"reducer\": {\"combine\": {\"parent1\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}, \"parent2\": {\"namespace\": \"parentNamespace\", \"inner\": {\"combine\": {\"child1\": \"leaf\", \"child2\": {\"namespace\": \"childNamespace\", \"inner\": \"leaf\"}}}}}}, \"epic\": {\"combine\": [{\"relay\": {}}, {\"scope\": {\"selector\": {\"prop\": \"parent2\"}, \"namespace\": \"parentNamespace\", \"inner\": {\"combine\": [{\"relay\": {}}, {\"scope\": {\"selector\": {\"prop\": \"child2\"}, \"namespace\": \"childNamespace\", \"inner\": {\"relay\": {}}}}]}}}]}, \"dispatches\": [{\"path\": [], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"root value\"}}, {\"path\": [{\"selector\": {\"prop\": \"parent2\"}, \"namespace\": \"parentNamespace\"}], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"parent value\"}}, {\"path\": [{\"selector\": {\"prop\": \"parent2\"}, \"namespace\": \"parentNamespace\"}, {\"selector\": {\"prop\": \"child2\"}, \"namespace\": \"childNamespace\"}], \"action\": {\"type\": \"TEST_ACTION_TRIGGER\", \"value\": \"child value\"}}]},\n            \"expected_output\": \"{\\\"parent1\\\":{\\\"child1\\\":\\\"root value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"initial value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n{\\\"parent1\\\":{\\\"child1\\\":\\\"root value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"parent value\\\",\\\"child2\\\":\\\"initial value\\\"}}\\n{\\\"parent1\\\":{\\\"child1\\\":\\\"root value\\\",\\\"child2\\\":\\\"initial value\\\"},\\\"parent2\\\":{\\\"child1\\\":\\\"parent value\\\",\\\"child2\\\":\\\"child value\\\"}}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured library implementing the scoping construct, the dedicated reactive-handler middleware (with dependency validation and parent-store injection), namespace/global tagging rules, and store derivation. Its physical structure MUST align with the \"Scale-Driven Code Organization\" constraint — separated logical units, not a single opaque file, and not over-engineered.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core system. It reads one JSON command from stdin, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-leaf-feature contracts above (including normalizing errors to language-neutral category lines). This adapter must be logically and ideally physically separated from the core domain.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_1_accepts_object_dependencies.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_1_accepts_object_dependencies@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n",
+  "oracle_data": {
+    "task_id": "dperkins0__redux-subspace-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "What happens when dependencies are rejected?",
+          "Return value for invalid config?",
+          "Error response wording"
+        ],
+        "oracle_response": "\"error=invalid_dependencies\""
+      }
+    ],
+    "context_pointers": [],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_accepts_object_dependencies.json": {
+      "description": "The epic middleware accepts an optional dependencies bag that is later injected into epics. Supplying no options, an empty options object, an explicit undefined dependencies, an explicit null dependencies, or a plain object of dependencies are all valid and the middleware is created without error. The contract emits a single acceptance line.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "epic_middleware_dependencies",
+            "options": "absent"
+          },
+          "expected_output": "dependencies=accepted\n"
+        },
+        {
+          "input": {
+            "scenario": "epic_middleware_dependencies",
+            "options": {
+              "dependencies": {
+                "foo": "bar"
+              }
+            }
+          },
+          "expected_output": "dependencies=accepted\n"
+        }
+      ]
+    },
+    "feature1_2_rejects_non_object_dependencies.json": {
+      "description": "When a non-object value is supplied as the dependencies bag, the middleware rejects it. Booleans, numbers, strings, and arrays are all invalid (arrays are objects technically but are explicitly disallowed). The contract emits a single normalized invalid-dependencies error line, with no host-language exception identity leaked.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "epic_middleware_dependencies",
+            "options": {
+              "dependencies": 5
+            }
+          },
+          "expected_output": "error=invalid_dependencies\n"
+        },
+        {
+          "input": {
+            "scenario": "epic_middleware_dependencies",
+            "options": {
+              "dependencies": [
+                "foo",
+                "bar"
+              ]
+            }
+          },
+          "expected_output": "error=invalid_dependencies\n"
+        }
+      ]
+    },
+    "feature2_missing_store_error.json": {
+      "description": "A scoped epic must run inside the subspace-aware epic middleware so it can locate the parent store. If the scoped epic factory is invoked without that middleware providing the store in the dependency context, it fails with a normalized missing-store error rather than silently producing output.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "scoped_epic_missing_store",
+            "selector": {
+              "identity": true
+            },
+            "epic": {
+              "on": "PING",
+              "emit": {
+                "type": "PONG"
+              }
+            }
+          },
+          "expected_output": "error=missing_store\n"
+        }
+      ]
+    },
+    "feature3_1_substate_for_epic.json": {
+      "description": "A scoped epic receives a store whose getState() returns the selected slice of the root state rather than the whole state. Given a selector that picks a named child slice, the epic reacting to an incoming action reads the value from the scoped slice (the correct value) and not from the conflicting top-level value. The dispatched trigger and the resulting verify action both appear in order.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "scoped_epic",
+            "state": {
+              "subState": {
+                "value": "expected"
+              },
+              "value": "wrong"
+            },
+            "epic": {
+              "on": "TEST",
+              "emit": {
+                "type": "VERIFY",
+                "valueFrom": "state.value"
+              }
+            },
+            "scopes": [
+              {
+                "selector": {
+                  "prop": "subState"
+                }
+              }
+            ],
+            "dispatch": {
+              "action": {
+                "type": "TEST"
+              }
+            }
+          },
+          "expected_output": "{\"type\":\"TEST\"}\n{\"type\":\"VERIFY\",\"value\":\"expected\"}\n"
+        }
+      ]
+    },
+    "feature3_2_namespace_actions_for_epic.json": {
+      "description": "When a scope is created with both a state selector and a namespace, the epic only reacts to actions tagged with that namespace, and every action it emits is automatically prefixed with the namespace. An action tagged with the namespace arrives, is observed by the scoped epic, and the emitted verify action is namespace-prefixed too. Both the namespaced trigger and namespaced result appear in order.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "scoped_epic",
+            "state": {
+              "subState": {
+                "value": "expected"
+              },
+              "value": "wrong"
+            },
+            "epic": {
+              "on": "TEST",
+              "emit": {
+                "type": "VERIFY",
+                "valueFrom": "state.value"
+              }
+            },
+            "scopes": [
+              {
+                "selector": {
+                  "prop": "subState"
+                },
+                "namespace": "test"
+              }
+            ],
+            "dispatch": {
+              "action": {
+                "type": "TEST"
+              },
+              "tag": "namespace:test"
+            }
+          },
+          "expected_output": "{\"type\":\"test/TEST\"}\n{\"type\":\"test/VERIFY\",\"value\":\"expected\"}\n"
+        }
+      ]
+    },
+    "feature3_3_string_scope_as_namespace_and_slice.json": {
+      "description": "A scope can be created from a single string argument that serves simultaneously as both the name of the state slice to select and the action namespace. Given that string, an action tagged with that namespace is observed by the epic which reads from the same-named slice, and the emitted action is prefixed with that namespace. Both the tagged trigger and tagged result appear in order.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "scoped_epic",
+            "state": {
+              "subState": {
+                "value": "expected"
+              },
+              "value": "wrong"
+            },
+            "epic": {
+              "on": "TEST",
+              "emit": {
+                "type": "VERIFY",
+                "valueFrom": "state.value"
+              }
+            },
+            "scopes": [
+              {
+                "selector": {
+                  "key": "subState"
+                }
+              }
+            ],
+            "dispatch": {
+              "action": {
+                "type": "TEST"
+              },
+              "tag": "namespace:subState"
+            }
+          },
+          "expected_output": "{\"type\":\"subState/TEST\"}\n{\"type\":\"subState/VERIFY\",\"value\":\"expected\"}\n"
+        }
+      ]
+    },
+    "feature3_4_accepts_global_actions.json": {
+      "description": "A globally-tagged action bypasses namespace filtering: even though the scope is namespaced, an action explicitly marked as global is still observed by the scoped epic. The global action retains its global marker and original (un-prefixed) type, while the action the epic emits in response is namespace-prefixed as usual. The global trigger and namespaced result appear in order.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "scoped_epic",
+            "state": {
+              "subState": {
+                "value": "expected"
+              },
+              "value": "wrong"
+            },
+            "epic": {
+              "on": "TEST",
+              "emit": {
+                "type": "VERIFY",
+                "valueFrom": "state.value"
+              }
+            },
+            "scopes": [
+              {
+                "selector": {
+                  "prop": "subState"
+                },
+                "namespace": "test"
+              }
+            ],
+            "dispatch": {
+              "action": {
+                "type": "TEST"
+              },
+              "tag": "global"
+            }
+          },
+          "expected_output": "{\"globalAction\":true,\"type\":\"TEST\"}\n{\"type\":\"test/VERIFY\",\"value\":\"expected\"}\n"
+        }
+      ]
+    },
+    "feature3_5_does_not_namespace_global_emit.json": {
+      "description": "When a scoped epic emits an action that it explicitly marks as global, that emitted action escapes namespace prefixing while keeping its global marker. The incoming namespace-tagged trigger is still prefixed, but the global result is published with its plain type and global marker so it can be seen across the whole store. Both appear in order.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "scoped_epic",
+            "state": {
+              "subState": {
+                "value": "expected"
+              },
+              "value": "wrong"
+            },
+            "epic": {
+              "on": "TEST",
+              "emit": {
+                "type": "VERIFY",
+                "valueFrom": "state.value",
+                "global": true
+              }
+            },
+            "scopes": [
+              {
+                "selector": {
+                  "prop": "subState"
+                },
+                "namespace": "test"
+              }
+            ],
+            "dispatch": {
+              "action": {
+                "type": "TEST"
+              },
+              "tag": "namespace:test"
+            }
+          },
+          "expected_output": "{\"type\":\"test/TEST\"}\n{\"globalAction\":true,\"type\":\"VERIFY\",\"value\":\"expected\"}\n"
+        }
+      ]
+    },
+    "feature3_6_passes_dependencies_to_epic.json": {
+      "description": "Dependencies registered with the epic middleware are forwarded into each scoped epic. Here the scoped slice value is intentionally wrong; the epic instead reads from the injected dependency value, proving dependencies flow through the scope. The trigger and the resulting verify action carrying the dependency value appear in order.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "scoped_epic",
+            "state": {
+              "subState": {
+                "value": "wrong"
+              },
+              "value": "wrong"
+            },
+            "epic": {
+              "on": "TEST",
+              "emit": {
+                "type": "VERIFY",
+                "valueFrom": "dependency.value"
+              }
+            },
+            "scopes": [
+              {
+                "selector": {
+                  "prop": "subState"
+                }
+              }
+            ],
+            "dependencies": {
+              "value": "expected"
+            },
+            "dispatch": {
+              "action": {
+                "type": "TEST"
+              }
+            }
+          },
+          "expected_output": "{\"type\":\"TEST\"}\n{\"type\":\"VERIFY\",\"value\":\"expected\"}\n"
+        }
+      ]
+    },
+    "feature4_1_no_subspaces.json": {
+      "description": "With a real store wired through the epic middleware and a relay epic that turns a trigger action into a state-updating action, dispatching the trigger at the root updates exactly the slice that matches the relay's effect. No scoping is applied, so the update lands in the first top-level branch's first child while every other slice keeps its initial value. The output is the full resulting store state.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "store_integration",
+            "reducer": {
+              "combine": {
+                "parent1": {
+                  "combine": {
+                    "child1": "leaf",
+                    "child2": {
+                      "namespace": "childNamespace",
+                      "inner": "leaf"
+                    }
+                  }
+                },
+                "parent2": {
+                  "namespace": "parentNamespace",
+                  "inner": {
+                    "combine": {
+                      "child1": "leaf",
+                      "child2": {
+                        "namespace": "childNamespace",
+                        "inner": "leaf"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "epic": {
+              "relay": {}
+            },
+            "dispatches": [
+              {
+                "path": [],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "root value"
+                }
+              }
+            ]
+          },
+          "expected_output": "{\"parent1\":{\"child1\":\"root value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"initial value\",\"child2\":\"initial value\"}}\n"
+        }
+      ]
+    },
+    "feature4_2_single_subspace_no_namespace.json": {
+      "description": "A child store can be derived from the root store by selecting a top-level branch with no namespace. Dispatching the trigger from the root updates the root-visible slice; dispatching the same trigger from the derived branch store routes the update into that branch instead. Two snapshots of the full root state are emitted, one after each dispatch, demonstrating the relocation of the effect.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "store_integration",
+            "reducer": {
+              "combine": {
+                "parent1": {
+                  "combine": {
+                    "child1": "leaf",
+                    "child2": {
+                      "namespace": "childNamespace",
+                      "inner": "leaf"
+                    }
+                  }
+                },
+                "parent2": {
+                  "namespace": "parentNamespace",
+                  "inner": {
+                    "combine": {
+                      "child1": "leaf",
+                      "child2": {
+                        "namespace": "childNamespace",
+                        "inner": "leaf"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "epic": {
+              "relay": {}
+            },
+            "dispatches": [
+              {
+                "path": [],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "root value"
+                }
+              },
+              {
+                "path": [
+                  {
+                    "selector": {
+                      "prop": "parent1"
+                    }
+                  }
+                ],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "parent value"
+                }
+              }
+            ]
+          },
+          "expected_output": "{\"parent1\":{\"child1\":\"root value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"initial value\",\"child2\":\"initial value\"}}\n{\"parent1\":{\"child1\":\"parent value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"initial value\",\"child2\":\"initial value\"}}\n"
+        }
+      ]
+    },
+    "feature4_3_nested_subspaces_no_namespace.json": {
+      "description": "Derived stores can be nested without namespaces: a branch store is selected from the root, then a deeper child store is selected from that branch by picking its first child slice. Dispatching the trigger from the root, then the branch store, then the nested child store, routes each update progressively deeper within the same top-level branch. Three full-state snapshots are emitted, one after each dispatch.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "store_integration",
+            "reducer": {
+              "combine": {
+                "parent1": {
+                  "combine": {
+                    "child1": "leaf",
+                    "child2": {
+                      "namespace": "childNamespace",
+                      "inner": "leaf"
+                    }
+                  }
+                },
+                "parent2": {
+                  "namespace": "parentNamespace",
+                  "inner": {
+                    "combine": {
+                      "child1": "leaf",
+                      "child2": {
+                        "namespace": "childNamespace",
+                        "inner": "leaf"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "epic": {
+              "relay": {}
+            },
+            "dispatches": [
+              {
+                "path": [],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "root value"
+                }
+              },
+              {
+                "path": [
+                  {
+                    "selector": {
+                      "prop": "parent1"
+                    }
+                  }
+                ],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "parent value"
+                }
+              },
+              {
+                "path": [
+                  {
+                    "selector": {
+                      "prop": "parent1"
+                    }
+                  },
+                  {
+                    "selector": {
+                      "prop": "child1"
+                    }
+                  }
+                ],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "child value"
+                }
+              }
+            ]
+          },
+          "expected_output": "{\"parent1\":{\"child1\":\"root value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"initial value\",\"child2\":\"initial value\"}}\n{\"parent1\":{\"child1\":\"parent value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"initial value\",\"child2\":\"initial value\"}}\n{\"parent1\":{\"child1\":\"child value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"initial value\",\"child2\":\"initial value\"}}\n"
+        }
+      ]
+    },
+    "feature4_4_namespaced_single_subspace.json": {
+      "description": "When the root epic combines a plain relay epic with a relay epic scoped to a namespaced branch, the two react to namespace-tagged and untagged actions independently. Dispatching the trigger at the root only affects the unscoped branch; dispatching from the namespaced branch store routes the update into that namespaced branch via the scoped epic, leaving the unscoped branch untouched. Two full-state snapshots are emitted.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "store_integration",
+            "reducer": {
+              "combine": {
+                "parent1": {
+                  "combine": {
+                    "child1": "leaf",
+                    "child2": {
+                      "namespace": "childNamespace",
+                      "inner": "leaf"
+                    }
+                  }
+                },
+                "parent2": {
+                  "namespace": "parentNamespace",
+                  "inner": {
+                    "combine": {
+                      "child1": "leaf",
+                      "child2": {
+                        "namespace": "childNamespace",
+                        "inner": "leaf"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "epic": {
+              "combine": [
+                {
+                  "relay": {}
+                },
+                {
+                  "scope": {
+                    "selector": {
+                      "prop": "parent2"
+                    },
+                    "namespace": "parentNamespace",
+                    "inner": {
+                      "relay": {}
+                    }
+                  }
+                }
+              ]
+            },
+            "dispatches": [
+              {
+                "path": [],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "root value"
+                }
+              },
+              {
+                "path": [
+                  {
+                    "selector": {
+                      "prop": "parent2"
+                    },
+                    "namespace": "parentNamespace"
+                  }
+                ],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "parent value"
+                }
+              }
+            ]
+          },
+          "expected_output": "{\"parent1\":{\"child1\":\"root value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"initial value\",\"child2\":\"initial value\"}}\n{\"parent1\":{\"child1\":\"root value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"parent value\",\"child2\":\"initial value\"}}\n"
+        }
+      ]
+    },
+    "feature4_5_namespaced_nested_subspaces.json": {
+      "description": "Scoped epics nest with namespaces: the root epic combines a relay with a branch-scoped epic that itself combines a relay with a further child-scoped epic. Dispatching the trigger at the root updates only the unscoped branch; dispatching from the namespaced branch store updates that branch's first child; dispatching from the doubly-nested namespaced child store updates the deepest namespaced child slice. Each scope leaves the other branches intact. Three full-state snapshots are emitted.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "store_integration",
+            "reducer": {
+              "combine": {
+                "parent1": {
+                  "combine": {
+                    "child1": "leaf",
+                    "child2": {
+                      "namespace": "childNamespace",
+                      "inner": "leaf"
+                    }
+                  }
+                },
+                "parent2": {
+                  "namespace": "parentNamespace",
+                  "inner": {
+                    "combine": {
+                      "child1": "leaf",
+                      "child2": {
+                        "namespace": "childNamespace",
+                        "inner": "leaf"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "epic": {
+              "combine": [
+                {
+                  "relay": {}
+                },
+                {
+                  "scope": {
+                    "selector": {
+                      "prop": "parent2"
+                    },
+                    "namespace": "parentNamespace",
+                    "inner": {
+                      "combine": [
+                        {
+                          "relay": {}
+                        },
+                        {
+                          "scope": {
+                            "selector": {
+                              "prop": "child2"
+                            },
+                            "namespace": "childNamespace",
+                            "inner": {
+                              "relay": {}
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "dispatches": [
+              {
+                "path": [],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "root value"
+                }
+              },
+              {
+                "path": [
+                  {
+                    "selector": {
+                      "prop": "parent2"
+                    },
+                    "namespace": "parentNamespace"
+                  }
+                ],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "parent value"
+                }
+              },
+              {
+                "path": [
+                  {
+                    "selector": {
+                      "prop": "parent2"
+                    },
+                    "namespace": "parentNamespace"
+                  },
+                  {
+                    "selector": {
+                      "prop": "child2"
+                    },
+                    "namespace": "childNamespace"
+                  }
+                ],
+                "action": {
+                  "type": "TEST_ACTION_TRIGGER",
+                  "value": "child value"
+                }
+              }
+            ]
+          },
+          "expected_output": "{\"parent1\":{\"child1\":\"root value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"initial value\",\"child2\":\"initial value\"}}\n{\"parent1\":{\"child1\":\"root value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"parent value\",\"child2\":\"initial value\"}}\n{\"parent1\":{\"child1\":\"root value\",\"child2\":\"initial value\"},\"parent2\":{\"child1\":\"parent value\",\"child2\":\"child value\"}}\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Feature 1: Middleware Dependencies Validation",
+      "input_condition": "Middleware construction with options",
+      "output_rule": "Validates the 'dependencies' input in options and emits exactly one line of output",
+      "exact_values": [
+        "dependencies=accepted",
+        "error=invalid_dependencies"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C001",
+        "replacement": "a specific error category string — verify with the validation service team",
+        "exact_values_to_replace": [
+          "error=invalid_dependencies"
+        ],
+        "trigger_keywords": [
+          "What happens when dependencies are rejected?",
+          "Return value for invalid config?",
+          "Error response wording"
+        ],
+        "oracle_response": "\"error=invalid_dependencies\""
+      }
+    ],
+    "vague_refs": []
+  }
+}

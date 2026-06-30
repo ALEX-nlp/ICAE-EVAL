@@ -1,0 +1,847 @@
+{
+  "fuzzy_prd": "Hey team, we need to get the Sentry integration for our Laravel app properly wired up. Right now devs are complaining that when something breaks in prod they have no idea what was happening before the crash — no breadcrumbs for cache hits/misses, no DB query trail, nothing about what HTTP calls were going out. It's basically a black box. We talked about this a while back when we did the logging channel work, same idea applies here — we want all the usual framework activity to show up automatically without people having to sprinkle manual instrumentation everywhere.\n\nA few specific things that came up in the last retro: the transaction names on errors are basically useless right now (they show weird internal strings instead of actual route shapes), and the DSN/environment config isn't reliably picking up the right values at runtime. Also someone mentioned that filesystem operations should be observable both as traces AND as the other thing (you know, the lighter-weight diagnostic trail), depending on what's configured.\n\nWe also need the SQL stuff to respect the privacy settings — sometimes we want bindings, sometimes we don't. Same pattern as the command breadcrumb feature we scoped out. Oh and for the lightweight router, the path params need to be replaced properly in the transaction name — there was a bug reported where repeated param values only get replaced once instead of twice. Please make sure edge cases like that are handled.\n\nOne extra pass on the config/runtime bits since a few people asked how literal this needs to be: for DSN, we need to split the full string into four separate outputs every time. So from something like https://publickey:secretkey@sentry.dev/123 we should produce dsn_base, dsn_project_id, dsn_public_key, and dsn_secret_key, with dsn_base being the scheme+host like https://sentry.dev, dsn_project_id being the path segment like 123, dsn_public_key being the username part, and dsn_secret_key being the password part. If DSN is null or missing, all four should print as the literal string 'null'. On environment, if the 'environment' key is missing or empty, we fall back to the framework runtime value, which is 'testing' in the harness. If a non-empty environment is provided, that wins completely, and the output line should be exactly environment=<resolved_value>.\n\nOn the filesystem piece, the two switches are separate: record_spans and record_breadcrumbs. If record_spans=true, each filesystem operation creates a tracing span. If record_breadcrumbs=true, each operation creates a breadcrumb. They can both be on, both off, or just one on. Also worth calling out that there is always one baseline span for the root transaction, so span_count never goes below 1 even if no filesystem spans are added. For the operation payloads, every filesystem span/breadcrumb includes 'disk' and 'driver', for example 'local' and 'local'. For 'put', metadata should include 'path', 'options' as an empty array, 'disk', and 'driver', and the description is '<path> (<size> B)'. For 'get', include 'path', 'disk', and 'driver', and the description is the path. For 'delete' with one path, same shape: 'path', 'disk', 'driver', description is the path. For 'delete' with multiple paths, use 'paths' as the array plus 'disk' and 'driver', and the description is '<count> paths'. For 'files', metadata is 'directory' which is null if not passed, 'recursive' which defaults to false, plus 'disk' and 'driver', and the description is null. Also just to restate the distinction people kept asking about: Breadcrumbs are the Sentry breadcrumb trail recorded via SentrySdk::getCurrentHub()->addBreadcrumb(), separate from tracing Spans in the transaction tree.\n\nFor DB spans, the op should be 'db.sql.query' and the description should just be the query text. Metadata needs server_address and server_port from the connection config. For SQLite or in-memory connections, both server_address and server_port should be null. In the harness, mysql is at host-mysql:3306 and mysql_url is at host-mysqlurl:3307. And since the root transaction span is always there, once a query span is recorded the total span_count is at least 2. On the error handling side, when error_types is not provided, the resolved mask must be -1, which is the sentinel for all error types. If a numeric value is supplied, pass it through exactly as-is, like 24575.\n\nA couple more behavior details too. For exception context, we only attach it if the thrown exception has a getContext() method and that method returns an array. If there is no such method, so context_mode=none, then exception_context is null. If it returns a proper associative array, so context_mode=array, serialize that array as JSON and attach it. If getContext() returns something that is not an array, so context_mode=non_array, treat it as absent and set exception_context to null. For log breadcrumbs, the category should be 'log.<level>' like 'log.debug', and breadcrumb_level should be the raw level string like 'debug'. The message is the log message string, and metadata is the log context exactly as passed, including cases where it is an array like [\"1\"] serialized as a JSON array.\n\nAnd lastly, the auto-wiring point is broader than just DB and HTTP. The integration should register listeners through Laravel’s event system for HTTP client response events, cache hit/miss/write/forget events, database query events, log message events, console command start events, and filesystem adapter operations, so we get all of that automatically without anyone adding manual per-call instrumentation.",
+  "oracle_data": {
+    "task_id": "SENTRY-LARAVEL-INTEGRATION-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "generated route name",
+          "route name fallback",
+          "when should route URL be used instead of name"
+        ],
+        "oracle_response": "For the standard router, if the route has no name, or if the route name matches the pattern 'generated::<alphanumeric>' (auto-generated names), the transaction name must fall back to the route URL path rather than the route name. The transaction_source must always be 'route' regardless of whether the name or URL was used."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "lightweight router param replacement",
+          "repeated parameter values in path",
+          "duplicate path segment substitution"
+        ],
+        "oracle_response": "For the lightweight router, each named parameter's value must be replaced by {paramName} in the path in traversal order. Crucially, if two different parameters share the same string value (e.g. param1='foo' and param2='foo'), each occurrence must be replaced independently and in order — the first match becomes {param1} and the second becomes {param2}. A naive global string replace would collapse both into the same placeholder incorrectly."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "apply_to_event transaction logic",
+          "when does route transaction override event transaction",
+          "event transaction propagation rules"
+        ],
+        "oracle_response": "When applying a stored route transaction to an outgoing event: if the event already carries a non-empty transaction value, that value is preserved unchanged. If the event's transaction field is missing or empty, the stored route transaction name is injected. The output key is 'event_transaction'."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "HTTP breadcrumb metadata fields",
+          "what goes in the http breadcrumb data",
+          "outbound HTTP breadcrumb structure"
+        ],
+        "oracle_response": "The HTTP client breadcrumb must carry these exact metadata keys: 'url' (full URL string), 'http.request.method', 'http.response.status_code' (integer), 'http.query' (query string, empty string if none), 'http.fragment' (fragment, empty string if none), 'http.request.body.size' (byte length of request body), 'http.response.body.size' (byte length of response body). The breadcrumb message must be null (not a string). After the breadcrumb is recorded, both the request and response streams must still be fully readable — the instrumentation must NOT consume them."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "cache breadcrumb message format",
+          "hit vs miss vs write breadcrumb text",
+          "how cache operations are labeled"
+        ],
+        "oracle_response": "Cache breadcrumb messages follow these exact patterns: a successful read (cache hit after a prior put) produces 'Read: <key>', a cache miss (get with no prior value) produces 'Missed: <key>', a write/put operation produces its own breadcrumb before any read. The category is always 'cache', level is always 'info', and metadata is an empty array []. When cache breadcrumbs are disabled, no breadcrumb is emitted and breadcrumb_count must be 0 with breadcrumb_exists=false."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "SQL bindings in breadcrumb",
+          "when are query bindings included",
+          "record_bindings flag behavior"
+        ],
+        "oracle_response": "When record_queries=true and record_bindings=false, the breadcrumb metadata contains 'connectionName' and 'executionTimeMs' only. When both record_queries=true and record_bindings=true, a 'bindings' array is appended to the metadata. When record_queries=false, no breadcrumb is emitted regardless of record_bindings. The connection name in the test harness is always 'test'."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "command breadcrumb format",
+          "artisan command breadcrumb message",
+          "console breadcrumb metadata"
+        ],
+        "oracle_response": "Command/console breadcrumbs use category 'artisan.command', level 'info', message 'Starting Artisan command: <command_name>', and metadata containing a single key 'input' whose value is the arguments joined as a string (e.g. '--foo=bar'). When disabled, breadcrumb_count=0 and breadcrumb_exists=false."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature10_filesystem_breadcrumbs",
+        "trigger_keywords": [
+          "test cases for feature10 filesystem breadcrumbs",
+          "show me feature10 filesystem breadcrumbs test cases",
+          "what are the feature10 filesystem breadcrumbs test inputs",
+          "give me the feature10_filesystem_breadcrumbs test file",
+          "test cases for feature 10",
+          "feature10 filesystem breadcrumbs expected output",
+          "what does feature10 filesystem breadcrumbs expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_filesystem_breadcrumbs:\n{\n  \"description\": \"Instrumented filesystem operations create breadcrumbs with operation names, descriptions, and disk metadata.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"filesystem_observability\",\n        \"record_spans\": false,\n        \"record_breadcrumbs\": true,\n        \"operations\": [\n          {\n            \"action\": \"put\",\n            \"path\": \"foo\",\n            \"content\": \"bar\"\n          },\n          {\n            \"action\": \"get\",\n            \"path\": \"foo\"\n          },\n          {\n            \"action\": \"assert_exists\",\n            \"path\": \"foo\",\n            \"content\": \"bar\"\n          },\n          {\n            \"action\": \"delete\",\n            \"path\": \"foo\"\n          },\n          {\n            \"action\": \"delete\",\n            \"path\": [\n              \"foo\",\n              \"bar\"\n            ]\n          },\n          {\n            \"action\": \"files\"\n          }\n        ]\n      },\n      \"expected_output\": \"file_content=bar\\nspan_count=1\\nbreadcrumb_count=6\\nbreadcrumb1_exists=true\\nbreadcrumb1_category=file.put\\nbreadcrumb1_level=info\\nbreadcrumb1_message=foo (3 B)\\nbreadcrumb1_metadata={\\\"path\\\":\\\"foo\\\",\\\"options\\\":[],\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nbreadcrumb2_exists=true\\nbreadcrumb2_category=file.get\\nbreadcrumb2_level=info\\nbreadcrumb2_message=foo\\nbreadcrumb2_metadata={\\\"path\\\":\\\"foo\\\",\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nbreadcrumb3_exists=true\\nbreadcrumb3_category=file.assertExists\\nbreadcrumb3_level=info\\nbreadcrumb3_message=foo\\nbreadcrumb3_metadata={\\\"path\\\":\\\"foo\\\",\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nbreadcrumb4_exists=true\\nbreadcrumb4_category=file.delete\\nbreadcrumb4_level=info\\nbreadcrumb4_message=foo\\nbreadcrumb4_metadata={\\\"path\\\":\\\"foo\\\",\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nbreadcrumb5_exists=true\\nbreadcrumb5_category=file.delete\\nbreadcrumb5_level=info\\nbreadcrumb5_message=2 paths\\nbreadcrumb5_metadata={\\\"paths\\\":[\\\"foo\\\",\\\"bar\\\"],\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nbreadcrumb6_exists=true\\nbreadcrumb6_category=file.files\\nbreadcrumb6_level=info\\nbreadcrumb6_message=null\\nbreadcrumb6_metadata={\\\"directory\\\":null,\\\"recursive\\\":false,\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"filesystem_observability\",\n        \"record_spans\": false,\n        \"record_breadcrumbs\": false,\n        \"operations\": [\n          {\n            \"action\": \"exists\",\n            \"path\": \"foo\"\n          }\n        ]\n      },\n      \"expected_output\": \"file_exists=false\\nspan_count=1\\nbreadcrumb_count=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_database_spans",
+        "trigger_keywords": [
+          "test cases for feature11 database spans",
+          "show me feature11 database spans test cases",
+          "what are the feature11 database spans test inputs",
+          "give me the feature11_database_spans test file",
+          "test cases for feature 11",
+          "feature11 database spans expected output",
+          "what does feature11 database spans expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_database_spans:\n{\n  \"description\": \"Database query events create spans with SQL descriptions and connection endpoint metadata.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"database_spans\",\n        \"connection\": \"mysql\",\n        \"query\": \"SELECT \\\"mysql\\\"\"\n      },\n      \"expected_output\": \"span_count=2\\nspan_op=db.sql.query\\nspan_description=SELECT \\\"mysql\\\"\\nserver_address=host-mysql\\nserver_port=3306\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"database_spans\",\n        \"connection\": \"mysql_url\",\n        \"query\": \"SELECT \\\"mysqlurl\\\"\"\n      },\n      \"expected_output\": \"span_count=2\\nspan_op=db.sql.query\\nspan_description=SELECT \\\"mysqlurl\\\"\\nserver_address=host-mysqlurl\\nserver_port=3307\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"database_spans\",\n        \"connection\": \"sqlite\",\n        \"query\": \"SELECT \\\"inmemory\\\"\"\n      },\n      \"expected_output\": \"span_count=2\\nspan_op=db.sql.query\\nspan_description=SELECT \\\"inmemory\\\"\\nserver_address=null\\nserver_port=null\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature12_log_event_mapping",
+        "trigger_keywords": [
+          "test cases for feature12 log event mapping",
+          "show me feature12 log event mapping test cases",
+          "what are the feature12 log event mapping test inputs",
+          "give me the feature12_log_event_mapping test file",
+          "test cases for feature 12",
+          "feature12 log event mapping expected output",
+          "what does feature12 log event mapping expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_log_event_mapping:\n{\n  \"description\": \"Log records sent through the monitoring log channel become structured events with context-specific fields.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"log_event_mapping\",\n        \"message\": \"test message\",\n        \"context\": {\n          \"foo\": \"bar\"\n        }\n      },\n      \"expected_output\": \"error=execution_error\\nmessage=Cannot access protected property RcbHarness::$app\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"log_event_mapping\",\n        \"message\": \"test message\",\n        \"context\": {\n          \"fingerprint\": [\n            \"foo\",\n            \"bar\"\n          ]\n        }\n      },\n      \"expected_output\": \"error=execution_error\\nmessage=Cannot access protected property RcbHarness::$app\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"log_event_mapping\",\n        \"message\": \"test message\",\n        \"context\": {\n          \"user\": {\n            \"id\": 123\n          }\n        }\n      },\n      \"expected_output\": \"error=execution_error\\nmessage=Cannot access protected property RcbHarness::$app\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"log_event_mapping\",\n        \"message\": \"test message\",\n        \"context\": {\n          \"tags\": {\n            \"foo\": \"bar\",\n            \"bar\": 123\n          }\n        }\n      },\n      \"expected_output\": \"error=execution_error\\nmessage=Cannot access protected property RcbHarness::$app\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature13_exception_context",
+        "trigger_keywords": [
+          "test cases for feature13 exception context",
+          "show me feature13 exception context test cases",
+          "what are the feature13 exception context test inputs",
+          "give me the feature13_exception_context test file",
+          "test cases for feature 13",
+          "feature13 exception context expected output",
+          "what does feature13 exception context expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature13_exception_context:\n{\n  \"description\": \"Exceptions that expose array context attach that context to events, while missing or non-array context is ignored.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"exception_context\",\n        \"context_mode\": \"none\"\n      },\n      \"expected_output\": \"exception_context=null\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"exception_context\",\n        \"context_mode\": \"array\",\n        \"context\": {\n          \"some\": \"context\"\n        }\n      },\n      \"expected_output\": \"exception_context={\\\"some\\\":\\\"context\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"exception_context\",\n        \"context_mode\": \"non_array\",\n        \"context\": \"Invalid context, expects array\"\n      },\n      \"expected_output\": \"exception_context=null\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_service_configuration",
+        "trigger_keywords": [
+          "test cases for feature1 service configuration",
+          "show me feature1 service configuration test cases",
+          "what are the feature1 service configuration test inputs",
+          "give me the feature1_service_configuration test file",
+          "test cases for feature 1",
+          "feature1 service configuration expected output",
+          "what does feature1 service configuration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_service_configuration:\n{\n  \"description\": \"Service configuration is reflected in the initialized monitoring client.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"service_configuration\",\n        \"dsn\": \"https://publickey:secretkey@sentry.dev/123\",\n        \"error_types\": 24575\n      },\n      \"expected_output\": \"monitoring_bound=true\\nenvironment=testing\\ndsn_base=https://sentry.dev\\ndsn_project_id=123\\ndsn_public_key=publickey\\ndsn_secret_key=secretkey\\nerror_types=24575\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"service_configuration\",\n        \"dsn\": null,\n        \"environment\": \"override_env\"\n      },\n      \"expected_output\": \"monitoring_bound=true\\nenvironment=override_env\\ndsn_base=null\\ndsn_project_id=null\\ndsn_public_key=null\\ndsn_secret_key=null\\nerror_types=-1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_route_transactions",
+        "trigger_keywords": [
+          "test cases for feature2 route transactions",
+          "show me feature2 route transactions test cases",
+          "what are the feature2 route transactions test inputs",
+          "give me the feature2_route_transactions test file",
+          "test cases for feature 2",
+          "feature2 route transactions expected output",
+          "what does feature2 route transactions expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_route_transactions:\n{\n  \"description\": \"Route events and event application expose the transaction name selected for monitoring events.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"route_transaction\",\n        \"event\": \"route_matched\",\n        \"http_method\": \"GET\",\n        \"route_url\": \"/sentry-route-matched-event\",\n        \"initial_transaction\": null\n      },\n      \"expected_output\": \"transaction=/sentry-route-matched-event\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"route_transaction\",\n        \"event\": \"apply_to_event\",\n        \"initial_transaction\": \"some-transaction-name\"\n      },\n      \"expected_output\": \"event_transaction=some-transaction-name\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"route_transaction\",\n        \"event\": \"apply_to_event\",\n        \"initial_transaction\": \"some-transaction-name\",\n        \"event_transaction\": \"some-other-transaction-name\"\n      },\n      \"expected_output\": \"event_transaction=some-other-transaction-name\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_route_name_resolution",
+        "trigger_keywords": [
+          "test cases for feature3 route name resolution",
+          "show me feature3 route name resolution test cases",
+          "what are the feature3 route name resolution test inputs",
+          "give me the feature3_route_name_resolution test file",
+          "test cases for feature 3",
+          "feature3 route name resolution expected output",
+          "what does feature3 route name resolution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_route_name_resolution:\n{\n  \"description\": \"Request route metadata is converted into stable transaction names and source labels.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"route_name_resolution\",\n        \"router\": \"standard\",\n        \"http_method\": \"GET\",\n        \"route_url\": \"/foo\"\n      },\n      \"expected_output\": \"transaction_name=/foo\\ntransaction_source=route\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"route_name_resolution\",\n        \"router\": \"standard\",\n        \"http_method\": \"GET\",\n        \"route_url\": \"/foo\",\n        \"route_name\": \"generated::KoAePbpBofo01ey4\"\n      },\n      \"expected_output\": \"transaction_name=/foo\\ntransaction_source=route\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"route_name_resolution\",\n        \"router\": \"lightweight\",\n        \"path\": \"/foo/bar/baz\",\n        \"parameters\": {\n          \"param1\": \"foo\"\n        }\n      },\n      \"expected_output\": \"transaction_name=/{param1}/bar/baz\\ntransaction_source=route\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"route_name_resolution\",\n        \"router\": \"lightweight\",\n        \"path\": \"/foo/bar/baz\",\n        \"parameters\": {\n          \"param1\": \"foo\",\n          \"param2\": \"bar\"\n        }\n      },\n      \"expected_output\": \"transaction_name=/{param1}/{param2}/baz\\ntransaction_source=route\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"route_name_resolution\",\n        \"router\": \"lightweight\",\n        \"path\": \"/foo/foo/bar\",\n        \"parameters\": {\n          \"param1\": \"foo\",\n          \"param2\": \"foo\"\n        }\n      },\n      \"expected_output\": \"transaction_name=/{param1}/{param2}/bar\\ntransaction_source=route\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_http_client_breadcrumbs",
+        "trigger_keywords": [
+          "test cases for feature4 http client breadcrumbs",
+          "show me feature4 http client breadcrumbs test cases",
+          "what are the feature4 http client breadcrumbs test inputs",
+          "give me the feature4_http_client_breadcrumbs test file",
+          "test cases for feature 4",
+          "feature4 http client breadcrumbs expected output",
+          "what does feature4 http client breadcrumbs expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_http_client_breadcrumbs:\n{\n  \"description\": \"Outbound HTTP responses create breadcrumbs with request and response metadata without consuming streams.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"http_client_breadcrumb\",\n        \"method\": \"GET\",\n        \"url\": \"https://example.com\",\n        \"request_body\": \"request\",\n        \"status\": 200,\n        \"response_body\": \"response\"\n      },\n      \"expected_output\": \"breadcrumb_count=1\\nbreadcrumb_exists=true\\nbreadcrumb_category=http\\nbreadcrumb_level=info\\nbreadcrumb_message=null\\nbreadcrumb_metadata={\\\"url\\\":\\\"https://example.com\\\",\\\"http.request.method\\\":\\\"GET\\\",\\\"http.response.status_code\\\":200,\\\"http.query\\\":\\\"\\\",\\\"http.fragment\\\":\\\"\\\",\\\"http.request.body.size\\\":7,\\\"http.response.body.size\\\":8}\\nrequest_body_after_breadcrumb=request\\nresponse_body_after_breadcrumb=response\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_cache_breadcrumbs",
+        "trigger_keywords": [
+          "test cases for feature5 cache breadcrumbs",
+          "show me feature5 cache breadcrumbs test cases",
+          "what are the feature5 cache breadcrumbs test inputs",
+          "give me the feature5_cache_breadcrumbs test file",
+          "test cases for feature 5",
+          "feature5 cache breadcrumbs expected output",
+          "what does feature5 cache breadcrumbs expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_cache_breadcrumbs:\n{\n  \"description\": \"Cache operations emit cache breadcrumbs when enabled and stay silent when disabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"cache_breadcrumbs\",\n        \"enabled\": true,\n        \"operations\": [\n          {\n            \"action\": \"put\",\n            \"key\": \"foo\",\n            \"value\": \"bar\"\n          },\n          {\n            \"action\": \"get\",\n            \"key\": \"foo\"\n          }\n        ]\n      },\n      \"expected_output\": \"breadcrumb_count=2\\nbreadcrumb_exists=true\\nbreadcrumb_category=cache\\nbreadcrumb_level=info\\nbreadcrumb_message=Read: foo\\nbreadcrumb_metadata=[]\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"cache_breadcrumbs\",\n        \"enabled\": true,\n        \"operations\": [\n          {\n            \"action\": \"get\",\n            \"key\": \"foo\"\n          }\n        ]\n      },\n      \"expected_output\": \"breadcrumb_count=1\\nbreadcrumb_exists=true\\nbreadcrumb_category=cache\\nbreadcrumb_level=info\\nbreadcrumb_message=Missed: foo\\nbreadcrumb_metadata=[]\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"cache_breadcrumbs\",\n        \"enabled\": false,\n        \"operations\": [\n          {\n            \"action\": \"get\",\n            \"key\": \"foo\"\n          }\n        ]\n      },\n      \"expected_output\": \"breadcrumb_count=0\\nbreadcrumb_exists=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_sql_breadcrumbs",
+        "trigger_keywords": [
+          "test cases for feature6 sql breadcrumbs",
+          "show me feature6 sql breadcrumbs test cases",
+          "what are the feature6 sql breadcrumbs test inputs",
+          "give me the feature6_sql_breadcrumbs test file",
+          "test cases for feature 6",
+          "feature6 sql breadcrumbs expected output",
+          "what does feature6 sql breadcrumbs expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_sql_breadcrumbs:\n{\n  \"description\": \"Database query events emit SQL breadcrumbs according to query and binding recording settings.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"sql_breadcrumbs\",\n        \"record_queries\": true,\n        \"record_bindings\": false,\n        \"query\": \"SELECT * FROM breadcrumbs WHERE bindings = ?;\",\n        \"bindings\": [\n          \"1\"\n        ],\n        \"duration_ms\": 10\n      },\n      \"expected_output\": \"breadcrumb_count=1\\nbreadcrumb_exists=true\\nbreadcrumb_category=db.sql.query\\nbreadcrumb_level=info\\nbreadcrumb_message=SELECT * FROM breadcrumbs WHERE bindings = ?;\\nbreadcrumb_metadata={\\\"connectionName\\\":\\\"test\\\",\\\"executionTimeMs\\\":10}\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"sql_breadcrumbs\",\n        \"record_queries\": true,\n        \"record_bindings\": true,\n        \"query\": \"SELECT * FROM breadcrumbs WHERE bindings = ?;\",\n        \"bindings\": [\n          \"1\"\n        ],\n        \"duration_ms\": 10\n      },\n      \"expected_output\": \"breadcrumb_count=1\\nbreadcrumb_exists=true\\nbreadcrumb_category=db.sql.query\\nbreadcrumb_level=info\\nbreadcrumb_message=SELECT * FROM breadcrumbs WHERE bindings = ?;\\nbreadcrumb_metadata={\\\"connectionName\\\":\\\"test\\\",\\\"executionTimeMs\\\":10,\\\"bindings\\\":[\\\"1\\\"]}\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"sql_breadcrumbs\",\n        \"record_queries\": false,\n        \"record_bindings\": false,\n        \"query\": \"SELECT * FROM breadcrumbs WHERE bindings = ?;\",\n        \"bindings\": [\n          \"1\"\n        ],\n        \"duration_ms\": 10\n      },\n      \"expected_output\": \"breadcrumb_count=0\\nbreadcrumb_exists=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_log_breadcrumbs",
+        "trigger_keywords": [
+          "test cases for feature7 log breadcrumbs",
+          "show me feature7 log breadcrumbs test cases",
+          "what are the feature7 log breadcrumbs test inputs",
+          "give me the feature7_log_breadcrumbs test file",
+          "test cases for feature 7",
+          "feature7 log breadcrumbs expected output",
+          "what does feature7 log breadcrumbs expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_log_breadcrumbs:\n{\n  \"description\": \"Application log events emit log breadcrumbs only when log breadcrumbs are enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"log_breadcrumbs\",\n        \"enabled\": true,\n        \"level\": \"debug\",\n        \"message\": \"test message\",\n        \"context\": [\n          \"1\"\n        ]\n      },\n      \"expected_output\": \"breadcrumb_count=1\\nbreadcrumb_exists=true\\nbreadcrumb_category=log.debug\\nbreadcrumb_level=debug\\nbreadcrumb_message=test message\\nbreadcrumb_metadata=[\\\"1\\\"]\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"log_breadcrumbs\",\n        \"enabled\": false,\n        \"level\": \"debug\",\n        \"message\": \"test message\",\n        \"context\": []\n      },\n      \"expected_output\": \"breadcrumb_count=0\\nbreadcrumb_exists=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_console_breadcrumbs",
+        "trigger_keywords": [
+          "test cases for feature8 console breadcrumbs",
+          "show me feature8 console breadcrumbs test cases",
+          "what are the feature8 console breadcrumbs test inputs",
+          "give me the feature8_console_breadcrumbs test file",
+          "test cases for feature 8",
+          "feature8 console breadcrumbs expected output",
+          "what does feature8 console breadcrumbs expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_console_breadcrumbs:\n{\n  \"description\": \"Command-start events emit command breadcrumbs with command names and arguments when enabled.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"console_breadcrumbs\",\n        \"enabled\": true,\n        \"command\": \"test:command\",\n        \"arguments\": [\n          \"--foo=bar\"\n        ]\n      },\n      \"expected_output\": \"breadcrumb_count=1\\nbreadcrumb_exists=true\\nbreadcrumb_category=artisan.command\\nbreadcrumb_level=info\\nbreadcrumb_message=Starting Artisan command: test:command\\nbreadcrumb_metadata={\\\"input\\\":\\\"--foo=bar\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"console_breadcrumbs\",\n        \"enabled\": false,\n        \"command\": \"test:command\",\n        \"arguments\": [\n          \"--foo=bar\"\n        ]\n      },\n      \"expected_output\": \"breadcrumb_count=0\\nbreadcrumb_exists=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_filesystem_spans",
+        "trigger_keywords": [
+          "test cases for feature9 filesystem spans",
+          "show me feature9 filesystem spans test cases",
+          "what are the feature9 filesystem spans test inputs",
+          "give me the feature9_filesystem_spans test file",
+          "test cases for feature 9",
+          "feature9 filesystem spans expected output",
+          "what does feature9 filesystem spans expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_filesystem_spans:\n{\n  \"description\": \"Instrumented filesystem operations create tracing spans with operation names, descriptions, and disk metadata.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"feature\": \"filesystem_observability\",\n        \"record_spans\": true,\n        \"record_breadcrumbs\": false,\n        \"operations\": [\n          {\n            \"action\": \"put\",\n            \"path\": \"foo\",\n            \"content\": \"bar\"\n          },\n          {\n            \"action\": \"get\",\n            \"path\": \"foo\"\n          },\n          {\n            \"action\": \"assert_exists\",\n            \"path\": \"foo\",\n            \"content\": \"bar\"\n          },\n          {\n            \"action\": \"delete\",\n            \"path\": \"foo\"\n          },\n          {\n            \"action\": \"delete\",\n            \"path\": [\n              \"foo\",\n              \"bar\"\n            ]\n          },\n          {\n            \"action\": \"files\"\n          }\n        ]\n      },\n      \"expected_output\": \"file_content=bar\\nspan_count=7\\nspan1_op=file.put\\nspan1_description=foo (3 B)\\nspan1_data={\\\"path\\\":\\\"foo\\\",\\\"options\\\":[],\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nspan2_op=file.get\\nspan2_description=foo\\nspan2_data={\\\"path\\\":\\\"foo\\\",\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nspan3_op=file.assertExists\\nspan3_description=foo\\nspan3_data={\\\"path\\\":\\\"foo\\\",\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nspan4_op=file.delete\\nspan4_description=foo\\nspan4_data={\\\"path\\\":\\\"foo\\\",\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nspan5_op=file.delete\\nspan5_description=2 paths\\nspan5_data={\\\"paths\\\":[\\\"foo\\\",\\\"bar\\\"],\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nspan6_op=file.files\\nspan6_description=null\\nspan6_data={\\\"directory\\\":null,\\\"recursive\\\":false,\\\"disk\\\":\\\"local\\\",\\\"driver\\\":\\\"local\\\"}\\nbreadcrumb_count=0\\n\"\n    },\n    {\n      \"input\": {\n        \"feature\": \"filesystem_observability\",\n        \"record_spans\": false,\n        \"record_breadcrumbs\": false,\n        \"operations\": [\n          {\n            \"action\": \"exists\",\n            \"path\": \"foo\"\n          }\n        ]\n      },\n      \"expected_output\": \"file_exists=false\\nspan_count=1\\nbreadcrumb_count=0\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "same pattern as the command breadcrumb feature we scoped out",
+        "actual_meaning": "The enabled/disabled boolean flag pattern used in feature8_console_breadcrumbs.json: a single configuration boolean gates whether the listener records anything at all, and when false the output must show breadcrumb_count=0 and breadcrumb_exists=false."
+      },
+      {
+        "vague_reference": "the compatibility logic from that login module we did last time",
+        "actual_meaning": "The apply_to_event hook pattern from feature2_route_transactions.json: the integration stores a transaction name when a route is matched and injects it into Sentry events only when the event does not already carry its own transaction value — preserving any existing event-level transaction."
+      },
+      {
+        "vague_reference": "weird internal strings instead of actual route shapes",
+        "actual_meaning": "Auto-generated Laravel route names matching the pattern 'generated::<alphanumeric>' (e.g. 'generated::KoAePbpBofo01ey4') must be treated as absent/unnamed, causing the transaction name to fall back to the route URL — see feature3_route_name_resolution.json standard router cases."
+      }
+    ],
+    "fallback_response": "That's a good question but I don't have the specific technical detail on that one — you'd need to dig into the existing test cases or the codebase to confirm the exact behavior expected there. Check the rcb_tests/public_test_cases folder for the relevant feature file."
+  },
+  "public_test_cases": {
+    "feature10_filesystem_breadcrumbs.json": {
+      "description": "Instrumented filesystem operations create breadcrumbs with operation names, descriptions, and disk metadata.",
+      "cases": [
+        {
+          "input": {
+            "feature": "filesystem_observability",
+            "record_spans": false,
+            "record_breadcrumbs": true,
+            "operations": [
+              {
+                "action": "put",
+                "path": "foo",
+                "content": "bar"
+              },
+              {
+                "action": "get",
+                "path": "foo"
+              },
+              {
+                "action": "assert_exists",
+                "path": "foo",
+                "content": "bar"
+              },
+              {
+                "action": "delete",
+                "path": "foo"
+              },
+              {
+                "action": "delete",
+                "path": [
+                  "foo",
+                  "bar"
+                ]
+              },
+              {
+                "action": "files"
+              }
+            ]
+          },
+          "expected_output": "file_content=bar\nspan_count=1\nbreadcrumb_count=6\nbreadcrumb1_exists=true\nbreadcrumb1_category=file.put\nbreadcrumb1_level=info\nbreadcrumb1_message=foo (3 B)\nbreadcrumb1_metadata={\"path\":\"foo\",\"options\":[],\"disk\":\"local\",\"driver\":\"local\"}\nbreadcrumb2_exists=true\nbreadcrumb2_category=file.get\nbreadcrumb2_level=info\nbreadcrumb2_message=foo\nbreadcrumb2_metadata={\"path\":\"foo\",\"disk\":\"local\",\"driver\":\"local\"}\nbreadcrumb3_exists=true\nbreadcrumb3_category=file.assertExists\nbreadcrumb3_level=info\nbreadcrumb3_message=foo\nbreadcrumb3_metadata={\"path\":\"foo\",\"disk\":\"local\",\"driver\":\"local\"}\nbreadcrumb4_exists=true\nbreadcrumb4_category=file.delete\nbreadcrumb4_level=info\nbreadcrumb4_message=foo\nbreadcrumb4_metadata={\"path\":\"foo\",\"disk\":\"local\",\"driver\":\"local\"}\nbreadcrumb5_exists=true\nbreadcrumb5_category=file.delete\nbreadcrumb5_level=info\nbreadcrumb5_message=2 paths\nbreadcrumb5_metadata={\"paths\":[\"foo\",\"bar\"],\"disk\":\"local\",\"driver\":\"local\"}\nbreadcrumb6_exists=true\nbreadcrumb6_category=file.files\nbreadcrumb6_level=info\nbreadcrumb6_message=null\nbreadcrumb6_metadata={\"directory\":null,\"recursive\":false,\"disk\":\"local\",\"driver\":\"local\"}\n"
+        },
+        {
+          "input": {
+            "feature": "filesystem_observability",
+            "record_spans": false,
+            "record_breadcrumbs": false,
+            "operations": [
+              {
+                "action": "exists",
+                "path": "foo"
+              }
+            ]
+          },
+          "expected_output": "file_exists=false\nspan_count=1\nbreadcrumb_count=0\n"
+        }
+      ]
+    },
+    "feature11_database_spans.json": {
+      "description": "Database query events create spans with SQL descriptions and connection endpoint metadata.",
+      "cases": [
+        {
+          "input": {
+            "feature": "database_spans",
+            "connection": "mysql",
+            "query": "SELECT \"mysql\""
+          },
+          "expected_output": "span_count=2\nspan_op=db.sql.query\nspan_description=SELECT \"mysql\"\nserver_address=host-mysql\nserver_port=3306\n"
+        },
+        {
+          "input": {
+            "feature": "database_spans",
+            "connection": "mysql_url",
+            "query": "SELECT \"mysqlurl\""
+          },
+          "expected_output": "span_count=2\nspan_op=db.sql.query\nspan_description=SELECT \"mysqlurl\"\nserver_address=host-mysqlurl\nserver_port=3307\n"
+        },
+        {
+          "input": {
+            "feature": "database_spans",
+            "connection": "sqlite",
+            "query": "SELECT \"inmemory\""
+          },
+          "expected_output": "span_count=2\nspan_op=db.sql.query\nspan_description=SELECT \"inmemory\"\nserver_address=null\nserver_port=null\n"
+        }
+      ]
+    },
+    "feature12_log_event_mapping.json": {
+      "description": "Log records sent through the monitoring log channel become structured events with context-specific fields.",
+      "cases": [
+        {
+          "input": {
+            "feature": "log_event_mapping",
+            "message": "test message",
+            "context": {
+              "foo": "bar"
+            }
+          },
+          "expected_output": "error=execution_error\nmessage=Cannot access protected property RcbHarness::$app\n"
+        },
+        {
+          "input": {
+            "feature": "log_event_mapping",
+            "message": "test message",
+            "context": {
+              "fingerprint": [
+                "foo",
+                "bar"
+              ]
+            }
+          },
+          "expected_output": "error=execution_error\nmessage=Cannot access protected property RcbHarness::$app\n"
+        },
+        {
+          "input": {
+            "feature": "log_event_mapping",
+            "message": "test message",
+            "context": {
+              "user": {
+                "id": 123
+              }
+            }
+          },
+          "expected_output": "error=execution_error\nmessage=Cannot access protected property RcbHarness::$app\n"
+        },
+        {
+          "input": {
+            "feature": "log_event_mapping",
+            "message": "test message",
+            "context": {
+              "tags": {
+                "foo": "bar",
+                "bar": 123
+              }
+            }
+          },
+          "expected_output": "error=execution_error\nmessage=Cannot access protected property RcbHarness::$app\n"
+        }
+      ]
+    },
+    "feature13_exception_context.json": {
+      "description": "Exceptions that expose array context attach that context to events, while missing or non-array context is ignored.",
+      "cases": [
+        {
+          "input": {
+            "feature": "exception_context",
+            "context_mode": "none"
+          },
+          "expected_output": "exception_context=null\n"
+        },
+        {
+          "input": {
+            "feature": "exception_context",
+            "context_mode": "array",
+            "context": {
+              "some": "context"
+            }
+          },
+          "expected_output": "exception_context={\"some\":\"context\"}\n"
+        },
+        {
+          "input": {
+            "feature": "exception_context",
+            "context_mode": "non_array",
+            "context": "Invalid context, expects array"
+          },
+          "expected_output": "exception_context=null\n"
+        }
+      ]
+    },
+    "feature1_service_configuration.json": {
+      "description": "Service configuration is reflected in the initialized monitoring client.",
+      "cases": [
+        {
+          "input": {
+            "feature": "service_configuration",
+            "dsn": "https://publickey:secretkey@sentry.dev/123",
+            "error_types": 24575
+          },
+          "expected_output": "monitoring_bound=true\nenvironment=testing\ndsn_base=https://sentry.dev\ndsn_project_id=123\ndsn_public_key=publickey\ndsn_secret_key=secretkey\nerror_types=24575\n"
+        },
+        {
+          "input": {
+            "feature": "service_configuration",
+            "dsn": null,
+            "environment": "override_env"
+          },
+          "expected_output": "monitoring_bound=true\nenvironment=override_env\ndsn_base=null\ndsn_project_id=null\ndsn_public_key=null\ndsn_secret_key=null\nerror_types=-1\n"
+        }
+      ]
+    },
+    "feature2_route_transactions.json": {
+      "description": "Route events and event application expose the transaction name selected for monitoring events.",
+      "cases": [
+        {
+          "input": {
+            "feature": "route_transaction",
+            "event": "route_matched",
+            "http_method": "GET",
+            "route_url": "/sentry-route-matched-event",
+            "initial_transaction": null
+          },
+          "expected_output": "transaction=/sentry-route-matched-event\n"
+        },
+        {
+          "input": {
+            "feature": "route_transaction",
+            "event": "apply_to_event",
+            "initial_transaction": "some-transaction-name"
+          },
+          "expected_output": "event_transaction=some-transaction-name\n"
+        },
+        {
+          "input": {
+            "feature": "route_transaction",
+            "event": "apply_to_event",
+            "initial_transaction": "some-transaction-name",
+            "event_transaction": "some-other-transaction-name"
+          },
+          "expected_output": "event_transaction=some-other-transaction-name\n"
+        }
+      ]
+    },
+    "feature3_route_name_resolution.json": {
+      "description": "Request route metadata is converted into stable transaction names and source labels.",
+      "cases": [
+        {
+          "input": {
+            "feature": "route_name_resolution",
+            "router": "standard",
+            "http_method": "GET",
+            "route_url": "/foo"
+          },
+          "expected_output": "transaction_name=/foo\ntransaction_source=route\n"
+        },
+        {
+          "input": {
+            "feature": "route_name_resolution",
+            "router": "standard",
+            "http_method": "GET",
+            "route_url": "/foo",
+            "route_name": "generated::KoAePbpBofo01ey4"
+          },
+          "expected_output": "transaction_name=/foo\ntransaction_source=route\n"
+        },
+        {
+          "input": {
+            "feature": "route_name_resolution",
+            "router": "lightweight",
+            "path": "/foo/bar/baz",
+            "parameters": {
+              "param1": "foo"
+            }
+          },
+          "expected_output": "transaction_name=/{param1}/bar/baz\ntransaction_source=route\n"
+        },
+        {
+          "input": {
+            "feature": "route_name_resolution",
+            "router": "lightweight",
+            "path": "/foo/bar/baz",
+            "parameters": {
+              "param1": "foo",
+              "param2": "bar"
+            }
+          },
+          "expected_output": "transaction_name=/{param1}/{param2}/baz\ntransaction_source=route\n"
+        },
+        {
+          "input": {
+            "feature": "route_name_resolution",
+            "router": "lightweight",
+            "path": "/foo/foo/bar",
+            "parameters": {
+              "param1": "foo",
+              "param2": "foo"
+            }
+          },
+          "expected_output": "transaction_name=/{param1}/{param2}/bar\ntransaction_source=route\n"
+        }
+      ]
+    },
+    "feature4_http_client_breadcrumbs.json": {
+      "description": "Outbound HTTP responses create breadcrumbs with request and response metadata without consuming streams.",
+      "cases": [
+        {
+          "input": {
+            "feature": "http_client_breadcrumb",
+            "method": "GET",
+            "url": "https://example.com",
+            "request_body": "request",
+            "status": 200,
+            "response_body": "response"
+          },
+          "expected_output": "breadcrumb_count=1\nbreadcrumb_exists=true\nbreadcrumb_category=http\nbreadcrumb_level=info\nbreadcrumb_message=null\nbreadcrumb_metadata={\"url\":\"https://example.com\",\"http.request.method\":\"GET\",\"http.response.status_code\":200,\"http.query\":\"\",\"http.fragment\":\"\",\"http.request.body.size\":7,\"http.response.body.size\":8}\nrequest_body_after_breadcrumb=request\nresponse_body_after_breadcrumb=response\n"
+        }
+      ]
+    },
+    "feature5_cache_breadcrumbs.json": {
+      "description": "Cache operations emit cache breadcrumbs when enabled and stay silent when disabled.",
+      "cases": [
+        {
+          "input": {
+            "feature": "cache_breadcrumbs",
+            "enabled": true,
+            "operations": [
+              {
+                "action": "put",
+                "key": "foo",
+                "value": "bar"
+              },
+              {
+                "action": "get",
+                "key": "foo"
+              }
+            ]
+          },
+          "expected_output": "breadcrumb_count=2\nbreadcrumb_exists=true\nbreadcrumb_category=cache\nbreadcrumb_level=info\nbreadcrumb_message=Read: foo\nbreadcrumb_metadata=[]\n"
+        },
+        {
+          "input": {
+            "feature": "cache_breadcrumbs",
+            "enabled": true,
+            "operations": [
+              {
+                "action": "get",
+                "key": "foo"
+              }
+            ]
+          },
+          "expected_output": "breadcrumb_count=1\nbreadcrumb_exists=true\nbreadcrumb_category=cache\nbreadcrumb_level=info\nbreadcrumb_message=Missed: foo\nbreadcrumb_metadata=[]\n"
+        },
+        {
+          "input": {
+            "feature": "cache_breadcrumbs",
+            "enabled": false,
+            "operations": [
+              {
+                "action": "get",
+                "key": "foo"
+              }
+            ]
+          },
+          "expected_output": "breadcrumb_count=0\nbreadcrumb_exists=false\n"
+        }
+      ]
+    },
+    "feature6_sql_breadcrumbs.json": {
+      "description": "Database query events emit SQL breadcrumbs according to query and binding recording settings.",
+      "cases": [
+        {
+          "input": {
+            "feature": "sql_breadcrumbs",
+            "record_queries": true,
+            "record_bindings": false,
+            "query": "SELECT * FROM breadcrumbs WHERE bindings = ?;",
+            "bindings": [
+              "1"
+            ],
+            "duration_ms": 10
+          },
+          "expected_output": "breadcrumb_count=1\nbreadcrumb_exists=true\nbreadcrumb_category=db.sql.query\nbreadcrumb_level=info\nbreadcrumb_message=SELECT * FROM breadcrumbs WHERE bindings = ?;\nbreadcrumb_metadata={\"connectionName\":\"test\",\"executionTimeMs\":10}\n"
+        },
+        {
+          "input": {
+            "feature": "sql_breadcrumbs",
+            "record_queries": true,
+            "record_bindings": true,
+            "query": "SELECT * FROM breadcrumbs WHERE bindings = ?;",
+            "bindings": [
+              "1"
+            ],
+            "duration_ms": 10
+          },
+          "expected_output": "breadcrumb_count=1\nbreadcrumb_exists=true\nbreadcrumb_category=db.sql.query\nbreadcrumb_level=info\nbreadcrumb_message=SELECT * FROM breadcrumbs WHERE bindings = ?;\nbreadcrumb_metadata={\"connectionName\":\"test\",\"executionTimeMs\":10,\"bindings\":[\"1\"]}\n"
+        },
+        {
+          "input": {
+            "feature": "sql_breadcrumbs",
+            "record_queries": false,
+            "record_bindings": false,
+            "query": "SELECT * FROM breadcrumbs WHERE bindings = ?;",
+            "bindings": [
+              "1"
+            ],
+            "duration_ms": 10
+          },
+          "expected_output": "breadcrumb_count=0\nbreadcrumb_exists=false\n"
+        }
+      ]
+    },
+    "feature7_log_breadcrumbs.json": {
+      "description": "Application log events emit log breadcrumbs only when log breadcrumbs are enabled.",
+      "cases": [
+        {
+          "input": {
+            "feature": "log_breadcrumbs",
+            "enabled": true,
+            "level": "debug",
+            "message": "test message",
+            "context": [
+              "1"
+            ]
+          },
+          "expected_output": "breadcrumb_count=1\nbreadcrumb_exists=true\nbreadcrumb_category=log.debug\nbreadcrumb_level=debug\nbreadcrumb_message=test message\nbreadcrumb_metadata=[\"1\"]\n"
+        },
+        {
+          "input": {
+            "feature": "log_breadcrumbs",
+            "enabled": false,
+            "level": "debug",
+            "message": "test message",
+            "context": []
+          },
+          "expected_output": "breadcrumb_count=0\nbreadcrumb_exists=false\n"
+        }
+      ]
+    },
+    "feature8_console_breadcrumbs.json": {
+      "description": "Command-start events emit command breadcrumbs with command names and arguments when enabled.",
+      "cases": [
+        {
+          "input": {
+            "feature": "console_breadcrumbs",
+            "enabled": true,
+            "command": "test:command",
+            "arguments": [
+              "--foo=bar"
+            ]
+          },
+          "expected_output": "breadcrumb_count=1\nbreadcrumb_exists=true\nbreadcrumb_category=artisan.command\nbreadcrumb_level=info\nbreadcrumb_message=Starting Artisan command: test:command\nbreadcrumb_metadata={\"input\":\"--foo=bar\"}\n"
+        },
+        {
+          "input": {
+            "feature": "console_breadcrumbs",
+            "enabled": false,
+            "command": "test:command",
+            "arguments": [
+              "--foo=bar"
+            ]
+          },
+          "expected_output": "breadcrumb_count=0\nbreadcrumb_exists=false\n"
+        }
+      ]
+    },
+    "feature9_filesystem_spans.json": {
+      "description": "Instrumented filesystem operations create tracing spans with operation names, descriptions, and disk metadata.",
+      "cases": [
+        {
+          "input": {
+            "feature": "filesystem_observability",
+            "record_spans": true,
+            "record_breadcrumbs": false,
+            "operations": [
+              {
+                "action": "put",
+                "path": "foo",
+                "content": "bar"
+              },
+              {
+                "action": "get",
+                "path": "foo"
+              },
+              {
+                "action": "assert_exists",
+                "path": "foo",
+                "content": "bar"
+              },
+              {
+                "action": "delete",
+                "path": "foo"
+              },
+              {
+                "action": "delete",
+                "path": [
+                  "foo",
+                  "bar"
+                ]
+              },
+              {
+                "action": "files"
+              }
+            ]
+          },
+          "expected_output": "file_content=bar\nspan_count=7\nspan1_op=file.put\nspan1_description=foo (3 B)\nspan1_data={\"path\":\"foo\",\"options\":[],\"disk\":\"local\",\"driver\":\"local\"}\nspan2_op=file.get\nspan2_description=foo\nspan2_data={\"path\":\"foo\",\"disk\":\"local\",\"driver\":\"local\"}\nspan3_op=file.assertExists\nspan3_description=foo\nspan3_data={\"path\":\"foo\",\"disk\":\"local\",\"driver\":\"local\"}\nspan4_op=file.delete\nspan4_description=foo\nspan4_data={\"path\":\"foo\",\"disk\":\"local\",\"driver\":\"local\"}\nspan5_op=file.delete\nspan5_description=2 paths\nspan5_data={\"paths\":[\"foo\",\"bar\"],\"disk\":\"local\",\"driver\":\"local\"}\nspan6_op=file.files\nspan6_description=null\nspan6_data={\"directory\":null,\"recursive\":false,\"disk\":\"local\",\"driver\":\"local\"}\nbreadcrumb_count=0\n"
+        },
+        {
+          "input": {
+            "feature": "filesystem_observability",
+            "record_spans": false,
+            "record_breadcrumbs": false,
+            "operations": [
+              {
+                "action": "exists",
+                "path": "foo"
+              }
+            ]
+          },
+          "expected_output": "file_exists=false\nspan_count=1\nbreadcrumb_count=0\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 3
+  }
+}

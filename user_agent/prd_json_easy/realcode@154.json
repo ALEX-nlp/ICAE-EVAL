@@ -1,0 +1,701 @@
+{
+  "fuzzy_prd": "# Structured Key/Value Logging Toolkit - PRD\n\n## Project Goal\n\nBuild a structured-logging toolkit whose fundamental unit is a *log event* expressed as a flat, variadic sequence of alternating keys and values. The toolkit lets developers compose loggers that attach persistent context, tag severity, bind values that are recomputed on every event, swap their output sink at runtime, and render each event in a chosen wire format — all behind one tiny logging contract — so applications get consistent, machine-parseable logs without hand-formatting strings.\n\n---\n\n## Background & Problem\n\nWithout a structured-logging toolkit, developers concatenate log strings by hand (`\"user=\" + id + \" action=\" + a`). This is repetitive, easy to get out of order, impossible to parse reliably downstream, and forces a single hard-coded output format. Adding request-scoped context (a request id, a region) means threading variables through every call site, and recording a per-event timestamp or caller location means recomputing it manually everywhere.\n\nWith this toolkit, a logger is just something that accepts a list of alternating key/value pairs. Context can be bolted onto a logger once and then automatically prepended to every later event; a value can be declared *dynamic* so it is re-evaluated on each event; severity tagging, output-format selection, and runtime sink replacement are all composable wrappers around the same minimal contract. The result is uniform structured output (key=value text or one JSON object per line) with zero bespoke formatting code.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain has several distinct responsibilities (event encoders, context composition, severity tagging, dynamic value binding, runtime sink swapping, and a standard-log-line parser). It MUST NOT be a single \"god file\"; use a clear multi-file layout that separates these concerns. Do not over-engineer, but do not collapse independent concerns into one module either.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below are a **black-box contract** for the execution adapter, NOT the internal data model. The core logging library must know nothing about stdin/stdout or JSON parsing. A separate execution adapter translates each JSON command into idiomatic calls on the core library and renders the resulting log output.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Keep parsing, routing, encoding, severity tagging, value binding, and output rendering in distinct units.\n   - **Open/Closed Principle (OCP):** New encoders or new wrapping behaviors must be addable without modifying the core event contract.\n   - **Liskov Substitution Principle (LSP):** Every logger wrapper (context, severity, swappable sink) must be usable anywhere a base logger is expected.\n   - **Interface Segregation Principle (ISP):** The core logging contract must be a single, minimal operation that accepts a key/value list.\n   - **Dependency Inversion Principle (DIP):** Wrappers depend on the abstract logging contract, never on a concrete encoder or I/O sink.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public surface must be elegant and idiomatic to the target language, hiding the encoding and composition machinery.\n   - **Resilience:** Handle edge cases gracefully — a swappable sink with no active target must silently discard events without erroring; malformed requests must surface as a normalized, language-neutral error category rather than a runtime fault.\n\n---\n\n## Core Features\n\n### Feature 1: Event Encoders\n\n**As a developer**, I want to render a single log event (a flat list of alternating keys and values) into a chosen wire format, so I can emit consistent, parseable log lines without hand-building strings.\n\n**Expected Behavior / Usage:**\n\nA log event is a flat sequence whose even positions are keys and whose odd positions are values. Two encoders are offered. Both terminate each event with a newline. Both interpret a value that is an *error* object specially: the error is rendered as its plain message text, not as a structural dump. An event with an odd number of elements (a key without a value) is invalid and surfaces as the normalized error category `invalid_keyvals`.\n\n*1.1 Key=Value Text Encoder — render an event as space-separated `key=value` pairs*\n\nPairs are emitted left to right in the order supplied, joined by single spaces, each as `key=value`, where the value uses its natural textual representation and an error value uses its message text.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_prefix_encoder.json`\n\n```json\n{\n    \"description\": \"Encode a single log event as space-separated key=value pairs. Each value is rendered by its natural textual form; an error value renders as its message text. The line is terminated by a newline.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"encode\", \"format\": \"prefix\", \"keyvals\": [\"hello\", \"world\"]},\n            \"expected_output\": \"hello=world\\n\"\n        },\n        {\n            \"input\": {\"op\": \"encode\", \"format\": \"prefix\", \"keyvals\": [\"a\", 1, \"err\", {\"$err\": \"error\"}]},\n            \"expected_output\": \"a=1 err=error\\n\"\n        }\n    ]\n}\n```\n\n*1.2 JSON Encoder — render an event as one JSON object per line*\n\nThe event is rendered as a single JSON object with keys emitted in sorted order. Nested maps and arrays are rendered as JSON; an error value is rendered as its message string.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_2_json_encoder.json`\n\n```json\n{\n    \"description\": \"Encode a single log event as one JSON object on a line. Keys are emitted in sorted order. An error value is rendered as its message string; nested maps and arrays are rendered as JSON. The object is terminated by a newline.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"encode\", \"format\": \"json\", \"keyvals\": [\"err\", {\"$err\": \"err\"}, \"m\", {\"0\": 0}, \"a\", [1, 2, 3]]},\n            \"expected_output\": \"{\\\"a\\\":[1,2,3],\\\"err\\\":\\\"err\\\",\\\"m\\\":{\\\"0\\\":0}}\\n\"\n        },\n        {\n            \"input\": {\"op\": \"encode\", \"format\": \"json\", \"keyvals\": [\"k\", \"v\"]},\n            \"expected_output\": \"{\\\"k\\\":\\\"v\\\"}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Contextual Logging\n\n**As a developer**, I want to attach persistent key/value context to a logger once and have it automatically included in every later event, so I don't thread request-scoped fields through every call site.\n\n**Expected Behavior / Usage:**\n\nContext is applied in layers. Each layer contributes a flat key/value list that is remembered by the returned logger and prepended to every subsequent event in front of that event's own pairs. Layers accumulate: applying a second layer keeps the first. The captured context is snapshotted at attach time, so mutating the original input list afterward does not affect what was stored. When the final event is emitted, all accumulated context plus the per-event pairs are merged and rendered by the selected encoder (so under the JSON encoder the merged keys appear in sorted order).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_contextual_logging.json`\n\n```json\n{\n    \"description\": \"Attach persistent context to a logger, then emit an event. Context layers are applied in order and accumulate; each layer's key/value pairs are prepended to every subsequent event. The final emitted record merges all accumulated context with the per-event key/value pairs, rendered by the selected encoder.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"contextual\", \"format\": \"json\", \"context\": [[\"a\", 123], [\"b\", \"c\"]], \"keyvals\": [\"msg\", \"message\"]},\n            \"expected_output\": \"{\\\"a\\\":123,\\\"b\\\":\\\"c\\\",\\\"msg\\\":\\\"message\\\"}\\n\"\n        },\n        {\n            \"input\": {\"op\": \"contextual\", \"format\": \"prefix\", \"context\": [[\"region\", \"us\"]], \"keyvals\": [\"msg\", \"hi\"]},\n            \"expected_output\": \"region=us msg=hi\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Leveled Logging\n\n**As a developer**, I want to tag events with a severity, so I can filter and route logs by importance without manually adding a level field each time.\n\n**Expected Behavior / Usage:**\n\nA leveled logger is derived from a base logger and exposes three severities: debug, info, and error. Selecting a severity automatically injects a single context pair — a *level key* mapped to that severity's *level value* — ahead of the event's own pairs. The injection reuses the same context mechanism as Feature 2, so it can be combined with additional context layers, and the rendered output obeys the chosen encoder's ordering rules.\n\n*3.1 Default Severity Tags — built-in level key and values*\n\nBy default the injected key is `level` and the values are the upper-case severity names `DEBUG`, `INFO`, and `ERROR`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_default_levels.json`\n\n```json\n{\n    \"description\": \"Emit an event through a severity-tagged logger using the default configuration. Selecting a severity automatically injects a context pair whose key is \\\"level\\\" and whose value is the upper-case severity name (DEBUG, INFO, or ERROR) ahead of the event's own pairs.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"leveled\", \"format\": \"prefix\", \"level\": \"debug\", \"keyvals\": [\"msg\", \"👨\"]},\n            \"expected_output\": \"level=DEBUG msg=👨\\n\"\n        },\n        {\n            \"input\": {\"op\": \"leveled\", \"format\": \"prefix\", \"level\": \"info\", \"keyvals\": [\"msg\", \"🚀\"]},\n            \"expected_output\": \"level=INFO msg=🚀\\n\"\n        },\n        {\n            \"input\": {\"op\": \"leveled\", \"format\": \"prefix\", \"level\": \"error\", \"keyvals\": [\"msg\", \"🍵\"]},\n            \"expected_output\": \"level=ERROR msg=🍵\\n\"\n        }\n    ]\n}\n```\n\n*3.2 Customized Severity Tags — overridden level key and values, with extra context*\n\nThe level key and any of the three per-severity values may be overridden. Additional context layers can be stacked on top of the severity tag before emitting; the merged record is rendered by the chosen encoder (sorted keys under the JSON encoder).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_customized_levels.json`\n\n```json\n{\n    \"description\": \"Emit an event through a severity-tagged logger whose level key and per-severity values have been customized. The injected severity pair uses the configured key and the configured value for the selected severity, and additional context can be stacked on top before emitting.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"leveled\", \"format\": \"json\", \"level\": \"debug\", \"levelKey\": \"l\", \"levelValues\": {\"debug\": \"⛄\", \"info\": \"🌜\", \"error\": \"🌊\"}, \"context\": [[\"easter_island\", \"🗿\"]], \"keyvals\": [\"msg\", \"💃💃💃\"]},\n            \"expected_output\": \"{\\\"easter_island\\\":\\\"🗿\\\",\\\"l\\\":\\\"⛄\\\",\\\"msg\\\":\\\"💃💃💃\\\"}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Dynamic Value Binding\n\n**As a developer**, I want a value attached as context to be re-evaluated on every event instead of captured once, so fields like a timestamp reflect the moment each event is emitted.\n\n**Expected Behavior / Usage:**\n\nA value placed into context may be a *dynamic value* — a zero-argument producer that is invoked once per emitted event to yield that event's concrete value. Static values are stored verbatim; dynamic values are recomputed on each call. To make this observable deterministically, the dynamic value here is a mock clock seeded with a start instant and a fixed step: on each evaluation it advances by the step and yields the new instant formatted as an ISO-8601/RFC-3339 timestamp string. Emitting the same logger N times therefore produces N events whose timestamp advances by one step each time, proving the value is bound per event rather than once.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_dynamic_value_binding.json`\n\n```json\n{\n    \"description\": \"Attach a dynamic value to a logger that is re-evaluated on every log event rather than captured once. Here a deterministic mock clock advances by a fixed step on each evaluation, so two successive events bound to the same logger carry different timestamp values, proving the value is recomputed per event.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"dynamic\", \"format\": \"prefix\", \"start\": \"[the mock clock start and step values]\", \"stepSeconds\": 1, \"calls\": 2, \"keyvals\": [\"foo\", \"bar\"]},\n            \"expected_output\": \"ts=[the mock clock start and step values] foo=bar\\nts=2015-04-25T00:00:02Z foo=bar\\n\"\n        },\n        {\n            \"input\": {\"op\": \"dynamic\", \"format\": \"prefix\", \"start\": \"[the mock clock start and step values]\", \"stepSeconds\": 5, \"calls\": 3, \"keyvals\": [\"foo\", \"bar\"]},\n            \"expected_output\": \"ts=2015-04-25T00:00:05Z foo=bar\\nts=2015-04-25T00:00:10Z foo=bar\\nts=2015-04-25T00:00:15Z foo=bar\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Swappable Output Sink\n\n**As a developer**, I want a logger whose active destination can be replaced at runtime, so a globally shared logger can be reconfigured by application code without re-wiring call sites.\n\n**Expected Behavior / Usage:**\n\nA swappable logger forwards each event to whatever sink is currently active. Before any sink is installed (and after the sink is explicitly cleared) it silently discards events and reports no error. At each step the active sink may be replaced — either with a named encoder, or cleared back to the discarding state — and then one event is emitted through whichever sink is active at that moment. The output is the concatenation of every event that reached a real encoder; events emitted while discarding contribute nothing.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_swappable_sink.json`\n\n```json\n{\n    \"description\": \"A swappable logger whose active sink can be replaced between events. Before any sink is set it silently discards events with no error. Each step optionally swaps the active sink (an encoder name, or null to return to discarding) and then emits one event; the concatenated output reflects whichever sink was active at each step. Setting the sink to null again discards subsequent events.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"rebind\", \"steps\": [\n                {\"keyvals\": [\"k\", \"v\"]},\n                {\"sink\": \"json\", \"keyvals\": [\"k\", \"v\"]},\n                {\"sink\": \"prefix\", \"keyvals\": [\"k\", \"v\"]},\n                {\"sink\": null, \"keyvals\": [\"k\", \"v\"]}\n            ]},\n            \"expected_output\": \"{\\\"k\\\":\\\"v\\\"}\\nk=v\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Standard Log-Line Adapter\n\n**As a developer**, I want to feed a plain standard-library-style log line into the structured pipeline and have its parts extracted into named fields, so legacy or third-party log output becomes structured without changing the emitter.\n\n**Expected Behavior / Usage:**\n\nA raw log line is parsed into up to three fields and re-emitted as `key=value` pairs. An optional leading date in `YYYY/MM/DD` form and an optional time in `HH:MM:SS` form (with optional fractional seconds) are concatenated, separated by a single space when both are present, into one timestamp under key `ts`. An optional file reference in `path:line` form is captured under key `file`. The remaining text after an optional `\": \"` separator is the message under key `msg`. Fields that are absent are omitted, and the present fields are emitted in the fixed order `ts`, `file`, `msg`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_stdlib_line_adapter.json`\n\n```json\n{\n    \"description\": \"Parse a single raw standard log line and re-emit it as structured key=value pairs. An optional leading date (YYYY/MM/DD) and time (HH:MM:SS with optional fractional seconds) are joined into a single timestamp under key \\\"ts\\\"; an optional file:line reference goes under key \\\"file\\\"; the remaining message text goes under key \\\"msg\\\". Absent fields are omitted. Fields appear in the order ts, file, msg.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"hello\"}, \"expected_output\": \"msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"2009/01/23: hello\"}, \"expected_output\": \"ts=2009/01/23 msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"2009/01/23 01:23:23: hello\"}, \"expected_output\": \"ts=2009/01/23 01:23:23 msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"01:23:23: hello\"}, \"expected_output\": \"ts=01:23:23 msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"2009/01/23 01:23:23.123123: hello\"}, \"expected_output\": \"ts=2009/01/23 01:23:23.123123 msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"2009/01/23 01:23:23.123123 /a/b/c/d.go:23: hello\"}, \"expected_output\": \"ts=2009/01/23 01:23:23.123123 file=/a/b/c/d.go:23 msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"01:23:23.123123 /a/b/c/d.go:23: hello\"}, \"expected_output\": \"ts=01:23:23.123123 file=/a/b/c/d.go:23 msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"2009/01/23 01:23:23 /a/b/c/d.go:23: hello\"}, \"expected_output\": \"ts=2009/01/23 01:23:23 file=/a/b/c/d.go:23 msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"2009/01/23 /a/b/c/d.go:23: hello\"}, \"expected_output\": \"ts=2009/01/23 file=/a/b/c/d.go:23 msg=hello\\n\"},\n        {\"input\": {\"op\": \"adapt_line\", \"line\": \"/a/b/c/d.go:23: hello\"}, \"expected_output\": \"file=/a/b/c/d.go:23 msg=hello\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured logging library implementing the features above — event encoders, context composition, severity tagging, dynamic value binding, swappable sink, and the standard-log-line adapter — with a single minimal logging contract at its center. Its physical structure MUST follow the Scale-Driven Code Organization constraint (multi-file, one concern per unit).\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON command from stdin, invokes the appropriate core logic, and prints the rendered log output to stdout, strictly matching the per-leaf-feature contracts above. It must be logically and physically separated from the core library, and it must normalize any failure into a language-neutral `error=<category>` line rather than leaking a host runtime fault.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_1_prefix_encoder.json` under `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_1_prefix_encoder@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` contains **only** the raw stdout of the program under test (no PASS/FAIL or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- sink set to null explicitly\n- No sink set initially\n",
+  "oracle_data": {
+    "task_id": "go-kit__kit-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C013",
+        "trigger_keywords": [
+          "custom level key",
+          "emoji log format",
+          "badger cherry",
+          "easter island output",
+          "what are the custom level values"
+        ],
+        "oracle_response": "The custom configuration uses the key 'l' mapped to '⛄' and the key 'easter_island' mapped to '🗿'."
+      },
+      {
+        "constraint_id": "C015",
+        "trigger_keywords": [
+          "mock clock initialization",
+          "start timestamp",
+          "step value",
+          "when does the mock clock begin",
+          "exact mock clock values"
+        ],
+        "oracle_response": "The mock clock initializes at '2015-04-25T00:00:00Z' and advances by '2015-04-25T00:00:01Z' for each step."
+      },
+      {
+        "constraint_id": "TC_feature4_dynamic_value_binding",
+        "trigger_keywords": [
+          "test cases for feature4 dynamic value binding",
+          "show me feature4 dynamic value binding test cases",
+          "what are the feature4 dynamic value binding inputs and outputs",
+          "give me the feature4_dynamic_value_binding test file",
+          "feature4 dynamic value binding expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_dynamic_value_binding:\n{\n  \"description\": \"Attach a dynamic value to a logger that is re-evaluated on every log event rather than captured once. Here a deterministic mock clock advances by a fixed step on each evaluation, so two successive events bound to the same logger carry different timestamp values, proving the value is recomputed per event.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"dynamic\",\n        \"format\": \"prefix\",\n        \"start\": \"2015-04-25T00:00:00Z\",\n        \"stepSeconds\": 1,\n        \"calls\": 2,\n        \"keyvals\": [\n          \"foo\",\n          \"bar\"\n        ]\n      },\n      \"expected_output\": \"ts=2015-04-25T00:00:01Z foo=bar\\nts=2015-04-25T00:00:02Z foo=bar\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"dynamic\",\n        \"format\": \"prefix\",\n        \"start\": \"2015-04-25T00:00:00Z\",\n        \"stepSeconds\": 5,\n        \"calls\": 3,\n        \"keyvals\": [\n          \"foo\",\n          \"bar\"\n        ]\n      },\n      \"expected_output\": \"ts=2015-04-25T00:00:05Z foo=bar\\nts=2015-04-25T00:00:10Z foo=bar\\nts=2015-04-25T00:00:15Z foo=bar\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "sink set to null explicitly",
+        "actual_meaning": "The condition where the sink is initialized or set to a null literal value in the configuration object."
+      },
+      {
+        "vague_reference": "No sink set initially",
+        "actual_meaning": "The initial state of the sink field before any assignment operation occurs."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_prefix_encoder.json": {
+      "description": "Encode a single log event as space-separated key=value pairs. Each value is rendered by its natural textual form; an error value renders as its message text. The line is terminated by a newline.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "format": "prefix",
+            "keyvals": [
+              "hello",
+              "world"
+            ]
+          },
+          "expected_output": "hello=world\n"
+        },
+        {
+          "input": {
+            "op": "encode",
+            "format": "prefix",
+            "keyvals": [
+              "a",
+              1,
+              "err",
+              {
+                "$err": "error"
+              }
+            ]
+          },
+          "expected_output": "a=1 err=error\n"
+        }
+      ]
+    },
+    "feature1_2_json_encoder.json": {
+      "description": "Encode a single log event as one JSON object on a line. Keys are emitted in sorted order. An error value is rendered as its message string; nested maps and arrays are rendered as JSON. The object is terminated by a newline.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "format": "json",
+            "keyvals": [
+              "err",
+              {
+                "$err": "err"
+              },
+              "m",
+              {
+                "0": 0
+              },
+              "a",
+              [
+                1,
+                2,
+                3
+              ]
+            ]
+          },
+          "expected_output": "{\"a\":[1,2,3],\"err\":\"err\",\"m\":{\"0\":0}}\n"
+        },
+        {
+          "input": {
+            "op": "encode",
+            "format": "json",
+            "keyvals": [
+              "k",
+              "v"
+            ]
+          },
+          "expected_output": "{\"k\":\"v\"}\n"
+        }
+      ]
+    },
+    "feature2_contextual_logging.json": {
+      "description": "Attach persistent context to a logger, then emit an event. Context layers are applied in order and accumulate; each layer's key/value pairs are prepended to every subsequent event. The final emitted record merges all accumulated context with the per-event key/value pairs, rendered by the selected encoder.",
+      "cases": [
+        {
+          "input": {
+            "op": "contextual",
+            "format": "json",
+            "context": [
+              [
+                "a",
+                123
+              ],
+              [
+                "b",
+                "c"
+              ]
+            ],
+            "keyvals": [
+              "msg",
+              "message"
+            ]
+          },
+          "expected_output": "{\"a\":123,\"b\":\"c\",\"msg\":\"message\"}\n"
+        },
+        {
+          "input": {
+            "op": "contextual",
+            "format": "prefix",
+            "context": [
+              [
+                "region",
+                "us"
+              ]
+            ],
+            "keyvals": [
+              "msg",
+              "hi"
+            ]
+          },
+          "expected_output": "region=us msg=hi\n"
+        }
+      ]
+    },
+    "feature3_1_default_levels.json": {
+      "description": "Emit an event through a severity-tagged logger using the default configuration. Selecting a severity automatically injects a context pair whose key is \"level\" and whose value is the upper-case severity name (DEBUG, INFO, or ERROR) ahead of the event's own pairs.",
+      "cases": [
+        {
+          "input": {
+            "op": "leveled",
+            "format": "prefix",
+            "level": "debug",
+            "keyvals": [
+              "msg",
+              "👨"
+            ]
+          },
+          "expected_output": "level=DEBUG msg=👨\n"
+        },
+        {
+          "input": {
+            "op": "leveled",
+            "format": "prefix",
+            "level": "info",
+            "keyvals": [
+              "msg",
+              "🚀"
+            ]
+          },
+          "expected_output": "level=INFO msg=🚀\n"
+        },
+        {
+          "input": {
+            "op": "leveled",
+            "format": "prefix",
+            "level": "error",
+            "keyvals": [
+              "msg",
+              "🍵"
+            ]
+          },
+          "expected_output": "level=ERROR msg=🍵\n"
+        }
+      ]
+    },
+    "feature3_2_customized_levels.json": {
+      "description": "Emit an event through a severity-tagged logger whose level key and per-severity values have been customized. The injected severity pair uses the configured key and the configured value for the selected severity, and additional context can be stacked on top before emitting.",
+      "cases": [
+        {
+          "input": {
+            "op": "leveled",
+            "format": "json",
+            "level": "debug",
+            "levelKey": "l",
+            "levelValues": {
+              "debug": "⛄",
+              "info": "🌜",
+              "error": "🌊"
+            },
+            "context": [
+              [
+                "easter_island",
+                "🗿"
+              ]
+            ],
+            "keyvals": [
+              "msg",
+              "💃💃💃"
+            ]
+          },
+          "expected_output": "{\"easter_island\":\"🗿\",\"l\":\"⛄\",\"msg\":\"💃💃💃\"}\n"
+        }
+      ]
+    },
+    "feature4_dynamic_value_binding.json": {
+      "description": "Attach a dynamic value to a logger that is re-evaluated on every log event rather than captured once. Here a deterministic mock clock advances by a fixed step on each evaluation, so two successive events bound to the same logger carry different timestamp values, proving the value is recomputed per event.",
+      "cases": [
+        {
+          "input": {
+            "op": "dynamic",
+            "format": "prefix",
+            "start": "2015-04-25T00:00:00Z",
+            "stepSeconds": 1,
+            "calls": 2,
+            "keyvals": [
+              "foo",
+              "bar"
+            ]
+          },
+          "expected_output": "ts=2015-04-25T00:00:01Z foo=bar\nts=2015-04-25T00:00:02Z foo=bar\n"
+        },
+        {
+          "input": {
+            "op": "dynamic",
+            "format": "prefix",
+            "start": "2015-04-25T00:00:00Z",
+            "stepSeconds": 5,
+            "calls": 3,
+            "keyvals": [
+              "foo",
+              "bar"
+            ]
+          },
+          "expected_output": "ts=2015-04-25T00:00:05Z foo=bar\nts=2015-04-25T00:00:10Z foo=bar\nts=2015-04-25T00:00:15Z foo=bar\n"
+        }
+      ]
+    },
+    "feature5_swappable_sink.json": {
+      "description": "A swappable logger whose active sink can be replaced between events. Before any sink is set it silently discards events with no error. Each step optionally swaps the active sink (an encoder name, or null to return to discarding) and then emits one event; the concatenated output reflects whichever sink was active at each step. Setting the sink to null again discards subsequent events.",
+      "cases": [
+        {
+          "input": {
+            "op": "rebind",
+            "steps": [
+              {
+                "keyvals": [
+                  "k",
+                  "v"
+                ]
+              },
+              {
+                "sink": "json",
+                "keyvals": [
+                  "k",
+                  "v"
+                ]
+              },
+              {
+                "sink": "prefix",
+                "keyvals": [
+                  "k",
+                  "v"
+                ]
+              },
+              {
+                "sink": null,
+                "keyvals": [
+                  "k",
+                  "v"
+                ]
+              }
+            ]
+          },
+          "expected_output": "{\"k\":\"v\"}\nk=v\n"
+        }
+      ]
+    },
+    "feature6_stdlib_line_adapter.json": {
+      "description": "Parse a single raw standard log line and re-emit it as structured key=value pairs. An optional leading date (YYYY/MM/DD) and time (HH:MM:SS with optional fractional seconds) are joined into a single timestamp under key \"ts\"; an optional file:line reference goes under key \"file\"; the remaining message text goes under key \"msg\". Absent fields are omitted. Fields appear in the order ts, file, msg.",
+      "cases": [
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "hello"
+          },
+          "expected_output": "msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "2009/01/23: hello"
+          },
+          "expected_output": "ts=2009/01/23 msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "2009/01/23 01:23:23: hello"
+          },
+          "expected_output": "ts=2009/01/23 01:23:23 msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "01:23:23: hello"
+          },
+          "expected_output": "ts=01:23:23 msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "2009/01/23 01:23:23.123123: hello"
+          },
+          "expected_output": "ts=2009/01/23 01:23:23.123123 msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "2009/01/23 01:23:23.123123 /a/b/c/d.go:23: hello"
+          },
+          "expected_output": "ts=2009/01/23 01:23:23.123123 file=/a/b/c/d.go:23 msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "01:23:23.123123 /a/b/c/d.go:23: hello"
+          },
+          "expected_output": "ts=01:23:23.123123 file=/a/b/c/d.go:23 msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "2009/01/23 01:23:23 /a/b/c/d.go:23: hello"
+          },
+          "expected_output": "ts=2009/01/23 01:23:23 file=/a/b/c/d.go:23 msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "2009/01/23 /a/b/c/d.go:23: hello"
+          },
+          "expected_output": "ts=2009/01/23 file=/a/b/c/d.go:23 msg=hello\n"
+        },
+        {
+          "input": {
+            "op": "adapt_line",
+            "line": "/a/b/c/d.go:23: hello"
+          },
+          "expected_output": "file=/a/b/c/d.go:23 msg=hello\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Encoder Prefix",
+      "input_condition": "Format is 'prefix'",
+      "output_rule": "Line terminated parts joined by single spaces",
+      "exact_values": [
+        "key=value"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Encoder Prefix",
+      "input_condition": "Value is an error object {$$errmessage}",
+      "output_rule": "Rendered as the plain message text value",
+      "exact_values": [
+        "error:",
+        "text"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Encoder Prefix",
+      "input_condition": "Key-Value list has odd (malformed) length",
+      "output_rule": "Surface as normalized error 'invalid_keyvals'",
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Encoder JSON",
+      "input_condition": "Format is 'json'",
+      "output_rule": "Keys emitted in sorted order",
+      "exact_values": [
+        "sorted"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Encoder JSON",
+      "input_condition": "Value is an error object {$$errmessage}",
+      "output_rule": "Rendered as a string message",
+      "exact_values": [
+        "string"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Encoder JSON",
+      "input_condition": "Value is a nested map",
+      "output_rule": "Rendered as nested JSON",
+      "exact_values": [
+        "{}"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Encoder JSON",
+      "input_condition": "Value is an array",
+      "output_rule": "Rendered as JSON array (original order)",
+      "exact_values": [
+        "[ ]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Context Logger",
+      "input_condition": "Context list is provided alongside keyvals",
+      "output_rule": "Context pairs prepended to event pairs in order",
+      "exact_values": [
+        "prepended"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Context Logger",
+      "input_condition": "Multiple context layers provided",
+      "output_rule": "Layers accumulate sequentially (repeated pairs merged)",
+      "exact_values": [
+        "accumulate"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Context Logger",
+      "input_condition": "Context value is static",
+      "output_rule": "Captured once and reused for all events",
+      "exact_values": [
+        "static"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Leveled Logger",
+      "input_condition": "Level is specified (debug/info/error)",
+      "output_rule": "Injects a context pair: {levelKey: levelValue}",
+      "exact_values": [
+        "l:DEBUG",
+        "l:INFO",
+        "l:ERROR"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Leveled Logger",
+      "input_condition": "Default configuration",
+      "output_rule": "Key is 'level'; Values are uppercase severity names",
+      "exact_values": [
+        "level=DEBUG",
+        "level=INFO",
+        "level=ERROR"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Leveled Logger",
+      "input_condition": "Custom configuration (levelKey/levelValues)",
+      "output_rule": "Uses provided key and per-severity values",
+      "exact_values": [
+        "l:⛄",
+        "easter_island:🗿"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Dynamic Value",
+      "input_condition": "Dynamic value bound to a key",
+      "output_rule": "Re-evaluated on every emitted event",
+      "exact_values": [
+        "re-evaluate"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Dynamic Value",
+      "input_condition": "Mock clock with start/step",
+      "output_rule": "Starts at 'start' then advances by 'step' for each call",
+      "exact_values": [
+        "2015-04-25T00:00:00Z",
+        "2015-04-25T00:00:01Z"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Swappable Sink",
+      "input_condition": "No sink set initially",
+      "output_rule": "Silently discards events; no output, no error",
+      "exact_values": [
+        "null output"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Swappable Sink",
+      "input_condition": "Sink set to 'null' explicitly",
+      "output_rule": "Silently discards subsequent events",
+      "exact_values": [
+        "null output"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Swappable Sink",
+      "input_condition": "Sink changed between steps",
+      "output_rule": "Event emitted using the encoder active at that moment",
+      "exact_values": [
+        "concatenated output based on active sink"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Line Adapter",
+      "input_condition": "Line follows pattern YYYY/MM/DD HH:MM:SS...",
+      "output_rule": "Date and time stripped and combined into 'ts' field",
+      "exact_values": [
+        "ts=...",
+        "YYYY/MM/DD ..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Line Adapter",
+      "input_condition": "Line contains '/path:line: message'",
+      "output_rule": "Path and line extracted into 'file' field",
+      "exact_values": [
+        "file=/...:..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Line Adapter",
+      "input_condition": "Line is strictly 'message'",
+      "output_rule": "Only 'msg' field present",
+      "exact_values": [
+        "msg=..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Line Adapter",
+      "input_condition": "Fractional seconds present (e.g., .123123)",
+      "output_rule": "Included in the timestamp string",
+      "exact_values": [
+        "01:23:23.123123"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Line Adapter",
+      "input_condition": "Time present but no date",
+      "output_rule": "Time parsed into timestamp; no space between date and time components",
+      "exact_values": [
+        "ts=01:23:23"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Global Identity",
+      "input_condition": "N/A (Trace)",
+      "output_rule": "Field in input is 'op', output format is JSON with specific keys",
+      "exact_values": [
+        "input.op: qink"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Consistency",
+      "input_condition": "N/A (Trace)",
+      "output_rule": "Output keys in JSON must be alphabetically sorted for consistency across operations",
+      "exact_values": [
+        "keys sorted"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "Encoder JSON",
+      "input_condition": "Nested map key is a string",
+      "output_rule": "Retains key as string",
+      "exact_values": [
+        "\"0\":0"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C013",
+        "replacement": "a custom config using non-standard keys and emoji values",
+        "exact_values_to_replace": [
+          "l:⛄",
+          "easter_island:🗿"
+        ],
+        "trigger_keywords": [
+          "custom level key",
+          "emoji log format",
+          "badger cherry",
+          "easter island output",
+          "what are the custom level values"
+        ],
+        "oracle_response": "The custom configuration uses the key 'l' mapped to '⛄' and the key 'easter_island' mapped to '🗿'."
+      },
+      {
+        "constraint_id": "C015",
+        "replacement": "the mock clock start and step values",
+        "exact_values_to_replace": [
+          "2015-04-25T00:00:00Z",
+          "2015-04-25T00:00:01Z"
+        ],
+        "trigger_keywords": [
+          "mock clock initialization",
+          "start timestamp",
+          "step value",
+          "when does the mock clock begin",
+          "exact mock clock values"
+        ],
+        "oracle_response": "The mock clock initializes at '2015-04-25T00:00:00Z' and advances by '2015-04-25T00:00:01Z' for each step."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C017",
+        "vague_phrase": "sink set to null explicitly",
+        "actual_meaning": "The condition where the sink is initialized or set to a null literal value in the configuration object."
+      },
+      {
+        "constraint_id": "C016",
+        "vague_phrase": "No sink set initially",
+        "actual_meaning": "The initial state of the sink field before any assignment operation occurs."
+      }
+    ]
+  }
+}

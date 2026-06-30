@@ -1,0 +1,5 @@
+## Product Requirement Document
+
+Hey team, we need to update how the NetworkResponseAdapter handles incoming API responses and failures for the new dashboard. Basically, the system needs to take a JSON input with an 'action' field and route it correctly. If the action is 'map_response', we need to check the status code: 2xx with a body should result in a success output showing the payload, while non-2xx codes with a body should flag a server error with the status and message. For 'map_failure' actions, IO issues should map to network errors, and HTTP failures with a code and body should map to server errors. Also, when extracting values from a successful response, just output the payload. 
+
+A couple of specific formatting rules: please handle headers exactly as the legacy auth middleware does, ensuring they appear in the output correctly. Also, make sure the final output follows the standard stream termination protocol used in the logging module so our downstream parsers don't choke. We'll test with standard success and error scenarios first. Let me know if you need clarification on the routing logic.

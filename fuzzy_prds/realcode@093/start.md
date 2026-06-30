@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+We need a dependency injection container that allows teams to register value factories and automatically resolve the full dependency graph at runtime. Developers declare what a factory produces and what it needs as inputs; the container wires everything together, building each value at most once and caching it for subsequent requests — similar to how our configuration subsystem lazily initialises shared clients.
+
+The system must support several registration and resolution variants. A single factory can produce multiple distinct value types at once. Values of the same type can coexist when each is tagged with a unique label; label matching must be exact, so casing differences count as different labels. A consumer may declare a dependency as optional, in which case the container supplies an absent indicator rather than failing.
+
+The system must detect circular wiring at registration time and reject the offending registration immediately, leaving earlier valid registrations intact. Misuse scenarios — registering a null factory, a non-callable value, invoking with a non-callable target, requesting a type with no registered factory, registering a duplicate factory for an already-known type, or a factory that reports failure at construction time — must each produce a distinct, well-defined error category. The error taxonomy should follow the same conventions used in our validation middleware layer. Each constructed instance carries an observable integer payload so tests can confirm exactly which instance was received.

@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+We need a small support library for the administrative dashboard of our map tile server. The dashboard repeats the same error-prone transformations on every screen, producing inconsistent size labels, broken URLs, and subtly wrong charts. We want to centralize three categories of functionality.
+
+First, display storage sizes in a human-friendly format. Raw byte counts must be converted to readable labels using a decimal scale. Edge cases — zero, a single byte, missing or invalid inputs, and extremely large values — must produce distinct, well-defined labels.
+
+Second, the dashboard calls backend API endpoints but the server can be hosted at different paths or domains. We need a way to derive the correct API root from either an explicit configuration setting or the current browser location, ensuring that query strings and hash fragments never corrupt the constructed address. Given this base and a relative path, the library must assemble a properly joined absolute URL.
+
+Third, the dashboard needs to visualize request performance. It reads a metrics exposition format emitted by the server — look for the relevant metric family name already used in the codebase — and extracts per-endpoint duration totals, request counts, and latency distribution buckets. Those must also be aggregated into logical endpoint groupings whose definitions already live somewhere in the source tree. Bucket data must be sorted correctly and the redundant catch-all upper bound dropped.
+
+All logic should be pure functions decoupled from I/O, with a thin command-dispatch adapter on top.
+
+A couple small specifics that came up while people were reviewing this. On the size formatting side, 0 is its own special case and must come back as '0 Bytes', and 1 is also special-cased as '1 Byte'. Everything else that is valid and non-zero uses the plural unit form from exactly ['Bytes', 'KB', 'MB', 'GB', 'TB'] with decimal (1000-based) scaling. If the input is absent (undefined), null, NaN, or negative, return 'Unknown size'. Also, if the CLI adapter gets the literal string 'NaN', it should turn that into Number.NaN before handing off to the pure formatter. And if Math.floor(bytes) / 1000^i yields an index i >= 5, that’s past TB and should return 'File too large'.
+
+On the URL helper, buildMartinUrl should trim any trailing slash off the base URL and make sure the path starts with '/'. The final join is just normalizedBaseUrl + normalizedPath, so you end up with exactly one slash between them. Also worth calling out that special characters in the path, including things like '@', underscores, and braces, should stay exactly as they are.
+
+For the metrics parsing, this is the Prometheus text exposition format, and the metric family we care about is 'martin_http_requests_duration_seconds', parsed in src/lib/prometheus.ts. The endpoint grouping source of truth is the ENDPOINT_GROUPS constant exported from src/lib/prometheus.ts, mapping group names to arrays of endpoint path patterns. Right now those predefined groups are tiles -> ['/{source_ids}/{z}/{x}/{y}', '/{source_ids}'], sprites -> ['/sprite/{source_ids}.json', '/sprite/{source_ids}.png', '/sdf_sprite/{source_ids}.json', '/sdf_sprite/{source_ids}.png'], fonts -> ['/font/{fontstack}/{start}-{end}'], styles -> ['/style/{style_id}'].

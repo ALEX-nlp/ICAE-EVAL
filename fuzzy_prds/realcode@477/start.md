@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a small request-builder thing for the search service. Basically we want something that takes a high-level 'count documents' instruction and turns it into a proper HTTP request — method, path, params, body, all that. The tricky part (and the reason this came up) is that our ops team noticed the service is getting hit with a bunch of empty `{}` payloads on simple count requests, and some of the upstream servers are behaving weirdly when they receive those. So we need to make sure the body is only included when it actually has something meaningful in it — same kind of logic we used in that index-routing module a while back, you know the one.
+
+Also some inputs are lightweight enough that they should just ride on the URL rather than going into a body. The structured stuff obviously needs to be serialized properly — for term-style queries, refer to how we nested things in the last search PR.
+
+The whole thing needs to be cleanly separated — don't just throw everything in one file. There should be a runnable adapter that reads from stdin and prints the wire request to stdout so we can test it. Tests should live under rcb_tests/ and run with a single bash command. If something goes in wrong, don't blow up with a stack trace — surface a clean generic error. Probably a two-day task, let me know if anything is unclear.

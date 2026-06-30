@@ -1,0 +1,2146 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out that lightweight inference runner we've been talking about. The idea is that our data science folks export a trained model once, and then any production service can just run it without needing the whole training framework installed. We had a similar portability story with that config-loading module from the auth service — same vibe here, just for neural nets.\n\nThe runner needs to handle a few different evaluation styles: the standard layered one, a sequence-folding one for time-series stuff, and a more flexible graph-based one for complex routing. Each style reads a self-contained model description and spits out named results as plain text.\n\nOne thing that came up in ops review: some of our input pipelines occasionally produce bad values (missing sensors, overflow, that kind of thing) and we need the runner to handle those gracefully rather than blowing up. Also, the output formatting needs to be totally consistent across environments — our diff-based monitoring will flag any whitespace or precision drift as an incident.\n\nArchitecture-wise, please don't make this a single giant file — last time that happened with the analytics batch job it was a nightmare to maintain. Keep the parsing, math, evaluation strategies, and I/O handling clearly separated.\n\nErrors should come out in a normalized text format, not raw stack traces or framework exceptions, since downstream log parsers don't know how to handle those.\n\nA couple extra details from the questions that came back. On formatting, the text output really does need to be locked down: render values with roughly six significant figures, trim trailing zeros and any unnecessary decimal point, and if the result is an integer just print it as `2`, `-3`, `0`. For non-integers, use the minimal representation like `0.880797` or `-4.06896e-05`. That exact textual rendering is part of the contract and needs to stay stable across environments.\n\nAlso, on the input path, every variable has an `offset` and a `scale`, and before anything hits the first layer we apply `(value + offset) * scale`. That’s true in all three modes: `feed_forward`, `recurrent`, and `graph`. If an incoming value is non-finite and shows up as the string tokens `nan`, `inf`, or `-inf`, then if there’s a default for that variable in the `defaults` map of the config, we swap in that default first, before any preprocessing or layer math. If there’s no default declared, the non-finite value just propagates as-is. Important detail there: the substitution happens before the `(value + offset) * scale` affine normalization step. This is the same config-loading and input-preprocessing pipeline we called out already, specifically the per-variable `offset`/`scale` affine transform and the `defaults`-based non-finite substitution logic described in Feature 2 (feature2_1_input_scaling.json and feature2_2_default_substitution.json).\n\nOn errors, keep them single-line and language-neutral on stdout, with normalized categories only. For malformed JSON, emit `error=invalid_command` then `detail=malformed_json`. For an unrecognized mode, emit `error=unknown_mode` then `mode=<value>`. For an invalid network description, emit `error=invalid_configuration`. For a runtime evaluation failure, emit `error=evaluation_failed`. For an output-rank mismatch, emit `error=output_rank_mismatch`. And never emit a host-runtime stack trace.\n\nLast bit is output shape by mode. In graph mode, output starts with a header line `<output-node-name>:` and then the value lines. With `op=compute`, each value line is `<label> <value>`. With `op=scan`, each value line is `<label> <v1> <v2> ...` with one value per sequence step. In `feed_forward` and `recurrent`, there’s no header, just one line per named output as `<name> <value>`.",
+  "oracle_data": {
+    "task_id": "lwtnn-inference-engine-001",
+    "golden_api_signature": "run(command_json: str) -> str",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what layer types are supported",
+          "which layer architectures does the engine know about",
+          "supported layer kinds beyond dense"
+        ],
+        "oracle_response": "The engine must support: `dense` (fully-connected affine + activation), `normalization` (per-feature `weight * (input + bias)`), `maxout` (max over parallel affine sub-layers), `highway` (gated mix of transform branch and carry-through: `H(x)*T(x) + x*(1-T(x))`), `simplernn` (simple recurrent: `activation(W*x + U*h_prev + b)`), `gru` (gated recurrent unit with update gate z, reset gate r, candidate h), and `lstm` (long short-term memory with input gate i, forget gate f, output gate o, cell c). Adding new kinds must not require modifying the core engine."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what graph node types are available",
+          "which node types can appear in a computation graph",
+          "what is a time_distributed node"
+        ],
+        "oracle_response": "Graph nodes can be of type: `input` (reads a named input block and emits a fixed-size vector), `input_sequence` (reads a named sequence input), `feed_forward` (applies a layer by `layer_index` to its single source), `concatenate` (concatenates vectors from multiple source nodes), and `time_distributed` (applies a layer independently at every time step of a sequence source, producing a sequence output for `op=scan`)."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "how should the code be organized across files",
+          "what is the expected file structure",
+          "is a single file acceptable for the whole engine"
+        ],
+        "oracle_response": "The project must NOT be a single god file. The required separation is: configuration parsing, the core math/graph engine, the evaluation strategies (feed_forward, recurrent, graph), and the I/O adapter (stdin/stdout, command JSON). The core engine must be fully decoupled from stdin/stdout. The adapter alone translates a command into engine calls and renders results. New layer kinds or evaluation strategies must be addable without modifying the core engine."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "how does the highway layer work exactly",
+          "what is the formula for highway gating",
+          "carry gate and transform gate in highway layer"
+        ],
+        "oracle_response": "A highway layer computes `output = H(x) * T(x) + x * (1 - T(x))` where `H(x)` is the transform branch (affine + main activation applied to input), `T(x)` is the transform gate (sigmoid of the `t` component's affine output), and the carry branch uses the `carry` component. The identity shortcut `x` is mixed with the transform output using the gate value."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "how does recurrent mode differ from feed_forward for inputs",
+          "sequence input format in recurrent mode",
+          "what is the sequence field in recurrent commands"
+        ],
+        "oracle_response": "In `recurrent` mode the command carries a `sequence` field (not `values`). Each key in `sequence` is a named input channel, and the value is an ordered list of scalars — one per time step. The recurrent layer folds the sequence into a single final state vector by stepping through each time step and applying the cell update. The config `inputs` list still declares the offset/scale for each channel."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid op field values",
+          "what values can op take",
+          "list all supported op values",
+          "what actions does the dispatcher handle",
+          "which op strings does the adapter support",
+          "what are the possible op inputs",
+          "tell me all the op names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'op' field. Valid values are: 'compute', 'scan'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature1_dense_activations",
+        "trigger_keywords": [
+          "test cases for feature1 dense activations",
+          "show me feature1 dense activations test cases",
+          "what are the feature1 dense activations test inputs",
+          "give me the feature1_dense_activations test file",
+          "test cases for feature 1",
+          "feature1 dense activations expected output",
+          "what does feature1 dense activations expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_dense_activations:\n{\n  \"description\": \"Evaluate a single fully-connected layer (identity weights, zero bias) on a two-element input, applying a named element-wise activation to the affine result. Each case selects a different activation so the reader sees how the same pre-activation values (2, -3) are transformed.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            },\n            {\n              \"name\": \"x1\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                0.0,\n                0.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0,\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"a\",\n            \"b\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 2.0,\n          \"x1\": -3.0\n        }\n      },\n      \"expected_output\": \"a 2\\nb -3\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            },\n            {\n              \"name\": \"x1\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                0.0,\n                0.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0,\n                0.0\n              ],\n              \"activation\": \"sigmoid\"\n            }\n          ],\n          \"outputs\": [\n            \"a\",\n            \"b\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 2.0,\n          \"x1\": -3.0\n        }\n      },\n      \"expected_output\": \"a 0.880797\\nb 0.0474259\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            },\n            {\n              \"name\": \"x1\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                0.0,\n                0.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0,\n                0.0\n              ],\n              \"activation\": \"rectified\"\n            }\n          ],\n          \"outputs\": [\n            \"a\",\n            \"b\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 2.0,\n          \"x1\": -3.0\n        }\n      },\n      \"expected_output\": \"a 2\\nb 0\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            },\n            {\n              \"name\": \"x1\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                0.0,\n                0.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0,\n                0.0\n              ],\n              \"activation\": \"tanh\"\n            }\n          ],\n          \"outputs\": [\n            \"a\",\n            \"b\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 2.0,\n          \"x1\": -3.0\n        }\n      },\n      \"expected_output\": \"a 0.964028\\nb -0.995055\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_input_scaling",
+        "trigger_keywords": [
+          "test cases for feature2 1 input scaling",
+          "show me feature2 1 input scaling test cases",
+          "what are the feature2 1 input scaling test inputs",
+          "give me the feature2_1_input_scaling test file",
+          "test cases for feature 2",
+          "feature2 1 input scaling expected output",
+          "what does feature2 1 input scaling expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_input_scaling:\n{\n  \"description\": \"Each named input is preprocessed as (value + offset) * scale before it reaches the network. A linear identity layer exposes the scaled value directly so the preprocessing transform is observable.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": -1.0,\n              \"scale\": 2.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"y\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 4.0\n        }\n      },\n      \"expected_output\": \"y 6\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 0.5\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"y\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 10.0\n        }\n      },\n      \"expected_output\": \"y 5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_default_substitution",
+        "trigger_keywords": [
+          "test cases for feature2 2 default substitution",
+          "show me feature2 2 default substitution test cases",
+          "what are the feature2 2 default substitution test inputs",
+          "give me the feature2_2_default_substitution test file",
+          "test cases for feature 2",
+          "feature2 2 default substitution expected output",
+          "what does feature2 2 default substitution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_default_substitution:\n{\n  \"description\": \"When an input value is non-finite (NaN, +inf, -inf) and a default is declared for that variable, the engine substitutes the default before evaluation. Special inputs are passed as the string tokens nan/inf/-inf.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {\n            \"x0\": 5.0\n          },\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"y\"\n          ]\n        },\n        \"values\": {\n          \"x0\": \"nan\"\n        }\n      },\n      \"expected_output\": \"y 5\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {\n            \"x0\": -2.0\n          },\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"y\"\n          ]\n        },\n        \"values\": {\n          \"x0\": \"inf\"\n        }\n      },\n      \"expected_output\": \"y -2\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_normalization",
+        "trigger_keywords": [
+          "test cases for feature3 1 normalization",
+          "show me feature3 1 normalization test cases",
+          "what are the feature3 1 normalization test inputs",
+          "give me the feature3_1_normalization test file",
+          "test cases for feature 3",
+          "feature3 1 normalization expected output",
+          "what does feature3 1 normalization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_normalization:\n{\n  \"description\": \"A per-feature normalization layer computes weight * (input + bias) for each element independently (an affine batch-normalization-style rescaling). Two independent features are normalized with distinct weight/bias pairs.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            },\n            {\n              \"name\": \"x1\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"normalization\",\n              \"weights\": [\n                2.0,\n                3.0\n              ],\n              \"bias\": [\n                1.0,\n                -1.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"a\",\n            \"b\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 2.0,\n          \"x1\": 2.0\n        }\n      },\n      \"expected_output\": \"a 6\\nb 3\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"normalization\",\n              \"weights\": [\n                0.5\n              ],\n              \"bias\": [\n                4.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"y\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 6.0\n        }\n      },\n      \"expected_output\": \"y 5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_maxout",
+        "trigger_keywords": [
+          "test cases for feature3 2 maxout",
+          "show me feature3 2 maxout test cases",
+          "what are the feature3 2 maxout test inputs",
+          "give me the feature3_2_maxout test file",
+          "test cases for feature 3",
+          "feature3 2 maxout expected output",
+          "what does feature3 2 maxout expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_maxout:\n{\n  \"description\": \"A maxout layer holds several parallel affine sub-layers and, per output unit, emits the maximum over all sub-layers' pre-activations. A trailing linear identity layer exposes the selected maximum.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"maxout\",\n              \"sublayers\": [\n                {\n                  \"weights\": [\n                    1.0\n                  ],\n                  \"bias\": [\n                    0.0\n                  ]\n                },\n                {\n                  \"weights\": [\n                    -2.0\n                  ],\n                  \"bias\": [\n                    1.0\n                  ]\n                }\n              ]\n            },\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"m\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 2.0\n        }\n      },\n      \"expected_output\": \"m 2\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"maxout\",\n              \"sublayers\": [\n                {\n                  \"weights\": [\n                    1.0\n                  ],\n                  \"bias\": [\n                    0.0\n                  ]\n                },\n                {\n                  \"weights\": [\n                    -2.0\n                  ],\n                  \"bias\": [\n                    1.0\n                  ]\n                }\n              ]\n            },\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"m\"\n          ]\n        },\n        \"values\": {\n          \"x0\": -1.0\n        }\n      },\n      \"expected_output\": \"m 3\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_highway",
+        "trigger_keywords": [
+          "test cases for feature3 3 highway",
+          "show me feature3 3 highway test cases",
+          "what are the feature3 3 highway test inputs",
+          "give me the feature3_3_highway test file",
+          "test cases for feature 3",
+          "feature3 3 highway expected output",
+          "what does feature3 3 highway expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_highway:\n{\n  \"description\": \"A highway layer mixes a transformed branch and a carried-through branch using learned transform/carry gates: output = H(x)*T(x) + x*(1 - T(x)). A trailing linear identity layer exposes the gated result.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            },\n            {\n              \"name\": \"x1\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"highway\",\n              \"activation\": \"rectified\",\n              \"components\": {\n                \"t\": {\n                  \"weights\": [\n                    1.0,\n                    0.0,\n                    0.0,\n                    1.0\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"carry\": {\n                  \"weights\": [\n                    0.0,\n                    0.0,\n                    0.0,\n                    0.0\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                }\n              }\n            },\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                0.0,\n                0.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0,\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"a\",\n            \"b\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 1.0,\n          \"x1\": 1.0\n        }\n      },\n      \"expected_output\": \"a 1\\nb 1\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"feed_forward\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            },\n            {\n              \"name\": \"x1\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"highway\",\n              \"activation\": \"rectified\",\n              \"components\": {\n                \"t\": {\n                  \"weights\": [\n                    0.0,\n                    0.0,\n                    0.0,\n                    0.0\n                  ],\n                  \"bias\": [\n                    -10.0,\n                    -10.0\n                  ]\n                },\n                \"carry\": {\n                  \"weights\": [\n                    0.0,\n                    0.0,\n                    0.0,\n                    0.0\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                }\n              }\n            },\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                0.0,\n                0.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0,\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": [\n            \"a\",\n            \"b\"\n          ]\n        },\n        \"values\": {\n          \"x0\": 4.0,\n          \"x1\": -5.0\n        }\n      },\n      \"expected_output\": \"a 2\\nb -2.5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_simple_recurrent",
+        "trigger_keywords": [
+          "test cases for feature4 1 simple recurrent",
+          "show me feature4 1 simple recurrent test cases",
+          "what are the feature4 1 simple recurrent test inputs",
+          "give me the feature4_1_simple_recurrent test file",
+          "test cases for feature 4",
+          "feature4 1 simple recurrent expected output",
+          "what does feature4 1 simple recurrent expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_simple_recurrent:\n{\n  \"description\": \"A simple recurrent layer folds an ordered sequence into a single fixed-size state vector. At each step the new state is activation(W*input + U*prev + b); the engine returns the final state. Input is one named channel sampled over several time steps.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"recurrent\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"simplernn\",\n              \"activation\": \"linear\",\n              \"components\": {\n                \"h\": {\n                  \"weights\": [\n                    1.0\n                  ],\n                  \"U\": [\n                    0.5\n                  ],\n                  \"bias\": [\n                    0.0\n                  ]\n                }\n              }\n            }\n          ],\n          \"outputs\": [\n            \"h0\"\n          ]\n        },\n        \"sequence\": {\n          \"x0\": [\n            1.0,\n            1.0,\n            1.0\n          ]\n        }\n      },\n      \"expected_output\": \"h0 1.75\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"recurrent\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"simplernn\",\n              \"activation\": \"linear\",\n              \"components\": {\n                \"h\": {\n                  \"weights\": [\n                    1.0\n                  ],\n                  \"U\": [\n                    0.5\n                  ],\n                  \"bias\": [\n                    0.0\n                  ]\n                }\n              }\n            }\n          ],\n          \"outputs\": [\n            \"h0\"\n          ]\n        },\n        \"sequence\": {\n          \"x0\": [\n            2.0,\n            -1.0\n          ]\n        }\n      },\n      \"expected_output\": \"h0 0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_gated_recurrent",
+        "trigger_keywords": [
+          "test cases for feature4 2 gated recurrent",
+          "show me feature4 2 gated recurrent test cases",
+          "what are the feature4 2 gated recurrent test inputs",
+          "give me the feature4_2_gated_recurrent test file",
+          "test cases for feature 4",
+          "feature4 2 gated recurrent expected output",
+          "what does feature4 2 gated recurrent expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_2_gated_recurrent:\n{\n  \"description\": \"A gated recurrent layer reduces a sequence to a final state using update and reset gates (inner activation) plus a candidate state (main activation). Output is the final two-element state for the supplied single-channel sequence.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"recurrent\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"gru\",\n              \"activation\": \"tanh\",\n              \"components\": {\n                \"z\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"r\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"h\": {\n                  \"weights\": [\n                    0.3,\n                    0.4\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                }\n              },\n              \"inner_activation\": \"sigmoid\"\n            }\n          ],\n          \"outputs\": [\n            \"h0\",\n            \"h1\"\n          ]\n        },\n        \"sequence\": {\n          \"x0\": [\n            1.0,\n            0.5,\n            -0.5\n          ]\n        }\n      },\n      \"expected_output\": \"h0 -4.06896e-05\\nh1 -0.00823268\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"recurrent\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"gru\",\n              \"activation\": \"tanh\",\n              \"components\": {\n                \"z\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"r\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"h\": {\n                  \"weights\": [\n                    0.3,\n                    0.4\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                }\n              },\n              \"inner_activation\": \"sigmoid\"\n            }\n          ],\n          \"outputs\": [\n            \"h0\",\n            \"h1\"\n          ]\n        },\n        \"sequence\": {\n          \"x0\": [\n            0.2,\n            0.2,\n            0.2,\n            0.2\n          ]\n        }\n      },\n      \"expected_output\": \"h0 0.0581038\\nh1 0.0771669\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_3_lstm_recurrent",
+        "trigger_keywords": [
+          "test cases for feature4 3 lstm recurrent",
+          "show me feature4 3 lstm recurrent test cases",
+          "what are the feature4 3 lstm recurrent test inputs",
+          "give me the feature4_3_lstm_recurrent test file",
+          "test cases for feature 4",
+          "feature4 3 lstm recurrent expected output",
+          "what does feature4 3 lstm recurrent expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_3_lstm_recurrent:\n{\n  \"description\": \"A long short-term memory layer reduces a sequence to a final hidden state using input, forget, and output gates over an internal cell state. Output is the final two-element hidden state for the supplied single-channel sequence.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"recurrent\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"lstm\",\n              \"activation\": \"tanh\",\n              \"components\": {\n                \"i\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"f\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"o\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"c\": {\n                  \"weights\": [\n                    0.3,\n                    0.4\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                }\n              },\n              \"inner_activation\": \"sigmoid\"\n            }\n          ],\n          \"outputs\": [\n            \"h0\",\n            \"h1\"\n          ]\n        },\n        \"sequence\": {\n          \"x0\": [\n            1.0,\n            0.5,\n            -0.5\n          ]\n        }\n      },\n      \"expected_output\": \"h0 0.00439862\\nh1 0.0077197\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"recurrent\",\n        \"config\": {\n          \"defaults\": {},\n          \"inputs\": [\n            {\n              \"name\": \"x0\",\n              \"offset\": 0.0,\n              \"scale\": 1.0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"lstm\",\n              \"activation\": \"tanh\",\n              \"components\": {\n                \"i\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"f\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"o\": {\n                  \"weights\": [\n                    0.1,\n                    0.2\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                },\n                \"c\": {\n                  \"weights\": [\n                    0.3,\n                    0.4\n                  ],\n                  \"U\": [\n                    0.1,\n                    0.0,\n                    0.0,\n                    0.1\n                  ],\n                  \"bias\": [\n                    0.0,\n                    0.0\n                  ]\n                }\n              },\n              \"inner_activation\": \"sigmoid\"\n            }\n          ],\n          \"outputs\": [\n            \"h0\",\n            \"h1\"\n          ]\n        },\n        \"sequence\": {\n          \"x0\": [\n            -1.0,\n            -1.0,\n            2.0\n          ]\n        }\n      },\n      \"expected_output\": \"h0 0.0960763\\nh1 0.142141\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_graph_feedforward",
+        "trigger_keywords": [
+          "test cases for feature5 1 graph feedforward",
+          "show me feature5 1 graph feedforward test cases",
+          "what are the feature5 1 graph feedforward test inputs",
+          "give me the feature5_1_graph_feedforward test file",
+          "test cases for feature 5",
+          "feature5 1 graph feedforward expected output",
+          "what does feature5 1 graph feedforward expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_graph_feedforward:\n{\n  \"description\": \"A computation graph routes a named input node through a feed-forward node to a named output node. The output block is printed as a header line '<output>:' followed by one '<label> <value>' line per output unit.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"graph\",\n        \"config\": {\n          \"inputs\": [\n            {\n              \"name\": \"node_0\",\n              \"variables\": [\n                {\n                  \"name\": \"x0\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                },\n                {\n                  \"name\": \"x1\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            }\n          ],\n          \"input_sequences\": [],\n          \"nodes\": [\n            {\n              \"type\": \"input\",\n              \"sources\": [\n                0\n              ],\n              \"size\": 2\n            },\n            {\n              \"type\": \"feed_forward\",\n              \"sources\": [\n                0\n              ],\n              \"layer_index\": 0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                0.0,\n                0.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0,\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": {\n            \"out\": {\n              \"labels\": [\n                \"a\",\n                \"b\"\n              ],\n              \"node_index\": 1\n            }\n          }\n        },\n        \"op\": \"compute\",\n        \"inputs\": {\n          \"node_0\": {\n            \"x0\": 3.0,\n            \"x1\": 4.0\n          }\n        }\n      },\n      \"expected_output\": \"out:\\na 3\\nb 4\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"graph\",\n        \"config\": {\n          \"inputs\": [\n            {\n              \"name\": \"node_0\",\n              \"variables\": [\n                {\n                  \"name\": \"x0\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                },\n                {\n                  \"name\": \"x1\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            }\n          ],\n          \"input_sequences\": [],\n          \"nodes\": [\n            {\n              \"type\": \"input\",\n              \"sources\": [\n                0\n              ],\n              \"size\": 2\n            },\n            {\n              \"type\": \"feed_forward\",\n              \"sources\": [\n                0\n              ],\n              \"layer_index\": 0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                0.0,\n                0.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0,\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": {\n            \"out\": {\n              \"labels\": [\n                \"a\",\n                \"b\"\n              ],\n              \"node_index\": 1\n            }\n          }\n        },\n        \"op\": \"compute\",\n        \"inputs\": {\n          \"node_0\": {\n            \"x0\": -2.0,\n            \"x1\": 8.0\n          }\n        }\n      },\n      \"expected_output\": \"out:\\na -2\\nb 8\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_graph_concatenate",
+        "trigger_keywords": [
+          "test cases for feature5 2 graph concatenate",
+          "show me feature5 2 graph concatenate test cases",
+          "what are the feature5 2 graph concatenate test inputs",
+          "give me the feature5_2_graph_concatenate test file",
+          "test cases for feature 5",
+          "feature5 2 graph concatenate expected output",
+          "what does feature5 2 graph concatenate expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_graph_concatenate:\n{\n  \"description\": \"A computation graph merges two independent input nodes with a concatenate node, then feeds the combined vector to a dense node that sums the two channels. Demonstrates multi-input fan-in within one graph.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"graph\",\n        \"config\": {\n          \"inputs\": [\n            {\n              \"name\": \"node_a\",\n              \"variables\": [\n                {\n                  \"name\": \"u\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            },\n            {\n              \"name\": \"node_b\",\n              \"variables\": [\n                {\n                  \"name\": \"v\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            }\n          ],\n          \"input_sequences\": [],\n          \"nodes\": [\n            {\n              \"type\": \"input\",\n              \"sources\": [\n                0\n              ],\n              \"size\": 1\n            },\n            {\n              \"type\": \"input\",\n              \"sources\": [\n                1\n              ],\n              \"size\": 1\n            },\n            {\n              \"type\": \"concatenate\",\n              \"sources\": [\n                0,\n                1\n              ]\n            },\n            {\n              \"type\": \"feed_forward\",\n              \"sources\": [\n                2\n              ],\n              \"layer_index\": 0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": {\n            \"merged\": {\n              \"labels\": [\n                \"s\"\n              ],\n              \"node_index\": 3\n            }\n          }\n        },\n        \"op\": \"compute\",\n        \"inputs\": {\n          \"node_a\": {\n            \"u\": 5.0\n          },\n          \"node_b\": {\n            \"v\": 7.0\n          }\n        }\n      },\n      \"expected_output\": \"merged:\\ns 12\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"graph\",\n        \"config\": {\n          \"inputs\": [\n            {\n              \"name\": \"node_a\",\n              \"variables\": [\n                {\n                  \"name\": \"u\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            },\n            {\n              \"name\": \"node_b\",\n              \"variables\": [\n                {\n                  \"name\": \"v\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            }\n          ],\n          \"input_sequences\": [],\n          \"nodes\": [\n            {\n              \"type\": \"input\",\n              \"sources\": [\n                0\n              ],\n              \"size\": 1\n            },\n            {\n              \"type\": \"input\",\n              \"sources\": [\n                1\n              ],\n              \"size\": 1\n            },\n            {\n              \"type\": \"concatenate\",\n              \"sources\": [\n                0,\n                1\n              ]\n            },\n            {\n              \"type\": \"feed_forward\",\n              \"sources\": [\n                2\n              ],\n              \"layer_index\": 0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                1.0,\n                1.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": {\n            \"merged\": {\n              \"labels\": [\n                \"s\"\n              ],\n              \"node_index\": 3\n            }\n          }\n        },\n        \"op\": \"compute\",\n        \"inputs\": {\n          \"node_a\": {\n            \"u\": -3.0\n          },\n          \"node_b\": {\n            \"v\": 10.0\n          }\n        }\n      },\n      \"expected_output\": \"merged:\\ns 7\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_3_graph_multi_output",
+        "trigger_keywords": [
+          "test cases for feature5 3 graph multi output",
+          "show me feature5 3 graph multi output test cases",
+          "what are the feature5 3 graph multi output test inputs",
+          "give me the feature5_3_graph_multi_output test file",
+          "test cases for feature 5",
+          "feature5 3 graph multi output expected output",
+          "what does feature5 3 graph multi output expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_graph_multi_output:\n{\n  \"description\": \"A computation graph exposes several output nodes. The caller names which output to evaluate; only that output's header and values are emitted. Two cases select two different outputs from the same graph and input.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"graph\",\n        \"config\": {\n          \"inputs\": [\n            {\n              \"name\": \"node_0\",\n              \"variables\": [\n                {\n                  \"name\": \"x0\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            }\n          ],\n          \"input_sequences\": [],\n          \"nodes\": [\n            {\n              \"type\": \"input\",\n              \"sources\": [\n                0\n              ],\n              \"size\": 1\n            },\n            {\n              \"type\": \"feed_forward\",\n              \"sources\": [\n                0\n              ],\n              \"layer_index\": 0\n            },\n            {\n              \"type\": \"feed_forward\",\n              \"sources\": [\n                0\n              ],\n              \"layer_index\": 1\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                2.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            },\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                10.0\n              ],\n              \"bias\": [\n                1.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": {\n            \"double\": {\n              \"labels\": [\n                \"d\"\n              ],\n              \"node_index\": 1\n            },\n            \"scaled\": {\n              \"labels\": [\n                \"s\"\n              ],\n              \"node_index\": 2\n            }\n          }\n        },\n        \"op\": \"compute\",\n        \"inputs\": {\n          \"node_0\": {\n            \"x0\": 3.0\n          }\n        },\n        \"output\": \"double\"\n      },\n      \"expected_output\": \"double:\\nd 6\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"graph\",\n        \"config\": {\n          \"inputs\": [\n            {\n              \"name\": \"node_0\",\n              \"variables\": [\n                {\n                  \"name\": \"x0\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            }\n          ],\n          \"input_sequences\": [],\n          \"nodes\": [\n            {\n              \"type\": \"input\",\n              \"sources\": [\n                0\n              ],\n              \"size\": 1\n            },\n            {\n              \"type\": \"feed_forward\",\n              \"sources\": [\n                0\n              ],\n              \"layer_index\": 0\n            },\n            {\n              \"type\": \"feed_forward\",\n              \"sources\": [\n                0\n              ],\n              \"layer_index\": 1\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                2.0\n              ],\n              \"bias\": [\n                0.0\n              ],\n              \"activation\": \"linear\"\n            },\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                10.0\n              ],\n              \"bias\": [\n                1.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": {\n            \"double\": {\n              \"labels\": [\n                \"d\"\n              ],\n              \"node_index\": 1\n            },\n            \"scaled\": {\n              \"labels\": [\n                \"s\"\n              ],\n              \"node_index\": 2\n            }\n          }\n        },\n        \"op\": \"compute\",\n        \"inputs\": {\n          \"node_0\": {\n            \"x0\": 3.0\n          }\n        },\n        \"output\": \"scaled\"\n      },\n      \"expected_output\": \"scaled:\\ns 31\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_4_graph_sequence_scan",
+        "trigger_keywords": [
+          "test cases for feature5 4 graph sequence scan",
+          "show me feature5 4 graph sequence scan test cases",
+          "what are the feature5 4 graph sequence scan test inputs",
+          "give me the feature5_4_graph_sequence_scan test file",
+          "test cases for feature 5",
+          "feature5 4 graph sequence scan expected output",
+          "what does feature5 4 graph sequence scan expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_4_graph_sequence_scan:\n{\n  \"description\": \"A computation graph applies the same dense transform independently at every time step of an input sequence (time-distributed), returning a full output sequence. The scan output prints each label followed by one value per time step.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"mode\": \"graph\",\n        \"config\": {\n          \"inputs\": [],\n          \"input_sequences\": [\n            {\n              \"name\": \"seq_0\",\n              \"variables\": [\n                {\n                  \"name\": \"x0\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            }\n          ],\n          \"nodes\": [\n            {\n              \"type\": \"input_sequence\",\n              \"sources\": [\n                0\n              ],\n              \"size\": 1\n            },\n            {\n              \"type\": \"time_distributed\",\n              \"sources\": [\n                0\n              ],\n              \"layer_index\": 0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                2.0\n              ],\n              \"bias\": [\n                1.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": {\n            \"out\": {\n              \"labels\": [\n                \"y\"\n              ],\n              \"node_index\": 1\n            }\n          }\n        },\n        \"op\": \"scan\",\n        \"sequences\": {\n          \"seq_0\": {\n            \"x0\": [\n              1.0,\n              2.0,\n              3.0\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"out:\\ny 3 5 7\\n\"\n    },\n    {\n      \"input\": {\n        \"mode\": \"graph\",\n        \"config\": {\n          \"inputs\": [],\n          \"input_sequences\": [\n            {\n              \"name\": \"seq_0\",\n              \"variables\": [\n                {\n                  \"name\": \"x0\",\n                  \"offset\": 0.0,\n                  \"scale\": 1.0\n                }\n              ]\n            }\n          ],\n          \"nodes\": [\n            {\n              \"type\": \"input_sequence\",\n              \"sources\": [\n                0\n              ],\n              \"size\": 1\n            },\n            {\n              \"type\": \"time_distributed\",\n              \"sources\": [\n                0\n              ],\n              \"layer_index\": 0\n            }\n          ],\n          \"layers\": [\n            {\n              \"architecture\": \"dense\",\n              \"weights\": [\n                2.0\n              ],\n              \"bias\": [\n                1.0\n              ],\n              \"activation\": \"linear\"\n            }\n          ],\n          \"outputs\": {\n            \"out\": {\n              \"labels\": [\n                \"y\"\n              ],\n              \"node_index\": 1\n            }\n          }\n        },\n        \"op\": \"scan\",\n        \"sequences\": {\n          \"seq_0\": {\n            \"x0\": [\n              0.0,\n              -1.0\n            ]\n          }\n        }\n      },\n      \"expected_output\": \"out:\\ny 1 -1\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the output formatting needs to be totally consistent across environments — our diff-based monitoring will flag any whitespace or precision drift",
+        "actual_meaning": "The exact numeric rendering contract: ~6 significant figures, trailing zeros trimmed, no unnecessary decimal point for integer-valued results, scientific notation for very small values (e.g. `-4.06896e-05`), as demonstrated in feature4_2_gated_recurrent.json and feature1_dense_activations.json expected outputs"
+      }
+    ],
+    "fallback_response": "That detail isn't something I can clarify from the business side — you'll want to check the PRD (start.md) and the public test case JSON files in rcb_tests/public_test_cases/ for the exact behavioral contract. The test cases are the ground truth for expected inputs and outputs."
+  },
+  "public_test_cases": {
+    "feature1_dense_activations.json": {
+      "description": "Evaluate a single fully-connected layer (identity weights, zero bias) on a two-element input, applying a named element-wise activation to the affine result. Each case selects a different activation so the reader sees how the same pre-activation values (2, -3) are transformed.",
+      "cases": [
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                },
+                {
+                  "name": "x1",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0,
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "a",
+                "b"
+              ]
+            },
+            "values": {
+              "x0": 2.0,
+              "x1": -3.0
+            }
+          },
+          "expected_output": "a 2\nb -3\n"
+        },
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                },
+                {
+                  "name": "x1",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0,
+                    0.0
+                  ],
+                  "activation": "sigmoid"
+                }
+              ],
+              "outputs": [
+                "a",
+                "b"
+              ]
+            },
+            "values": {
+              "x0": 2.0,
+              "x1": -3.0
+            }
+          },
+          "expected_output": "a 0.880797\nb 0.0474259\n"
+        },
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                },
+                {
+                  "name": "x1",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0,
+                    0.0
+                  ],
+                  "activation": "rectified"
+                }
+              ],
+              "outputs": [
+                "a",
+                "b"
+              ]
+            },
+            "values": {
+              "x0": 2.0,
+              "x1": -3.0
+            }
+          },
+          "expected_output": "a 2\nb 0\n"
+        },
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                },
+                {
+                  "name": "x1",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0,
+                    0.0
+                  ],
+                  "activation": "tanh"
+                }
+              ],
+              "outputs": [
+                "a",
+                "b"
+              ]
+            },
+            "values": {
+              "x0": 2.0,
+              "x1": -3.0
+            }
+          },
+          "expected_output": "a 0.964028\nb -0.995055\n"
+        }
+      ]
+    },
+    "feature2_1_input_scaling.json": {
+      "description": "Each named input is preprocessed as (value + offset) * scale before it reaches the network. A linear identity layer exposes the scaled value directly so the preprocessing transform is observable.",
+      "cases": [
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": -1.0,
+                  "scale": 2.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "y"
+              ]
+            },
+            "values": {
+              "x0": 4.0
+            }
+          },
+          "expected_output": "y 6\n"
+        },
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 0.5
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "y"
+              ]
+            },
+            "values": {
+              "x0": 10.0
+            }
+          },
+          "expected_output": "y 5\n"
+        }
+      ]
+    },
+    "feature2_2_default_substitution.json": {
+      "description": "When an input value is non-finite (NaN, +inf, -inf) and a default is declared for that variable, the engine substitutes the default before evaluation. Special inputs are passed as the string tokens nan/inf/-inf.",
+      "cases": [
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {
+                "x0": 5.0
+              },
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "y"
+              ]
+            },
+            "values": {
+              "x0": "nan"
+            }
+          },
+          "expected_output": "y 5\n"
+        },
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {
+                "x0": -2.0
+              },
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "y"
+              ]
+            },
+            "values": {
+              "x0": "inf"
+            }
+          },
+          "expected_output": "y -2\n"
+        }
+      ]
+    },
+    "feature3_1_normalization.json": {
+      "description": "A per-feature normalization layer computes weight * (input + bias) for each element independently (an affine batch-normalization-style rescaling). Two independent features are normalized with distinct weight/bias pairs.",
+      "cases": [
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                },
+                {
+                  "name": "x1",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "normalization",
+                  "weights": [
+                    2.0,
+                    3.0
+                  ],
+                  "bias": [
+                    1.0,
+                    -1.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "a",
+                "b"
+              ]
+            },
+            "values": {
+              "x0": 2.0,
+              "x1": 2.0
+            }
+          },
+          "expected_output": "a 6\nb 3\n"
+        },
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "normalization",
+                  "weights": [
+                    0.5
+                  ],
+                  "bias": [
+                    4.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "y"
+              ]
+            },
+            "values": {
+              "x0": 6.0
+            }
+          },
+          "expected_output": "y 5\n"
+        }
+      ]
+    },
+    "feature3_2_maxout.json": {
+      "description": "A maxout layer holds several parallel affine sub-layers and, per output unit, emits the maximum over all sub-layers' pre-activations. A trailing linear identity layer exposes the selected maximum.",
+      "cases": [
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "maxout",
+                  "sublayers": [
+                    {
+                      "weights": [
+                        1.0
+                      ],
+                      "bias": [
+                        0.0
+                      ]
+                    },
+                    {
+                      "weights": [
+                        -2.0
+                      ],
+                      "bias": [
+                        1.0
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "m"
+              ]
+            },
+            "values": {
+              "x0": 2.0
+            }
+          },
+          "expected_output": "m 2\n"
+        },
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "maxout",
+                  "sublayers": [
+                    {
+                      "weights": [
+                        1.0
+                      ],
+                      "bias": [
+                        0.0
+                      ]
+                    },
+                    {
+                      "weights": [
+                        -2.0
+                      ],
+                      "bias": [
+                        1.0
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "m"
+              ]
+            },
+            "values": {
+              "x0": -1.0
+            }
+          },
+          "expected_output": "m 3\n"
+        }
+      ]
+    },
+    "feature3_3_highway.json": {
+      "description": "A highway layer mixes a transformed branch and a carried-through branch using learned transform/carry gates: output = H(x)*T(x) + x*(1 - T(x)). A trailing linear identity layer exposes the gated result.",
+      "cases": [
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                },
+                {
+                  "name": "x1",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "highway",
+                  "activation": "rectified",
+                  "components": {
+                    "t": {
+                      "weights": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "carry": {
+                      "weights": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    }
+                  }
+                },
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0,
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "a",
+                "b"
+              ]
+            },
+            "values": {
+              "x0": 1.0,
+              "x1": 1.0
+            }
+          },
+          "expected_output": "a 1\nb 1\n"
+        },
+        {
+          "input": {
+            "mode": "feed_forward",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                },
+                {
+                  "name": "x1",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "highway",
+                  "activation": "rectified",
+                  "components": {
+                    "t": {
+                      "weights": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "bias": [
+                        -10.0,
+                        -10.0
+                      ]
+                    },
+                    "carry": {
+                      "weights": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    }
+                  }
+                },
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0,
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": [
+                "a",
+                "b"
+              ]
+            },
+            "values": {
+              "x0": 4.0,
+              "x1": -5.0
+            }
+          },
+          "expected_output": "a 2\nb -2.5\n"
+        }
+      ]
+    },
+    "feature4_1_simple_recurrent.json": {
+      "description": "A simple recurrent layer folds an ordered sequence into a single fixed-size state vector. At each step the new state is activation(W*input + U*prev + b); the engine returns the final state. Input is one named channel sampled over several time steps.",
+      "cases": [
+        {
+          "input": {
+            "mode": "recurrent",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "simplernn",
+                  "activation": "linear",
+                  "components": {
+                    "h": {
+                      "weights": [
+                        1.0
+                      ],
+                      "U": [
+                        0.5
+                      ],
+                      "bias": [
+                        0.0
+                      ]
+                    }
+                  }
+                }
+              ],
+              "outputs": [
+                "h0"
+              ]
+            },
+            "sequence": {
+              "x0": [
+                1.0,
+                1.0,
+                1.0
+              ]
+            }
+          },
+          "expected_output": "h0 1.75\n"
+        },
+        {
+          "input": {
+            "mode": "recurrent",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "simplernn",
+                  "activation": "linear",
+                  "components": {
+                    "h": {
+                      "weights": [
+                        1.0
+                      ],
+                      "U": [
+                        0.5
+                      ],
+                      "bias": [
+                        0.0
+                      ]
+                    }
+                  }
+                }
+              ],
+              "outputs": [
+                "h0"
+              ]
+            },
+            "sequence": {
+              "x0": [
+                2.0,
+                -1.0
+              ]
+            }
+          },
+          "expected_output": "h0 0\n"
+        }
+      ]
+    },
+    "feature4_2_gated_recurrent.json": {
+      "description": "A gated recurrent layer reduces a sequence to a final state using update and reset gates (inner activation) plus a candidate state (main activation). Output is the final two-element state for the supplied single-channel sequence.",
+      "cases": [
+        {
+          "input": {
+            "mode": "recurrent",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "gru",
+                  "activation": "tanh",
+                  "components": {
+                    "z": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "r": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "h": {
+                      "weights": [
+                        0.3,
+                        0.4
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    }
+                  },
+                  "inner_activation": "sigmoid"
+                }
+              ],
+              "outputs": [
+                "h0",
+                "h1"
+              ]
+            },
+            "sequence": {
+              "x0": [
+                1.0,
+                0.5,
+                -0.5
+              ]
+            }
+          },
+          "expected_output": "h0 -4.06896e-05\nh1 -0.00823268\n"
+        },
+        {
+          "input": {
+            "mode": "recurrent",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "gru",
+                  "activation": "tanh",
+                  "components": {
+                    "z": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "r": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "h": {
+                      "weights": [
+                        0.3,
+                        0.4
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    }
+                  },
+                  "inner_activation": "sigmoid"
+                }
+              ],
+              "outputs": [
+                "h0",
+                "h1"
+              ]
+            },
+            "sequence": {
+              "x0": [
+                0.2,
+                0.2,
+                0.2,
+                0.2
+              ]
+            }
+          },
+          "expected_output": "h0 0.0581038\nh1 0.0771669\n"
+        }
+      ]
+    },
+    "feature4_3_lstm_recurrent.json": {
+      "description": "A long short-term memory layer reduces a sequence to a final hidden state using input, forget, and output gates over an internal cell state. Output is the final two-element hidden state for the supplied single-channel sequence.",
+      "cases": [
+        {
+          "input": {
+            "mode": "recurrent",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "lstm",
+                  "activation": "tanh",
+                  "components": {
+                    "i": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "f": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "o": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "c": {
+                      "weights": [
+                        0.3,
+                        0.4
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    }
+                  },
+                  "inner_activation": "sigmoid"
+                }
+              ],
+              "outputs": [
+                "h0",
+                "h1"
+              ]
+            },
+            "sequence": {
+              "x0": [
+                1.0,
+                0.5,
+                -0.5
+              ]
+            }
+          },
+          "expected_output": "h0 0.00439862\nh1 0.0077197\n"
+        },
+        {
+          "input": {
+            "mode": "recurrent",
+            "config": {
+              "defaults": {},
+              "inputs": [
+                {
+                  "name": "x0",
+                  "offset": 0.0,
+                  "scale": 1.0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "lstm",
+                  "activation": "tanh",
+                  "components": {
+                    "i": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "f": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "o": {
+                      "weights": [
+                        0.1,
+                        0.2
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "c": {
+                      "weights": [
+                        0.3,
+                        0.4
+                      ],
+                      "U": [
+                        0.1,
+                        0.0,
+                        0.0,
+                        0.1
+                      ],
+                      "bias": [
+                        0.0,
+                        0.0
+                      ]
+                    }
+                  },
+                  "inner_activation": "sigmoid"
+                }
+              ],
+              "outputs": [
+                "h0",
+                "h1"
+              ]
+            },
+            "sequence": {
+              "x0": [
+                -1.0,
+                -1.0,
+                2.0
+              ]
+            }
+          },
+          "expected_output": "h0 0.0960763\nh1 0.142141\n"
+        }
+      ]
+    },
+    "feature5_1_graph_feedforward.json": {
+      "description": "A computation graph routes a named input node through a feed-forward node to a named output node. The output block is printed as a header line '<output>:' followed by one '<label> <value>' line per output unit.",
+      "cases": [
+        {
+          "input": {
+            "mode": "graph",
+            "config": {
+              "inputs": [
+                {
+                  "name": "node_0",
+                  "variables": [
+                    {
+                      "name": "x0",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    },
+                    {
+                      "name": "x1",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                }
+              ],
+              "input_sequences": [],
+              "nodes": [
+                {
+                  "type": "input",
+                  "sources": [
+                    0
+                  ],
+                  "size": 2
+                },
+                {
+                  "type": "feed_forward",
+                  "sources": [
+                    0
+                  ],
+                  "layer_index": 0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0,
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": {
+                "out": {
+                  "labels": [
+                    "a",
+                    "b"
+                  ],
+                  "node_index": 1
+                }
+              }
+            },
+            "op": "compute",
+            "inputs": {
+              "node_0": {
+                "x0": 3.0,
+                "x1": 4.0
+              }
+            }
+          },
+          "expected_output": "out:\na 3\nb 4\n"
+        },
+        {
+          "input": {
+            "mode": "graph",
+            "config": {
+              "inputs": [
+                {
+                  "name": "node_0",
+                  "variables": [
+                    {
+                      "name": "x0",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    },
+                    {
+                      "name": "x1",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                }
+              ],
+              "input_sequences": [],
+              "nodes": [
+                {
+                  "type": "input",
+                  "sources": [
+                    0
+                  ],
+                  "size": 2
+                },
+                {
+                  "type": "feed_forward",
+                  "sources": [
+                    0
+                  ],
+                  "layer_index": 0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0,
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": {
+                "out": {
+                  "labels": [
+                    "a",
+                    "b"
+                  ],
+                  "node_index": 1
+                }
+              }
+            },
+            "op": "compute",
+            "inputs": {
+              "node_0": {
+                "x0": -2.0,
+                "x1": 8.0
+              }
+            }
+          },
+          "expected_output": "out:\na -2\nb 8\n"
+        }
+      ]
+    },
+    "feature5_2_graph_concatenate.json": {
+      "description": "A computation graph merges two independent input nodes with a concatenate node, then feeds the combined vector to a dense node that sums the two channels. Demonstrates multi-input fan-in within one graph.",
+      "cases": [
+        {
+          "input": {
+            "mode": "graph",
+            "config": {
+              "inputs": [
+                {
+                  "name": "node_a",
+                  "variables": [
+                    {
+                      "name": "u",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                },
+                {
+                  "name": "node_b",
+                  "variables": [
+                    {
+                      "name": "v",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                }
+              ],
+              "input_sequences": [],
+              "nodes": [
+                {
+                  "type": "input",
+                  "sources": [
+                    0
+                  ],
+                  "size": 1
+                },
+                {
+                  "type": "input",
+                  "sources": [
+                    1
+                  ],
+                  "size": 1
+                },
+                {
+                  "type": "concatenate",
+                  "sources": [
+                    0,
+                    1
+                  ]
+                },
+                {
+                  "type": "feed_forward",
+                  "sources": [
+                    2
+                  ],
+                  "layer_index": 0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": {
+                "merged": {
+                  "labels": [
+                    "s"
+                  ],
+                  "node_index": 3
+                }
+              }
+            },
+            "op": "compute",
+            "inputs": {
+              "node_a": {
+                "u": 5.0
+              },
+              "node_b": {
+                "v": 7.0
+              }
+            }
+          },
+          "expected_output": "merged:\ns 12\n"
+        },
+        {
+          "input": {
+            "mode": "graph",
+            "config": {
+              "inputs": [
+                {
+                  "name": "node_a",
+                  "variables": [
+                    {
+                      "name": "u",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                },
+                {
+                  "name": "node_b",
+                  "variables": [
+                    {
+                      "name": "v",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                }
+              ],
+              "input_sequences": [],
+              "nodes": [
+                {
+                  "type": "input",
+                  "sources": [
+                    0
+                  ],
+                  "size": 1
+                },
+                {
+                  "type": "input",
+                  "sources": [
+                    1
+                  ],
+                  "size": 1
+                },
+                {
+                  "type": "concatenate",
+                  "sources": [
+                    0,
+                    1
+                  ]
+                },
+                {
+                  "type": "feed_forward",
+                  "sources": [
+                    2
+                  ],
+                  "layer_index": 0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    1.0,
+                    1.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": {
+                "merged": {
+                  "labels": [
+                    "s"
+                  ],
+                  "node_index": 3
+                }
+              }
+            },
+            "op": "compute",
+            "inputs": {
+              "node_a": {
+                "u": -3.0
+              },
+              "node_b": {
+                "v": 10.0
+              }
+            }
+          },
+          "expected_output": "merged:\ns 7\n"
+        }
+      ]
+    },
+    "feature5_3_graph_multi_output.json": {
+      "description": "A computation graph exposes several output nodes. The caller names which output to evaluate; only that output's header and values are emitted. Two cases select two different outputs from the same graph and input.",
+      "cases": [
+        {
+          "input": {
+            "mode": "graph",
+            "config": {
+              "inputs": [
+                {
+                  "name": "node_0",
+                  "variables": [
+                    {
+                      "name": "x0",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                }
+              ],
+              "input_sequences": [],
+              "nodes": [
+                {
+                  "type": "input",
+                  "sources": [
+                    0
+                  ],
+                  "size": 1
+                },
+                {
+                  "type": "feed_forward",
+                  "sources": [
+                    0
+                  ],
+                  "layer_index": 0
+                },
+                {
+                  "type": "feed_forward",
+                  "sources": [
+                    0
+                  ],
+                  "layer_index": 1
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    2.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                },
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    10.0
+                  ],
+                  "bias": [
+                    1.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": {
+                "double": {
+                  "labels": [
+                    "d"
+                  ],
+                  "node_index": 1
+                },
+                "scaled": {
+                  "labels": [
+                    "s"
+                  ],
+                  "node_index": 2
+                }
+              }
+            },
+            "op": "compute",
+            "inputs": {
+              "node_0": {
+                "x0": 3.0
+              }
+            },
+            "output": "double"
+          },
+          "expected_output": "double:\nd 6\n"
+        },
+        {
+          "input": {
+            "mode": "graph",
+            "config": {
+              "inputs": [
+                {
+                  "name": "node_0",
+                  "variables": [
+                    {
+                      "name": "x0",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                }
+              ],
+              "input_sequences": [],
+              "nodes": [
+                {
+                  "type": "input",
+                  "sources": [
+                    0
+                  ],
+                  "size": 1
+                },
+                {
+                  "type": "feed_forward",
+                  "sources": [
+                    0
+                  ],
+                  "layer_index": 0
+                },
+                {
+                  "type": "feed_forward",
+                  "sources": [
+                    0
+                  ],
+                  "layer_index": 1
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    2.0
+                  ],
+                  "bias": [
+                    0.0
+                  ],
+                  "activation": "linear"
+                },
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    10.0
+                  ],
+                  "bias": [
+                    1.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": {
+                "double": {
+                  "labels": [
+                    "d"
+                  ],
+                  "node_index": 1
+                },
+                "scaled": {
+                  "labels": [
+                    "s"
+                  ],
+                  "node_index": 2
+                }
+              }
+            },
+            "op": "compute",
+            "inputs": {
+              "node_0": {
+                "x0": 3.0
+              }
+            },
+            "output": "scaled"
+          },
+          "expected_output": "scaled:\ns 31\n"
+        }
+      ]
+    },
+    "feature5_4_graph_sequence_scan.json": {
+      "description": "A computation graph applies the same dense transform independently at every time step of an input sequence (time-distributed), returning a full output sequence. The scan output prints each label followed by one value per time step.",
+      "cases": [
+        {
+          "input": {
+            "mode": "graph",
+            "config": {
+              "inputs": [],
+              "input_sequences": [
+                {
+                  "name": "seq_0",
+                  "variables": [
+                    {
+                      "name": "x0",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                }
+              ],
+              "nodes": [
+                {
+                  "type": "input_sequence",
+                  "sources": [
+                    0
+                  ],
+                  "size": 1
+                },
+                {
+                  "type": "time_distributed",
+                  "sources": [
+                    0
+                  ],
+                  "layer_index": 0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    2.0
+                  ],
+                  "bias": [
+                    1.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": {
+                "out": {
+                  "labels": [
+                    "y"
+                  ],
+                  "node_index": 1
+                }
+              }
+            },
+            "op": "scan",
+            "sequences": {
+              "seq_0": {
+                "x0": [
+                  1.0,
+                  2.0,
+                  3.0
+                ]
+              }
+            }
+          },
+          "expected_output": "out:\ny 3 5 7\n"
+        },
+        {
+          "input": {
+            "mode": "graph",
+            "config": {
+              "inputs": [],
+              "input_sequences": [
+                {
+                  "name": "seq_0",
+                  "variables": [
+                    {
+                      "name": "x0",
+                      "offset": 0.0,
+                      "scale": 1.0
+                    }
+                  ]
+                }
+              ],
+              "nodes": [
+                {
+                  "type": "input_sequence",
+                  "sources": [
+                    0
+                  ],
+                  "size": 1
+                },
+                {
+                  "type": "time_distributed",
+                  "sources": [
+                    0
+                  ],
+                  "layer_index": 0
+                }
+              ],
+              "layers": [
+                {
+                  "architecture": "dense",
+                  "weights": [
+                    2.0
+                  ],
+                  "bias": [
+                    1.0
+                  ],
+                  "activation": "linear"
+                }
+              ],
+              "outputs": {
+                "out": {
+                  "labels": [
+                    "y"
+                  ],
+                  "node_index": 1
+                }
+              }
+            },
+            "op": "scan",
+            "sequences": {
+              "seq_0": {
+                "x0": [
+                  0.0,
+                  -1.0
+                ]
+              }
+            }
+          },
+          "expected_output": "out:\ny 1 -1\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C003",
+      "C004",
+      "C005"
+    ],
+    "kept_c": [
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 1,
+    "kept_cp": 1
+  }
+}

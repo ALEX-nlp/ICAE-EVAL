@@ -1,0 +1,859 @@
+{
+  "fuzzy_prd": "Hey team, we need to wrap up the WASM runtime loader library. Basically the idea is that devs hand us a raw binary blob and we handle all the ugly plumbing — wiring up their callbacks, letting them read/write module state, and catching every possible way things can go wrong so it surfaces as something meaningful instead of a crash. We had a similar pattern in that import-validation flow we built for the scripting sandbox project — same idea where you pre-check everything before actually running. The big complaints we keep hearing are: (1) when something goes wrong with a binary or a missing hook, people get totally opaque native faults with no idea what happened; (2) numeric values going across the boundary come back mangled or lose precision; (3) stdout from the module just disappears. We also need the memory side to be safe — oversized allocations should fail clean. There's also the question of what happens when a host callback itself throws — that needs to bubble up properly rather than silently swallowing. The execution adapter piece that reads test scenarios and drives all this should stay completely separate from the core library logic. Make sure the overall code is organized by responsibility — don't dump everything in one file. Refer to the existing test scenarios to understand the expected wire format for outputs.\n\nOne more pass on the output behavior since a few folks asked for the exact shape. When compilation fails, like a bad magic number case, the adapter must emit exactly two lines: `error=compile_failed` first, then `detail=<runtime validation message>` second. That detail needs to carry the runtime’s raw message as-is, for example `Validation error: Bad magic number (at offset 0)` followed by a null byte `\\0`. On function calls, wrong arity and wrong scalar type need to stay separate: wrong number of arguments emits `error=argument_count` and nothing else, and wrong scalar type emits `error=argument_type`, also as a single line.\n\nAlso, the export-name check is just a lookup result, not a failure path. If the name exists, emit `lookup[<name>]=present`; if it does not, emit `lookup[<name>]=missing`. No `error=` line for that. Same idea on globals: `read_global` for an exported global emits `global[<name>]=<value>`, `read_import_global` for an imported global emits `global[<ns>::<name>]=<value>`, and a successful `write_global` should just re-report the updated value in the same read format, so `global[<name>]=<new_value>`.\n\nOn the formatting side, float output needs to match the actual width crossing the boundary. 32-bit float results must render at single-precision fidelity, so IEEE-754 float32 rounding is what shows up. The concrete example here is 1234.5678 + 8765.4321 as f32 rendering as `9999.9990234375`, not `9999.9999`. For f64, keep full double precision, so those same inputs as f64 render as `9999.9999`. And if the scenario asks for `report_build: true` and instantiation succeeds, the adapter should include `instantiated=true` as a line in the output, but only when `report_build` explicitly asks for it.\n\nOn structure, we do want to be pretty strict about separation of responsibility. Binary compilation, import collection/validation, instantiation, typed value marshaling, memory management, globals, and the WASI/stdout layer should live in distinct units, and the execution adapter that does JSON stdin/stdout needs to stay completely separate from the core library. The core side should expose an idiomatic object API around module, instance builder, instance, functions, globals, and memory, with no coupling to JSON or stdio. And for the import pre-check behavior we talked about before, keep the same validation pass before instantiation for all required imports being present, kind mismatches, unknown import names, and duplicate fills, with each one mapping to its own distinct error category.",
+  "oracle_data": {
+    "task_id": "dart-archive__wasm-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "void return representation",
+          "function returns nothing output",
+          "how is void rendered"
+        ],
+        "oracle_response": "A function with no return value must be reported as `result[<fn>]=void` — the literal string `void`, not `0`, not an empty string, not omitted. This distinguishes a side-effecting call from a function that returns a numeric zero."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "host import receives args",
+          "echo args from module call",
+          "import_call step output format"
+        ],
+        "oracle_response": "After a module calls a host import, an `import_call` step queries what arguments that import received. The output line is `import_call[<namespace>::<name>]=<v1>,<v2>,...` with values comma-separated and no spaces. For example: `import_call[env::report]=123,456`."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "host import throws exception",
+          "error from host callback",
+          "imported function error propagation"
+        ],
+        "oracle_response": "When a host import declared with `throw` behavior is called by the module, the error must unwind the in-progress `invoke` and be reported as `error=imported_function_threw` followed by `message=<the error message text>` on the next line. Control must not continue past the throw."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "writing to a constant global",
+          "const global error",
+          "immutable global write"
+        ],
+        "oracle_response": "Attempting to write to a constant (imported, non-mutable) global must emit `error=const_global_write` (one line, no additional fields). Attempting to write a value whose type does not match the global's declared scalar type must emit `error=bad_value_type` followed by `type=<declared type name>` on the next line (e.g. `type=int32`)."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "memory size output format",
+          "pages and bytes reporting",
+          "memory info step"
+        ],
+        "oracle_response": "The memory `info` op emits two lines: `pages=<n>` then `bytes=<n>`. A write op emits `write[<index>]=<value>`. A read op emits `byte[<index>]=<value>`. A grow op on success emits `grow[<n>]=ok`. Failure to create memory emits `error=memory_create_failed`; failure to grow emits `error=memory_grow_failed`."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "import validation errors",
+          "missing import at instantiation",
+          "duplicate import filling"
+        ],
+        "oracle_response": "Import validation produces distinct error categories: `error=missing_import` when a required import was not supplied; `error=import_kind_mismatch` followed by `expected=<kind>` when the supplied import is the wrong kind (e.g. global supplied where function expected); `error=import_not_found` followed by `import=<ns>::<name>` when the supplied import names a module/name pair that does not exist in the module's import section; `error=import_already_filled` when the same import slot is filled twice."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "wasi stdout capture",
+          "system interface enable",
+          "wasi fill failed error"
+        ],
+        "oracle_response": "Enabling the WASI system interface on a module that does not have the required `wasi_unstable::fd_write` import must emit `error=wasi_fill_failed`. Enabling it twice on the same builder must emit `error=wasi_already_enabled`. Building a module that imports WASI functions without enabling WASI must emit `error=missing_import`. Requesting captured stdout or stderr when capture was not enabled must emit `error=stdout_without_wasi` or `error=stderr_without_wasi` respectively. Captured output is reported as `output=<text>` or `stdout=<text>`."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_module_compilation",
+        "trigger_keywords": [
+          "test cases for feature1 module compilation",
+          "show me feature1 module compilation test cases",
+          "what are the feature1 module compilation test inputs",
+          "give me the feature1_module_compilation test file",
+          "test cases for feature 1",
+          "feature1 module compilation expected output",
+          "what does feature1 module compilation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_module_compilation:\n{\n  \"description\": \"Compiling a byte buffer into a module: a buffer whose leading bytes are not the WASM binary signature is rejected with a normalized compile-failure category and the underlying validation detail.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0100000001060160017e017e071302066d656d6f727902000673717561726500000020007e0b\"\n      },\n      \"expected_output\": \"error=compile_failed\\ndetail=Validation error: Bad magic number (at offset 0)\\u0000\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_function_invocation",
+        "trigger_keywords": [
+          "test cases for feature2 function invocation",
+          "show me feature2 function invocation test cases",
+          "what are the feature2 function invocation test inputs",
+          "give me the feature2_function_invocation test file",
+          "test cases for feature 2",
+          "feature2 function invocation expected output",
+          "what does feature2 function invocation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_function_invocation:\n{\n  \"description\": \"Looking up an exported function by name and calling it; looking up a name that is not exported reports it as missing; calling with the wrong number or wrong type of arguments yields normalized argument errors.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001060160017e017e030201000405017001010105030100020608017f01418088040b071302066d656d6f727902000673717561726500000a09010700200020007e0b\",\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"square\",\n            \"args\": [\n              1234\n            ]\n          },\n          {\n            \"op\": \"lookup\",\n            \"name\": \"not_a_function\"\n          }\n        ]\n      },\n      \"expected_output\": \"result[square]=1522756\\nlookup[not_a_function]=missing\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001060160017e017e030201000405017001010105030100020608017f01418088040b071302066d656d6f727902000673717561726500000a09010700200020007e0b\",\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"square\",\n            \"args\": []\n          }\n        ]\n      },\n      \"expected_output\": \"error=argument_count\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001060160017e017e030201000405017001010105030100020608017f01418088040b071302066d656d6f727902000673717561726500000a09010700200020007e0b\",\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"square\",\n            \"args\": [\n              1.23\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"error=argument_type\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_numeric_types",
+        "trigger_keywords": [
+          "test cases for feature3 numeric types",
+          "show me feature3 numeric types test cases",
+          "what are the feature3 numeric types test inputs",
+          "give me the feature3_numeric_types test file",
+          "test cases for feature 3",
+          "feature3 numeric types expected output",
+          "what does feature3 numeric types expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_numeric_types:\n{\n  \"description\": \"Calling functions that add the four scalar value types (32/64-bit integers and 32/64-bit floats) and returning the wire result for each.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001190460027e7e017e60027f7f017f60027c7c017c60027d7d017d030504000102030405017001010105030100020608017f01418088040b072e05066d656d6f727902000661646449363400000661646449333200010661646446363400020661646446333200030a21040700200120007c0b0700200120006a0b070020002001a00b070020002001920b\",\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"addI64\",\n            \"args\": [\n              81985529216486895,\n              1147797409030816545\n            ]\n          },\n          {\n            \"op\": \"invoke\",\n            \"name\": \"addI32\",\n            \"args\": [\n              11259375,\n              16702650\n            ]\n          },\n          {\n            \"op\": \"invoke\",\n            \"name\": \"addF64\",\n            \"args\": [\n              1234.5678,\n              8765.4321\n            ]\n          },\n          {\n            \"op\": \"invoke\",\n            \"name\": \"addF32\",\n            \"args\": [\n              1234.5678,\n              8765.4321\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"result[addI64]=1229782938247303440\\nresult[addI32]=27962025\\nresult[addF64]=9999.9999\\nresult[addF32]=9999.9990234375\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_void_and_noarg",
+        "trigger_keywords": [
+          "test cases for feature4 void and noarg",
+          "show me feature4 void and noarg test cases",
+          "what are the feature4 void and noarg test inputs",
+          "give me the feature4_void_and_noarg test file",
+          "test cases for feature 4",
+          "feature4 void and noarg expected output",
+          "what does feature4 void and noarg expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_void_and_noarg:\n{\n  \"description\": \"Calling a function with a void return type (which reports no value) followed by a parameterless function that returns the state mutated by the first call.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d01000000010a0260027e7e006000017e03030200010405017001010105030100020608017f01419088040b071603066d656d6f727902000373657400000367657400010a1e0210004100200120007c370380888080000b0b004100290380888080000b0b0f01004180080b080000000000000000\",\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"set\",\n            \"args\": [\n              123,\n              456\n            ]\n          },\n          {\n            \"op\": \"invoke\",\n            \"name\": \"get\",\n            \"args\": []\n          }\n        ]\n      },\n      \"expected_output\": \"result[set]=void\\nresult[get]=579\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_host_function_args",
+        "trigger_keywords": [
+          "test cases for feature5 1 host function args",
+          "show me feature5 1 host function args test cases",
+          "what are the feature5 1 host function args test inputs",
+          "give me the feature5_1_host_function_args test file",
+          "test cases for feature 5",
+          "feature5 1 host function args expected output",
+          "what does feature5 1 host function args expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_host_function_args:\n{\n  \"description\": \"A module function that calls back into a host-provided function; the host import records the arguments it receives, demonstrating values flow from module code into the host callback.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001090260027e7e00600000020e0103656e76067265706f72740000030201010405017001010105030100020608017f01418088040b071802066d656d6f727902000b7265706f7274537475666600010a10010e0042fb0042c8031080808080000b\",\n        \"imports\": [\n          {\n            \"kind\": \"function\",\n            \"module\": \"env\",\n            \"name\": \"report\",\n            \"behavior\": \"echo_args\",\n            \"arity\": 2\n          }\n        ],\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"reportStuff\",\n            \"args\": []\n          },\n          {\n            \"op\": \"import_call\",\n            \"ref\": \"env::report\"\n          }\n        ]\n      },\n      \"expected_output\": \"result[reportStuff]=void\\nimport_call[env::report]=123,456\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_host_function_exception",
+        "trigger_keywords": [
+          "test cases for feature5 2 host function exception",
+          "show me feature5 2 host function exception test cases",
+          "what are the feature5 2 host function exception test inputs",
+          "give me the feature5_2_host_function_exception test file",
+          "test cases for feature 5",
+          "feature5 2 host function exception expected output",
+          "what does feature5 2 host function exception expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_host_function_exception:\n{\n  \"description\": \"When a host-provided import raises an error during a module call, the error propagates out of the call and is reported with a normalized category plus the error message.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001040160000002110203656e760161000003656e7601620000030201000405017001010105030100020608017f01418088040b070f02066d656d6f7279020002666e00020a10010e001080808080001081808080000b\",\n        \"imports\": [\n          {\n            \"kind\": \"function\",\n            \"module\": \"env\",\n            \"name\": \"a\",\n            \"behavior\": \"throw\",\n            \"message\": \"Hello exception!\",\n            \"arity\": 0\n          },\n          {\n            \"kind\": \"function\",\n            \"module\": \"env\",\n            \"name\": \"b\",\n            \"behavior\": \"return\",\n            \"arity\": 0,\n            \"value\": null\n          }\n        ],\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"fn\",\n            \"args\": []\n          }\n        ]\n      },\n      \"expected_output\": \"error=imported_function_threw\\nmessage=Hello exception!\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_globals",
+        "trigger_keywords": [
+          "test cases for feature6 globals",
+          "show me feature6 globals test cases",
+          "what are the feature6 globals test inputs",
+          "give me the feature6_globals test file",
+          "test cases for feature 6",
+          "feature6 globals expected output",
+          "what does feature6 globals expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_globals:\n{\n  \"description\": \"Reading exported and imported globals, calling a function that depends on them, writing a mutable global and observing the dependent function change, then the errors raised by writing a constant global and by writing a value of the wrong type.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d010000000105016000017f020c0103656e7603626172037f000302010004040170000005030100010606017f0141250b071603066d656d6f727902000362617a000003666f6f03010a09010700230123006c0b0b0a0100410c0b0425000000\",\n        \"imports\": [\n          {\n            \"kind\": \"global\",\n            \"module\": \"env\",\n            \"name\": \"bar\",\n            \"value\": 10\n          }\n        ],\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"read_global\",\n            \"name\": \"foo\"\n          },\n          {\n            \"op\": \"read_import_global\",\n            \"ref\": \"env::bar\"\n          },\n          {\n            \"op\": \"invoke\",\n            \"name\": \"baz\",\n            \"args\": []\n          },\n          {\n            \"op\": \"write_global\",\n            \"name\": \"foo\",\n            \"value\": 99\n          },\n          {\n            \"op\": \"invoke\",\n            \"name\": \"baz\",\n            \"args\": []\n          },\n          {\n            \"op\": \"write_import_global\",\n            \"ref\": \"env::bar\",\n            \"value\": 100\n          },\n          {\n            \"op\": \"write_global\",\n            \"name\": \"foo\",\n            \"value\": 3.14159\n          }\n        ]\n      },\n      \"expected_output\": \"global[foo]=37\\nglobal[env::bar]=10\\nresult[baz]=370\\nglobal[foo]=99\\nresult[baz]=990\\nerror=const_global_write\\nerror=bad_value_type\\ntype=int32\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_1_memory_ops",
+        "trigger_keywords": [
+          "test cases for feature7 1 memory ops",
+          "show me feature7 1 memory ops test cases",
+          "what are the feature7 1 memory ops test inputs",
+          "give me the feature7_1_memory_ops test file",
+          "test cases for feature 7",
+          "feature7 1 memory ops expected output",
+          "what does feature7 1 memory ops expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_1_memory_ops:\n{\n  \"description\": \"Creating a standalone linear memory, reporting its size in pages and bytes, writing and reading a byte, growing it by some pages, and confirming size grew and the written byte survived the grow.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000006810000\",\n        \"standalone_memory\": {\n          \"pages\": 100\n        },\n        \"memory_ops\": [\n          {\n            \"op\": \"info\"\n          },\n          {\n            \"op\": \"write\",\n            \"index\": 123,\n            \"value\": 45\n          },\n          {\n            \"op\": \"read\",\n            \"index\": 123\n          },\n          {\n            \"op\": \"grow\",\n            \"pages\": 10\n          },\n          {\n            \"op\": \"info\"\n          },\n          {\n            \"op\": \"read\",\n            \"index\": 123\n          }\n        ]\n      },\n      \"expected_output\": \"pages=100\\nbytes=6553600\\nwrite[123]=45\\nbyte[123]=45\\ngrow[10]=ok\\npages=110\\nbytes=7208960\\nbyte[123]=45\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_2_memory_errors",
+        "trigger_keywords": [
+          "test cases for feature7 2 memory errors",
+          "show me feature7 2 memory errors test cases",
+          "what are the feature7 2 memory errors test inputs",
+          "give me the feature7_2_memory_errors test file",
+          "test cases for feature 7",
+          "feature7 2 memory errors expected output",
+          "what does feature7 2 memory errors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_2_memory_errors:\n{\n  \"description\": \"Memory operations that exceed limits: requesting an impossibly large initial size fails creation; growing past the implementation limit fails; growing past a declared maximum fails. Each yields a normalized category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000006810000\",\n        \"standalone_memory\": {\n          \"pages\": 1000000000\n        }\n      },\n      \"expected_output\": \"error=memory_create_failed\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000006810000\",\n        \"standalone_memory\": {\n          \"pages\": 100,\n          \"max\": 200\n        },\n        \"memory_ops\": [\n          {\n            \"op\": \"grow\",\n            \"pages\": 300\n          }\n        ]\n      },\n      \"expected_output\": \"error=memory_grow_failed\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_import_validation",
+        "trigger_keywords": [
+          "test cases for feature8 import validation",
+          "show me feature8 import validation test cases",
+          "what are the feature8 import validation test inputs",
+          "give me the feature8_import_validation test file",
+          "test cases for feature 8",
+          "feature8 import validation expected output",
+          "what does feature8 import validation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_import_validation:\n{\n  \"description\": \"Instantiation-time import checking: a fully and correctly supplied set of imports instantiates successfully; leaving an import unfilled, supplying an import of the wrong kind (memory/global where a function is expected), naming an import that does not exist, or filling the same import twice each yields a normalized category (with the offending import name where relevant).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b\",\n        \"imports\": [\n          {\n            \"kind\": \"function\",\n            \"module\": \"env\",\n            \"name\": \"someFn\",\n            \"behavior\": \"return\",\n            \"arity\": 4,\n            \"value\": 123\n          }\n        ],\n        \"build\": true,\n        \"report_build\": true\n      },\n      \"expected_output\": \"instantiated=true\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b\",\n        \"build\": true\n      },\n      \"expected_output\": \"error=missing_import\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b\",\n        \"imports\": [\n          {\n            \"kind\": \"global\",\n            \"module\": \"env\",\n            \"name\": \"someFn\",\n            \"value\": 123\n          }\n        ]\n      },\n      \"expected_output\": \"error=import_kind_mismatch\\nexpected=global\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b\",\n        \"imports\": [\n          {\n            \"kind\": \"function\",\n            \"module\": \"foo\",\n            \"name\": \"someFn\",\n            \"behavior\": \"return\",\n            \"arity\": 4,\n            \"value\": 123\n          }\n        ],\n        \"build\": true\n      },\n      \"expected_output\": \"error=import_not_found\\nimport=foo::someFn\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b\",\n        \"imports\": [\n          {\n            \"kind\": \"function\",\n            \"module\": \"env\",\n            \"name\": \"someFn\",\n            \"behavior\": \"return\",\n            \"arity\": 4,\n            \"value\": 123\n          },\n          {\n            \"kind\": \"function\",\n            \"module\": \"env\",\n            \"name\": \"someFn\",\n            \"behavior\": \"return\",\n            \"arity\": 4,\n            \"value\": 456\n          }\n        ]\n      },\n      \"expected_output\": \"error=import_already_filled\\nimport=env::someFn\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_1_wasi_capture_stdout",
+        "trigger_keywords": [
+          "test cases for feature9 1 wasi capture stdout",
+          "show me feature9 1 wasi capture stdout test cases",
+          "what are the feature9 1 wasi capture stdout test inputs",
+          "give me the feature9_1_wasi_capture_stdout test file",
+          "test cases for feature 9",
+          "feature9 1 wasi capture stdout expected output",
+          "what does feature9 1 wasi capture stdout expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_1_wasi_capture_stdout:\n{\n  \"description\": \"Enabling the system interface with stdout capture, running the module entry point, and reading back the captured standard output text.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001330960037f7f7f017f60047f7f7f7f017f60000060027f7f017f60017f017f60037f7e7f017e6000017f60017f0060037f7f7f00021a010d776173695f756e737461626c650866645f77726974650001030f0e03040003020705040306020208000405017001040405060101800280020609017f0141c095c0020b072e04066d656d6f72790200115f5f7761736d5f63616c6c5f63746f72730005046d61696e0004065f7374617274000b0909010041010b03080e070aae0c0ebf0101057f4180082104024020012802102202047f200205200110020d0120012802100b200128021422056b20004904402001418008200020012802241100000f0b024020012c004b4100480d0020002103034020032202450d012002417f6a22034180086a2d0000410a470d000b20014180082002200128022411000022032002490d01200020026b210020024180086a210420012802142105200221060b20052004200010031a2001200128021420006a360214200020066a21030b20030b5901017f200020002d004a2201417f6a2001723a004a20002802002201410871044020002001412072360200417f0f0b200042003702042000200028022c220136021c200020013602142000200120002802306a36021041000b820401037f20024180c0004f0440200020012002100d20000f0b200020026a210302402000200173410371450440024020024101480440200021020c010b2000410371450440200021020c010b200021020340200220012d00003a0000200141016a2101200241016a220220034f0d0120024103710d000b0b02402003417c71220441c000490d002002200441406a22054b0d0003402002200128020036020020022001280204360204200220012802083602082002200128020c36020c2002200128021036021020022001280214360214200220012802183602182002200128021c36021c2002200128022036022020022001280224360224200220012802283602282002200128022c36022c2002200128023036023020022001280234360234200220012802383602382002200128023c36023c200141406b2101200241406b220220054d0d000b0b200220044f0d01034020022001280200360200200141046a2101200241046a22022004490d000b0c010b20034104490440200021020c010b2003417c6a22042000490440200021020c010b200021020340200220012d00003a0000200220012d00013a0001200220012d00023a0002200220012d00033a0003200141046a2101200241046a220220044d0d000b0b200220034904400340200220012d00003a0000200141016a2101200241016a22022003470d000b0b20000b0600100c41000b0300010b7e01037f230041106b220124002001410a3a000f024020002802102202450440200010020d01200028021021020b02402000280214220320024f0d0020002c004b410a460d002000200341016a3602142003410a3a00000c010b20002001410f6a410120002802241100004101470d0020012d000f1a0b200141106a24000b040042000b040041000b3101017f200021022002027f200128024c417f4c04402002200110010c010b2002200110010b220146044020000f0b20010b6201037f418008210003402000220141046a210020012802002202417f73200241fffdfb776a7141808182847871450d000b0240200241ff0171450440200121000c010b034020012d00012102200141016a2200210120020d000b0b20004180086b0b0c00027f4100410010040b1a0b6601027f419008280200220028024c41004e047f41010520010b1a0240417f4100100a2201200120001009471b4100480d00024020002d004b410a460d002000280214220120002802104f0d002000200141016a3602142001410a3a00000c010b200010060b0b3d01017f2002044003402000200120024180c00020024180c000491b22031003210020014180406b210120004180406b2100200220036b22020d000b0b0bb10201067f230041206b220324002003200028021c2204360210200028021421052003200236021c200320013602182003200520046b2201360214200120026a210641022105200341106a210103400240027f2006027f200028023c200120052003410c6a100004402003417f36020c417f0c010b200328020c0b22044604402000200028022c220136021c200020013602142000200120002802306a36021020020c010b2004417f4a0d012000410036021c2000420037031020002000280200412072360200410020054102460d001a200220012802046b0b2104200341206a240020040f0b200141086a20012004200128020422074b22081b220120042007410020081b6b220720012802006a3602002001200128020420076b360204200620046b2106200520086b21050c00000b000b0b4d06004180080b1268656c6c6f2c20776f726c64210000001804004198080b01050041a4080b01010041bc080b0e0200000003000000b804000000040041d4080b01010041e3080b050affffffff\",\n        \"wasi\": {\n          \"capture_stdout\": true\n        },\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"_start\",\n            \"args\": []\n          },\n          {\n            \"op\": \"read_stdout\"\n          }\n        ]\n      },\n      \"expected_output\": \"result[_start]=void\\nstdout=hello, world!\\n\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_2_manual_fd_write",
+        "trigger_keywords": [
+          "test cases for feature9 2 manual fd write",
+          "show me feature9 2 manual fd write test cases",
+          "what are the feature9 2 manual fd write test inputs",
+          "give me the feature9_2_manual_fd_write test file",
+          "test cases for feature 9",
+          "feature9 2 manual fd write expected output",
+          "what does feature9 2 manual fd write expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_2_manual_fd_write:\n{\n  \"description\": \"Supplying a host write function manually (instead of enabling the system interface): the module entry point calls it, the host reads the strings from the instance memory and accumulates them, and the accumulated output is reported.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001330960037f7f7f017f60047f7f7f7f017f60000060027f7f017f60017f017f60037f7e7f017e6000017f60017f0060037f7f7f00021a010d776173695f756e737461626c650866645f77726974650001030f0e03040003020705040306020208000405017001040405060101800280020609017f0141c095c0020b072e04066d656d6f72790200115f5f7761736d5f63616c6c5f63746f72730005046d61696e0004065f7374617274000b0909010041010b03080e070aae0c0ebf0101057f4180082104024020012802102202047f200205200110020d0120012802100b200128021422056b20004904402001418008200020012802241100000f0b024020012c004b4100480d0020002103034020032202450d012002417f6a22034180086a2d0000410a470d000b20014180082002200128022411000022032002490d01200020026b210020024180086a210420012802142105200221060b20052004200010031a2001200128021420006a360214200020066a21030b20030b5901017f200020002d004a2201417f6a2001723a004a20002802002201410871044020002001412072360200417f0f0b200042003702042000200028022c220136021c200020013602142000200120002802306a36021041000b820401037f20024180c0004f0440200020012002100d20000f0b200020026a210302402000200173410371450440024020024101480440200021020c010b2000410371450440200021020c010b200021020340200220012d00003a0000200141016a2101200241016a220220034f0d0120024103710d000b0b02402003417c71220441c000490d002002200441406a22054b0d0003402002200128020036020020022001280204360204200220012802083602082002200128020c36020c2002200128021036021020022001280214360214200220012802183602182002200128021c36021c2002200128022036022020022001280224360224200220012802283602282002200128022c36022c2002200128023036023020022001280234360234200220012802383602382002200128023c36023c200141406b2101200241406b220220054d0d000b0b200220044f0d01034020022001280200360200200141046a2101200241046a22022004490d000b0c010b20034104490440200021020c010b2003417c6a22042000490440200021020c010b200021020340200220012d00003a0000200220012d00013a0001200220012d00023a0002200220012d00033a0003200141046a2101200241046a220220044d0d000b0b200220034904400340200220012d00003a0000200141016a2101200241016a22022003470d000b0b20000b0600100c41000b0300010b7e01037f230041106b220124002001410a3a000f024020002802102202450440200010020d01200028021021020b02402000280214220320024f0d0020002c004b410a460d002000200341016a3602142003410a3a00000c010b20002001410f6a410120002802241100004101470d0020012d000f1a0b200141106a24000b040042000b040041000b3101017f200021022002027f200128024c417f4c04402002200110010c010b2002200110010b220146044020000f0b20010b6201037f418008210003402000220141046a210020012802002202417f73200241fffdfb776a7141808182847871450d000b0240200241ff0171450440200121000c010b034020012d00012102200141016a2200210120020d000b0b20004180086b0b0c00027f4100410010040b1a0b6601027f419008280200220028024c41004e047f41010520010b1a0240417f4100100a2201200120001009471b4100480d00024020002d004b410a460d002000280214220120002802104f0d002000200141016a3602142001410a3a00000c010b200010060b0b3d01017f2002044003402000200120024180c00020024180c000491b22031003210020014180406b210120004180406b2100200220036b22020d000b0b0bb10201067f230041206b220324002003200028021c2204360210200028021421052003200236021c200320013602182003200520046b2201360214200120026a210641022105200341106a210103400240027f2006027f200028023c200120052003410c6a100004402003417f36020c417f0c010b200328020c0b22044604402000200028022c220136021c200020013602142000200120002802306a36021020020c010b2004417f4a0d012000410036021c2000420037031020002000280200412072360200410020054102460d001a200220012802046b0b2104200341206a240020040f0b200141086a20012004200128020422074b22081b220120042007410020081b6b220720012802006a3602002001200128020420076b360204200620046b2106200520086b21050c00000b000b0b4d06004180080b1268656c6c6f2c20776f726c64210000001804004198080b01050041a4080b01010041bc080b0e0200000003000000b804000000040041d4080b01010041e3080b050affffffff\",\n        \"imports\": [\n          {\n            \"kind\": \"function\",\n            \"module\": \"wasi_unstable\",\n            \"name\": \"fd_write\",\n            \"behavior\": \"fd_write_capture\",\n            \"arity\": 4\n          }\n        ],\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"invoke\",\n            \"name\": \"_start\",\n            \"args\": []\n          },\n          {\n            \"op\": \"captured_output\"\n          }\n        ]\n      },\n      \"expected_output\": \"result[_start]=void\\noutput=hello, world!\\n\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_3_wasi_errors",
+        "trigger_keywords": [
+          "test cases for feature9 3 wasi errors",
+          "show me feature9 3 wasi errors test cases",
+          "what are the feature9 3 wasi errors test inputs",
+          "give me the feature9_3_wasi_errors test file",
+          "test cases for feature 9",
+          "feature9 3 wasi errors expected output",
+          "what does feature9 3 wasi errors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_3_wasi_errors:\n{\n  \"description\": \"System-interface error conditions: enabling it for a module that lacks the required imports fails; enabling it twice fails; building a module that needs the interface without enabling it reports a missing import; and requesting captured stdout/stderr when capture was not enabled fails. Each yields a normalized category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000006810000\",\n        \"wasi\": {}\n      },\n      \"expected_output\": \"error=wasi_fill_failed\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001330960037f7f7f017f60047f7f7f7f017f60000060027f7f017f60017f017f60037f7e7f017e6000017f60017f0060037f7f7f00021a010d776173695f756e737461626c650866645f77726974650001030f0e03040003020705040306020208000405017001040405060101800280020609017f0141c095c0020b072e04066d656d6f72790200115f5f7761736d5f63616c6c5f63746f72730005046d61696e0004065f7374617274000b0909010041010b03080e070aae0c0ebf0101057f4180082104024020012802102202047f200205200110020d0120012802100b200128021422056b20004904402001418008200020012802241100000f0b024020012c004b4100480d0020002103034020032202450d012002417f6a22034180086a2d0000410a470d000b20014180082002200128022411000022032002490d01200020026b210020024180086a210420012802142105200221060b20052004200010031a2001200128021420006a360214200020066a21030b20030b5901017f200020002d004a2201417f6a2001723a004a20002802002201410871044020002001412072360200417f0f0b200042003702042000200028022c220136021c200020013602142000200120002802306a36021041000b820401037f20024180c0004f0440200020012002100d20000f0b200020026a210302402000200173410371450440024020024101480440200021020c010b2000410371450440200021020c010b200021020340200220012d00003a0000200141016a2101200241016a220220034f0d0120024103710d000b0b02402003417c71220441c000490d002002200441406a22054b0d0003402002200128020036020020022001280204360204200220012802083602082002200128020c36020c2002200128021036021020022001280214360214200220012802183602182002200128021c36021c2002200128022036022020022001280224360224200220012802283602282002200128022c36022c2002200128023036023020022001280234360234200220012802383602382002200128023c36023c200141406b2101200241406b220220054d0d000b0b200220044f0d01034020022001280200360200200141046a2101200241046a22022004490d000b0c010b20034104490440200021020c010b2003417c6a22042000490440200021020c010b200021020340200220012d00003a0000200220012d00013a0001200220012d00023a0002200220012d00033a0003200141046a2101200241046a220220044d0d000b0b200220034904400340200220012d00003a0000200141016a2101200241016a22022003470d000b0b20000b0600100c41000b0300010b7e01037f230041106b220124002001410a3a000f024020002802102202450440200010020d01200028021021020b02402000280214220320024f0d0020002c004b410a460d002000200341016a3602142003410a3a00000c010b20002001410f6a410120002802241100004101470d0020012d000f1a0b200141106a24000b040042000b040041000b3101017f200021022002027f200128024c417f4c04402002200110010c010b2002200110010b220146044020000f0b20010b6201037f418008210003402000220141046a210020012802002202417f73200241fffdfb776a7141808182847871450d000b0240200241ff0171450440200121000c010b034020012d00012102200141016a2200210120020d000b0b20004180086b0b0c00027f4100410010040b1a0b6601027f419008280200220028024c41004e047f41010520010b1a0240417f4100100a2201200120001009471b4100480d00024020002d004b410a460d002000280214220120002802104f0d002000200141016a3602142001410a3a00000c010b200010060b0b3d01017f2002044003402000200120024180c00020024180c000491b22031003210020014180406b210120004180406b2100200220036b22020d000b0b0bb10201067f230041206b220324002003200028021c2204360210200028021421052003200236021c200320013602182003200520046b2201360214200120026a210641022105200341106a210103400240027f2006027f200028023c200120052003410c6a100004402003417f36020c417f0c010b200328020c0b22044604402000200028022c220136021c200020013602142000200120002802306a36021020020c010b2004417f4a0d012000410036021c2000420037031020002000280200412072360200410020054102460d001a200220012802046b0b2104200341206a240020040f0b200141086a20012004200128020422074b22081b220120042007410020081b6b220720012802006a3602002001200128020420076b360204200620046b2106200520086b21050c00000b000b0b4d06004180080b1268656c6c6f2c20776f726c64210000001804004198080b01050041a4080b01010041bc080b0e0200000003000000b804000000040041d4080b01010041e3080b050affffffff\",\n        \"wasi\": {},\n        \"wasi_twice\": true\n      },\n      \"expected_output\": \"error=wasi_already_enabled\\n\"\n    },\n    {\n      \"input\": {\n        \"module\": \"0061736d0100000001330960037f7f7f017f60047f7f7f7f017f60000060027f7f017f60017f017f60037f7e7f017e6000017f60017f0060037f7f7f00021a010d776173695f756e737461626c650866645f77726974650001030f0e03040003020705040306020208000405017001040405060101800280020609017f0141c095c0020b072e04066d656d6f72790200115f5f7761736d5f63616c6c5f63746f72730005046d61696e0004065f7374617274000b0909010041010b03080e070aae0c0ebf0101057f4180082104024020012802102202047f200205200110020d0120012802100b200128021422056b20004904402001418008200020012802241100000f0b024020012c004b4100480d0020002103034020032202450d012002417f6a22034180086a2d0000410a470d000b20014180082002200128022411000022032002490d01200020026b210020024180086a210420012802142105200221060b20052004200010031a2001200128021420006a360214200020066a21030b20030b5901017f200020002d004a2201417f6a2001723a004a20002802002201410871044020002001412072360200417f0f0b200042003702042000200028022c220136021c200020013602142000200120002802306a36021041000b820401037f20024180c0004f0440200020012002100d20000f0b200020026a210302402000200173410371450440024020024101480440200021020c010b2000410371450440200021020c010b200021020340200220012d00003a0000200141016a2101200241016a220220034f0d0120024103710d000b0b02402003417c71220441c000490d002002200441406a22054b0d0003402002200128020036020020022001280204360204200220012802083602082002200128020c36020c2002200128021036021020022001280214360214200220012802183602182002200128021c36021c2002200128022036022020022001280224360224200220012802283602282002200128022c36022c2002200128023036023020022001280234360234200220012802383602382002200128023c36023c200141406b2101200241406b220220054d0d000b0b200220044f0d01034020022001280200360200200141046a2101200241046a22022004490d000b0c010b20034104490440200021020c010b2003417c6a22042000490440200021020c010b200021020340200220012d00003a0000200220012d00013a0001200220012d00023a0002200220012d00033a0003200141046a2101200241046a220220044d0d000b0b200220034904400340200220012d00003a0000200141016a2101200241016a22022003470d000b0b20000b0600100c41000b0300010b7e01037f230041106b220124002001410a3a000f024020002802102202450440200010020d01200028021021020b02402000280214220320024f0d0020002c004b410a460d002000200341016a3602142003410a3a00000c010b20002001410f6a410120002802241100004101470d0020012d000f1a0b200141106a24000b040042000b040041000b3101017f200021022002027f200128024c417f4c04402002200110010c010b2002200110010b220146044020000f0b20010b6201037f418008210003402000220141046a210020012802002202417f73200241fffdfb776a7141808182847871450d000b0240200241ff0171450440200121000c010b034020012d00012102200141016a2200210120020d000b0b20004180086b0b0c00027f4100410010040b1a0b6601027f419008280200220028024c41004e047f41010520010b1a0240417f4100100a2201200120001009471b4100480d00024020002d004b410a460d002000280214220120002802104f0d002000200141016a3602142001410a3a00000c010b200010060b0b3d01017f2002044003402000200120024180c00020024180c000491b22031003210020014180406b210120004180406b2100200220036b22020d000b0b0bb10201067f230041206b220324002003200028021c2204360210200028021421052003200236021c200320013602182003200520046b2201360214200120026a210641022105200341106a210103400240027f2006027f200028023c200120052003410c6a100004402003417f36020c417f0c010b200328020c0b22044604402000200028022c220136021c200020013602142000200120002802306a36021020020c010b2004417f4a0d012000410036021c2000420037031020002000280200412072360200410020054102460d001a200220012802046b0b2104200341206a240020040f0b200141086a20012004200128020422074b22081b220120042007410020081b6b220720012802006a3602002001200128020420076b360204200620046b2106200520086b21050c00000b000b0b4d06004180080b1268656c6c6f2c20776f726c64210000001804004198080b01050041a4080b01010041bc080b0e0200000003000000b804000000040041d4080b01010041e3080b050affffffff\",\n        \"imports\": [\n          {\n            \"kind\": \"function\",\n            \"module\": \"wasi_unstable\",\n            \"name\": \"fd_write\",\n            \"behavior\": \"return\",\n            \"arity\": 4,\n            \"value\": 0\n          }\n        ],\n        \"build\": true,\n        \"steps\": [\n          {\n            \"op\": \"try_stdout\"\n          },\n          {\n            \"op\": \"try_stderr\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=stdout_without_wasi\\nerror=stderr_without_wasi\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the existing test scenarios to understand the expected wire format for outputs",
+        "actual_meaning": "The JSON files under rcb_tests/public_test_cases/ (features 1–9), whose `expected_output` strings define the exact line-oriented text format the execution adapter must produce for every operation result and error category."
+      },
+      {
+        "vague_reference": "stdout from the module just disappears",
+        "actual_meaning": "Feature 9 (feature9_1_wasi_capture_stdout.json, feature9_2_manual_fd_write.json, feature9_3_wasi_errors.json): the WASI system interface layer that intercepts fd_write calls and accumulates captured output, returned as `output=<text>` or `stdout=<text>` lines."
+      }
+    ],
+    "fallback_response": "I don't have specific details on that aspect — please check the test case files under rcb_tests/public_test_cases/ and the PRD in start.md for the authoritative contract. If you're seeing unexpected output, compare it character-for-character against the `expected_output` strings in the relevant feature's JSON file."
+  },
+  "public_test_cases": {
+    "feature1_module_compilation.json": {
+      "description": "Compiling a byte buffer into a module: a buffer whose leading bytes are not the WASM binary signature is rejected with a normalized compile-failure category and the underlying validation detail.",
+      "cases": [
+        {
+          "input": {
+            "module": "0100000001060160017e017e071302066d656d6f727902000673717561726500000020007e0b"
+          },
+          "expected_output": "error=compile_failed\ndetail=Validation error: Bad magic number (at offset 0)\u0000\n"
+        }
+      ]
+    },
+    "feature2_function_invocation.json": {
+      "description": "Looking up an exported function by name and calling it; looking up a name that is not exported reports it as missing; calling with the wrong number or wrong type of arguments yields normalized argument errors.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000001060160017e017e030201000405017001010105030100020608017f01418088040b071302066d656d6f727902000673717561726500000a09010700200020007e0b",
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "square",
+                "args": [
+                  1234
+                ]
+              },
+              {
+                "op": "lookup",
+                "name": "not_a_function"
+              }
+            ]
+          },
+          "expected_output": "result[square]=1522756\nlookup[not_a_function]=missing\n"
+        },
+        {
+          "input": {
+            "module": "0061736d0100000001060160017e017e030201000405017001010105030100020608017f01418088040b071302066d656d6f727902000673717561726500000a09010700200020007e0b",
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "square",
+                "args": []
+              }
+            ]
+          },
+          "expected_output": "error=argument_count\n"
+        },
+        {
+          "input": {
+            "module": "0061736d0100000001060160017e017e030201000405017001010105030100020608017f01418088040b071302066d656d6f727902000673717561726500000a09010700200020007e0b",
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "square",
+                "args": [
+                  1.23
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=argument_type\n"
+        }
+      ]
+    },
+    "feature3_numeric_types.json": {
+      "description": "Calling functions that add the four scalar value types (32/64-bit integers and 32/64-bit floats) and returning the wire result for each.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000001190460027e7e017e60027f7f017f60027c7c017c60027d7d017d030504000102030405017001010105030100020608017f01418088040b072e05066d656d6f727902000661646449363400000661646449333200010661646446363400020661646446333200030a21040700200120007c0b0700200120006a0b070020002001a00b070020002001920b",
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "addI64",
+                "args": [
+                  81985529216486895,
+                  1147797409030816545
+                ]
+              },
+              {
+                "op": "invoke",
+                "name": "addI32",
+                "args": [
+                  11259375,
+                  16702650
+                ]
+              },
+              {
+                "op": "invoke",
+                "name": "addF64",
+                "args": [
+                  1234.5678,
+                  8765.4321
+                ]
+              },
+              {
+                "op": "invoke",
+                "name": "addF32",
+                "args": [
+                  1234.5678,
+                  8765.4321
+                ]
+              }
+            ]
+          },
+          "expected_output": "result[addI64]=1229782938247303440\nresult[addI32]=27962025\nresult[addF64]=9999.9999\nresult[addF32]=9999.9990234375\n"
+        }
+      ]
+    },
+    "feature4_void_and_noarg.json": {
+      "description": "Calling a function with a void return type (which reports no value) followed by a parameterless function that returns the state mutated by the first call.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d01000000010a0260027e7e006000017e03030200010405017001010105030100020608017f01419088040b071603066d656d6f727902000373657400000367657400010a1e0210004100200120007c370380888080000b0b004100290380888080000b0b0f01004180080b080000000000000000",
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "set",
+                "args": [
+                  123,
+                  456
+                ]
+              },
+              {
+                "op": "invoke",
+                "name": "get",
+                "args": []
+              }
+            ]
+          },
+          "expected_output": "result[set]=void\nresult[get]=579\n"
+        }
+      ]
+    },
+    "feature5_1_host_function_args.json": {
+      "description": "A module function that calls back into a host-provided function; the host import records the arguments it receives, demonstrating values flow from module code into the host callback.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000001090260027e7e00600000020e0103656e76067265706f72740000030201010405017001010105030100020608017f01418088040b071802066d656d6f727902000b7265706f7274537475666600010a10010e0042fb0042c8031080808080000b",
+            "imports": [
+              {
+                "kind": "function",
+                "module": "env",
+                "name": "report",
+                "behavior": "echo_args",
+                "arity": 2
+              }
+            ],
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "reportStuff",
+                "args": []
+              },
+              {
+                "op": "import_call",
+                "ref": "env::report"
+              }
+            ]
+          },
+          "expected_output": "result[reportStuff]=void\nimport_call[env::report]=123,456\n"
+        }
+      ]
+    },
+    "feature5_2_host_function_exception.json": {
+      "description": "When a host-provided import raises an error during a module call, the error propagates out of the call and is reported with a normalized category plus the error message.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000001040160000002110203656e760161000003656e7601620000030201000405017001010105030100020608017f01418088040b070f02066d656d6f7279020002666e00020a10010e001080808080001081808080000b",
+            "imports": [
+              {
+                "kind": "function",
+                "module": "env",
+                "name": "a",
+                "behavior": "throw",
+                "message": "Hello exception!",
+                "arity": 0
+              },
+              {
+                "kind": "function",
+                "module": "env",
+                "name": "b",
+                "behavior": "return",
+                "arity": 0,
+                "value": null
+              }
+            ],
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "fn",
+                "args": []
+              }
+            ]
+          },
+          "expected_output": "error=imported_function_threw\nmessage=Hello exception!\n"
+        }
+      ]
+    },
+    "feature6_globals.json": {
+      "description": "Reading exported and imported globals, calling a function that depends on them, writing a mutable global and observing the dependent function change, then the errors raised by writing a constant global and by writing a value of the wrong type.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d010000000105016000017f020c0103656e7603626172037f000302010004040170000005030100010606017f0141250b071603066d656d6f727902000362617a000003666f6f03010a09010700230123006c0b0b0a0100410c0b0425000000",
+            "imports": [
+              {
+                "kind": "global",
+                "module": "env",
+                "name": "bar",
+                "value": 10
+              }
+            ],
+            "build": true,
+            "steps": [
+              {
+                "op": "read_global",
+                "name": "foo"
+              },
+              {
+                "op": "read_import_global",
+                "ref": "env::bar"
+              },
+              {
+                "op": "invoke",
+                "name": "baz",
+                "args": []
+              },
+              {
+                "op": "write_global",
+                "name": "foo",
+                "value": 99
+              },
+              {
+                "op": "invoke",
+                "name": "baz",
+                "args": []
+              },
+              {
+                "op": "write_import_global",
+                "ref": "env::bar",
+                "value": 100
+              },
+              {
+                "op": "write_global",
+                "name": "foo",
+                "value": 3.14159
+              }
+            ]
+          },
+          "expected_output": "global[foo]=37\nglobal[env::bar]=10\nresult[baz]=370\nglobal[foo]=99\nresult[baz]=990\nerror=const_global_write\nerror=bad_value_type\ntype=int32\n"
+        }
+      ]
+    },
+    "feature7_1_memory_ops.json": {
+      "description": "Creating a standalone linear memory, reporting its size in pages and bytes, writing and reading a byte, growing it by some pages, and confirming size grew and the written byte survived the grow.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000006810000",
+            "standalone_memory": {
+              "pages": 100
+            },
+            "memory_ops": [
+              {
+                "op": "info"
+              },
+              {
+                "op": "write",
+                "index": 123,
+                "value": 45
+              },
+              {
+                "op": "read",
+                "index": 123
+              },
+              {
+                "op": "grow",
+                "pages": 10
+              },
+              {
+                "op": "info"
+              },
+              {
+                "op": "read",
+                "index": 123
+              }
+            ]
+          },
+          "expected_output": "pages=100\nbytes=6553600\nwrite[123]=45\nbyte[123]=45\ngrow[10]=ok\npages=110\nbytes=7208960\nbyte[123]=45\n"
+        }
+      ]
+    },
+    "feature7_2_memory_errors.json": {
+      "description": "Memory operations that exceed limits: requesting an impossibly large initial size fails creation; growing past the implementation limit fails; growing past a declared maximum fails. Each yields a normalized category.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000006810000",
+            "standalone_memory": {
+              "pages": 1000000000
+            }
+          },
+          "expected_output": "error=memory_create_failed\n"
+        },
+        {
+          "input": {
+            "module": "0061736d0100000006810000",
+            "standalone_memory": {
+              "pages": 100,
+              "max": 200
+            },
+            "memory_ops": [
+              {
+                "op": "grow",
+                "pages": 300
+              }
+            ]
+          },
+          "expected_output": "error=memory_grow_failed\n"
+        }
+      ]
+    },
+    "feature8_import_validation.json": {
+      "description": "Instantiation-time import checking: a fully and correctly supplied set of imports instantiates successfully; leaving an import unfilled, supplying an import of the wrong kind (memory/global where a function is expected), naming an import that does not exist, or filling the same import twice each yields a normalized category (with the offending import name where relevant).",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b",
+            "imports": [
+              {
+                "kind": "function",
+                "module": "env",
+                "name": "someFn",
+                "behavior": "return",
+                "arity": 4,
+                "value": 123
+              }
+            ],
+            "build": true,
+            "report_build": true
+          },
+          "expected_output": "instantiated=true\n"
+        },
+        {
+          "input": {
+            "module": "0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b",
+            "build": true
+          },
+          "expected_output": "error=missing_import\n"
+        },
+        {
+          "input": {
+            "module": "0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b",
+            "imports": [
+              {
+                "kind": "global",
+                "module": "env",
+                "name": "someFn",
+                "value": 123
+              }
+            ]
+          },
+          "expected_output": "error=import_kind_mismatch\nexpected=global\n"
+        },
+        {
+          "input": {
+            "module": "0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b",
+            "imports": [
+              {
+                "kind": "function",
+                "module": "foo",
+                "name": "someFn",
+                "behavior": "return",
+                "arity": 4,
+                "value": 123
+              }
+            ],
+            "build": true
+          },
+          "expected_output": "error=import_not_found\nimport=foo::someFn\n"
+        },
+        {
+          "input": {
+            "module": "0061736d01000000010c0260047f7e7d7c017e600000020e0103656e7606736f6d65466e0000030201010405017001010105030100020608017f01418088040b071102066d656d6f7279020004626c616800010a1d011b004101420243000040404400000000000010401080808080001a0b",
+            "imports": [
+              {
+                "kind": "function",
+                "module": "env",
+                "name": "someFn",
+                "behavior": "return",
+                "arity": 4,
+                "value": 123
+              },
+              {
+                "kind": "function",
+                "module": "env",
+                "name": "someFn",
+                "behavior": "return",
+                "arity": 4,
+                "value": 456
+              }
+            ]
+          },
+          "expected_output": "error=import_already_filled\nimport=env::someFn\n"
+        }
+      ]
+    },
+    "feature9_1_wasi_capture_stdout.json": {
+      "description": "Enabling the system interface with stdout capture, running the module entry point, and reading back the captured standard output text.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000001330960037f7f7f017f60047f7f7f7f017f60000060027f7f017f60017f017f60037f7e7f017e6000017f60017f0060037f7f7f00021a010d776173695f756e737461626c650866645f77726974650001030f0e03040003020705040306020208000405017001040405060101800280020609017f0141c095c0020b072e04066d656d6f72790200115f5f7761736d5f63616c6c5f63746f72730005046d61696e0004065f7374617274000b0909010041010b03080e070aae0c0ebf0101057f4180082104024020012802102202047f200205200110020d0120012802100b200128021422056b20004904402001418008200020012802241100000f0b024020012c004b4100480d0020002103034020032202450d012002417f6a22034180086a2d0000410a470d000b20014180082002200128022411000022032002490d01200020026b210020024180086a210420012802142105200221060b20052004200010031a2001200128021420006a360214200020066a21030b20030b5901017f200020002d004a2201417f6a2001723a004a20002802002201410871044020002001412072360200417f0f0b200042003702042000200028022c220136021c200020013602142000200120002802306a36021041000b820401037f20024180c0004f0440200020012002100d20000f0b200020026a210302402000200173410371450440024020024101480440200021020c010b2000410371450440200021020c010b200021020340200220012d00003a0000200141016a2101200241016a220220034f0d0120024103710d000b0b02402003417c71220441c000490d002002200441406a22054b0d0003402002200128020036020020022001280204360204200220012802083602082002200128020c36020c2002200128021036021020022001280214360214200220012802183602182002200128021c36021c2002200128022036022020022001280224360224200220012802283602282002200128022c36022c2002200128023036023020022001280234360234200220012802383602382002200128023c36023c200141406b2101200241406b220220054d0d000b0b200220044f0d01034020022001280200360200200141046a2101200241046a22022004490d000b0c010b20034104490440200021020c010b2003417c6a22042000490440200021020c010b200021020340200220012d00003a0000200220012d00013a0001200220012d00023a0002200220012d00033a0003200141046a2101200241046a220220044d0d000b0b200220034904400340200220012d00003a0000200141016a2101200241016a22022003470d000b0b20000b0600100c41000b0300010b7e01037f230041106b220124002001410a3a000f024020002802102202450440200010020d01200028021021020b02402000280214220320024f0d0020002c004b410a460d002000200341016a3602142003410a3a00000c010b20002001410f6a410120002802241100004101470d0020012d000f1a0b200141106a24000b040042000b040041000b3101017f200021022002027f200128024c417f4c04402002200110010c010b2002200110010b220146044020000f0b20010b6201037f418008210003402000220141046a210020012802002202417f73200241fffdfb776a7141808182847871450d000b0240200241ff0171450440200121000c010b034020012d00012102200141016a2200210120020d000b0b20004180086b0b0c00027f4100410010040b1a0b6601027f419008280200220028024c41004e047f41010520010b1a0240417f4100100a2201200120001009471b4100480d00024020002d004b410a460d002000280214220120002802104f0d002000200141016a3602142001410a3a00000c010b200010060b0b3d01017f2002044003402000200120024180c00020024180c000491b22031003210020014180406b210120004180406b2100200220036b22020d000b0b0bb10201067f230041206b220324002003200028021c2204360210200028021421052003200236021c200320013602182003200520046b2201360214200120026a210641022105200341106a210103400240027f2006027f200028023c200120052003410c6a100004402003417f36020c417f0c010b200328020c0b22044604402000200028022c220136021c200020013602142000200120002802306a36021020020c010b2004417f4a0d012000410036021c2000420037031020002000280200412072360200410020054102460d001a200220012802046b0b2104200341206a240020040f0b200141086a20012004200128020422074b22081b220120042007410020081b6b220720012802006a3602002001200128020420076b360204200620046b2106200520086b21050c00000b000b0b4d06004180080b1268656c6c6f2c20776f726c64210000001804004198080b01050041a4080b01010041bc080b0e0200000003000000b804000000040041d4080b01010041e3080b050affffffff",
+            "wasi": {
+              "capture_stdout": true
+            },
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "_start",
+                "args": []
+              },
+              {
+                "op": "read_stdout"
+              }
+            ]
+          },
+          "expected_output": "result[_start]=void\nstdout=hello, world!\n\n"
+        }
+      ]
+    },
+    "feature9_2_manual_fd_write.json": {
+      "description": "Supplying a host write function manually (instead of enabling the system interface): the module entry point calls it, the host reads the strings from the instance memory and accumulates them, and the accumulated output is reported.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000001330960037f7f7f017f60047f7f7f7f017f60000060027f7f017f60017f017f60037f7e7f017e6000017f60017f0060037f7f7f00021a010d776173695f756e737461626c650866645f77726974650001030f0e03040003020705040306020208000405017001040405060101800280020609017f0141c095c0020b072e04066d656d6f72790200115f5f7761736d5f63616c6c5f63746f72730005046d61696e0004065f7374617274000b0909010041010b03080e070aae0c0ebf0101057f4180082104024020012802102202047f200205200110020d0120012802100b200128021422056b20004904402001418008200020012802241100000f0b024020012c004b4100480d0020002103034020032202450d012002417f6a22034180086a2d0000410a470d000b20014180082002200128022411000022032002490d01200020026b210020024180086a210420012802142105200221060b20052004200010031a2001200128021420006a360214200020066a21030b20030b5901017f200020002d004a2201417f6a2001723a004a20002802002201410871044020002001412072360200417f0f0b200042003702042000200028022c220136021c200020013602142000200120002802306a36021041000b820401037f20024180c0004f0440200020012002100d20000f0b200020026a210302402000200173410371450440024020024101480440200021020c010b2000410371450440200021020c010b200021020340200220012d00003a0000200141016a2101200241016a220220034f0d0120024103710d000b0b02402003417c71220441c000490d002002200441406a22054b0d0003402002200128020036020020022001280204360204200220012802083602082002200128020c36020c2002200128021036021020022001280214360214200220012802183602182002200128021c36021c2002200128022036022020022001280224360224200220012802283602282002200128022c36022c2002200128023036023020022001280234360234200220012802383602382002200128023c36023c200141406b2101200241406b220220054d0d000b0b200220044f0d01034020022001280200360200200141046a2101200241046a22022004490d000b0c010b20034104490440200021020c010b2003417c6a22042000490440200021020c010b200021020340200220012d00003a0000200220012d00013a0001200220012d00023a0002200220012d00033a0003200141046a2101200241046a220220044d0d000b0b200220034904400340200220012d00003a0000200141016a2101200241016a22022003470d000b0b20000b0600100c41000b0300010b7e01037f230041106b220124002001410a3a000f024020002802102202450440200010020d01200028021021020b02402000280214220320024f0d0020002c004b410a460d002000200341016a3602142003410a3a00000c010b20002001410f6a410120002802241100004101470d0020012d000f1a0b200141106a24000b040042000b040041000b3101017f200021022002027f200128024c417f4c04402002200110010c010b2002200110010b220146044020000f0b20010b6201037f418008210003402000220141046a210020012802002202417f73200241fffdfb776a7141808182847871450d000b0240200241ff0171450440200121000c010b034020012d00012102200141016a2200210120020d000b0b20004180086b0b0c00027f4100410010040b1a0b6601027f419008280200220028024c41004e047f41010520010b1a0240417f4100100a2201200120001009471b4100480d00024020002d004b410a460d002000280214220120002802104f0d002000200141016a3602142001410a3a00000c010b200010060b0b3d01017f2002044003402000200120024180c00020024180c000491b22031003210020014180406b210120004180406b2100200220036b22020d000b0b0bb10201067f230041206b220324002003200028021c2204360210200028021421052003200236021c200320013602182003200520046b2201360214200120026a210641022105200341106a210103400240027f2006027f200028023c200120052003410c6a100004402003417f36020c417f0c010b200328020c0b22044604402000200028022c220136021c200020013602142000200120002802306a36021020020c010b2004417f4a0d012000410036021c2000420037031020002000280200412072360200410020054102460d001a200220012802046b0b2104200341206a240020040f0b200141086a20012004200128020422074b22081b220120042007410020081b6b220720012802006a3602002001200128020420076b360204200620046b2106200520086b21050c00000b000b0b4d06004180080b1268656c6c6f2c20776f726c64210000001804004198080b01050041a4080b01010041bc080b0e0200000003000000b804000000040041d4080b01010041e3080b050affffffff",
+            "imports": [
+              {
+                "kind": "function",
+                "module": "wasi_unstable",
+                "name": "fd_write",
+                "behavior": "fd_write_capture",
+                "arity": 4
+              }
+            ],
+            "build": true,
+            "steps": [
+              {
+                "op": "invoke",
+                "name": "_start",
+                "args": []
+              },
+              {
+                "op": "captured_output"
+              }
+            ]
+          },
+          "expected_output": "result[_start]=void\noutput=hello, world!\n\n"
+        }
+      ]
+    },
+    "feature9_3_wasi_errors.json": {
+      "description": "System-interface error conditions: enabling it for a module that lacks the required imports fails; enabling it twice fails; building a module that needs the interface without enabling it reports a missing import; and requesting captured stdout/stderr when capture was not enabled fails. Each yields a normalized category.",
+      "cases": [
+        {
+          "input": {
+            "module": "0061736d0100000006810000",
+            "wasi": {}
+          },
+          "expected_output": "error=wasi_fill_failed\n"
+        },
+        {
+          "input": {
+            "module": "0061736d0100000001330960037f7f7f017f60047f7f7f7f017f60000060027f7f017f60017f017f60037f7e7f017e6000017f60017f0060037f7f7f00021a010d776173695f756e737461626c650866645f77726974650001030f0e03040003020705040306020208000405017001040405060101800280020609017f0141c095c0020b072e04066d656d6f72790200115f5f7761736d5f63616c6c5f63746f72730005046d61696e0004065f7374617274000b0909010041010b03080e070aae0c0ebf0101057f4180082104024020012802102202047f200205200110020d0120012802100b200128021422056b20004904402001418008200020012802241100000f0b024020012c004b4100480d0020002103034020032202450d012002417f6a22034180086a2d0000410a470d000b20014180082002200128022411000022032002490d01200020026b210020024180086a210420012802142105200221060b20052004200010031a2001200128021420006a360214200020066a21030b20030b5901017f200020002d004a2201417f6a2001723a004a20002802002201410871044020002001412072360200417f0f0b200042003702042000200028022c220136021c200020013602142000200120002802306a36021041000b820401037f20024180c0004f0440200020012002100d20000f0b200020026a210302402000200173410371450440024020024101480440200021020c010b2000410371450440200021020c010b200021020340200220012d00003a0000200141016a2101200241016a220220034f0d0120024103710d000b0b02402003417c71220441c000490d002002200441406a22054b0d0003402002200128020036020020022001280204360204200220012802083602082002200128020c36020c2002200128021036021020022001280214360214200220012802183602182002200128021c36021c2002200128022036022020022001280224360224200220012802283602282002200128022c36022c2002200128023036023020022001280234360234200220012802383602382002200128023c36023c200141406b2101200241406b220220054d0d000b0b200220044f0d01034020022001280200360200200141046a2101200241046a22022004490d000b0c010b20034104490440200021020c010b2003417c6a22042000490440200021020c010b200021020340200220012d00003a0000200220012d00013a0001200220012d00023a0002200220012d00033a0003200141046a2101200241046a220220044d0d000b0b200220034904400340200220012d00003a0000200141016a2101200241016a22022003470d000b0b20000b0600100c41000b0300010b7e01037f230041106b220124002001410a3a000f024020002802102202450440200010020d01200028021021020b02402000280214220320024f0d0020002c004b410a460d002000200341016a3602142003410a3a00000c010b20002001410f6a410120002802241100004101470d0020012d000f1a0b200141106a24000b040042000b040041000b3101017f200021022002027f200128024c417f4c04402002200110010c010b2002200110010b220146044020000f0b20010b6201037f418008210003402000220141046a210020012802002202417f73200241fffdfb776a7141808182847871450d000b0240200241ff0171450440200121000c010b034020012d00012102200141016a2200210120020d000b0b20004180086b0b0c00027f4100410010040b1a0b6601027f419008280200220028024c41004e047f41010520010b1a0240417f4100100a2201200120001009471b4100480d00024020002d004b410a460d002000280214220120002802104f0d002000200141016a3602142001410a3a00000c010b200010060b0b3d01017f2002044003402000200120024180c00020024180c000491b22031003210020014180406b210120004180406b2100200220036b22020d000b0b0bb10201067f230041206b220324002003200028021c2204360210200028021421052003200236021c200320013602182003200520046b2201360214200120026a210641022105200341106a210103400240027f2006027f200028023c200120052003410c6a100004402003417f36020c417f0c010b200328020c0b22044604402000200028022c220136021c200020013602142000200120002802306a36021020020c010b2004417f4a0d012000410036021c2000420037031020002000280200412072360200410020054102460d001a200220012802046b0b2104200341206a240020040f0b200141086a20012004200128020422074b22081b220120042007410020081b6b220720012802006a3602002001200128020420076b360204200620046b2106200520086b21050c00000b000b0b4d06004180080b1268656c6c6f2c20776f726c64210000001804004198080b01050041a4080b01010041bc080b0e0200000003000000b804000000040041d4080b01010041e3080b050affffffff",
+            "wasi": {},
+            "wasi_twice": true
+          },
+          "expected_output": "error=wasi_already_enabled\n"
+        },
+        {
+          "input": {
+            "module": "0061736d0100000001330960037f7f7f017f60047f7f7f7f017f60000060027f7f017f60017f017f60037f7e7f017e6000017f60017f0060037f7f7f00021a010d776173695f756e737461626c650866645f77726974650001030f0e03040003020705040306020208000405017001040405060101800280020609017f0141c095c0020b072e04066d656d6f72790200115f5f7761736d5f63616c6c5f63746f72730005046d61696e0004065f7374617274000b0909010041010b03080e070aae0c0ebf0101057f4180082104024020012802102202047f200205200110020d0120012802100b200128021422056b20004904402001418008200020012802241100000f0b024020012c004b4100480d0020002103034020032202450d012002417f6a22034180086a2d0000410a470d000b20014180082002200128022411000022032002490d01200020026b210020024180086a210420012802142105200221060b20052004200010031a2001200128021420006a360214200020066a21030b20030b5901017f200020002d004a2201417f6a2001723a004a20002802002201410871044020002001412072360200417f0f0b200042003702042000200028022c220136021c200020013602142000200120002802306a36021041000b820401037f20024180c0004f0440200020012002100d20000f0b200020026a210302402000200173410371450440024020024101480440200021020c010b2000410371450440200021020c010b200021020340200220012d00003a0000200141016a2101200241016a220220034f0d0120024103710d000b0b02402003417c71220441c000490d002002200441406a22054b0d0003402002200128020036020020022001280204360204200220012802083602082002200128020c36020c2002200128021036021020022001280214360214200220012802183602182002200128021c36021c2002200128022036022020022001280224360224200220012802283602282002200128022c36022c2002200128023036023020022001280234360234200220012802383602382002200128023c36023c200141406b2101200241406b220220054d0d000b0b200220044f0d01034020022001280200360200200141046a2101200241046a22022004490d000b0c010b20034104490440200021020c010b2003417c6a22042000490440200021020c010b200021020340200220012d00003a0000200220012d00013a0001200220012d00023a0002200220012d00033a0003200141046a2101200241046a220220044d0d000b0b200220034904400340200220012d00003a0000200141016a2101200241016a22022003470d000b0b20000b0600100c41000b0300010b7e01037f230041106b220124002001410a3a000f024020002802102202450440200010020d01200028021021020b02402000280214220320024f0d0020002c004b410a460d002000200341016a3602142003410a3a00000c010b20002001410f6a410120002802241100004101470d0020012d000f1a0b200141106a24000b040042000b040041000b3101017f200021022002027f200128024c417f4c04402002200110010c010b2002200110010b220146044020000f0b20010b6201037f418008210003402000220141046a210020012802002202417f73200241fffdfb776a7141808182847871450d000b0240200241ff0171450440200121000c010b034020012d00012102200141016a2200210120020d000b0b20004180086b0b0c00027f4100410010040b1a0b6601027f419008280200220028024c41004e047f41010520010b1a0240417f4100100a2201200120001009471b4100480d00024020002d004b410a460d002000280214220120002802104f0d002000200141016a3602142001410a3a00000c010b200010060b0b3d01017f2002044003402000200120024180c00020024180c000491b22031003210020014180406b210120004180406b2100200220036b22020d000b0b0bb10201067f230041206b220324002003200028021c2204360210200028021421052003200236021c200320013602182003200520046b2201360214200120026a210641022105200341106a210103400240027f2006027f200028023c200120052003410c6a100004402003417f36020c417f0c010b200328020c0b22044604402000200028022c220136021c200020013602142000200120002802306a36021020020c010b2004417f4a0d012000410036021c2000420037031020002000280200412072360200410020054102460d001a200220012802046b0b2104200341206a240020040f0b200141086a20012004200128020422074b22081b220120042007410020081b6b220720012802006a3602002001200128020420076b360204200620046b2106200520086b21050c00000b000b0b4d06004180080b1268656c6c6f2c20776f726c64210000001804004198080b01050041a4080b01010041bc080b0e0200000003000000b804000000040041d4080b01010041e3080b050affffffff",
+            "imports": [
+              {
+                "kind": "function",
+                "module": "wasi_unstable",
+                "name": "fd_write",
+                "behavior": "return",
+                "arity": 4,
+                "value": 0
+              }
+            ],
+            "build": true,
+            "steps": [
+              {
+                "op": "try_stdout"
+              },
+              {
+                "op": "try_stderr"
+              }
+            ]
+          },
+          "expected_output": "error=stdout_without_wasi\nerror=stderr_without_wasi\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 1,
+    "kept_cp": 2
+  }
+}

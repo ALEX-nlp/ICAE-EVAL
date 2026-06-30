@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to get this route protection wrapper thing finished up. Basically the core problem is that right now anyone can just navigate directly to protected pages without being logged in, and we're getting complaints that users sometimes see a flash of protected content before being kicked out, or worse they just stay on the page in a broken state. We want something reusable so devs don't have to copy-paste the same auth check into every single screen component.
+
+The wrapper should handle the usual stuff — send people to login if they're not authenticated, and make sure the URL they were trying to get to is preserved somewhere in the redirect so we can send them back after they log in. Similar to what we did with the compatibility logic on the login module last time, there's also a pending/loading state to think about — we don't want to redirect someone mid-authentication.
+
+Also we need it to support more advanced access rules beyond just 'is logged in', like checking profile fields. And it needs to work for nested routes too, not just top-level ones. There's also a case where we explicitly do NOT want to record the attempted URL — some routes are sensitive and we don't want that leaking into query params. The wrapper should also pass through any props or metadata the underlying component needs. Let's make sure this doesn't fire duplicate redirects after mount either, that was a problem before.

@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to ship the build manifest emitter feature we've been talking about. Basically the idea is that after every webpack build, we want a JSON file written out that tells our deployment pipeline what files were emitted, where they live, and what URLs they'll be served from. Right now our ops guys are hand-editing these lists every release and it keeps breaking things in staging when chunk names change.
+
+We also need it to handle the unhappy paths — like when a dependency is missing during compilation, we want a structured signal in that JSON rather than just a raw exception dump, similar to how we handled error normalization in the auth pipeline work last quarter.
+
+There's also a request from the CDN team that we support serving assets from a different base URL than what webpack knows about, and the security folks want hash algorithm metadata attached to each asset for SRI purposes.
+
+One thing I keep forgetting to mention: the file ordering in the output JSON matters to the frontend team — they complained last time that keys came out in random order and it broke their diffing tools. Also we need the path fields to be configurable so people can opt into relative paths instead of absolutes.
+
+Finally, if someone reruns the build, the manifest should reflect the new state, not keep stale chunk info from the previous run. Can we make sure that's covered too?
+
+A couple follow-ups from the questions that came in. On the happy path, the manifest shape should be pretty locked: 'status' set to 'done', 'publicPath' as the base URL, a 'chunks' object mapping each entry name to an ordered list of its emitted file names, and an 'assets' object mapping each file name to an object with 'name', 'path', and 'publicPath' fields. Also, yes, ordering really is a hard requirement here — both the 'assets' object keys and the 'chunks' object keys need to come out in strict alphabetical (lexicographic) order so the frontend diffing stays deterministic.
+
+For split chunks, the ordering inside each entry list matters too. If multiple entry points share a common split chunk, each entry's file list in 'chunks' needs to put the shared file(s) before the entry-specific file. So if 'app1' depends on 'commons.js' and 'app1.js', the list should be ['js/commons.js', 'js/app1.js'] in that order. And for compressed outputs, if we emit things like .gz and .br alongside the originals, each compressed file should get its own entry in the 'assets' object with its own 'name', 'path', and 'publicPath' fields, but those compressed files should not be listed in 'chunks' — only the original uncompressed file names belong in the chunk membership lists.
+
+On paths and URLs, when relative paths mode is enabled, the 'path' field for each asset should be relative to the emitted output root, like 'js/main.js', instead of an absolute filesystem path. The 'publicPath' URL fields do not change with that setting and should stay fully formed absolute URLs. Separately, for the custom URL override behavior, the build-level publicPath override should replace both the manifest-level 'publicPath' and each asset's 'publicPath', with each asset URL built by appending the asset name to the override base.
+
+For the failure case, when the build dies because of an unresolvable import, the manifest should still be structured and predictable: 'status' as 'error', an 'error' field set to the normalized string 'missing_module', and a 'missing_request' field pulled from the bundler error text. The piece we want extracted is specifically the substring after 'Can' and before the module path, i.e. 't resolve ' from the tail of 'Can't resolve '. Same idea as before: take the noisy raw error and normalize it into something the pipeline can actually use.
+
+Last thing, any text we store or output as part of this should have terminal control sequences stripped first. That includes ANSI color codes, styling sequences, reset codes, and hyperlink escape sequences, and the final result should contain only the user-visible characters. Empty input should produce empty output, and if the text has no control sequences it should pass through unchanged.

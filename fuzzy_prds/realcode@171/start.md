@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to get this auth gateway thing wrapped up. Basically it's a reverse proxy that sits in front of our internal apps and handles all the 'who are you and can you come in' stuff uniformly. Right now every team is rolling their own and it's a mess — some check email case-sensitively, some don't sign cookies at all, etc.
+
+The core pieces are: (1) a way to decide if an email address is allowed in, based on domain rules or an explicit list — similar to how we handled the login module last time; (2) checking username/password against a static file using that hashing approach we standardized on; (3) packing session info into a cookie string that can survive a round-trip without leaking tokens; (4) the actual HTTP front door that challenges unauthenticated users and has a couple of fixed public endpoints; and (5) a config validator that catches ALL the problems at once instead of exploding on the first one.
+
+A few things I'm fuzzy on: how exactly the cookie encryption works when someone uses the wrong key to decode — does it blow up or gracefully degrade? Also not sure about the exact rules for when config validation considers the secret 'long enough' for certain features. And what happens with the sign-in page redirect when someone hits the sign-in path directly vs a protected path? Can someone clarify these before we hand this to the dev team?

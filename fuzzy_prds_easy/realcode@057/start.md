@@ -1,0 +1,234 @@
+## Product Requirement Document
+
+# Fluent Value-Assertion Engine — Structured Pass/Fail Checks With Human-Readable Diagnostics
+
+## Project Goal
+
+Build a small, fluent assertion engine that lets developers state an expectation about a value — that it equals another value, exists, is of a given type, stands in a numeric order, matches a pattern, or contains something — and get back either a quiet confirmation that the expectation held or a clear, human-readable diagnostic explaining exactly what was expected and what was found. This removes the need for every test or guard to hand-write its own comparison-plus-error-message boilerplate.
+
+---
+
+## Background & Problem
+
+Without a shared assertion engine, developers scatter ad-hoc comparisons throughout their code and tests, each followed by a bespoke error string. The comparisons drift apart (shallow vs. deep equality, substring vs. element containment), and the error messages are inconsistent and often omit the values involved, making failures hard to diagnose.
+
+With this engine, a single well-defined contract turns a value plus an expectation into a deterministic outcome: the expectation either holds or is violated, and a violation always renders a uniform diagnostic that names the relation and both operands. The engine performs structural (deep) comparison where it matters — object and array equality, subset containment — so callers do not re-implement these subtleties. Invalid uses (comparing the wrong kinds of values) are reported as neutral, categorized errors rather than crashing.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.
+   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.
+   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single "god file". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.
+   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.
+
+3. **Adherence to SOLID Design Principles:**
+   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):
+   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.
+   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.
+
+---
+
+## Core Features
+
+Every feature is exercised through one request object with a `check` field naming the relation to verify, an `actual` field carrying the value under test (an absent `actual` denotes the undefined/missing value), and — for relations that need one — an `expected` field. The adapter renders a uniform outcome record:
+
+- A satisfied assertion prints two lines: `check=<relation>` then `outcome=hold`.
+- A violated assertion prints three lines: `check=<relation>`, `outcome=violation`, then `message=<diagnostic>`. The diagnostic is the engine's own human-readable sentence; values are rendered inline (strings in single quotes, arrays as `[ a, b, c ]`, objects as `{ k: v }`, regular expressions in `/.../ ` form).
+- A request whose operand kinds are invalid for the chosen relation prints three lines: `check=<relation>`, `outcome=error`, then `error=<category>`, a neutral category name (never a host-language exception type).
+
+Every emitted line is terminated by a newline.
+
+### Feature 1: Deep Structural Equality
+
+**As a developer**, I want to assert that two values are equal by structure rather than by reference, so I can compare objects and arrays without hand-writing recursive comparisons.
+
+**Expected Behavior / Usage:**
+
+The `equal` relation holds when `actual` and `expected` are structurally equal: primitives compare by value, two objects are equal when they have the same keys and equal values regardless of key order, and arrays are equal when all corresponding elements are equal. When they are not equal it reports a violation whose diagnostic reads `Expected <actual> to equal <expected>`. The `not_equal` relation is the exact negation: it holds when the two values are not structurally equal and reports a violation when they are.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_equality.json`
+
+```json
+{
+    "description": "Deep structural equality of two values. The engine compares the actual value against the expected value by structure, not by reference: two objects with the same keys and values are equal regardless of key order. The positive relation reports a violation (with a diagnostic naming both rendered operands) when the values are not structurally equal. When the relation is satisfied the engine reports that the assertion held with no diagnostic.",
+    "cases": [
+        {
+            "input": {"check": "equal", "actual": "actual", "expected": "expected"},
+            "expected_output": "[a specific threshold value — check 'Exact_Method' configuration]\noutcome=violation\nmessage=Expected 'actual' to equal 'expected'\n"
+        },
+        {
+            "input": {"check": "equal", "actual": {"a": "a", "b": "b", "c": "c"}, "expected": {"b": "b", "c": "c", "a": "a"}},
+            "expected_output": "[a specific threshold value — check 'Exact_Method' configuration]\noutcome=hold\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Existence / Truthiness
+
+**As a developer**, I want to assert that a value is present (truthy) or absent (falsy), so I can guard against empty, zero, or missing values in one step.
+
+**Expected Behavior / Usage:**
+
+The `exist` relation holds when `actual` is truthy (any non-zero number, non-empty string, object, or array) and reports a violation `Expected <actual> to exist` for falsy values such as zero, null, or the absent/undefined value. The `not_exist` relation is the mirror image: it holds for falsy values and reports a violation `Expected <actual> to not exist` for truthy ones. An absent `actual` field denotes the undefined value and is treated as falsy.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_existence.json`
+
+```json
+{
+    "description": "Truthiness assertions. The existence relation is satisfied when the actual value is truthy and reports a violation for falsy values such as zero. A violation carries a diagnostic that renders the offending value.",
+    "cases": [
+        {
+            "input": {"check": "exist", "actual": 1},
+            "expected_output": "check=exist\noutcome=hold\n"
+        },
+        {
+            "input": {"check": "exist", "actual": 0},
+            "expected_output": "check=exist\noutcome=violation\nmessage=Expected 0 to exist\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 3: Type Membership
+
+**As a developer**, I want to assert that a value is of a named type, so I can validate shapes without writing per-type checks.
+
+**Expected Behavior / Usage:**
+
+The `be_a` relation takes a type-name descriptor in `expected` (a string such as `"number"`, `"string"`, or `"array"`). It holds when `actual` is of the named type: `"array"` matches any array, and every other name matches when the value's runtime type equals that name. A non-matching value yields a violation `Expected <actual> to be a <descriptor>` (the descriptor is rendered as a quoted string). The `not_be_a` relation negates the check and, when violated, reuses the same `to be a` phrasing. The descriptor must be a string; if it is some other kind of value (for example a number), the request is rejected with `error=invalid_type_descriptor` instead of being compared.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_type.json`
+
+```json
+{
+    "description": "Type-membership assertions driven by a type-name descriptor string. The relation is satisfied when the actual value is of the named type and reports a violation otherwise, with a diagnostic that renders the value and the requested type name.",
+    "cases": [
+        {
+            "input": {"check": "be_a", "actual": 4, "expected": "number"},
+            "expected_output": "check=be_a\noutcome=hold\n"
+        },
+        {
+            "input": {"check": "be_a", "actual": "actual", "expected": "number"},
+            "expected_output": "check=be_a\noutcome=violation\nmessage=Expected 'actual' to be a 'number'\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: Ordered Numeric Comparison
+
+**As a developer**, I want to assert that one number stands in a given order relative to another, so I can express bounds checks declaratively.
+
+**Expected Behavior / Usage:**
+
+Four relations compare two numbers: `less_than`, `less_than_or_equal`, `greater_than`, and `greater_than_or_equal`. Each holds when `actual` stands in the named order relative to `expected`; the inclusive variants additionally hold on equality. A failing comparison yields a violation whose diagnostic names the comparison in words, e.g. `Expected 3 to be less than 2` or `Expected 2 to be greater than or equal to 3`. Both operands must be numbers; if either is not a number the request is rejected with `error=operand_not_a_number`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_numeric_comparison.json`
+
+```json
+{
+    "description": "Ordered numeric comparison between two numbers. The strictly-less-than relation is satisfied when the actual number is below the expected number and otherwise reports a violation whose diagnostic names the comparison and both numbers.",
+    "cases": [
+        {
+            "input": {"check": "less_than", "actual": 2, "expected": 3},
+            "expected_output": "check=less_than\noutcome=hold\n"
+        },
+        {
+            "input": {"check": "less_than", "actual": 3, "expected": 2},
+            "expected_output": "check=less_than\noutcome=violation\nmessage=Expected 3 to be less than 2\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 5: Pattern Matching
+
+**As a developer**, I want to assert that a string does or does not match a regular expression, so I can validate text formats.
+
+**Expected Behavior / Usage:**
+
+The `match` relation takes the pattern in `expected` as a regular-expression source string (the adapter compiles it). It holds when the pattern matches the `actual` string and otherwise reports a violation `Expected <actual> to match <pattern>`, where the pattern is rendered in slash-delimited form. The `not_match` relation holds when the pattern does NOT match and reports a violation `Expected <actual> to not match <pattern>` when it does. The actual value must be a string; if it is not, the request is rejected with `error=actual_not_a_string`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_pattern.json`
+
+```json
+{
+    "description": "Regular-expression matching of a string against a pattern supplied as a regular-expression source string. The positive relation is satisfied when the pattern matches the actual string and reports a violation otherwise, rendering the actual string and the pattern in slash-delimited form.",
+    "cases": [
+        {
+            "input": {"check": "match", "actual": "actual", "expected": "^actual$"},
+            "expected_output": "check=match\noutcome=hold\n"
+        },
+        {
+            "input": {"check": "match", "actual": "actual", "expected": "nope"},
+            "expected_output": "check=match\noutcome=violation\nmessage=Expected 'actual' to match /nope/\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 6: Containment
+
+**As a developer**, I want to assert that a collection or string contains (or excludes) a value, with deep matching for structured elements, so I can check membership without manual iteration.
+
+**Expected Behavior / Usage:**
+
+The `include` relation accepts an array, object, or string as `actual`. It holds when: an array contains an element deeply equal to `expected`; an object contains `expected` as a deep subset (every key of `expected` is present in `actual` with a deeply-equal value, recursing into nested objects); or a string contains `expected` as a substring. A failure yields a violation `Expected <actual> to include <expected>`. The `exclude` relation is the negation for arrays and strings and accepts only an array or string as `actual`; a failure yields `Expected <actual> to exclude <expected>`. If `actual` is not an accepted kind for the relation, the request is rejected with `error=unsupported_actual_type`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature6_containment.json`
+
+```json
+{
+    "description": "Containment assertions across arrays, objects, and strings. Inclusion holds when an array contains a deeply-equal element, when an object contains the expected object as a deep subset, or when a string contains the expected substring. A violation diagnostic renders the container and the searched value.",
+    "cases": [
+        {
+            "input": {"check": "include", "actual": [1, 2, 3], "expected": 2},
+            "expected_output": "check=include\noutcome=hold\n"
+        },
+        {
+            "input": {"check": "include", "actual": {"a": 1, "b": 2, "c": 3}, "expected": {"d": 4}},
+            "expected_output": "check=include\noutcome=violation\nmessage=Expected { a: 1, b: 2, c: 3 } to include { d: 4 }\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing the assertion relations described above (deep equality, truthiness, type membership, ordered numeric comparison, pattern matching, and containment), with structured/deep comparison logic decoupled from standard I/O and JSON parsing. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the "Scale-Driven Code Organization" constraint.
+
+2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin and prints the resulting outcome record to stdout, matching the per-feature contracts above. The request's `check` selects the relation; `actual` carries the value under test (absent means undefined); `expected` carries the comparison operand where applicable (for pattern relations it is a regular-expression source string). On a satisfied assertion it prints `check=<relation>` then `outcome=hold`; on a violation it prints `check=<relation>`, `outcome=violation`, then `message=<engine diagnostic>`; on an operand-kind misuse it prints `check=<relation>`, `outcome=error`, then `error=<neutral category>`. Native runtime exceptions must be translated into these neutral category lines in the adapter layer, never leaking host-language type names.
+
+3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- apply the same logic as the 'verify' module in utils/validation

@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need to build that field-level data protection layer we've been talking about for a while. The core idea is that developers should be able to mark certain model fields as sensitive (think emails, SSNs, credit card numbers) and the system should just handle keeping that data safe in storage automatically — no manual crypto code at the call site. It should feel like a normal attribute to the developer but store something unreadable in the backing column.
+
+We also need it to be smart about edge cases — empty values, missing values, that sort of thing — and support the same kind of conditional logic we used on the login module last time. There should also be a way to swap in a custom encryption backend for teams that have their own crypto setup.
+
+Inheritance needs to work correctly too — child models should pick up whatever the parent declared. And we need class-level helpers for doing the transform outside of an instance context.
+
+Please make sure the codebase isn't just one big file — this thing has enough moving parts that it needs to be split up properly. The runner/adapter that processes the test harness commands should live separately from the core logic, which should know nothing about JSON or stdin.
+
+Let me know if anything's unclear, but try to dig into the existing test cases first before pinging me.
+
+One quick follow-up from the questions that came in: the default backing storage attribute name is just the attribute name with the prefix 'encrypted_' added, so 'email' becomes 'encrypted_email'. If a team wants to change that, they can do it with a custom 'prefix' and/or 'suffix' option pair, or skip that entirely and give an explicit 'attribute' option with the full storage attribute name.
+
+Also, there’s an alternate declaration entry point that shows up as 'alias' through the 'via' field in the harness, and it should register an attribute in exactly the same way as the main declaration keyword. In practice that means identical catalogue entries and identical accessor generation either way. And when an encrypted attribute is declared, it should also get the boolean query accessor. That predicate returns false when no value has been assigned, false after assigning an empty value, and true after assigning any non-empty value. It should reflect whether there’s a non-empty value sitting in the backing storage.
+
+On the class side, we do want encrypt and decrypt helper methods for each declared attribute so callers can do the transform without creating an instance. Those helpers take a value plus options, including key and IV/salt overrides, and return the encrypted or decrypted result directly. Non-string inputs should be coerced to their string form before encryption, so if two different inputs end up with the same string representation, they produce identical ciphertext under a fixed IV.
+
+A couple behavior details to lock down: by default, encrypting an absent (nil/null) value returns the absent value unchanged, and encrypting an empty string returns the empty string unchanged. Decryption should mirror that same passthrough behavior for absent and empty inputs. If an attribute sets 'allow_empty_value' option to true, then both empty string and nil do get encrypted, and on read you recover the original value.
+
+For the conditional behavior, encryption can be gated by 'if' and 'unless' options. A truthy 'if' condition or a falsy 'unless' condition permits encryption; a falsy 'if' or truthy 'unless' suppresses encryption and stores the plaintext verbatim. The condition can be a literal boolean or a symbolic reference like '$sym' to an instance method, and that gets evaluated at assignment time. IV and salt generation need to follow the same rule too, so neither is generated when encryption is suppressed. This is the same option-based conditional encryption behavior called out in feature10_conditional_guards.json and feature14_guard_iv_salt.json, where a boolean literal or a symbolic instance-method reference gates whether encryption and IV/salt generation happen for a given assignment.
+
+And just to reinforce the structure point, this still should not turn into one big file. We need distinct units for attribute declaration/registration, per-instance option and key evaluation logic, cipher delegation, encoding helpers, serialization helpers, and IV/salt generation. The execution adapter that reads JSON from stdin and writes the transcript to stdout needs to be a completely separate program from the core mixin, and the core mixin must have no knowledge of JSON, stdin, or stdout.

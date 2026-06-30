@@ -1,0 +1,260 @@
+## Product Requirement Document
+
+# System Artifact Parsing Utilities — Decoding OS, Firewall, and Tooling Text Formats into Structured Data
+
+## Project Goal
+
+Build a small library of pure, side-effect-free parsing utilities that turn the assorted textual artifacts a host/guest management layer must consume — kernel socket tables, firewall NAT rule dumps, command-line argument vectors, SSH client version banners, SSH public-key lines, and property-list device registries — into clean structured values, so higher-level code can make decisions without re-implementing fiddly format decoding everywhere.
+
+---
+
+## Background & Problem
+
+A system that supervises virtual machines and their guests constantly inspects the textual output of operating-system facilities and command-line tools. Each such artifact has its own idiosyncratic encoding: addresses packed as little-endian hex, firewall rules expressed in a save/restore syntax, version banners with vendor noise, key lines with type-specific length rules, XML property lists with alternating key/value elements.
+
+Without a dedicated parsing layer, this decoding logic gets scattered and duplicated, is hard to test, and tends to be subtly wrong (endianness mistakes, off-by-one length checks, brittle string slicing). This library centralizes the decoders behind small, well-specified, individually testable functions. Each function takes raw text (or a simple value) and returns a precise structured result; none of them performs I/O, spawns processes, or reaches the network — they are pure transformations from input text to output data.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.
+   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.
+   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single "god file". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.
+   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.
+
+3. **Adherence to SOLID Design Principles:**
+   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):
+   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.
+   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.
+
+---
+
+## Core Features
+
+### Feature 1: Decode Kernel Network Socket Tables
+
+**As a developer**, I want to decode the kernel's socket table dump into plain IP/port/[a specific list of buffer state fields — ask the implementation team for the exact snapshot]ate records, so I can discover which sockets a gue[a specific list of buffer state fields — ask the implementation team for the exact snapshot] has open without parsing hex by hand.
+
+**Expected Behavior / Usage:**
+
+The input names an address family (`tcp` for IPv4-[a specific list of buffer state fields — ask the implementation team for the exact snapshot]yle 8-hex-digit addresses, `tcp6` for 32-hex-digit addresses) and supplies the full table text. The first line is a header that labels the columns; the parser locates the local-address column and the state column by name from that header, then processes every subsequent non-empty line as one socket. The local-address field is a single token of the form `<hex-address>:<hex-port>`: the address part is decoded little-endian within each 4-byte group (so `0100007F` is `127.0.0.1` and a 32-digit token decodes to an IPv6 address such as `fe80::70a6:57ff:fe71:c75d`), while the port part is a big-endian hex number. The state column is a hex code that maps to a connection state — a listening socket versus an established one. For each socket the output is one line reporting the address family, the decoded IP address, the decoded port, and the state label.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_parse_socket_table.json`
+
+```json
+{
+    "description": "Parse a kernel network socket table rendered in the /proc/net/{tcp,tcp6} text format. The first line is a header naming the columns; each following non-empty line describes one socket. The local address column packs an IP address and a port into a single hexadecimal token (the IP encoded little-endian per 4-byte group, the port big-endian after a colon), and a separate column gives the connection state as a hex code. For the requested address family, emit one line per socket reporting the decoded IP address, the decoded port, and the connection state mapped to a human label (a listening socket versus an established one).",
+    "cases": [
+        {
+            "input": {
+                "op": "parse_net_tcp",
+                "kind": "tcp",
+                "table": "[a specific list of buffer state fields — ask the implementation team for the exact snapshot]  [a specific list of buffer state fields — ask the implementation team for the exact snapshot] [a specific list of buffer state fields — ask the implementation team for the exact snapshot]   st [a specific list of buffer state fields — ask the implementation team for the exact snapshot] [a specific list of buffer state fields — ask the implementation team for the exact snapshot] [a specific list of buffer state fields — ask the implementation team for the exact snapshot] [a specific list of buffer state fields — ask the implementation team for the exact snapshot] re[a specific list of buffer state fields — ask the implementation team for the exact snapshot]nsmt   [a specific list of buffer state fields — ask the implementation team for the exact snapshot]  [a specific list of buffer state fields — ask the implementation team for the exact snapshot] [a specific list of buffer state fields — ask the implementation team for the exact snapshot]\n   0: 0100007F:8AEF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 28152 1 0000000000000000 100 0 0 10 0\n   1: 0103000A:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 31474 1 0000000000000000 100 0 0 10 5\n   2: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   102        0 30955 1 0000000000000000 100 0 0 10 0\n   3: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 32910 1 0000000000000000 100 0 0 10 0\n   4: 0100007F:053A 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 31430 1 0000000000000000 100 0 0 10 0\n   5: 0B3CA8C0:0016 690AA8C0:F705 01 00000000:00000000 02:00028D8B 00000000     0        0 32989 4 0000000000000000 20 4 31 10 19\n"
+            },
+            "expected_output": "kind=tcp ip=127.0.0.1 port=35567 state=listen\nkind=tcp ip=10.0.3.1 port=53 state=listen\nkind=tcp ip=127.0.0.53 port=53 state=listen\nkind=tcp ip=0.0.0.0 port=22 state=listen\nkind=tcp ip=127.0.0.1 port=1338 state=listen\nkind=tcp ip=192.168.60.11 port=22 state=established\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Ex[a specific list of buffer state fields — ask the implementation team for the exact snapshot]act Forwarded Ports From Firewall NAT Rules
+
+**As a developer**, I want to read back which host ports are being forwarded to guest containers from a firewall NAT rule dump, so I can mirror those forwards without tracking them separately.
+
+**Expected Behavior / Usage:**
+
+The input is the full text of a NAT table dump in the line-oriented save format (each line is one rule, e.g. an append directive `-A <chain> ... -j <target>`). Most lines are chain declarations, policies, masquerade or accept rules, and per-container bookkeeping; these are ignored. The parser keys only on the rules that perform the actual destination translation for a published container port: such a rule belongs to a per-container forwarding chain, declares the protocol, names a destination port via the `--dport` option, and may optionally pin a destination IP via `-d <ip>/32`. When a forwarding rule pins no destination IP it applies to all interfaces, and the unspecified address `0.0.0.0` is reported for it. For each detected forwarding rule the output is one line reporting whether it is a TCP rule, the bound IP address, and the forwarded port.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_parse_nat_rules.json`
+
+```json
+{
+    "description": "Scan a firewall NAT rule dump (one rule per line, in the textual `-S` save format) and extract the host port-forwarding entries created for published container ports. Only the rules that actually perform the destination translation count; a forwarding rule names a destination port and may or may not pin a destination IP. When a rule pins no IP it applies to all interfaces and the unspecified address is reported. For each forwarding rule, emit a line reporting whether it is a TCP rule, the bound IP address, and the forwarded port.",
+    "cases": [
+        {
+            "input": {
+                "op": "parse_nat_rules",
+                "rules": "# Warning: iptables-legacy tables present, use iptables-legacy to see them\n-P PREROUTING ACCEPT\n-P INPUT ACCEPT\n-P OUTPUT ACCEPT\n-P POSTROUTING ACCEPT\n-N CNI-04579c7bb67f4c3f6cca0185\n-N CNI-28e04aad9bf52e38b43f8700\n-N CNI-2d72aeb202429907277c53c5\n-N CNI-2e2f8d5b91929ef9fc152e75\n-N CNI-3cbb832b23c724bdddedd7e4\n-N CNI-5033e3bad9f1265a2b04037f\n-N CNI-DN-04579c7bb67f4c3f6cca0\n-N CNI-DN-2d72aeb202429907277c5\n-N CNI-DN-2e2f8d5b91929ef9fc152\n-N CNI-HOSTPORT-DNAT\n-N CNI-HOSTPORT-MASQ\n-N CNI-HOSTPORT-SETMARK\n-N CNI-cb0db077a14ecd8d4a843636\n-N CNI-f1ca917e7b9939c7d8457d68\n-A PREROUTING -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT\n-A OUTPUT -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT\n-A POSTROUTING -m comment --comment \"CNI portfwd requiring masquerade\" -j CNI-HOSTPORT-MASQ\n-A POSTROUTING -s 10.4.0.3/32 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-44540a2b2cc6c1154d2a21aec473d6987ec4d6bc339e89ee295a6db433ad623e\\\"\" -j CNI-5033e3bad9f1265a2b04037f\n-A POSTROUTING -s 10.4.0.4/32 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-cf12b94944785a4c8937e237a0a277d893cbadebd50409ed5d4b8ca3f90fedf3\\\"\" -j CNI-28e04aad9bf52e38b43f8700\n-A POSTROUTING -s 10.4.0.5/32 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-e9d499901490e6a66277688ba8d71cca35a6d1ca6261bc5a7e11e45e80aa3ea3\\\"\" -j CNI-3cbb832b23c724bdddedd7e4\n-A POSTROUTING -s 10.4.0.6/32 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-a65e32cc21f9da99b4aa826914873e343f8f09f910657450be551aa24d676e51\\\"\" -j CNI-f1ca917e7b9939c7d8457d68\n-A POSTROUTING -s 10.4.0.7/32 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-c93e2a3a2264f98647f0d33dc80d88de81c0710bf30ea822e2ed19213f9c53b5\\\"\" -j CNI-2e2f8d5b91929ef9fc152e75\n-A POSTROUTING -s 10.4.0.8/32 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-a8df9868a5f7ee2468118331dd6185e5655f7ff8e77f067408b7ff40e9457860\\\"\" -j CNI-cb0db077a14ecd8d4a843636\n-A POSTROUTING -s 10.4.0.9/32 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-393bd750d06186633a02b44487765ce038b7df434bfb16027ca1903bf5f3dc31\\\"\" -j CNI-2d72aeb202429907277c53c5\n-A POSTROUTING -s 10.4.0.10/32 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-3d263c6a1c710edc1362764464c073ca834ec9adc0766411772f2b7a3dd1de0f\\\"\" -j CNI-04579c7bb67f4c3f6cca0185\n-A CNI-04579c7bb67f4c3f6cca0185 -d 10.4.0.0/24 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-3d263c6a1c710edc1362764464c073ca834ec9adc0766411772f2b7a3dd1de0f\\\"\" -j ACCEPT\n-A CNI-04579c7bb67f4c3f6cca0185 ! -d 224.0.0.0/4 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-3d263c6a1c710edc1362764464c073ca834ec9adc0766411772f2b7a3dd1de0f\\\"\" -j MASQUERADE\n-A CNI-28e04aad9bf52e38b43f8700 -d 10.4.0.0/24 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-cf12b94944785a4c8937e237a0a277d893cbadebd50409ed5d4b8ca3f90fedf3\\\"\" -j ACCEPT\n-A CNI-28e04aad9bf52e38b43f8700 ! -d 224.0.0.0/4 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-cf12b94944785a4c8937e237a0a277d893cbadebd50409ed5d4b8ca3f90fedf3\\\"\" -j MASQUERADE\n-A CNI-2d72aeb202429907277c53c5 -d 10.4.0.0/24 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-393bd750d06186633a02b44487765ce038b7df434bfb16027ca1903bf5f3dc31\\\"\" -j ACCEPT\n-A CNI-2d72aeb202429907277c53c5 ! -d 224.0.0.0/4 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-393bd750d06186633a02b44487765ce038b7df434bfb16027ca1903bf5f3dc31\\\"\" -j MASQUERADE\n-A CNI-2e2f8d5b91929ef9fc152e75 -d 10.4.0.0/24 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-c93e2a3a2264f98647f0d33dc80d88de81c0710bf30ea822e2ed19213f9c53b5\\\"\" -j ACCEPT\n-A CNI-2e2f8d5b91929ef9fc152e75 ! -d 224.0.0.0/4 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-c93e2a3a2264f98647f0d33dc80d88de81c0710bf30ea822e2ed19213f9c53b5\\\"\" -j MASQUERADE\n-A CNI-3cbb832b23c724bdddedd7e4 -d 10.4.0.0/24 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-e9d499901490e6a66277688ba8d71cca35a6d1ca6261bc5a7e11e45e80aa3ea3\\\"\" -j ACCEPT\n-A CNI-3cbb832b23c724bdddedd7e4 ! -d 224.0.0.0/4 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-e9d499901490e6a66277688ba8d71cca35a6d1ca6261bc5a7e11e45e80aa3ea3\\\"\" -j MASQUERADE\n-A CNI-5033e3bad9f1265a2b04037f -d 10.4.0.0/24 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-44540a2b2cc6c1154d2a21aec473d6987ec4d6bc339e89ee295a6db433ad623e\\\"\" -j ACCEPT\n-A CNI-5033e3bad9f1265a2b04037f ! -d 224.0.0.0/4 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-44540a2b2cc6c1154d2a21aec473d6987ec4d6bc339e89ee295a6db433ad623e\\\"\" -j MASQUERADE\n-A CNI-DN-04579c7bb67f4c3f6cca0 -s 10.4.0.0/24 -p tcp -m tcp --dport 8082 -j CNI-HOSTPORT-SETMARK\n-A CNI-DN-04579c7bb67f4c3f6cca0 -s 127.0.0.1/32 -p tcp -m tcp --dport 8082 -j CNI-HOSTPORT-SETMARK\n-A CNI-DN-04579c7bb67f4c3f6cca0 -p tcp -m tcp --dport 8082 -j DNAT --to-destination 10.4.0.10:80\n-A CNI-DN-2e2f8d5b91929ef9fc152 -s 10.4.0.0/24 -d 127.0.0.1/32 -p tcp -m tcp --dport 8081 -j CNI-HOSTPORT-SETMARK\n-A CNI-DN-2e2f8d5b91929ef9fc152 -s 127.0.0.1/32 -d 127.0.0.1/32 -p tcp -m tcp --dport 8081 -j CNI-HOSTPORT-SETMARK\n-A CNI-DN-2e2f8d5b91929ef9fc152 -d 127.0.0.1/32 -p tcp -m tcp --dport 8081 -j DNAT --to-destination 10.4.0.7:80\n-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment \"dnat name: \\\"bridge\\\" id: \\\"default-c93e2a3a2264f98647f0d33dc80d88de81c0710bf30ea822e2ed19213f9c53b5\\\"\" -m multiport --dports 8081 -j CNI-DN-2e2f8d5b91929ef9fc152\n-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment \"dnat name: \\\"bridge\\\" id: \\\"default-393bd750d06186633a02b44487765ce038b7df434bfb16027ca1903bf5f3dc31\\\"\" -m multiport --dports 8082 -j CNI-DN-2d72aeb202429907277c5\n-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment \"dnat name: \\\"bridge\\\" id: \\\"default-3d263c6a1c710edc1362764464c073ca834ec9adc0766411772f2b7a3dd1de0f\\\"\" -m multiport --dports 8082 -j CNI-DN-04579c7bb67f4c3f6cca0\n-A CNI-HOSTPORT-MASQ -m mark --mark 0x2000/0x2000 -j MASQUERADE\n-A CNI-HOSTPORT-SETMARK -m comment --comment \"CNI portfwd masquerade mark\" -j MARK --set-xmark 0x2000/0x2000\n-A CNI-cb0db077a14ecd8d4a843636 -d 10.4.0.0/24 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-a8df9868a5f7ee2468118331dd6185e5655f7ff8e77f067408b7ff40e9457860\\\"\" -j ACCEPT\n-A CNI-cb0db077a14ecd8d4a843636 ! -d 224.0.0.0/4 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-a8df9868a5f7ee2468118331dd6185e5655f7ff8e77f067408b7ff40e9457860\\\"\" -j MASQUERADE\n-A CNI-f1ca917e7b9939c7d8457d68 -d 10.4.0.0/24 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-a65e32cc21f9da99b4aa826914873e343f8f09f910657450be551aa24d676e51\\\"\" -j ACCEPT\n-A CNI-f1ca917e7b9939c7d8457d68 ! -d 224.0.0.0/4 -m comment --comment \"name: \\\"bridge\\\" id: \\\"default-a65e32cc21f9da99b4aa826914873e343f8f09f910657450be551aa24d676e51\\\"\" -j MASQUERADE\n"
+            },
+            "expected_output": "tcp=true ip=0.0.0.0 port=8082\ntcp=true ip=127.0.0.1 port=8081\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 3: Look Up A Flag's Value In An Argument Vector
+
+**As a developer**, I want to query a flag's value out of an already-tokenized command line, so I can inspect how a process was configured.
+
+**Expected Behavior / Usage:**
+
+The input is an ordered list of argument tokens plus the target flag to find. Tokens are either flags (a leading `-`) or values. A flag's value is the immediately following token when that token is itself not a flag; a flag that is the last token, or is immediately followed by another flag, is a standalone switch that is present but carries an empty value. The output reports two things on one line: whether the target flag is present at all, and its value (empty when it is a standalone switch). A flag that does not appear is reported as not present with an empty value.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_lookup_arg_value.json`
+
+```json
+{
+    "description": "Look up a flag inside a flat command-line argument vector and report its value. Arguments are an ordered list where a flag may be followed by its value, or may be a standalone switch with no value. Given a target flag, report whether the flag is present, and if so its value: a flag followed by a non-flag token yields that token; a standalone switch (last in the list, or followed by another flag) is present but carries an empty value; a flag that does not appear is reported as absent with an empty value.",
+    "cases": [
+        {
+            "input": {
+                "op": "arg_value",
+                "args": [
+                    "-cpu",
+                    "foo",
+                    "-no-reboot",
+                    "-m",
+                    "2G",
+                    "-s"
+                ],
+                "key": "-cpu"
+            },
+            "expected_output": "found=true value=foo\n"
+        },
+        {
+            "input": {
+                "op": "arg_value",
+                "args": [
+                    "-cpu",
+                    "foo",
+                    "-no-reboot",
+                    "-m",
+                    "2G",
+                    "-s"
+                ],
+                "key": "-machine"
+            },
+            "expected_output": "found=false value=\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 4: Normalize An SSH Client Version Banner
+
+**As a developer**, I want an SSH client's free-form version banner reduced to a clean three-part version, so I can compare versions reliably.
+
+**Expected Behavior / Usage:**
+
+The input is the raw version banner string. It opens with a token shaped like `OpenSSH_<major>.<minor>`, optionally followed by a portable-release suffix `p<patch>`, and may carry trailing vendor text separated by a space or a comma (for example a LibreSSL note). The major and minor numbers come from the leading token; the portable-release number, when present, becomes the third (patch) component, and when it is absent the patch component is `0`. Trailing vendor text is discarded. The output is the normalized dotted version string `<major>.<minor>.<patch>`.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_parse_openssh_version.json`
+
+```json
+{
+    "description": "Parse the version banner reported by an SSH client and normalize it to a three-part semantic version. The banner begins with a token of the form `OpenSSH_<major>.<minor>` optionally followed by a portable patch suffix (`p<n>`), and may carry trailing vendor text after a space or comma. The portable patch number becomes the semantic patch component; when no portable patch suffix is present the patch component is zero. Emit the normalized dotted version string.",
+    "cases": [
+        {
+            "input": {
+                "op": "parse_openssh_version",
+                "banner": "OpenSSH_8.4p1 Ubuntu"
+            },
+            "expected_output": "version=8.4.1\n"
+        },
+        {
+            "input": {
+                "op": "parse_openssh_version",
+                "banner": "OpenSSH_8.1p1, LibreSSL 2.7.3"
+            },
+            "expected_output": "version=8.1.1\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 5: Validate An SSH Public-Key Line
+
+**As a developer**, I want to check whether a line is a syntactically valid SSH public key, so I can filter junk before trusting it.
+
+**Expected Behavior / Usage:**
+
+The input is a single line. A valid line begins with a recognized key-type token — RSA, DSA, an ECDSA NIST-curve type, or Ed25519 — followed by whitespace and a base64-encoded key body, optionally followed by a comment. The key body's length must fall within the range expected for the declared key type. A line is rejected when its leading token is not one of the recognized key types, when the base64 body is the wrong length for the declared type, when there is no key body at all, or when the line is empty. The output reports the validity as a boolean.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature5_validate_public_key.json`
+
+```json
+{
+    "description": "Validate whether a single line is a well-formed SSH public key entry. A valid entry starts with a recognized key-type token (RSA, DSA, an ECDSA NIST curve type, or Ed25519) followed by a whitespace-separated base64 key body whose length falls within the bounds expected for that key type; an optional comment may follow. Lines whose leading token is not a recognized key type, whose key body is the wrong size for the declared type, that contain no key body, or that are empty are rejected. Report the validity as a boolean.",
+    "cases": [
+        {
+            "input": {
+                "op": "detect_public_key",
+                "line": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAACQDf2IooTVPDBw== 64bit"
+            },
+            "expected_output": "public_key_valid=true\n"
+        },
+        {
+            "input": {
+                "op": "detect_public_key",
+                "line": "wrong-algo AAAAB3NzaC1kc3MAAACBAP/yAytaYzqXq01uTd5+1RC="
+            },
+            "expected_output": "public_key_valid=false\n"
+        },
+        {
+            "input": {
+                "op": "detect_public_key",
+                "line": ""
+            },
+            "expected_output": "public_key_valid=false\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 6: Extract A Platform UUID From A Property-List Document
+
+**As a developer**, I want to pull the hardware platform UUID out of a device-registry property list, so I can derive a stable machine identifier.
+
+**Expected Behavior / Usage:**
+
+The input is the text of a property-list (plist) XML document describing a device registry. In this format a dictionary is a sequence of alternating `<key>` elements and their following value elements, and dictionaries may nest inside arrays inside other dictionaries. The platform UUID is the string value paired with the platform-UUID key, which is located inside a child entry of the root registry alongside other unrelated keys. The parser walks the structure, finds the value bound to that key, and the output reports the extracted UUID string.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature6_parse_platform_u[a specific list of buffer state fields — ask the implementation team for the exact snapshot].json`
+
+```json
+{
+    "description": "Extract the platform hardware UUID from a property-list (plist) XML document describing a device registry. The document is a nested structure of dictionaries and arrays where dictionary entries are encoded as alternating `<key>` and value elements. Locate the value paired with the platform-UUID key (which appears nested inside a child array, alongside unrelated keys) and emit that UUID string.",
+    "cases": [
+        {
+            "input": {
+                "op": "parse_platform_u[a specific list of buffer state fields — ask the implementation team for the exact snapshot]",
+                "plist": "\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n        <key>IOObjectClass</key>\n        <string>IORegistryEntry</string>\n        <key>IORegistryEntryChildren</key>\n        <array>\n                <dict>\n                        <key>foo</key>\n                        <string>foo value</string>\n                        <key>IOPlatformUUID</key>\n                        <string>1A008DA1-06E0-49AB-8EC9-88E9C85F67FB</string>\n                        <key>bar</key>\n                        <string>bar value</string>\n                </dict>\n        </array>\n        <key>IORegistryEntryName</key>\n        <string>Root</string>\n</dict>\n</plist>\n"
+            },
+            "expected_output": "u[a specific list of buffer state fields — ask the implementation team for the exact snapshot]=1A008DA1-06E0-49AB-8EC9-88E9C85F67FB\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing the six parsing utilities described above as pure, decoupled functions. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the "Scale-Driven Code Organization" constraint. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.
+
+2. **The Execution/Test Adapter:** A runnable program (CLI entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin, selects a utility via the request's `op` field, invokes the appropriate core function, and prints the result to stdout as `key=value` lines, matching the per-feature contracts above. The supported `op` values are `parse_net_tcp`, `parse_nat_rules`, `arg_value`, `parse_openssh_version`, `detect_public_key`, and `parse_platform_u[a specific list of buffer state fields — ask the implementation team for the exact snapshot]`.
+
+3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.

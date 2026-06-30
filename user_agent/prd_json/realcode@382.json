@@ -1,0 +1,1329 @@
+{
+  "fuzzy_prd": "Hey team, we need to ship the lifecycle container runtime we've been talking about. Basically the idea is that every 'region' of the app (a screen, a session, a subsystem) should be a named thing that lives in a tree, and when you kill a parent everything underneath it cleans up automatically — no more manually wiring teardown in 50 call sites. We've had a bunch of production incidents where background jobs keep running after the screen they belong to is gone, and also cases where cleanup callbacks blow up because they try to use something that's already been released.\n\nThe container should let you plug in observers that get notified when it starts up and shuts down. Registration should be safe to call multiple times without blowing things up. There's also that builder pattern we used in the auth flow last time — same idea here where observers attached during construction shouldn't fire until the thing is actually ready.\n\nBackground work needs to be tied to the container lifetime in a specific order — the work stuff has to stop BEFORE the regular cleanup callbacks run. Also need ancestor-walking for service and dependency lookups, and a neutral error story (no raw exceptions leaking out) for destroyed containers, missing deps, unnamed work scopes, etc. Check the existing test scaffolding for the exact shape of the ops.",
+  "oracle_data": {
+    "task_id": "APPPLAT-lifecycle-container-001",
+    "golden_api_signature": "execute(action: str, payload: dict) -> str",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "how should destroyed container errors be reported",
+          "what error category for use-after-destroy",
+          "what happens when you call build_child on a dead scope"
+        ],
+        "oracle_response": "Operations on a destroyed container (build_child, register observer, get_service) must raise an error reported as the neutral category 'scope_destroyed'. Repeating destroy itself is a no-op and must NOT raise any error. Raw host-language exception types must never leak into output."
+      },
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "what order does teardown happen in",
+          "when does background work get cancelled relative to observers",
+          "does the async scope cancel before or after exit callbacks"
+        ],
+        "oracle_response": "When a container is torn down, its bound asynchronous-work scope MUST be cancelled first, before any other lifecycle observer's exit callback fires. The expected reaction order in output is: background work first, then remaining registered observers in registration order."
+      },
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "what happens when an exit callback destroys an ancestor",
+          "re-entrant teardown safety",
+          "infinite loop when exit observer calls destroy on parent"
+        ],
+        "oracle_response": "Teardown must be re-entrant safe. If an exit callback calls destroy on a container that is already mid-teardown (e.g., an ancestor), the second destroy call must be a no-op and must not recurse or raise an error. The entire tree must end up destroyed without infinite loops."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "should registering the same observer twice fire entry twice",
+          "idempotent registration behavior",
+          "what if register is called 10 times with the same tracker"
+        ],
+        "oracle_response": "Observer registration is idempotent. Registering the same observer N times results in exactly one entry notification and exactly one exit notification, regardless of how many times register or destroy is called."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "when does entry fire during the builder pattern",
+          "observer registered mid-construction should not get entry immediately",
+          "deferred entry notification during assembly"
+        ],
+        "oracle_response": "An observer registered while a container is still being assembled (inside the builder phase) must NOT receive its entry notification immediately. Entry is deferred until assembly completes. A mid-assembly probe of the observer's entry tally should report 0; only after the container is fully built should it report 1."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what error when async work scope has no name",
+          "unnamed execution context rejection",
+          "constructing work scope without a name"
+        ],
+        "oracle_response": "Constructing a lifecycle-bound asynchronous-work scope without a named execution context must be rejected with the neutral error category 'missing_name'. A scope constructed with a name must return 'ok'."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what is the default child work scope name",
+          "how is child async scope name derived from parent",
+          "unnamed child work scope naming convention"
+        ],
+        "oracle_response": "Deriving a child asynchronous-work scope without an explicit name gives it a default name of '{parent_name}-child'. If an explicit child_name is provided, that name is used verbatim."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "does cancelling a child work scope affect the parent",
+          "child cancellation isolation",
+          "parent stays active when child async scope is cancelled"
+        ],
+        "oracle_response": "Cancelling a child asynchronous-work scope must NOT cancel its parent. Cancelling a parent DOES cascade and cancel all derived child scopes. Child cancellation is isolated; parent cancellation is cascading."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "how does dependency resolution walk ancestors",
+          "what error when no component satisfies a type",
+          "component_not_found error format and inspected list"
+        ],
+        "oracle_response": "Dependency resolution walks from the requesting container up through ancestors (nearest to farthest). If no container satisfies the requested type, the error must be 'component_not_found' and must include an 'inspected' list of the aggregate labels that were checked, in nearest-to-farthest order. A type held only by a descendant is NOT visible to an ancestor."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "ancestor chain include_self behavior",
+          "parents_chain with include_self false for root",
+          "what does ancestor enumeration return for a top-level container"
+        ],
+        "oracle_response": "The ancestor chain for a container is ordered nearest-to-farthest. With include_self=true, the container itself is prepended. For the root container with include_self=false, the result is an empty list []. For the root with include_self=true, the result contains only the root itself."
+      },
+      {
+        "constraint_id": "C011",
+        "trigger_keywords": [
+          "what happens to child async scope when container is destroyed",
+          "service work scope cancellation on container teardown",
+          "hosted async scope and derived child both cancelled on destroy"
+        ],
+        "oracle_response": "When a container hosting an asynchronous-work scope is torn down, both the hosted (parent) work scope and any child work scope derived from it must be cancelled. Both must report active=false after teardown."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid action field values",
+          "what values can action take",
+          "list all supported action values",
+          "what actions does the dispatcher handle",
+          "which action strings does the adapter support",
+          "what are the possible action inputs",
+          "tell me all the action names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'action' field. Valid values are: 'scope', 'async', 'di'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature1_1_scope_identity",
+        "trigger_keywords": [
+          "test cases for feature1 1 scope identity",
+          "show me feature1 1 scope identity test cases",
+          "what are the feature1 1 scope identity test inputs",
+          "give me the feature1_1_scope_identity test file",
+          "test cases for feature 1",
+          "feature1 1 scope identity expected output",
+          "what does feature1 1 scope identity expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_scope_identity:\n{\n  \"description\": \"A container has a human-readable name and a reference to the container that created it. A top-level container created without a parent reports a null parent. A nested container created from an existing one reports that container's name as its parent. The input lists the containers to create (each with a name and the id of its parent, or no parent for the top-level one) and the identity queries to run; the output echoes, per query, the queried container's own name and its parent's name (or a null marker for the top-level container).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\",\n            \"name\": \"root\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c\",\n            \"parent\": \"r\",\n            \"name\": \"child\"\n          },\n          {\n            \"op\": \"name\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"parent\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"name\",\n            \"scope\": \"c\"\n          },\n          {\n            \"op\": \"parent\",\n            \"scope\": \"c\"\n          }\n        ]\n      },\n      \"expected_output\": \"name[r]=root\\nparent[r]=null\\nname[c]=child\\nparent[c]=root\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_multiple_children",
+        "trigger_keywords": [
+          "test cases for feature1 2 multiple children",
+          "show me feature1 2 multiple children test cases",
+          "what are the feature1 2 multiple children test inputs",
+          "give me the feature1_2_multiple_children test file",
+          "test cases for feature 1",
+          "feature1 2 multiple children expected output",
+          "what does feature1 2 multiple children expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_multiple_children:\n{\n  \"description\": \"A single container may have any number of direct children. After creating several children under one parent, querying the parent's direct-child count returns how many children are currently attached. The input describes the containers to build and a count query; the output reports the number of direct children attached to the queried container.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c1\",\n            \"parent\": \"r\",\n            \"name\": \"child1\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c2\",\n            \"parent\": \"r\",\n            \"name\": \"child2\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c3\",\n            \"parent\": \"r\",\n            \"name\": \"child3\"\n          },\n          {\n            \"op\": \"children_count\",\n            \"scope\": \"r\"\n          }\n        ]\n      },\n      \"expected_output\": \"children[r]=3\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_ancestor_chain",
+        "trigger_keywords": [
+          "test cases for feature1 3 ancestor chain",
+          "show me feature1 3 ancestor chain test cases",
+          "what are the feature1 3 ancestor chain test inputs",
+          "give me the feature1_3_ancestor_chain test file",
+          "test cases for feature 1",
+          "feature1 3 ancestor chain expected output",
+          "what does feature1 3 ancestor chain expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_ancestor_chain:\n{\n  \"description\": \"Each container can enumerate its chain of ancestors, ordered from nearest to farthest, ending at the top-level container. The enumeration can optionally include the container itself as the first element. For the top-level container the chain that excludes itself is empty. The input builds a tree of named containers and requests ancestor chains (with or without including the container itself); the output lists, per request, the ordered ancestor names.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c1\",\n            \"parent\": \"r\",\n            \"name\": \"child1\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c2\",\n            \"parent\": \"r\",\n            \"name\": \"child2\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"g\",\n            \"parent\": \"c1\",\n            \"name\": \"grandchild\"\n          },\n          {\n            \"op\": \"parents_chain\",\n            \"scope\": \"g\",\n            \"include_self\": true\n          },\n          {\n            \"op\": \"parents_chain\",\n            \"scope\": \"g\",\n            \"include_self\": false\n          },\n          {\n            \"op\": \"parents_chain\",\n            \"scope\": \"c2\",\n            \"include_self\": true\n          },\n          {\n            \"op\": \"parents_chain\",\n            \"scope\": \"c2\",\n            \"include_self\": false\n          },\n          {\n            \"op\": \"parents_chain\",\n            \"scope\": \"r\",\n            \"include_self\": true\n          },\n          {\n            \"op\": \"parents_chain\",\n            \"scope\": \"r\",\n            \"include_self\": false\n          }\n        ]\n      },\n      \"expected_output\": \"parents[g,self=true]=[grandchild,child1,root]\\nparents[g,self=false]=[child1,root]\\nparents[c2,self=true]=[child2,root]\\nparents[c2,self=false]=[root]\\nparents[r,self=true]=[root]\\nparents[r,self=false]=[]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_destroy_cascades_to_children",
+        "trigger_keywords": [
+          "test cases for feature2 1 destroy cascades to children",
+          "show me feature2 1 destroy cascades to children test cases",
+          "what are the feature2 1 destroy cascades to children test inputs",
+          "give me the feature2_1_destroy_cascades_to_children test file",
+          "test cases for feature 2",
+          "feature2 1 destroy cascades to children expected output",
+          "what does feature2 1 destroy cascades to children expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_destroy_cascades_to_children:\n{\n  \"description\": \"Tearing down a container tears down all of its descendants. Before teardown, every container reports as alive; after the top-level container is torn down, it and every descendant report as torn down. The input builds a tree and queries liveness before and after tearing down the top-level container; the output reports each liveness query as a boolean.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c1\",\n            \"parent\": \"r\",\n            \"name\": \"child1\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c2\",\n            \"parent\": \"r\",\n            \"name\": \"child2\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c3\",\n            \"parent\": \"r\",\n            \"name\": \"child3\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"c1\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"c2\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"c3\"\n          },\n          {\n            \"op\": \"destroy\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"c1\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"c2\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"c3\"\n          }\n        ]\n      },\n      \"expected_output\": \"destroyed[c1]=false\\ndestroyed[c2]=false\\ndestroyed[c3]=false\\ndestroyed[r]=true\\ndestroyed[c1]=true\\ndestroyed[c2]=true\\ndestroyed[c3]=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_destroying_child_detaches",
+        "trigger_keywords": [
+          "test cases for feature2 2 destroying child detaches",
+          "show me feature2 2 destroying child detaches test cases",
+          "what are the feature2 2 destroying child detaches test inputs",
+          "give me the feature2_2_destroying_child_detaches test file",
+          "test cases for feature 2",
+          "feature2 2 destroying child detaches expected output",
+          "what does feature2 2 destroying child detaches expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_destroying_child_detaches:\n{\n  \"description\": \"Tearing down a child container detaches it from its parent. Immediately after the child is torn down, the parent's direct-child count drops accordingly. The input builds a parent with one child, queries the parent's child count, tears down the child, and queries again; the output reports the child count before and after the child is torn down.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c\",\n            \"parent\": \"r\",\n            \"name\": \"child\"\n          },\n          {\n            \"op\": \"children_count\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"destroy\",\n            \"scope\": \"c\"\n          },\n          {\n            \"op\": \"children_count\",\n            \"scope\": \"r\"\n          }\n        ]\n      },\n      \"expected_output\": \"children[r]=1\\nchildren[r]=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_use_after_destroy",
+        "trigger_keywords": [
+          "test cases for feature2 3 use after destroy",
+          "show me feature2 3 use after destroy test cases",
+          "what are the feature2 3 use after destroy test inputs",
+          "give me the feature2_3_use_after_destroy test file",
+          "test cases for feature 2",
+          "feature2 3 use after destroy expected output",
+          "what does feature2 3 use after destroy expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_use_after_destroy:\n{\n  \"description\": \"Once a container has been torn down it must no longer be used: lifecycle-affecting operations (creating a child, registering an observer, looking up a service) raise an error indicating the container is no longer usable. Repeating the teardown itself is a harmless no-op. Errors are reported as a neutral category, never leaking host-language runtime details. The input queries liveness, tears the container down, then attempts each forbidden operation and tears down again; the output reports the liveness queries and, per attempted operation, either success or the neutral error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"destroy\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"try\",\n            \"kind\": \"build_child\",\n            \"scope\": \"r\",\n            \"name\": \"x\"\n          },\n          {\n            \"op\": \"try\",\n            \"kind\": \"register\",\n            \"scope\": \"r\",\n            \"tracker\": \"t\"\n          },\n          {\n            \"op\": \"try\",\n            \"kind\": \"get_service\",\n            \"scope\": \"r\",\n            \"key\": \"\"\n          },\n          {\n            \"op\": \"destroy_times\",\n            \"scope\": \"r\",\n            \"times\": 1\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"r\"\n          }\n        ]\n      },\n      \"expected_output\": \"destroyed[r]=false\\ndestroyed[r]=true\\ntry[build_child]=error=scope_destroyed\\ntry[register]=error=scope_destroyed\\ntry[get_service]=error=scope_destroyed\\ndestroyed[r]=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_4_reentrant_destroy",
+        "trigger_keywords": [
+          "test cases for feature2 4 reentrant destroy",
+          "show me feature2 4 reentrant destroy test cases",
+          "what are the feature2 4 reentrant destroy test inputs",
+          "give me the feature2_4_reentrant_destroy test file",
+          "test cases for feature 2",
+          "feature2 4 reentrant destroy expected output",
+          "what does feature2 4 reentrant destroy expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_4_reentrant_destroy:\n{\n  \"description\": \"Teardown must be safe even when an exit callback triggers teardown of an already-tearing-down ancestor. Several children each register an exit callback that tears down the shared parent; tearing down the first child starts a chain reaction. When the dust settles, the parent and every child report as torn down without error or infinite recursion. The input builds the tree, attaches the re-entrant exit callbacks, and tears down the first child; the output reports the final liveness of the parent and every child.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"a\",\n            \"parent\": \"r\",\n            \"name\": \"child-0\"\n          },\n          {\n            \"op\": \"on_exit_destroy\",\n            \"scope\": \"a\",\n            \"target\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"b\",\n            \"parent\": \"r\",\n            \"name\": \"child-1\"\n          },\n          {\n            \"op\": \"on_exit_destroy\",\n            \"scope\": \"b\",\n            \"target\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c\",\n            \"parent\": \"r\",\n            \"name\": \"child-2\"\n          },\n          {\n            \"op\": \"on_exit_destroy\",\n            \"scope\": \"c\",\n            \"target\": \"r\"\n          },\n          {\n            \"op\": \"destroy_first_child\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"a\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"b\"\n          },\n          {\n            \"op\": \"is_destroyed\",\n            \"scope\": \"c\"\n          }\n        ]\n      },\n      \"expected_output\": \"destroyed[r]=true\\ndestroyed[a]=true\\ndestroyed[b]=true\\ndestroyed[c]=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_enter_on_register",
+        "trigger_keywords": [
+          "test cases for feature3 1 enter on register",
+          "show me feature3 1 enter on register test cases",
+          "what are the feature3 1 enter on register test inputs",
+          "give me the feature3_1_enter_on_register test file",
+          "test cases for feature 3",
+          "feature3 1 enter on register expected output",
+          "what does feature3 1 enter on register expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_enter_on_register:\n{\n  \"description\": \"Registering a lifecycle observer with an already-created container notifies the observer of entry immediately. The input creates a container and registers one observer, then queries the observer's tallies; the output reports how many entry and exit notifications the observer has received so far.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"register\",\n            \"scope\": \"r\",\n            \"tracker\": \"t\"\n          },\n          {\n            \"op\": \"tracker\",\n            \"tracker\": \"t\"\n          }\n        ]\n      },\n      \"expected_output\": \"tracker[t] enter=1 exit=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_idempotent_registration",
+        "trigger_keywords": [
+          "test cases for feature3 2 idempotent registration",
+          "show me feature3 2 idempotent registration test cases",
+          "what are the feature3 2 idempotent registration test inputs",
+          "give me the feature3_2_idempotent_registration test file",
+          "test cases for feature 3",
+          "feature3 2 idempotent registration expected output",
+          "what does feature3 2 idempotent registration expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_idempotent_registration:\n{\n  \"description\": \"Registering the same observer many times is idempotent: it is notified of entry exactly once no matter how many times it is registered, and of exit exactly once no matter how many times the container is torn down. The input registers one observer repeatedly, queries its tallies, tears the container down repeatedly, and queries again; the output reports the entry and exit tallies after each query.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"register_times\",\n            \"scope\": \"r\",\n            \"tracker\": \"t\",\n            \"times\": 10\n          },\n          {\n            \"op\": \"tracker\",\n            \"tracker\": \"t\"\n          },\n          {\n            \"op\": \"destroy_times\",\n            \"scope\": \"r\",\n            \"times\": 10\n          },\n          {\n            \"op\": \"tracker\",\n            \"tracker\": \"t\"\n          }\n        ]\n      },\n      \"expected_output\": \"tracker[t] enter=1 exit=0\\ntracker[t] enter=1 exit=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_child_exit_on_parent_destroy",
+        "trigger_keywords": [
+          "test cases for feature3 3 child exit on parent destroy",
+          "show me feature3 3 child exit on parent destroy test cases",
+          "what are the feature3 3 child exit on parent destroy test inputs",
+          "give me the feature3_3_child_exit_on_parent_destroy test file",
+          "test cases for feature 3",
+          "feature3 3 child exit on parent destroy expected output",
+          "what does feature3 3 child exit on parent destroy expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_child_exit_on_parent_destroy:\n{\n  \"description\": \"An observer registered on a child container is notified of exit when an ancestor is torn down. The input registers an observer on a child, tears down the top-level container, and queries the observer's tallies; the output reports the observer's entry and exit tallies after the teardown.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c\",\n            \"parent\": \"r\",\n            \"name\": \"child\"\n          },\n          {\n            \"op\": \"register\",\n            \"scope\": \"c\",\n            \"tracker\": \"t\"\n          },\n          {\n            \"op\": \"destroy\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"tracker\",\n            \"tracker\": \"t\"\n          }\n        ]\n      },\n      \"expected_output\": \"tracker[t] enter=1 exit=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_4_builder_deferred_enter",
+        "trigger_keywords": [
+          "test cases for feature3 4 builder deferred enter",
+          "show me feature3 4 builder deferred enter test cases",
+          "what are the feature3 4 builder deferred enter test inputs",
+          "give me the feature3_4_builder_deferred_enter test file",
+          "test cases for feature 3",
+          "feature3 4 builder deferred enter expected output",
+          "what does feature3 4 builder deferred enter expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_4_builder_deferred_enter:\n{\n  \"description\": \"An observer registered while a container is still being assembled is NOT notified of entry until assembly completes. Probing the observer's entry tally during assembly shows no notification yet; querying after the container is fully built shows exactly one entry notification. The input registers an observer during assembly, probes its entry tally mid-assembly, then queries after the container exists; the output reports the mid-assembly probe and the post-build tallies.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\",\n            \"builder_register\": [\n              \"t\"\n            ],\n            \"builder_emit_enter\": [\n              \"t\"\n            ]\n          },\n          {\n            \"op\": \"tracker\",\n            \"tracker\": \"t\"\n          }\n        ]\n      },\n      \"expected_output\": \"builder_enter[t]=0\\ntracker[t] enter=1 exit=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_5_on_exit_callback",
+        "trigger_keywords": [
+          "test cases for feature3 5 on exit callback",
+          "show me feature3 5 on exit callback test cases",
+          "what are the feature3 5 on exit callback test inputs",
+          "give me the feature3_5_on_exit_callback test file",
+          "test cases for feature 3",
+          "feature3 5 on exit callback expected output",
+          "what does feature3 5 on exit callback expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_5_on_exit_callback:\n{\n  \"description\": \"A container offers a convenience hook to run an arbitrary callback exactly once when it is torn down. The input attaches an exit callback to a child container and tears down the top-level container, then queries how many times the callback ran; the output reports the callback's invocation count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\"\n          },\n          {\n            \"op\": \"build_child\",\n            \"id\": \"c\",\n            \"parent\": \"r\",\n            \"name\": \"child\"\n          },\n          {\n            \"op\": \"on_exit_listener\",\n            \"id\": \"L\",\n            \"scope\": \"c\"\n          },\n          {\n            \"op\": \"destroy\",\n            \"scope\": \"r\"\n          },\n          {\n            \"op\": \"listener\",\n            \"id\": \"L\"\n          }\n        ]\n      },\n      \"expected_output\": \"listener[L]=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_service_lookup",
+        "trigger_keywords": [
+          "test cases for feature4 1 service lookup",
+          "show me feature4 1 service lookup test cases",
+          "what are the feature4 1 service lookup test inputs",
+          "give me the feature4_1_service_lookup test file",
+          "test cases for feature 4",
+          "feature4 1 service lookup expected output",
+          "what does feature4 1 service lookup expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_service_lookup:\n{\n  \"description\": \"A container can hold named service values supplied at assembly time and return them by key. Looking up a registered key returns its value; looking up an unknown key returns a null marker. The input assembles a container with one keyed service and queries both a known and an unknown key; the output reports each lookup's value or a null marker.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"scope\",\n        \"ops\": [\n          {\n            \"op\": \"create_root\",\n            \"id\": \"r\",\n            \"services\": {\n              \"key\": \"value\"\n            }\n          },\n          {\n            \"op\": \"service\",\n            \"scope\": \"r\",\n            \"key\": \"key\"\n          },\n          {\n            \"op\": \"service\",\n            \"scope\": \"r\",\n            \"key\": \"key2\"\n          }\n        ]\n      },\n      \"expected_output\": \"service[r,key]=value\\nservice[r,key2]=null\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_named_context_required",
+        "trigger_keywords": [
+          "test cases for feature5 1 named context required",
+          "show me feature5 1 named context required test cases",
+          "what are the feature5 1 named context required test inputs",
+          "give me the feature5_1_named_context_required test file",
+          "test cases for feature 5",
+          "feature5 1 named context required expected output",
+          "what does feature5 1 named context required expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_named_context_required:\n{\n  \"description\": \"A lifecycle-bound asynchronous-work scope must be constructed with an execution context that carries a name, for debuggability. Constructing one with a named context succeeds; constructing one with an unnamed context is rejected with a neutral error category. The input requests construction either with or without a name; the output is a success marker or the neutral rejection category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"construct\",\n        \"name\": \"abc\"\n      },\n      \"expected_output\": \"ok\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"construct\"\n      },\n      \"expected_output\": \"error=missing_name\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_exit_cancels_context",
+        "trigger_keywords": [
+          "test cases for feature5 2 exit cancels context",
+          "show me feature5 2 exit cancels context test cases",
+          "what are the feature5 2 exit cancels context test inputs",
+          "give me the feature5_2_exit_cancels_context test file",
+          "test cases for feature 5",
+          "feature5 2 exit cancels context expected output",
+          "what does feature5 2 exit cancels context expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_exit_cancels_context:\n{\n  \"description\": \"When a lifecycle-bound asynchronous-work scope receives its exit notification, its underlying execution context is cancelled and becomes inactive. The input constructs a named work scope and triggers its exit notification, then queries activity; the output reports whether the context is still active.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"exit_cancels\",\n        \"name\": \"abc\"\n      },\n      \"expected_output\": \"active=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_3_child_default_name",
+        "trigger_keywords": [
+          "test cases for feature5 3 child default name",
+          "show me feature5 3 child default name test cases",
+          "what are the feature5 3 child default name test inputs",
+          "give me the feature5_3_child_default_name test file",
+          "test cases for feature 5",
+          "feature5 3 child default name expected output",
+          "what does feature5 3 child default name expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_child_default_name:\n{\n  \"description\": \"Deriving a child asynchronous-work scope without an explicit name gives it a default name derived from the parent's name plus a suffix marking it as a child. The input constructs a named parent work scope and derives an unnamed child; the output reports the child's resulting name.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"child_default_name\",\n        \"name\": \"abc\"\n      },\n      \"expected_output\": \"name=abc-child\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_4_child_explicit_name",
+        "trigger_keywords": [
+          "test cases for feature5 4 child explicit name",
+          "show me feature5 4 child explicit name test cases",
+          "what are the feature5 4 child explicit name test inputs",
+          "give me the feature5_4_child_explicit_name test file",
+          "test cases for feature 5",
+          "feature5 4 child explicit name expected output",
+          "what does feature5 4 child explicit name expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_4_child_explicit_name:\n{\n  \"description\": \"Deriving a child asynchronous-work scope with an explicit name uses that name verbatim instead of a derived default. The input constructs a named parent work scope and derives a child with an explicit name; the output reports the child's resulting name.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"child_named\",\n        \"name\": \"abc\",\n        \"child_name\": \"def\"\n      },\n      \"expected_output\": \"name=def\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_5_parent_cancellation_cascades",
+        "trigger_keywords": [
+          "test cases for feature5 5 parent cancellation cascades",
+          "show me feature5 5 parent cancellation cascades test cases",
+          "what are the feature5 5 parent cancellation cascades test inputs",
+          "give me the feature5_5_parent_cancellation_cascades test file",
+          "test cases for feature 5",
+          "feature5 5 parent cancellation cascades expected output",
+          "what does feature5 5 parent cancellation cascades expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_5_parent_cancellation_cascades:\n{\n  \"description\": \"Cancelling a parent asynchronous-work scope also cancels any child work scope derived from it. The input constructs a parent work scope, derives a child, then cancels the parent and queries activity; the output reports whether the parent and the child are active afterward.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"parent_cancel\",\n        \"name\": \"abc\"\n      },\n      \"expected_output\": \"parent_active=false child_active=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_6_child_cancellation_isolated",
+        "trigger_keywords": [
+          "test cases for feature5 6 child cancellation isolated",
+          "show me feature5 6 child cancellation isolated test cases",
+          "what are the feature5 6 child cancellation isolated test inputs",
+          "give me the feature5_6_child_cancellation_isolated test file",
+          "test cases for feature 5",
+          "feature5 6 child cancellation isolated expected output",
+          "what does feature5 6 child cancellation isolated expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_6_child_cancellation_isolated:\n{\n  \"description\": \"Cancelling a child asynchronous-work scope does NOT cancel its parent. The input constructs a parent work scope, derives a child, then cancels the child and queries activity; the output reports that the parent stays active while the child is inactive.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"child_cancel\",\n        \"name\": \"abc\"\n      },\n      \"expected_output\": \"parent_active=true child_active=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_7_work_canceled_first",
+        "trigger_keywords": [
+          "test cases for feature5 7 work canceled first",
+          "show me feature5 7 work canceled first test cases",
+          "what are the feature5 7 work canceled first test inputs",
+          "give me the feature5_7_work_canceled_first test file",
+          "test cases for feature 5",
+          "feature5 7 work canceled first expected output",
+          "what does feature5 7 work canceled first expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_7_work_canceled_first:\n{\n  \"description\": \"When a container is torn down, its registered asynchronous-work scope is cancelled before any other lifecycle observer's exit callback runs, so background work stops before resource cleanup. A long-running background job and two ordinary observers are registered; teardown records the order in which each reacts. The input drives this teardown scenario; the output reports the reaction order as a comma-separated sequence, with the background work reacting first.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"exit_order\"\n      },\n      \"expected_output\": \"order=background,first,third\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_hosted_child_work",
+        "trigger_keywords": [
+          "test cases for feature6 1 hosted child work",
+          "show me feature6 1 hosted child work test cases",
+          "what are the feature6 1 hosted child work test inputs",
+          "give me the feature6_1_hosted_child_work test file",
+          "test cases for feature 6",
+          "feature6 1 hosted child work expected output",
+          "what does feature6 1 hosted child work expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_hosted_child_work:\n{\n  \"description\": \"A container can host a lifecycle-bound asynchronous-work scope as a service; requesting a work scope from the container yields a freshly derived child work scope whose name is derived from the hosted one. The input assembles a container hosting a named work scope and requests a work scope from it; the output reports the derived child work scope's name.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"service_child_name\",\n        \"name\": \"abc\"\n      },\n      \"expected_output\": \"name=abc-child\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_2_destroy_cancels_service",
+        "trigger_keywords": [
+          "test cases for feature6 2 destroy cancels service",
+          "show me feature6 2 destroy cancels service test cases",
+          "what are the feature6 2 destroy cancels service test inputs",
+          "give me the feature6_2_destroy_cancels_service test file",
+          "test cases for feature 6",
+          "feature6 2 destroy cancels service expected output",
+          "what does feature6 2 destroy cancels service expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_2_destroy_cancels_service:\n{\n  \"description\": \"When a container hosting an asynchronous-work scope is torn down, both the hosted work scope and any child work scope derived from it are cancelled. The input assembles a container hosting a named work scope, derives a child work scope, tears down the container, and queries activity; the output reports that both the hosted scope and the derived child are inactive afterward.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"async\",\n        \"mode\": \"service_cancel_on_destroy\",\n        \"name\": \"abc\"\n      },\n      \"expected_output\": \"parent_active=false child_active=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_1_register_and_resolve",
+        "trigger_keywords": [
+          "test cases for feature7 1 register and resolve",
+          "show me feature7 1 register and resolve test cases",
+          "what are the feature7 1 register and resolve test inputs",
+          "give me the feature7_1_register_and_resolve test file",
+          "test cases for feature 7",
+          "feature7 1 register and resolve expected output",
+          "what does feature7 1 register and resolve expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_1_register_and_resolve:\n{\n  \"description\": \"A container can hold a dependency aggregate and return it when a compatible type is requested. The input assembles a container holding one aggregate (identified by a label and the interface type it satisfies) and requests that type from the same container; the output reports the resolved aggregate's label.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"di\",\n        \"scopes\": [\n          {\n            \"id\": \"r\",\n            \"parent\": null,\n            \"component\": {\n              \"type\": \"alpha\",\n              \"id\": \"main_component\"\n            }\n          }\n        ],\n        \"lookups\": [\n          {\n            \"scope\": \"r\",\n            \"type\": \"alpha\"\n          }\n        ]\n      },\n      \"expected_output\": \"lookup[r,alpha]=component=main_component\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_2_resolve_through_ancestors",
+        "trigger_keywords": [
+          "test cases for feature7 2 resolve through ancestors",
+          "show me feature7 2 resolve through ancestors test cases",
+          "what are the feature7 2 resolve through ancestors test inputs",
+          "give me the feature7_2_resolve_through_ancestors test file",
+          "test cases for feature 7",
+          "feature7 2 resolve through ancestors expected output",
+          "what does feature7 2 resolve through ancestors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_2_resolve_through_ancestors:\n{\n  \"description\": \"Resolving a dependency aggregate searches the requesting container first and then walks up its ancestors, returning the nearest aggregate that satisfies the requested type; a type held only by a descendant is not visible to an ancestor. The input assembles a parent and child each holding an aggregate of a different type, then requests several types from both containers; the output reports, per request, the resolved aggregate's label, or a neutral not-found error listing the labels inspected along the ancestor chain when no match exists.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"di\",\n        \"scopes\": [\n          {\n            \"id\": \"p\",\n            \"parent\": null,\n            \"component\": {\n              \"type\": \"alpha\",\n              \"id\": \"parent_component\"\n            }\n          },\n          {\n            \"id\": \"c\",\n            \"parent\": \"p\",\n            \"component\": {\n              \"type\": \"beta\",\n              \"id\": \"child_component\"\n            }\n          }\n        ],\n        \"lookups\": [\n          {\n            \"scope\": \"c\",\n            \"type\": \"beta\"\n          },\n          {\n            \"scope\": \"c\",\n            \"type\": \"alpha\"\n          },\n          {\n            \"scope\": \"p\",\n            \"type\": \"alpha\"\n          },\n          {\n            \"scope\": \"p\",\n            \"type\": \"beta\"\n          }\n        ]\n      },\n      \"expected_output\": \"lookup[c,beta]=component=child_component\\nlookup[c,alpha]=component=parent_component\\nlookup[p,alpha]=component=parent_component\\nlookup[p,beta]=error=component_not_found inspected=[parent_component]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_3_unresolved_component_error",
+        "trigger_keywords": [
+          "test cases for feature7 3 unresolved component error",
+          "show me feature7 3 unresolved component error test cases",
+          "what are the feature7 3 unresolved component error test inputs",
+          "give me the feature7_3_unresolved_component_error test file",
+          "test cases for feature 7",
+          "feature7 3 unresolved component error expected output",
+          "what does feature7 3 unresolved component error expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_3_unresolved_component_error:\n{\n  \"description\": \"Requesting a dependency type that no container along the ancestor chain satisfies raises a neutral not-found error that lists, from nearest to farthest, the labels of the aggregates that were inspected. The error carries only domain information, never host-language runtime details. The input assembles a parent and child each holding an aggregate, then requests a type that none of them satisfies; the output reports the neutral not-found error with the inspected aggregate labels in nearest-to-farthest order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"di\",\n        \"scopes\": [\n          {\n            \"id\": \"p\",\n            \"parent\": null,\n            \"component\": {\n              \"type\": \"alpha\",\n              \"id\": \"parent_component\"\n            }\n          },\n          {\n            \"id\": \"c\",\n            \"parent\": \"p\",\n            \"component\": {\n              \"type\": \"beta\",\n              \"id\": \"child_component\"\n            }\n          }\n        ],\n        \"lookups\": [\n          {\n            \"scope\": \"c\",\n            \"type\": \"unit\"\n          }\n        ]\n      },\n      \"expected_output\": \"lookup[c,unit]=error=component_not_found inspected=[child_component,parent_component]\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "that builder pattern we used in the auth flow last time",
+        "actual_meaning": "Feature 3.4 (feature3_4_builder_deferred_enter.json): the 'builder_register' and 'builder_emit_enter' ops in create_root that defer observer entry notification until after assembly completes"
+      },
+      {
+        "vague_reference": "the work stuff has to stop BEFORE the regular cleanup callbacks run",
+        "actual_meaning": "Feature 5.7 (feature5_7_work_canceled_first.json): the async work scope bound to a container must be cancelled as the very first step of teardown, before any registered lifecycle observer's exit callback fires, producing output order: background,first,third"
+      },
+      {
+        "vague_reference": "a neutral error story for destroyed containers, missing deps, unnamed work scopes",
+        "actual_meaning": "Three distinct neutral error categories: 'scope_destroyed' (feature2_3), 'component_not_found' with inspected list (feature7_2, feature7_3), and 'missing_name' (feature5_1)"
+      },
+      {
+        "vague_reference": "Check the existing test scaffolding for the exact shape of the ops",
+        "actual_meaning": "rcb_tests/public_test_cases/ — each feature has a JSON file defining the exact 'action', 'ops', and 'expected_output' contract that the execution adapter must translate into core domain calls"
+      }
+    ],
+    "fallback_response": "That detail isn't fully specified in the ticket — please check the test case files under rcb_tests/public_test_cases/ for the exact expected behavior, and cross-reference the PRD sections in start.md for the corresponding feature description."
+  },
+  "public_test_cases": {
+    "feature1_1_scope_identity.json": {
+      "description": "A container has a human-readable name and a reference to the container that created it. A top-level container created without a parent reports a null parent. A nested container created from an existing one reports that container's name as its parent. The input lists the containers to create (each with a name and the id of its parent, or no parent for the top-level one) and the identity queries to run; the output echoes, per query, the queried container's own name and its parent's name (or a null marker for the top-level container).",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r",
+                "name": "root"
+              },
+              {
+                "op": "build_child",
+                "id": "c",
+                "parent": "r",
+                "name": "child"
+              },
+              {
+                "op": "name",
+                "scope": "r"
+              },
+              {
+                "op": "parent",
+                "scope": "r"
+              },
+              {
+                "op": "name",
+                "scope": "c"
+              },
+              {
+                "op": "parent",
+                "scope": "c"
+              }
+            ]
+          },
+          "expected_output": "name[r]=root\nparent[r]=null\nname[c]=child\nparent[c]=root\n"
+        }
+      ]
+    },
+    "feature1_2_multiple_children.json": {
+      "description": "A single container may have any number of direct children. After creating several children under one parent, querying the parent's direct-child count returns how many children are currently attached. The input describes the containers to build and a count query; the output reports the number of direct children attached to the queried container.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "c1",
+                "parent": "r",
+                "name": "child1"
+              },
+              {
+                "op": "build_child",
+                "id": "c2",
+                "parent": "r",
+                "name": "child2"
+              },
+              {
+                "op": "build_child",
+                "id": "c3",
+                "parent": "r",
+                "name": "child3"
+              },
+              {
+                "op": "children_count",
+                "scope": "r"
+              }
+            ]
+          },
+          "expected_output": "children[r]=3\n"
+        }
+      ]
+    },
+    "feature1_3_ancestor_chain.json": {
+      "description": "Each container can enumerate its chain of ancestors, ordered from nearest to farthest, ending at the top-level container. The enumeration can optionally include the container itself as the first element. For the top-level container the chain that excludes itself is empty. The input builds a tree of named containers and requests ancestor chains (with or without including the container itself); the output lists, per request, the ordered ancestor names.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "c1",
+                "parent": "r",
+                "name": "child1"
+              },
+              {
+                "op": "build_child",
+                "id": "c2",
+                "parent": "r",
+                "name": "child2"
+              },
+              {
+                "op": "build_child",
+                "id": "g",
+                "parent": "c1",
+                "name": "grandchild"
+              },
+              {
+                "op": "parents_chain",
+                "scope": "g",
+                "include_self": true
+              },
+              {
+                "op": "parents_chain",
+                "scope": "g",
+                "include_self": false
+              },
+              {
+                "op": "parents_chain",
+                "scope": "c2",
+                "include_self": true
+              },
+              {
+                "op": "parents_chain",
+                "scope": "c2",
+                "include_self": false
+              },
+              {
+                "op": "parents_chain",
+                "scope": "r",
+                "include_self": true
+              },
+              {
+                "op": "parents_chain",
+                "scope": "r",
+                "include_self": false
+              }
+            ]
+          },
+          "expected_output": "parents[g,self=true]=[grandchild,child1,root]\nparents[g,self=false]=[child1,root]\nparents[c2,self=true]=[child2,root]\nparents[c2,self=false]=[root]\nparents[r,self=true]=[root]\nparents[r,self=false]=[]\n"
+        }
+      ]
+    },
+    "feature2_1_destroy_cascades_to_children.json": {
+      "description": "Tearing down a container tears down all of its descendants. Before teardown, every container reports as alive; after the top-level container is torn down, it and every descendant report as torn down. The input builds a tree and queries liveness before and after tearing down the top-level container; the output reports each liveness query as a boolean.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "c1",
+                "parent": "r",
+                "name": "child1"
+              },
+              {
+                "op": "build_child",
+                "id": "c2",
+                "parent": "r",
+                "name": "child2"
+              },
+              {
+                "op": "build_child",
+                "id": "c3",
+                "parent": "r",
+                "name": "child3"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "c1"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "c2"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "c3"
+              },
+              {
+                "op": "destroy",
+                "scope": "r"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "r"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "c1"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "c2"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "c3"
+              }
+            ]
+          },
+          "expected_output": "destroyed[c1]=false\ndestroyed[c2]=false\ndestroyed[c3]=false\ndestroyed[r]=true\ndestroyed[c1]=true\ndestroyed[c2]=true\ndestroyed[c3]=true\n"
+        }
+      ]
+    },
+    "feature2_2_destroying_child_detaches.json": {
+      "description": "Tearing down a child container detaches it from its parent. Immediately after the child is torn down, the parent's direct-child count drops accordingly. The input builds a parent with one child, queries the parent's child count, tears down the child, and queries again; the output reports the child count before and after the child is torn down.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "c",
+                "parent": "r",
+                "name": "child"
+              },
+              {
+                "op": "children_count",
+                "scope": "r"
+              },
+              {
+                "op": "destroy",
+                "scope": "c"
+              },
+              {
+                "op": "children_count",
+                "scope": "r"
+              }
+            ]
+          },
+          "expected_output": "children[r]=1\nchildren[r]=0\n"
+        }
+      ]
+    },
+    "feature2_3_use_after_destroy.json": {
+      "description": "Once a container has been torn down it must no longer be used: lifecycle-affecting operations (creating a child, registering an observer, looking up a service) raise an error indicating the container is no longer usable. Repeating the teardown itself is a harmless no-op. Errors are reported as a neutral category, never leaking host-language runtime details. The input queries liveness, tears the container down, then attempts each forbidden operation and tears down again; the output reports the liveness queries and, per attempted operation, either success or the neutral error category.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "r"
+              },
+              {
+                "op": "destroy",
+                "scope": "r"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "r"
+              },
+              {
+                "op": "try",
+                "kind": "build_child",
+                "scope": "r",
+                "name": "x"
+              },
+              {
+                "op": "try",
+                "kind": "register",
+                "scope": "r",
+                "tracker": "t"
+              },
+              {
+                "op": "try",
+                "kind": "get_service",
+                "scope": "r",
+                "key": ""
+              },
+              {
+                "op": "destroy_times",
+                "scope": "r",
+                "times": 1
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "r"
+              }
+            ]
+          },
+          "expected_output": "destroyed[r]=false\ndestroyed[r]=true\ntry[build_child]=error=scope_destroyed\ntry[register]=error=scope_destroyed\ntry[get_service]=error=scope_destroyed\ndestroyed[r]=true\n"
+        }
+      ]
+    },
+    "feature2_4_reentrant_destroy.json": {
+      "description": "Teardown must be safe even when an exit callback triggers teardown of an already-tearing-down ancestor. Several children each register an exit callback that tears down the shared parent; tearing down the first child starts a chain reaction. When the dust settles, the parent and every child report as torn down without error or infinite recursion. The input builds the tree, attaches the re-entrant exit callbacks, and tears down the first child; the output reports the final liveness of the parent and every child.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "a",
+                "parent": "r",
+                "name": "child-0"
+              },
+              {
+                "op": "on_exit_destroy",
+                "scope": "a",
+                "target": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "b",
+                "parent": "r",
+                "name": "child-1"
+              },
+              {
+                "op": "on_exit_destroy",
+                "scope": "b",
+                "target": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "c",
+                "parent": "r",
+                "name": "child-2"
+              },
+              {
+                "op": "on_exit_destroy",
+                "scope": "c",
+                "target": "r"
+              },
+              {
+                "op": "destroy_first_child",
+                "scope": "r"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "r"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "a"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "b"
+              },
+              {
+                "op": "is_destroyed",
+                "scope": "c"
+              }
+            ]
+          },
+          "expected_output": "destroyed[r]=true\ndestroyed[a]=true\ndestroyed[b]=true\ndestroyed[c]=true\n"
+        }
+      ]
+    },
+    "feature3_1_enter_on_register.json": {
+      "description": "Registering a lifecycle observer with an already-created container notifies the observer of entry immediately. The input creates a container and registers one observer, then queries the observer's tallies; the output reports how many entry and exit notifications the observer has received so far.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "register",
+                "scope": "r",
+                "tracker": "t"
+              },
+              {
+                "op": "tracker",
+                "tracker": "t"
+              }
+            ]
+          },
+          "expected_output": "tracker[t] enter=1 exit=0\n"
+        }
+      ]
+    },
+    "feature3_2_idempotent_registration.json": {
+      "description": "Registering the same observer many times is idempotent: it is notified of entry exactly once no matter how many times it is registered, and of exit exactly once no matter how many times the container is torn down. The input registers one observer repeatedly, queries its tallies, tears the container down repeatedly, and queries again; the output reports the entry and exit tallies after each query.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "register_times",
+                "scope": "r",
+                "tracker": "t",
+                "times": 10
+              },
+              {
+                "op": "tracker",
+                "tracker": "t"
+              },
+              {
+                "op": "destroy_times",
+                "scope": "r",
+                "times": 10
+              },
+              {
+                "op": "tracker",
+                "tracker": "t"
+              }
+            ]
+          },
+          "expected_output": "tracker[t] enter=1 exit=0\ntracker[t] enter=1 exit=1\n"
+        }
+      ]
+    },
+    "feature3_3_child_exit_on_parent_destroy.json": {
+      "description": "An observer registered on a child container is notified of exit when an ancestor is torn down. The input registers an observer on a child, tears down the top-level container, and queries the observer's tallies; the output reports the observer's entry and exit tallies after the teardown.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "c",
+                "parent": "r",
+                "name": "child"
+              },
+              {
+                "op": "register",
+                "scope": "c",
+                "tracker": "t"
+              },
+              {
+                "op": "destroy",
+                "scope": "r"
+              },
+              {
+                "op": "tracker",
+                "tracker": "t"
+              }
+            ]
+          },
+          "expected_output": "tracker[t] enter=1 exit=1\n"
+        }
+      ]
+    },
+    "feature3_4_builder_deferred_enter.json": {
+      "description": "An observer registered while a container is still being assembled is NOT notified of entry until assembly completes. Probing the observer's entry tally during assembly shows no notification yet; querying after the container is fully built shows exactly one entry notification. The input registers an observer during assembly, probes its entry tally mid-assembly, then queries after the container exists; the output reports the mid-assembly probe and the post-build tallies.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r",
+                "builder_register": [
+                  "t"
+                ],
+                "builder_emit_enter": [
+                  "t"
+                ]
+              },
+              {
+                "op": "tracker",
+                "tracker": "t"
+              }
+            ]
+          },
+          "expected_output": "builder_enter[t]=0\ntracker[t] enter=1 exit=0\n"
+        }
+      ]
+    },
+    "feature3_5_on_exit_callback.json": {
+      "description": "A container offers a convenience hook to run an arbitrary callback exactly once when it is torn down. The input attaches an exit callback to a child container and tears down the top-level container, then queries how many times the callback ran; the output reports the callback's invocation count.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r"
+              },
+              {
+                "op": "build_child",
+                "id": "c",
+                "parent": "r",
+                "name": "child"
+              },
+              {
+                "op": "on_exit_listener",
+                "id": "L",
+                "scope": "c"
+              },
+              {
+                "op": "destroy",
+                "scope": "r"
+              },
+              {
+                "op": "listener",
+                "id": "L"
+              }
+            ]
+          },
+          "expected_output": "listener[L]=1\n"
+        }
+      ]
+    },
+    "feature4_1_service_lookup.json": {
+      "description": "A container can hold named service values supplied at assembly time and return them by key. Looking up a registered key returns its value; looking up an unknown key returns a null marker. The input assembles a container with one keyed service and queries both a known and an unknown key; the output reports each lookup's value or a null marker.",
+      "cases": [
+        {
+          "input": {
+            "action": "scope",
+            "ops": [
+              {
+                "op": "create_root",
+                "id": "r",
+                "services": {
+                  "key": "value"
+                }
+              },
+              {
+                "op": "service",
+                "scope": "r",
+                "key": "key"
+              },
+              {
+                "op": "service",
+                "scope": "r",
+                "key": "key2"
+              }
+            ]
+          },
+          "expected_output": "service[r,key]=value\nservice[r,key2]=null\n"
+        }
+      ]
+    },
+    "feature5_1_named_context_required.json": {
+      "description": "A lifecycle-bound asynchronous-work scope must be constructed with an execution context that carries a name, for debuggability. Constructing one with a named context succeeds; constructing one with an unnamed context is rejected with a neutral error category. The input requests construction either with or without a name; the output is a success marker or the neutral rejection category.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "construct",
+            "name": "abc"
+          },
+          "expected_output": "ok\n"
+        },
+        {
+          "input": {
+            "action": "async",
+            "mode": "construct"
+          },
+          "expected_output": "error=missing_name\n"
+        }
+      ]
+    },
+    "feature5_2_exit_cancels_context.json": {
+      "description": "When a lifecycle-bound asynchronous-work scope receives its exit notification, its underlying execution context is cancelled and becomes inactive. The input constructs a named work scope and triggers its exit notification, then queries activity; the output reports whether the context is still active.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "exit_cancels",
+            "name": "abc"
+          },
+          "expected_output": "active=false\n"
+        }
+      ]
+    },
+    "feature5_3_child_default_name.json": {
+      "description": "Deriving a child asynchronous-work scope without an explicit name gives it a default name derived from the parent's name plus a suffix marking it as a child. The input constructs a named parent work scope and derives an unnamed child; the output reports the child's resulting name.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "child_default_name",
+            "name": "abc"
+          },
+          "expected_output": "name=abc-child\n"
+        }
+      ]
+    },
+    "feature5_4_child_explicit_name.json": {
+      "description": "Deriving a child asynchronous-work scope with an explicit name uses that name verbatim instead of a derived default. The input constructs a named parent work scope and derives a child with an explicit name; the output reports the child's resulting name.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "child_named",
+            "name": "abc",
+            "child_name": "def"
+          },
+          "expected_output": "name=def\n"
+        }
+      ]
+    },
+    "feature5_5_parent_cancellation_cascades.json": {
+      "description": "Cancelling a parent asynchronous-work scope also cancels any child work scope derived from it. The input constructs a parent work scope, derives a child, then cancels the parent and queries activity; the output reports whether the parent and the child are active afterward.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "parent_cancel",
+            "name": "abc"
+          },
+          "expected_output": "parent_active=false child_active=false\n"
+        }
+      ]
+    },
+    "feature5_6_child_cancellation_isolated.json": {
+      "description": "Cancelling a child asynchronous-work scope does NOT cancel its parent. The input constructs a parent work scope, derives a child, then cancels the child and queries activity; the output reports that the parent stays active while the child is inactive.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "child_cancel",
+            "name": "abc"
+          },
+          "expected_output": "parent_active=true child_active=false\n"
+        }
+      ]
+    },
+    "feature5_7_work_canceled_first.json": {
+      "description": "When a container is torn down, its registered asynchronous-work scope is cancelled before any other lifecycle observer's exit callback runs, so background work stops before resource cleanup. A long-running background job and two ordinary observers are registered; teardown records the order in which each reacts. The input drives this teardown scenario; the output reports the reaction order as a comma-separated sequence, with the background work reacting first.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "exit_order"
+          },
+          "expected_output": "order=background,first,third\n"
+        }
+      ]
+    },
+    "feature6_1_hosted_child_work.json": {
+      "description": "A container can host a lifecycle-bound asynchronous-work scope as a service; requesting a work scope from the container yields a freshly derived child work scope whose name is derived from the hosted one. The input assembles a container hosting a named work scope and requests a work scope from it; the output reports the derived child work scope's name.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "service_child_name",
+            "name": "abc"
+          },
+          "expected_output": "name=abc-child\n"
+        }
+      ]
+    },
+    "feature6_2_destroy_cancels_service.json": {
+      "description": "When a container hosting an asynchronous-work scope is torn down, both the hosted work scope and any child work scope derived from it are cancelled. The input assembles a container hosting a named work scope, derives a child work scope, tears down the container, and queries activity; the output reports that both the hosted scope and the derived child are inactive afterward.",
+      "cases": [
+        {
+          "input": {
+            "action": "async",
+            "mode": "service_cancel_on_destroy",
+            "name": "abc"
+          },
+          "expected_output": "parent_active=false child_active=false\n"
+        }
+      ]
+    },
+    "feature7_1_register_and_resolve.json": {
+      "description": "A container can hold a dependency aggregate and return it when a compatible type is requested. The input assembles a container holding one aggregate (identified by a label and the interface type it satisfies) and requests that type from the same container; the output reports the resolved aggregate's label.",
+      "cases": [
+        {
+          "input": {
+            "action": "di",
+            "scopes": [
+              {
+                "id": "r",
+                "parent": null,
+                "component": {
+                  "type": "alpha",
+                  "id": "main_component"
+                }
+              }
+            ],
+            "lookups": [
+              {
+                "scope": "r",
+                "type": "alpha"
+              }
+            ]
+          },
+          "expected_output": "lookup[r,alpha]=component=main_component\n"
+        }
+      ]
+    },
+    "feature7_2_resolve_through_ancestors.json": {
+      "description": "Resolving a dependency aggregate searches the requesting container first and then walks up its ancestors, returning the nearest aggregate that satisfies the requested type; a type held only by a descendant is not visible to an ancestor. The input assembles a parent and child each holding an aggregate of a different type, then requests several types from both containers; the output reports, per request, the resolved aggregate's label, or a neutral not-found error listing the labels inspected along the ancestor chain when no match exists.",
+      "cases": [
+        {
+          "input": {
+            "action": "di",
+            "scopes": [
+              {
+                "id": "p",
+                "parent": null,
+                "component": {
+                  "type": "alpha",
+                  "id": "parent_component"
+                }
+              },
+              {
+                "id": "c",
+                "parent": "p",
+                "component": {
+                  "type": "beta",
+                  "id": "child_component"
+                }
+              }
+            ],
+            "lookups": [
+              {
+                "scope": "c",
+                "type": "beta"
+              },
+              {
+                "scope": "c",
+                "type": "alpha"
+              },
+              {
+                "scope": "p",
+                "type": "alpha"
+              },
+              {
+                "scope": "p",
+                "type": "beta"
+              }
+            ]
+          },
+          "expected_output": "lookup[c,beta]=component=child_component\nlookup[c,alpha]=component=parent_component\nlookup[p,alpha]=component=parent_component\nlookup[p,beta]=error=component_not_found inspected=[parent_component]\n"
+        }
+      ]
+    },
+    "feature7_3_unresolved_component_error.json": {
+      "description": "Requesting a dependency type that no container along the ancestor chain satisfies raises a neutral not-found error that lists, from nearest to farthest, the labels of the aggregates that were inspected. The error carries only domain information, never host-language runtime details. The input assembles a parent and child each holding an aggregate, then requests a type that none of them satisfies; the output reports the neutral not-found error with the inspected aggregate labels in nearest-to-farthest order.",
+      "cases": [
+        {
+          "input": {
+            "action": "di",
+            "scopes": [
+              {
+                "id": "p",
+                "parent": null,
+                "component": {
+                  "type": "alpha",
+                  "id": "parent_component"
+                }
+              },
+              {
+                "id": "c",
+                "parent": "p",
+                "component": {
+                  "type": "beta",
+                  "id": "child_component"
+                }
+              }
+            ],
+            "lookups": [
+              {
+                "scope": "c",
+                "type": "unit"
+              }
+            ]
+          },
+          "expected_output": "lookup[c,unit]=error=component_not_found inspected=[child_component,parent_component]\n"
+        }
+      ]
+    }
+  }
+}

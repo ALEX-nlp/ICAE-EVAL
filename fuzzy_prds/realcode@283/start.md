@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from a few enterprise customers who say their backend services are running out of connections under load and things just hang or crash in weird ways. We need to build some kind of connection/resource pooling layer that handles this gracefully. The basic idea is: you have a limited number of expensive things (think DB connections, HTTP clients, whatever), and you need to lend them out, get them back, and reuse them without leaking or deadlocking.
+
+We talked about this in the last architecture sync — basically the same pattern we used in that retry/backpressure module but applied to object lifecycle. Key things I remember being discussed: there should be a way to cap how many things exist at once, some warmup behavior so we're not cold-starting on the first real request, a queue for when everything is busy (but also a way to say 'don't queue at all'), and clean shutdown. Oh and someone mentioned we need to handle the case where a caller tries to return a resource twice or both return and destroy it — that was causing double-free bugs in the old code.
+
+Also the reuse order matters apparently — FIFO vs LIFO style — and there's some eviction logic for stale resources. I don't remember all the exact thresholds but it was something like 'if it's been sitting idle too long, toss it'. Context passing per-request was also brought up but I'm fuzzy on how that interacts with reuse. Can someone just build this out properly?

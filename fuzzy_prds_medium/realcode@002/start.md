@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need a small HTTP utility library — think something like the tiny fetch polyfill approach we used in the login module a while back, but more formalized. The core idea is: one function, you pass it a URL and some options, you get a promise back. It has to work the same whether the code runs in a browser or on a server, without the caller needing to know which environment they're in. The resolver should just figure it out automatically.
+
+The response object needs to let you read the body (text or structured data), inspect where the response actually came from (since redirects happen), copy the response if you need it in more than one place, and look up headers without worrying about casing issues — our support team keeps getting bug reports about headers being silently dropped because of case mismatches.
+
+On the server side, there's a known issue where protocol-relative links cause requests to fail silently — we've had a couple of incidents around this so it needs to be handled. Also, if the runtime already has a built-in HTTP client, we should obviously just use that instead of our own engine, and it shouldn't break if called in a detached way.
+
+The whole thing should be cleanly split up — don't just dump everything in one file. There should be a separate adapter layer that handles the stdin/stdout test interface so the core logic stays clean.
+
+One small thing to pin down from the questions that came in: if the caller doesn’t pass a method at all, we should default to 'get' in lowercase. That’s not just stylistic — the contract is looking for method=get in the output when no method was specified, so we need to make sure that shows up exactly that way.
+
+Also on the response headers bit, both get() and has() need to ignore casing on the field name. If the same header shows up more than once under different casing, we should treat that as the same header and join the values with a comma in arrival order. And if a header exists with an empty string value, has() should still come back true. On cloning, the important part is that clone() gives you a genuinely separate response object, not the same reference reused, and it should keep the same final URL the original ended up at after any redirects. The check here is clone_is_same_object=false, so that needs to be true in practice.
+
+On the server transport specifically, for the path we use when we’re in a server-like runtime and there isn’t already a native client available, we do need to normalize protocol-relative URLs before dispatch. So anything starting with '//' should be turned into an absolute 'https://' URL first — for example '//p' becomes 'https://p'. That normalization is only for the server transport path though, not the polyfill path and not the native-client path.
+
+And just to restate the native-client behavior a little more concretely: if the runtime already gives us a built-in fetch/HTTP client, the exported request function should delegate straight to it using a bound or arrow-wrapped reference so it’s still safe when called detached as a bare function. The native client’s return value should pass through unchanged, and the URL should be forwarded unmodified. This is the same basic delegation pattern from Feature 5 and matches the runtime-agnostic approach we used before in the auth flow work.

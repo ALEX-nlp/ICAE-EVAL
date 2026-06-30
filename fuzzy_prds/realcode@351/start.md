@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the auth framework work we've been discussing. The basic idea is that app developers shouldn't have to hand-roll all the account flow stuff — sign in, sign out, registration, the whole nine yards. We talked about this being similar to what we did on that other project with the scope-based session handling, so just follow that same pattern for the multi-scope parts.
+
+A few things I want to make sure are covered: users have been complaining that when they type their email in a different case it sometimes doesn't log them in — that needs to be handled consistently. Also we got a bug report that after a password reset the user isn't being signed in automatically, which is frustrating UX. The locked account flow and the confirmation email flow should both support both the regular HTML path and also the JSON API path since some of our consumers are mobile clients.
+
+The remember-me cookie behavior needs to work properly — right now it's not clear if a bad/expired remember token just silently fails or actually redirects. And the session expiry stuff needs to respect whether we're kicking out just one scope or all scopes at once, same logic as the sign-out scope policy. Tracking sign-ins (count, timestamps, IP) should also be suppressible. Can someone make sure all of this is specced out properly before we start? Thanks

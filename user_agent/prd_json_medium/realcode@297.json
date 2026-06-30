@@ -1,0 +1,838 @@
+{
+  "fuzzy_prd": "Hey team, we've been getting complaints from our backend devs that they have zero visibility into what's happening with our Kafka messaging layer. Right now if something goes wrong between a producer and a consumer, there's no way to trace the flow end-to-end without manually adding logging everywhere — which is a nightmare to maintain and people keep forgetting to do it consistently. We need to build some kind of auto-instrumentation wrapper around our Kafka client so that spans get created automatically whenever someone publishes or consumes a message, without the dev having to write any tracing code themselves.\n\nThe context propagation piece is really important — similar to what we did with the HTTP middleware tracing last quarter, we need trace IDs to flow through message headers so a consumer can pick up where the producer left off. There's also a question about batches — the PM from the data pipeline team mentioned their batch consumers work differently from per-message ones and the parent/child relationships should reflect that.\n\nAlso a few edge cases we've been burned by before: hooks that crash shouldn't break the whole trace, failed sends should still emit spans, and error messages in our observability tooling should be normalized category labels rather than raw exception strings. We also want to support some kind of version tagging on spans for future compatibility auditing. The adapter needs to read scenarios from stdin and write results to stdout for our test harness.\n\nOne extra pass on the batch behavior since a few folks asked: for a batch publish, each message gets exactly one PRODUCER span, and that span is named after that specific message's own topic, not the batch as a whole. Spans are emitted in declaration order across all topic groups, so if you have 2 messages to topic-A and 1 message to topic-B, that means 3 spans total: two named topic-A, one named topic-B. Each message is stamped with its own span's context. There is no single 'batch span' wrapping them. Also calling this out explicitly because it got missed before: s context. There is no single\n\nOn the consume side, consume_batch and consume_message really do behave differently. For consume_batch, we create one CONSUMER span with operation=receive as the root of a new trace, then one CONSUMER span with operation=process per message, and each of those process spans is a child of the receive span, not a child of any producer span. If those messages already had upstream trace context in their headers, that upstream context is not used as the parent in the batch case. Instead, the batch receive span starts a brand-new trace and the per-message processing span carries a link back to the original producer span. For consume_message, there is exactly one CONSUMER span with operation=process per delivery, and it uses the extracted context directly as parent when that context is present, so it becomes a child of the original producer span and shares the same trace ID. If no upstream context is present in the message headers, it just starts its own root trace.\n\nAlso confirming the propagation model is the W3C TraceContext + Baggage propagation pattern: injecting trace context into outgoing message headers at produce time and extracting it from headers at consume time, mirroring how HTTP instrumentation propagates context via request/response headers. If a consume_message step has observeBaggage=true and the message headers carry propagated baggage, we print a 'baggage key=value ...' line after the inject lines but before the spans block. All baggage key-value pairs go space-separated on that single line. That line only shows up for consume steps that explicitly set observeBaggage=true and only when baggage was actually present.\n\nOne more important implementation note from the team review: this must NOT turn into a single god file. Client patching, span lifecycle management, context propagation, output rendering, and the execution adapter for the stdin/stdout JSON bridge all need to live in separate modules. The instrumentation core has to stay fully decoupled from stdin/stdout and JSON parsing, and only the execution adapter should handle that translation.\n\nAnd lastly, on the enrichment hooks, if producerHook or consumerHook throws, we still create the span and it still finishes with status=unset, not error. A bad hook must never corrupt the trace or change the span's status. The only effect is that the custom attribute the hook was supposed to add just won't appear on the span if that hook blew up.",
+  "oracle_data": {
+    "task_id": "aspecto-io__opentelemetry-ext-js__kafka-tracing-instrumentation",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "how are errors normalized in output",
+          "what error category labels are used",
+          "handler failure error string format"
+        ],
+        "oracle_response": "Error categories in the stdout contract are normalized to language-neutral labels, never raw exception class names. The labels are: 'client_send_failure' when the underlying Kafka client rejects a produce call; 'handler_failure' when a consumer handler throws an error with a readable message; 'handler_failure_no_message' when the thrown value has no readable reason (e.g., an object with no message field or an undefined). Status messages on spans use the actual reason text when available, or the literal token '<none>' when not."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what happens to spans when send fails",
+          "producer error span timing",
+          "do spans exist if client rejects"
+        ],
+        "oracle_response": "Spans are created before the publish is attempted. So even when the client rejects the send, the spans still exist, still carry injected context headers, and are marked with status=error with their status_message set to the client's failure reason. The inject lines still appear in the output. The action line reports status=error error=client_send_failure."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "module version attribute format",
+          "how is version shown in span output",
+          "moduleVersionAttribute normalization"
+        ],
+        "oracle_response": "When a moduleVersionAttribute name is configured, every emitted span (both producer and consumer) carries an attribute under that configured name. In the stdout output, the version value is always normalized to the literal token '<version>' regardless of the actual library version string. This attribute appears after the standard messaging.* attributes in the span's attribute block."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "trace labeling in output",
+          "how are trace IDs shown",
+          "t0 t1 trace label assignment"
+        ],
+        "oracle_response": "Raw trace IDs are never printed. Each distinct trace is assigned a label t0, t1, t2, ... in first-seen order across all emitted spans. Spans are referenced by emission index (span#0, span#1, ...). Each single-message produce call with no upstream context starts its own root trace, so two messages in one produce call will appear as trace=t0 and trace=t1 respectively."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "output ordering inject lines vs action line vs spans block",
+          "stdout format order",
+          "where do inject lines appear relative to spans"
+        ],
+        "oracle_response": "The stdout output order per step is: (1) action line (e.g. 'produce topic=... status=ok result_records=N' with record sub-lines, or 'consume_message topic=... delivered=ok error=none'), then (2) inject lines ('inject msg=N carries=span#K') only for produce/produce_batch steps, then (3) optional baggage line when a consumer step observed propagated baggage, then after all steps: (4) 'spans=N' count followed by the full span blocks in emission order."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "non-promise handler behavior",
+          "synchronous consumer handler",
+          "return_non_promise handler instrumentation"
+        ],
+        "oracle_response": "A per-message consumer handler that returns a non-promise (synchronous return) must not break instrumentation. The span is still created and completed correctly, and the action line shows delivered=ok. The instrumentation layer must handle both promise-returning and non-promise-returning handlers gracefully."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "EXECUTION_CONTRACT",
+        "trigger_keywords": [
+          "opentelemetry steps scenario",
+          "config steps input"
+        ],
+        "oracle_response": "The adapter reads a scenario object with top-level config and steps. It does not route on a single top-level action. Each item in steps has its own action describing producer/consumer/error/hook operations; the adapter executes steps in order and renders collected spans deterministically."
+      },
+      {
+        "constraint_id": "TC_feature1_1_producer_send",
+        "trigger_keywords": [
+          "test cases for feature1 1 producer send",
+          "show me feature1 1 producer send test cases",
+          "what are the feature1 1 producer send test inputs",
+          "give me the feature1_1_producer_send test file",
+          "test cases for feature 1",
+          "feature1 1 producer send expected output",
+          "what does feature1 1 producer send expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_producer_send:\n{\n  \"description\": \"Producing one or more messages to a single topic emits one PRODUCER span per message, each named after the topic and carrying the messaging system/destination attributes; the client send result is passed back unchanged and each outgoing message is stamped with the span trace context.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"testing message content\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"success\",\n              \"records\": [\n                {\n                  \"topicName\": \"topic-name-1\",\n                  \"partition\": 0,\n                  \"offset\": \"18\"\n                }\n              ]\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=ok result_records=1\\n  record 0 topicName=topic-name-1 partition=0 offset=18\\ninject msg=0 carries=span#0\\nspans=1\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n\"\n    },\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"message1\"\n              },\n              {\n                \"value\": \"message2\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"success\",\n              \"records\": []\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=ok result_records=0\\ninject msg=0 carries=span#0\\ninject msg=1 carries=span#1\\nspans=2\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\nspan 1 kind=producer name=topic-name-1 trace=t1 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_producer_send_batch",
+        "trigger_keywords": [
+          "test cases for feature1 2 producer send batch",
+          "show me feature1 2 producer send batch test cases",
+          "what are the feature1 2 producer send batch test inputs",
+          "give me the feature1_2_producer_send_batch test file",
+          "test cases for feature 1",
+          "feature1 2 producer send batch expected output",
+          "what does feature1 2 producer send batch expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_producer_send_batch:\n{\n  \"description\": \"Producing a batch that spans several topics emits one PRODUCER span per message in declaration order, each named after that message’s topic, and stamps every outgoing message with its own span context.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"produce_batch\",\n            \"topicMessages\": [\n              {\n                \"topic\": \"topic-name-1\",\n                \"messages\": [\n                  {\n                    \"value\": \"message1-1\"\n                  },\n                  {\n                    \"value\": \"message1-2\"\n                  }\n                ]\n              },\n              {\n                \"topic\": \"topic-name-2\",\n                \"messages\": [\n                  {\n                    \"value\": \"message2-1\"\n                  }\n                ]\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"success\",\n              \"records\": []\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce_batch topics=2 status=ok result_records=0\\ninject msg=0 carries=span#0\\ninject msg=1 carries=span#1\\ninject msg=2 carries=span#2\\nspans=3\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\nspan 1 kind=producer name=topic-name-1 trace=t1 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\nspan 2 kind=producer name=topic-name-2 trace=t2 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-2\\n  messaging.destination_kind=topic\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_producer_send_failure",
+        "trigger_keywords": [
+          "test cases for feature1 3 producer send failure",
+          "show me feature1 3 producer send failure test cases",
+          "what are the feature1 3 producer send failure test inputs",
+          "give me the feature1_3_producer_send_failure test file",
+          "test cases for feature 1",
+          "feature1 3 producer send failure expected output",
+          "what does feature1 3 producer send failure expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_producer_send_failure:\n{\n  \"description\": \"When the underlying client rejects a send or batch-send, every span created for that operation is marked with an error status whose message is the client failure reason, and the failure is surfaced to the caller.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"testing message content\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"error\",\n              \"message\": \"error thrown from kafka client send\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=error error=client_send_failure\\ninject msg=0 carries=span#0\\nspans=1\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=error\\n  status_message=error thrown from kafka client send\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n\"\n    },\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"m1\"\n              },\n              {\n                \"value\": \"m2\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"error\",\n              \"message\": \"error thrown from kafka client send\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=error error=client_send_failure\\ninject msg=0 carries=span#0\\ninject msg=1 carries=span#1\\nspans=2\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=error\\n  status_message=error thrown from kafka client send\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\nspan 1 kind=producer name=topic-name-1 trace=t1 parent=root status=error\\n  status_message=error thrown from kafka client send\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_4_producer_hook",
+        "trigger_keywords": [
+          "test cases for feature1 4 producer hook",
+          "show me feature1 4 producer hook test cases",
+          "what are the feature1 4 producer hook test inputs",
+          "give me the feature1_4_producer_hook test file",
+          "test cases for feature 1",
+          "feature1 4 producer hook expected output",
+          "what does feature1 4 producer hook expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_4_producer_hook:\n{\n  \"description\": \"An optional producer enrichment callback runs for each producer span and may copy message data onto the span as a custom attribute; if the callback throws, the span is still created and finishes with an unset (non-error) status.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {\n          \"producerHook\": {\n            \"action\": \"copy_value_to_attribute\",\n            \"attribute\": \"attribute-from-hook\"\n          }\n        },\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"testing message content\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"success\",\n              \"records\": []\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=ok result_records=0\\ninject msg=0 carries=span#0\\nspans=1\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  attribute-from-hook=testing message content\\n\"\n    },\n    {\n      \"input\": {\n        \"config\": {\n          \"producerHook\": {\n            \"action\": \"throw\",\n            \"message\": \"error thrown from producer hook\"\n          }\n        },\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"testing message content\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"success\",\n              \"records\": []\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=ok result_records=0\\ninject msg=0 carries=span#0\\nspans=1\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_consume_each_message",
+        "trigger_keywords": [
+          "test cases for feature2 1 consume each message",
+          "show me feature2 1 consume each message test cases",
+          "what are the feature2 1 consume each message test inputs",
+          "give me the feature2_1_consume_each_message test file",
+          "test cases for feature 2",
+          "feature2 1 consume each message expected output",
+          "what does feature2 1 consume each message expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_consume_each_message:\n{\n  \"description\": \"Delivering a single message to a per-message consumer handler creates one CONSUMER span named after the topic, with the messaging attributes and a process operation; the span is created whether or not the handler returns a promise.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"partition\": 0,\n            \"message\": {\n              \"value\": \"message content\",\n              \"offset\": \"123\"\n            },\n            \"handler\": {\n              \"behavior\": \"resolve\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_message topic=topic-name-1 delivered=ok error=none\\nspans=1\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n\"\n    },\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"partition\": 0,\n            \"message\": {\n              \"value\": \"message content\",\n              \"offset\": \"123\"\n            },\n            \"handler\": {\n              \"behavior\": \"return_non_promise\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_message topic=topic-name-1 delivered=ok error=none\\nspans=1\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_consume_each_batch",
+        "trigger_keywords": [
+          "test cases for feature2 2 consume each batch",
+          "show me feature2 2 consume each batch test cases",
+          "what are the feature2 2 consume each batch test inputs",
+          "give me the feature2_2_consume_each_batch test file",
+          "test cases for feature 2",
+          "feature2 2 consume each batch expected output",
+          "what does feature2 2 consume each batch expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_consume_each_batch:\n{\n  \"description\": \"Delivering a batch to a per-batch consumer handler creates one receiving CONSUMER span for the batch (operation receive, root of a new trace) plus one processing CONSUMER span per message (operation process) that is a child of the receiving span; the spans are created whether or not the handler returns a promise.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"consume_batch\",\n            \"topic\": \"topic-name-1\",\n            \"partition\": 1234,\n            \"messages\": [\n              {\n                \"value\": \"message content\",\n                \"offset\": \"124\"\n              },\n              {\n                \"value\": \"message content\",\n                \"offset\": \"125\"\n              }\n            ],\n            \"handler\": {\n              \"behavior\": \"resolve\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_batch topic=topic-name-1 delivered=ok error=none\\nspans=3\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=receive\\nspan 1 kind=consumer name=topic-name-1 trace=t0 parent=span#0 status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\nspan 2 kind=consumer name=topic-name-1 trace=t0 parent=span#0 status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_consume_handler_failure",
+        "trigger_keywords": [
+          "test cases for feature2 3 consume handler failure",
+          "show me feature2 3 consume handler failure test cases",
+          "what are the feature2 3 consume handler failure test inputs",
+          "give me the feature2_3_consume_handler_failure test file",
+          "test cases for feature 2",
+          "feature2 3 consume handler failure expected output",
+          "what does feature2 3 consume handler failure expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_consume_handler_failure:\n{\n  \"description\": \"When a per-message consumer handler fails, its span is marked with an error status and the failure is re-surfaced to the caller; the error is reported as a neutral category. A thrown value with a readable reason yields that reason as the status message; a thrown value without a readable reason (including an empty/absent value) yields no status message.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"message\": {\n              \"value\": \"message content\",\n              \"offset\": \"123\"\n            },\n            \"handler\": {\n              \"behavior\": \"throw_error\",\n              \"message\": \"error thrown from eachMessage callback\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_message topic=topic-name-1 delivered=error error=handler_failure\\nspans=1\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=error\\n  status_message=error thrown from eachMessage callback\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n\"\n    },\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"message\": {\n              \"value\": \"message content\",\n              \"offset\": \"123\"\n            },\n            \"handler\": {\n              \"behavior\": \"throw_object_no_message\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_message topic=topic-name-1 delivered=error error=handler_failure_no_message\\nspans=1\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=error\\n  status_message=<none>\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n\"\n    },\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"message\": {\n              \"value\": \"message content\",\n              \"offset\": \"123\"\n            },\n            \"handler\": {\n              \"behavior\": \"throw_undefined\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_message topic=topic-name-1 delivered=error error=handler_failure_empty\\nspans=1\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=error\\n  status_message=<none>\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_4_consumer_hook",
+        "trigger_keywords": [
+          "test cases for feature2 4 consumer hook",
+          "show me feature2 4 consumer hook test cases",
+          "what are the feature2 4 consumer hook test inputs",
+          "give me the feature2_4_consumer_hook test file",
+          "test cases for feature 2",
+          "feature2 4 consumer hook expected output",
+          "what does feature2 4 consumer hook expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_4_consumer_hook:\n{\n  \"description\": \"An optional consumer enrichment callback runs for each consumer span and may copy message data onto the span as a custom attribute; if the callback throws, the span is still created.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {\n          \"consumerHook\": {\n            \"action\": \"copy_value_to_attribute\",\n            \"attribute\": \"attribute key from hook\"\n          }\n        },\n        \"steps\": [\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"message\": {\n              \"value\": \"message content\",\n              \"offset\": \"123\"\n            },\n            \"handler\": {\n              \"behavior\": \"resolve\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_message topic=topic-name-1 delivered=ok error=none\\nspans=1\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n  attribute key from hook=message content\\n\"\n    },\n    {\n      \"input\": {\n        \"config\": {\n          \"consumerHook\": {\n            \"action\": \"throw\",\n            \"message\": \"error thrown from consumer hook\"\n          }\n        },\n        \"steps\": [\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"message\": {\n              \"value\": \"message content\",\n              \"offset\": \"123\"\n            },\n            \"handler\": {\n              \"behavior\": \"resolve\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_message topic=topic-name-1 delivered=ok error=none\\nspans=1\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_propagation_message",
+        "trigger_keywords": [
+          "test cases for feature3 1 propagation message",
+          "show me feature3 1 propagation message test cases",
+          "what are the feature3 1 propagation message test inputs",
+          "give me the feature3_1_propagation_message test file",
+          "test cases for feature 3",
+          "feature3 1 propagation message expected output",
+          "what does feature3 1 propagation message expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_propagation_message:\n{\n  \"description\": \"Trace context and baggage injected into a message when it is produced are recovered when that same message is later delivered to a per-message consumer handler: the consumer span shares the producer span trace and is its child, and any baggage set around the produce call is visible inside the consumer handler.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"testing message content\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"success\",\n              \"records\": []\n            },\n            \"baggage\": {\n              \"foo\": \"bar\"\n            }\n          },\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"message\": {\n              \"value\": \"\"\n            },\n            \"headersFromMessage\": 0,\n            \"observeBaggage\": true,\n            \"handler\": {\n              \"behavior\": \"resolve\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=ok result_records=0\\nconsume_message topic=topic-name-1 delivered=ok error=none\\ninject msg=0 carries=span#0\\nbaggage foo=bar\\nspans=2\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\nspan 1 kind=consumer name=topic-name-1 trace=t0 parent=span#0 status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_propagation_batch_links",
+        "trigger_keywords": [
+          "test cases for feature3 2 propagation batch links",
+          "show me feature3 2 propagation batch links test cases",
+          "what are the feature3 2 propagation batch links test inputs",
+          "give me the feature3_2_propagation_batch_links test file",
+          "test cases for feature 3",
+          "feature3 2 propagation batch links expected output",
+          "what does feature3 2 propagation batch links expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_propagation_batch_links:\n{\n  \"description\": \"When a produced message is later delivered through a per-batch consumer handler, its processing span does not become a child of the original producer span but instead carries a link back to it; the processing span remains a child of the batch receiving span, and the receiving span starts a brand-new trace distinct from the producer.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {},\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"testing message content\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"success\",\n              \"records\": []\n            }\n          },\n          {\n            \"action\": \"consume_batch\",\n            \"topic\": \"topic-name-1\",\n            \"partition\": 0,\n            \"messages\": [\n              {\n                \"value\": \"\",\n                \"headersFromMessage\": 0\n              }\n            ],\n            \"handler\": {\n              \"behavior\": \"resolve\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=ok result_records=0\\nconsume_batch topic=topic-name-1 delivered=ok error=none\\ninject msg=0 carries=span#0\\nspans=3\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\nspan 1 kind=consumer name=topic-name-1 trace=t1 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=receive\\nspan 2 kind=consumer name=topic-name-1 trace=t1 parent=span#1 status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n  links=span#0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_module_version_attribute",
+        "trigger_keywords": [
+          "test cases for feature4 module version attribute",
+          "show me feature4 module version attribute test cases",
+          "what are the feature4 module version attribute test inputs",
+          "give me the feature4_module_version_attribute test file",
+          "test cases for feature 4",
+          "feature4 module version attribute expected output",
+          "what does feature4 module version attribute expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_module_version_attribute:\n{\n  \"description\": \"When a module-version attribute name is configured, every emitted span (producer and consumer alike) carries an attribute under that name whose value is the instrumented client library version string.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"config\": {\n          \"moduleVersionAttribute\": \"module.version\"\n        },\n        \"steps\": [\n          {\n            \"action\": \"produce\",\n            \"topic\": \"topic-name-1\",\n            \"messages\": [\n              {\n                \"value\": \"testing message content\"\n              }\n            ],\n            \"clientResponse\": {\n              \"status\": \"success\",\n              \"records\": []\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"produce topic=topic-name-1 status=ok result_records=0\\ninject msg=0 carries=span#0\\nspans=1\\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  module.version=<version>\\n\"\n    },\n    {\n      \"input\": {\n        \"config\": {\n          \"moduleVersionAttribute\": \"module.version\"\n        },\n        \"steps\": [\n          {\n            \"action\": \"consume_message\",\n            \"topic\": \"topic-name-1\",\n            \"message\": {\n              \"value\": \"message content\",\n              \"offset\": \"123\"\n            },\n            \"handler\": {\n              \"behavior\": \"resolve\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"consume_message topic=topic-name-1 delivered=ok error=none\\nspans=1\\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\\n  messaging.system=kafka\\n  messaging.destination=topic-name-1\\n  messaging.destination_kind=topic\\n  messaging.operation=process\\n  module.version=<version>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "version tagging on spans for future compatibility auditing",
+        "actual_meaning": "The moduleVersionAttribute config option: when set to an attribute name string, every emitted span gets an attribute under that name with the library version value, normalized to '<version>' in stdout output"
+      },
+      {
+        "vague_reference": "normalized category labels rather than raw exception strings",
+        "actual_meaning": "The error field in action lines uses fixed tokens: 'client_send_failure', 'handler_failure', 'handler_failure_no_message', 'handler_failure_no_reason' — never JavaScript Error class names or runtime-decorated messages"
+      }
+    ],
+    "fallback_response": "That's a good question but it's not something I have specific details on from the original ticket. You'd need to dig into the existing codebase or the test cases to figure out the exact expected behavior there — I don't want to guess and give you the wrong constraint."
+  },
+  "public_test_cases": {
+    "feature1_1_producer_send.json": {
+      "description": "Producing one or more messages to a single topic emits one PRODUCER span per message, each named after the topic and carrying the messaging system/destination attributes; the client send result is passed back unchanged and each outgoing message is stamped with the span trace context.",
+      "cases": [
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "testing message content"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "success",
+                  "records": [
+                    {
+                      "topicName": "topic-name-1",
+                      "partition": 0,
+                      "offset": "18"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=ok result_records=1\n  record 0 topicName=topic-name-1 partition=0 offset=18\ninject msg=0 carries=span#0\nspans=1\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n"
+        },
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "message1"
+                  },
+                  {
+                    "value": "message2"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "success",
+                  "records": []
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=ok result_records=0\ninject msg=0 carries=span#0\ninject msg=1 carries=span#1\nspans=2\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\nspan 1 kind=producer name=topic-name-1 trace=t1 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n"
+        }
+      ]
+    },
+    "feature1_2_producer_send_batch.json": {
+      "description": "Producing a batch that spans several topics emits one PRODUCER span per message in declaration order, each named after that message’s topic, and stamps every outgoing message with its own span context.",
+      "cases": [
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "produce_batch",
+                "topicMessages": [
+                  {
+                    "topic": "topic-name-1",
+                    "messages": [
+                      {
+                        "value": "message1-1"
+                      },
+                      {
+                        "value": "message1-2"
+                      }
+                    ]
+                  },
+                  {
+                    "topic": "topic-name-2",
+                    "messages": [
+                      {
+                        "value": "message2-1"
+                      }
+                    ]
+                  }
+                ],
+                "clientResponse": {
+                  "status": "success",
+                  "records": []
+                }
+              }
+            ]
+          },
+          "expected_output": "produce_batch topics=2 status=ok result_records=0\ninject msg=0 carries=span#0\ninject msg=1 carries=span#1\ninject msg=2 carries=span#2\nspans=3\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\nspan 1 kind=producer name=topic-name-1 trace=t1 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\nspan 2 kind=producer name=topic-name-2 trace=t2 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-2\n  messaging.destination_kind=topic\n"
+        }
+      ]
+    },
+    "feature1_3_producer_send_failure.json": {
+      "description": "When the underlying client rejects a send or batch-send, every span created for that operation is marked with an error status whose message is the client failure reason, and the failure is surfaced to the caller.",
+      "cases": [
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "testing message content"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "error",
+                  "message": "error thrown from kafka client send"
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=error error=client_send_failure\ninject msg=0 carries=span#0\nspans=1\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=error\n  status_message=error thrown from kafka client send\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n"
+        },
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "m1"
+                  },
+                  {
+                    "value": "m2"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "error",
+                  "message": "error thrown from kafka client send"
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=error error=client_send_failure\ninject msg=0 carries=span#0\ninject msg=1 carries=span#1\nspans=2\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=error\n  status_message=error thrown from kafka client send\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\nspan 1 kind=producer name=topic-name-1 trace=t1 parent=root status=error\n  status_message=error thrown from kafka client send\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n"
+        }
+      ]
+    },
+    "feature1_4_producer_hook.json": {
+      "description": "An optional producer enrichment callback runs for each producer span and may copy message data onto the span as a custom attribute; if the callback throws, the span is still created and finishes with an unset (non-error) status.",
+      "cases": [
+        {
+          "input": {
+            "config": {
+              "producerHook": {
+                "action": "copy_value_to_attribute",
+                "attribute": "attribute-from-hook"
+              }
+            },
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "testing message content"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "success",
+                  "records": []
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=ok result_records=0\ninject msg=0 carries=span#0\nspans=1\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  attribute-from-hook=testing message content\n"
+        },
+        {
+          "input": {
+            "config": {
+              "producerHook": {
+                "action": "throw",
+                "message": "error thrown from producer hook"
+              }
+            },
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "testing message content"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "success",
+                  "records": []
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=ok result_records=0\ninject msg=0 carries=span#0\nspans=1\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n"
+        }
+      ]
+    },
+    "feature2_1_consume_each_message.json": {
+      "description": "Delivering a single message to a per-message consumer handler creates one CONSUMER span named after the topic, with the messaging attributes and a process operation; the span is created whether or not the handler returns a promise.",
+      "cases": [
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "partition": 0,
+                "message": {
+                  "value": "message content",
+                  "offset": "123"
+                },
+                "handler": {
+                  "behavior": "resolve"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_message topic=topic-name-1 delivered=ok error=none\nspans=1\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n"
+        },
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "partition": 0,
+                "message": {
+                  "value": "message content",
+                  "offset": "123"
+                },
+                "handler": {
+                  "behavior": "return_non_promise"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_message topic=topic-name-1 delivered=ok error=none\nspans=1\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n"
+        }
+      ]
+    },
+    "feature2_2_consume_each_batch.json": {
+      "description": "Delivering a batch to a per-batch consumer handler creates one receiving CONSUMER span for the batch (operation receive, root of a new trace) plus one processing CONSUMER span per message (operation process) that is a child of the receiving span; the spans are created whether or not the handler returns a promise.",
+      "cases": [
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "consume_batch",
+                "topic": "topic-name-1",
+                "partition": 1234,
+                "messages": [
+                  {
+                    "value": "message content",
+                    "offset": "124"
+                  },
+                  {
+                    "value": "message content",
+                    "offset": "125"
+                  }
+                ],
+                "handler": {
+                  "behavior": "resolve"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_batch topic=topic-name-1 delivered=ok error=none\nspans=3\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=receive\nspan 1 kind=consumer name=topic-name-1 trace=t0 parent=span#0 status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\nspan 2 kind=consumer name=topic-name-1 trace=t0 parent=span#0 status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n"
+        }
+      ]
+    },
+    "feature2_3_consume_handler_failure.json": {
+      "description": "When a per-message consumer handler fails, its span is marked with an error status and the failure is re-surfaced to the caller; the error is reported as a neutral category. A thrown value with a readable reason yields that reason as the status message; a thrown value without a readable reason (including an empty/absent value) yields no status message.",
+      "cases": [
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "message": {
+                  "value": "message content",
+                  "offset": "123"
+                },
+                "handler": {
+                  "behavior": "throw_error",
+                  "message": "error thrown from eachMessage callback"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_message topic=topic-name-1 delivered=error error=handler_failure\nspans=1\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=error\n  status_message=error thrown from eachMessage callback\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n"
+        },
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "message": {
+                  "value": "message content",
+                  "offset": "123"
+                },
+                "handler": {
+                  "behavior": "throw_object_no_message"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_message topic=topic-name-1 delivered=error error=handler_failure_no_message\nspans=1\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=error\n  status_message=<none>\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n"
+        },
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "message": {
+                  "value": "message content",
+                  "offset": "123"
+                },
+                "handler": {
+                  "behavior": "throw_undefined"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_message topic=topic-name-1 delivered=error error=handler_failure_empty\nspans=1\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=error\n  status_message=<none>\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n"
+        }
+      ]
+    },
+    "feature2_4_consumer_hook.json": {
+      "description": "An optional consumer enrichment callback runs for each consumer span and may copy message data onto the span as a custom attribute; if the callback throws, the span is still created.",
+      "cases": [
+        {
+          "input": {
+            "config": {
+              "consumerHook": {
+                "action": "copy_value_to_attribute",
+                "attribute": "attribute key from hook"
+              }
+            },
+            "steps": [
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "message": {
+                  "value": "message content",
+                  "offset": "123"
+                },
+                "handler": {
+                  "behavior": "resolve"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_message topic=topic-name-1 delivered=ok error=none\nspans=1\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n  attribute key from hook=message content\n"
+        },
+        {
+          "input": {
+            "config": {
+              "consumerHook": {
+                "action": "throw",
+                "message": "error thrown from consumer hook"
+              }
+            },
+            "steps": [
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "message": {
+                  "value": "message content",
+                  "offset": "123"
+                },
+                "handler": {
+                  "behavior": "resolve"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_message topic=topic-name-1 delivered=ok error=none\nspans=1\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n"
+        }
+      ]
+    },
+    "feature3_1_propagation_message.json": {
+      "description": "Trace context and baggage injected into a message when it is produced are recovered when that same message is later delivered to a per-message consumer handler: the consumer span shares the producer span trace and is its child, and any baggage set around the produce call is visible inside the consumer handler.",
+      "cases": [
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "testing message content"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "success",
+                  "records": []
+                },
+                "baggage": {
+                  "foo": "bar"
+                }
+              },
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "message": {
+                  "value": ""
+                },
+                "headersFromMessage": 0,
+                "observeBaggage": true,
+                "handler": {
+                  "behavior": "resolve"
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=ok result_records=0\nconsume_message topic=topic-name-1 delivered=ok error=none\ninject msg=0 carries=span#0\nbaggage foo=bar\nspans=2\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\nspan 1 kind=consumer name=topic-name-1 trace=t0 parent=span#0 status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n"
+        }
+      ]
+    },
+    "feature3_2_propagation_batch_links.json": {
+      "description": "When a produced message is later delivered through a per-batch consumer handler, its processing span does not become a child of the original producer span but instead carries a link back to it; the processing span remains a child of the batch receiving span, and the receiving span starts a brand-new trace distinct from the producer.",
+      "cases": [
+        {
+          "input": {
+            "config": {},
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "testing message content"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "success",
+                  "records": []
+                }
+              },
+              {
+                "action": "consume_batch",
+                "topic": "topic-name-1",
+                "partition": 0,
+                "messages": [
+                  {
+                    "value": "",
+                    "headersFromMessage": 0
+                  }
+                ],
+                "handler": {
+                  "behavior": "resolve"
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=ok result_records=0\nconsume_batch topic=topic-name-1 delivered=ok error=none\ninject msg=0 carries=span#0\nspans=3\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\nspan 1 kind=consumer name=topic-name-1 trace=t1 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=receive\nspan 2 kind=consumer name=topic-name-1 trace=t1 parent=span#1 status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n  links=span#0\n"
+        }
+      ]
+    },
+    "feature4_module_version_attribute.json": {
+      "description": "When a module-version attribute name is configured, every emitted span (producer and consumer alike) carries an attribute under that name whose value is the instrumented client library version string.",
+      "cases": [
+        {
+          "input": {
+            "config": {
+              "moduleVersionAttribute": "module.version"
+            },
+            "steps": [
+              {
+                "action": "produce",
+                "topic": "topic-name-1",
+                "messages": [
+                  {
+                    "value": "testing message content"
+                  }
+                ],
+                "clientResponse": {
+                  "status": "success",
+                  "records": []
+                }
+              }
+            ]
+          },
+          "expected_output": "produce topic=topic-name-1 status=ok result_records=0\ninject msg=0 carries=span#0\nspans=1\nspan 0 kind=producer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  module.version=<version>\n"
+        },
+        {
+          "input": {
+            "config": {
+              "moduleVersionAttribute": "module.version"
+            },
+            "steps": [
+              {
+                "action": "consume_message",
+                "topic": "topic-name-1",
+                "message": {
+                  "value": "message content",
+                  "offset": "123"
+                },
+                "handler": {
+                  "behavior": "resolve"
+                }
+              }
+            ]
+          },
+          "expected_output": "consume_message topic=topic-name-1 delivered=ok error=none\nspans=1\nspan 0 kind=consumer name=topic-name-1 trace=t0 parent=root status=unset\n  messaging.system=kafka\n  messaging.destination=topic-name-1\n  messaging.destination_kind=topic\n  messaging.operation=process\n  module.version=<version>\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C003",
+      "C004"
+    ],
+    "kept_c": [
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

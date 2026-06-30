@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that compile-time sequence toolkit we've been talking about. Basically it's a C++ metaprogramming library thing — the core idea is that developers should be able to describe lists of types or numbers at compile time and do stuff with them (inspect, transform, search, sort, etc.) without writing tons of boilerplate. The adapter layer should read JSON commands from stdin and spit out results to stdout, similar to how we handled the dispatch logic in that type-registry module we built before.
+
+The tricky parts are around how sequences get printed — there's a specific bracket format we need to follow, and the search feature has some nuance around what counts as a 'match' depending on whether you're working with types or numbers. Also the reduction feature has this weird order-sensitive rule that someone on the backend team spec'd out but I don't think it's written down anywhere obvious.
+
+We also need a test harness script that runs all the JSON case files and saves raw output per case to a specific folder structure. Output files should never mix results from different case directories. The whole thing should be organized sensibly — don't just dump everything in one file but also don't over-engineer it. Let me know if anything's unclear, I'll try to dig up the old notes.

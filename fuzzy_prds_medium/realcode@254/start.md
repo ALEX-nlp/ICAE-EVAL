@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need to build out that compile-time sequence toolkit we've been talking about. Basically it's a C++ metaprogramming library thing — the core idea is that developers should be able to describe lists of types or numbers at compile time and do stuff with them (inspect, transform, search, sort, etc.) without writing tons of boilerplate. The adapter layer should read JSON commands from stdin and spit out results to stdout, similar to how we handled the dispatch logic in that type-registry module we built before.
+
+The tricky parts are around how sequences get printed — there's a specific bracket format we need to follow, and the search feature has some nuance around what counts as a 'match' depending on whether you're working with types or numbers. Also the reduction feature has this weird order-sensitive rule that someone on the backend team spec'd out but I don't think it's written down anywhere obvious.
+
+We also need a test harness script that runs all the JSON case files and saves raw output per case to a specific folder structure. Output files should never mix results from different case directories. The whole thing should be organized sensibly — don't just dump everything in one file but also don't over-engineer it. Let me know if anything's unclear, I'll try to dig up the old notes.
+
+Quick follow-up from the questions that came in: for output formatting, sequences need to use square bracket notation with comma-separated values and no spaces, e.g. `sequence=[0,1,2]`. Single-value observations like size, front, back, found, result should come out as `key=value` on their own individual lines, and each line ends with a newline character. On the adapter side, same pattern as described before: it reads a JSON command from stdin, inspects the `task` field, routes to the right core domain function, and then prints the formatted output to stdout.
+
+A couple specifics on matching behavior too. For type sequences, the match predicate is specifically about floating-point types, e.g. float, double. For value sequences, zero counts as non-matching and any non-zero value counts as matching. If nothing matches, print `found=no` and return an empty sequence as `[]`.
+
+On the reduction rule, the order-sensitive one some folks have been calling `odd_even` or similar, the behavior is by position and it is 1-indexed: elements at odd positions are added to the accumulator, and elements at even positions multiply the accumulator. That runs left-to-right starting from the initial value provided.
+
+For reverse ranges, generation counts down from `start` inclusive and excludes `stop`, so the values are descending. If start and stop are equal, that should just produce an empty sequence. The concrete example here is start=3, stop=0 produces [3,2,1].
+
+And for the harness, it should write one file per case under `rcb_tests/stdout/<cases-dir>/`. The filename format is `{feature_file_stem}@{case_index_zero_padded_3}.txt`, e.g. `feature1_type_sequence_access@000.txt`. The `--cases-dir` flag defaults to `public_test_cases`. Different case directories should never share output folders, which is how we avoid overwrites and keep results from separate case sets from getting mixed together.

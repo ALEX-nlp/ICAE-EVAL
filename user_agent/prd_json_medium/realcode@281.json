@@ -1,0 +1,911 @@
+{
+  "fuzzy_prd": "Hey team, we've been getting complaints from integration partners that our messaging layer is basically a black box — they keep running into silent data corruption when passing structured payloads back and forth, and nobody can figure out why until it's already in prod. We need a proper codec + framing engine that handles all the low-level wire stuff so devs don't have to hand-roll byte manipulation every time.\n\nThe big pain points: nested data structures (like maps-of-maps or lists-with-mixed-types) need to survive a full encode/decode cycle without losing type info. Auth handshakes are a recurring headache — the three real mechanisms work fine but there's this 'base' one that apparently should explicitly refuse rather than silently do nothing. Also the error reporting is a mess — when something goes wrong during encoding or frame parsing, partners are getting raw stack traces instead of clean categorized errors.\n\nThere's also the chunked body reassembly thing — large messages get split across multiple transport envelopes and we need to track readiness correctly as pieces arrive.\n\nFor structure, refer to how we handled the separation of concerns in that codec module from the py-amqp work — same philosophy applies here. Multi-file layout, nothing crammed into one giant file.\n\nOutput from all operations should go to stdout in the agreed line-oriented format. cc @backend-infra for the frame writer/handler pieces specifically.\n\nA few more specifics from the questions that came back: for `b` fields, consecutive bit arguments need to share octets, and the packing order is least-significant-bit-first. That means we keep packing a run of bits together and only flush to a whole number of bytes when a non-bit field shows up or when we hit the end of the argument list. So if there’s just one true bit in the byte, it should come out as 0x01, not 0x80.\n\nOn table/array values, integer sizing needs to be explicit. Anything inside field tables and arrays that falls outside the signed 32-bit range (-2147483648 to 2147483647) needs to go out on the wire as the 64-bit signed integer code (`l`, 0x6C). If it’s within that range, use the 32-bit signed integer code (`I`, 0x49). For long-string tagged values, when decoding an `S` / 0x53 payload, try UTF-8 first. If it’s valid UTF-8, return `str:<text>`. If it’s not valid UTF-8, return `bytes:<hex>` instead of throwing or turning it into junk text.\n\nAlso, every frame needs the same hard stop at the end: the single byte 0xCE. That applies across method frames (type 1), content-header frames (type 2), body frames (type 3), and heartbeat frames (type 8). On the error side, the abstract `AMQPError` base class and the intermediate category subclasses should default to `reply_code` of 0, while the concrete ones keep their real AMQP codes, like `NotFound` with reply_code=404. And if no details are passed in, the string form should be `<TypeName: unknown error>`.\n\nA couple encoding details too: timestamps using format code `T` in argument lists, or tag `T`/0x54 in tables/arrays, are an unsigned 64-bit integer in 8 bytes, big-endian, representing Unix epoch seconds. If the input is an ISO-8601 datetime string, convert it to UTC epoch seconds before encoding. Decimals with tag `D`/0x44 are 1 byte scale followed by a 4-byte signed integer, big-endian, for the unscaled value. So `55.5` becomes scale=1, unscaled=555, and `-3.4` becomes scale=1, unscaled=-34.\n\nOne output formatting thing we should be consistent about: whenever we render recovered table values or message properties, all keys need to be emitted in lexicographic (alphabetical) sorted order. That includes field tables in round-trip output, message property output, and nested table values too. And yes, still stick to the multi-file `src/` split from the PRD — primitive-field codec, composite table/array codec, property/header codec, body reassembly, authentication mechanisms, frame I/O, and error model should each stay as their own cohesive module instead of drifting into one giant file.\n\nLast bit on auth since this came up directly: the SASL hierarchy is PLAIN, AMQPLAIN, and EXTERNAL as the concrete implementations, and the abstract BASE mechanism should not pretend to work. If its initial_response gets called, it needs to return `error=not_implemented`.",
+  "oracle_data": {
+    "task_id": "celery__py-amqp-codec-framing-engine",
+    "golden_api_signature": "def handle(command: dict) -> str",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "error format for unsupported types",
+          "what to output when encoding fails",
+          "frame_syntax error output format"
+        ],
+        "oracle_response": "When a frame-syntax error occurs (unknown format code during decode, or unsupported type during table/array encode), the output MUST be exactly two lines: `error=frame_syntax` followed by `where=<location>` where location is one of `decode`, `encode_table`, or `encode_array`. No stack traces, exception messages, or additional fields may appear."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "BASE sasl mechanism behavior",
+          "abstract auth mechanism response",
+          "what does the base authentication return"
+        ],
+        "oracle_response": "The abstract base authentication mechanism MUST NOT return any response bytes. Requesting its initial response is an unsupported operation and must output exactly: `error=not_implemented`. No partial data or fallback empty response is acceptable."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "AMQPLAIN response format",
+          "AMQPLAIN table prefix",
+          "amqplain wire encoding difference"
+        ],
+        "oracle_response": "The AMQPLAIN mechanism encodes credentials as a field table containing `LOGIN` (long-string type, 0x53) and `PASSWORD` (long-string type, 0x53) entries using standard table wire format, but with the leading 4-byte table length prefix REMOVED. The result is the raw table body bytes only."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "content header structure",
+          "what is in the content frame header",
+          "class id reserved bytes body size layout"
+        ],
+        "oracle_response": "A content-frame header payload begins with: 2 bytes class id, 2 bytes reserved (zero), 8 bytes unsigned-long body size (big-endian), then the serialized property block (flags bitmap + property list). The header may begin at a non-zero `pad` offset within the provided buffer. When body_size is zero, `ready=true`; otherwise `ready=false`."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "property flags bitmap",
+          "which bit corresponds to which property",
+          "property presence encoding order"
+        ],
+        "oracle_response": "The 16-bit property-flags bitmap encodes property presence in fixed order, most-significant bit first, in this sequence: content_type, content_encoding, application_headers, delivery_mode, priority, correlation_id, reply_to, expiration, message_id, timestamp, type, user_id, app_id, cluster_id. A set bit means the property is present and its value follows in the property list."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "body frame splitting",
+          "frame max body chunking",
+          "how body is split across frames"
+        ],
+        "oracle_response": "When writing a content message whose body exceeds the negotiated frame_max, the body MUST be split across multiple body frames (type 3). Each body frame carries at most (frame_max - 8) bytes of body payload (accounting for the 7-byte frame header and 1-byte frame-end marker). The frame writer outputs the method frame, then the content-header frame, then as many body frames as needed."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "float rendering precision",
+          "how many digits for float output",
+          "single precision float display format"
+        ],
+        "oracle_response": "Single-precision float values recovered during round-trip or decode operations MUST be rendered with six significant digits in the output (e.g., `float:32.3100` may render as `float:32.31` if trailing zeros are dropped, but must be within single-precision tolerance). The exact format is six significant digits, dropping trailing zeros after the decimal point."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid op field values",
+          "what values can op take",
+          "list all supported op values",
+          "what actions does the dispatcher handle",
+          "which op strings does the adapter support",
+          "what are the possible op inputs",
+          "tell me all the op names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'op' field. Valid values are: 'amqp_error', 'frame_writer', 'frame_handler', 'encode', 'roundtrip', 'read_item', 'decode', 'properties', 'content_header', 'content_body', 'sasl'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature10_1_error_string",
+        "trigger_keywords": [
+          "test cases for feature10 1 error string",
+          "show me feature10 1 error string test cases",
+          "what are the feature10 1 error string test inputs",
+          "give me the feature10_1_error_string test file",
+          "test cases for feature 10",
+          "feature10 1 error string expected output",
+          "what does feature10 1 error string expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_1_error_string:\n{\n  \"description\": \"Render the human-readable string of a base protocol error. With no details, the error renders a generic '<TypeName: unknown error>' form. When only a method signature (class id, method id) is given, the error renders the signature, its reply code, and its reply text. When a reply text is given, the error renders that text verbatim. The output reports the rendered string, the error type name, and the numeric reply code.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"amqp_error\",\n        \"class\": \"AMQPError\"\n      },\n      \"expected_output\": \"str=<AMQPError: unknown error>\\ntype=AMQPError\\nreply_code=0\"\n    },\n    {\n      \"input\": {\n        \"op\": \"amqp_error\",\n        \"class\": \"AMQPError\",\n        \"method_sig\": [\n          50,\n          60\n        ]\n      },\n      \"expected_output\": \"str=(50, 60): (0) None\\ntype=AMQPError\\nreply_code=0\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_2_error_subclasses",
+        "trigger_keywords": [
+          "test cases for feature10 2 error subclasses",
+          "show me feature10 2 error subclasses test cases",
+          "what are the feature10 2 error subclasses test inputs",
+          "give me the feature10_2_error_subclasses test file",
+          "test cases for feature 10",
+          "feature10 2 error subclasses expected output",
+          "what does feature10 2 error subclasses expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_2_error_subclasses:\n{\n  \"description\": \"Render the string of each concrete protocol error type when constructed with no details. Each renders the generic '<TypeName: unknown error>' form. The output also reports the type name and the type's numeric reply code (zero for the abstract categories, the assigned AMQP code for the concrete conditions).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"amqp_error\",\n        \"class\": \"NotFound\"\n      },\n      \"expected_output\": \"str=<NotFound: unknown error>\\ntype=NotFound\\nreply_code=404\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_frame_writer",
+        "trigger_keywords": [
+          "test cases for feature11 frame writer",
+          "show me feature11 frame writer test cases",
+          "what are the feature11 frame writer test inputs",
+          "give me the feature11_frame_writer test file",
+          "test cases for feature 11",
+          "feature11 frame writer expected output",
+          "what does feature11 frame writer expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_frame_writer:\n{\n  \"description\": \"Encode an outbound frame (or sequence of frames) onto the transport byte stream. A method frame carries a 1-byte frame type, a 2-byte channel, a 4-byte payload length, the method signature plus arguments, and a 0xCE frame-end byte. A content message additionally emits a content-header frame (carrying the body length and serialized properties) and one or more body frames; when the total size exceeds the negotiated frame max the body is split across multiple body frames. A string body is encoded using the message's content encoding, defaulting to UTF-8 when none is set. The output reports the full transport byte stream as hex, the number of frames sent, and (for content frames) the resulting content encoding.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"frame_writer\",\n        \"frame_max\": 512,\n        \"type\": 1,\n        \"channel\": 1,\n        \"method_sig\": [\n          50,\n          10\n        ],\n        \"args_hex\": \"787878787878787878787878787878787878787878787878787878787878\",\n        \"content\": null\n      },\n      \"expected_output\": \"wire=010001000000220032000a787878787878787878787878787878787878787878787878787878787878ce\\nbytes_sent=1\"\n    },\n    {\n      \"input\": {\n        \"op\": \"frame_writer\",\n        \"frame_max\": 512,\n        \"type\": 2,\n        \"channel\": 1,\n        \"method_sig\": [\n          60,\n          40\n        ],\n        \"args_hex\": \"78787878787878787878\",\n        \"content\": {\n          \"body_hex\": \"79797979797979797979\",\n          \"properties\": {\n            \"content_type\": \"utf-8\"\n          }\n        }\n      },\n      \"expected_output\": \"wire=02000100000000ce02000100000014003c0000000000000000000a8000057574662d38ce0300010000000a79797979797979797979ce\\nbytes_sent=1\\ncontent_encoding=none\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature12_frame_handler",
+        "trigger_keywords": [
+          "test cases for feature12 frame handler",
+          "show me feature12 frame handler test cases",
+          "what are the feature12 frame handler test inputs",
+          "give me the feature12_frame_handler test file",
+          "test cases for feature 12",
+          "feature12 frame handler expected output",
+          "what does feature12 frame handler expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_frame_handler:\n{\n  \"description\": \"Feed a sequence of inbound frames through the frame assembler and report what it dispatches. A standalone method frame for a non-content method is dispatched immediately. A content-bearing method (such as a delivery) is held until its content-header frame arrives; if the announced body size is zero the message is dispatched right away, otherwise the assembler waits for body frames and dispatches once the whole body has been collected. A heartbeat frame is consumed without dispatching anything. Receiving a frame whose type is not the one currently expected on a channel is a protocol violation, reported as a normalized error. For each frame the output reports whether it completed a dispatchable unit, and for each dispatch the channel, the method signature, and the message body (or that there was no content).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"frame_handler\",\n        \"frames\": [\n          {\n            \"type\": 1,\n            \"channel\": 1,\n            \"payload_hex\": \"003c0033\"\n          }\n        ]\n      },\n      \"expected_output\": \"complete=true\\ndispatch channel=1 method=60,51 content=no\"\n    },\n    {\n      \"input\": {\n        \"op\": \"frame_handler\",\n        \"frames\": [\n          {\n            \"type\": 1,\n            \"channel\": 1,\n            \"payload_hex\": \"003c003c\"\n          },\n          {\n            \"type\": 2,\n            \"channel\": 1,\n            \"payload_hex\": \"003c000000000000000000100000\"\n          },\n          {\n            \"type\": 3,\n            \"channel\": 1,\n            \"payload_hex\": \"746865717569636b\"\n          },\n          {\n            \"type\": 3,\n            \"channel\": 1,\n            \"payload_hex\": \"62726f776e666f78\"\n          }\n        ]\n      },\n      \"expected_output\": \"complete=false\\ncomplete=false\\ncomplete=false\\ncomplete=true\\ndispatch channel=1 method=60,60 body=bytes:746865717569636b62726f776e666f78\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_serialize_fields",
+        "trigger_keywords": [
+          "test cases for feature1 serialize fields",
+          "show me feature1 serialize fields test cases",
+          "what are the feature1 serialize fields test inputs",
+          "give me the feature1_serialize_fields test file",
+          "test cases for feature 1",
+          "feature1 serialize fields expected output",
+          "what does feature1 serialize fields expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_serialize_fields:\n{\n  \"description\": \"Serialize a positional list of AMQP method arguments into the protocol wire byte stream. The request supplies a type-code format string (one code per argument: bit, octet, short, long, long-long, float, short string, long string, byte array, timestamp) and the matching list of typed values. Consecutive bit arguments are packed together into shared octets, least-significant-bit first, while every other type is laid out in network byte order. The output is the resulting byte stream rendered as a lowercase hex string.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"encode\",\n        \"format\": \"bobBlLbsbSTx\",\n        \"values\": [\n          {\n            \"t\": \"bool\",\n            \"v\": true\n          },\n          {\n            \"t\": \"int\",\n            \"v\": 32\n          },\n          {\n            \"t\": \"bool\",\n            \"v\": false\n          },\n          {\n            \"t\": \"int\",\n            \"v\": 3415\n          },\n          {\n            \"t\": \"int\",\n            \"v\": 4513134\n          },\n          {\n            \"t\": \"int\",\n            \"v\": 13241923419\n          },\n          {\n            \"t\": \"bool\",\n            \"v\": true\n          },\n          {\n            \"t\": \"bytes\",\n            \"v\": \"746865717569636b62726f776e666f78\"\n          },\n          {\n            \"t\": \"bool\",\n            \"v\": false\n          },\n          {\n            \"t\": \"str\",\n            \"v\": \"jumpsoverthelazydog\"\n          },\n          {\n            \"t\": \"datetime\",\n            \"v\": \"2015-03-13T10:23:00\"\n          },\n          {\n            \"t\": \"bytes\",\n            \"v\": \"746865717569636bff\"\n          }\n        ]\n      },\n      \"expected_output\": \"wire=0120000d570044dd6e000000031547b75b0110746865717569636b62726f776e666f7800000000136a756d70736f7665727468656c617a79646f67000000005502ba8400000009746865717569636bff\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_table_array_roundtrip",
+        "trigger_keywords": [
+          "test cases for feature2 table array roundtrip",
+          "show me feature2 table array roundtrip test cases",
+          "what are the feature2 table array roundtrip test inputs",
+          "give me the feature2_table_array_roundtrip test file",
+          "test cases for feature 2",
+          "feature2 table array roundtrip expected output",
+          "what does feature2 table array roundtrip expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_table_array_roundtrip:\n{\n  \"description\": \"Serialize a composite value (a field table or an array) and then parse it back, reporting the recovered value so the encoder and decoder can be checked as inverses. Tables map string keys to typed values; arrays hold an ordered sequence of typed values. Element types covered include strings, signed integers (including values beyond the 32-bit range, which must promote to a wider integer code), booleans, doubles, fixed-point decimals, timestamps, and nested tables/arrays, plus a void/null element. The output renders each recovered top-level value with an explicit type tag; table keys are reported in sorted order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"roundtrip\",\n        \"format\": \"F\",\n        \"values\": [\n          {\n            \"t\": \"table\",\n            \"v\": {\n              \"foo\": {\n                \"t\": \"int\",\n                \"v\": 32\n              },\n              \"bar\": {\n                \"t\": \"str\",\n                \"v\": \"baz\"\n              },\n              \"nil\": {\n                \"t\": \"none\"\n              },\n              \"array\": {\n                \"t\": \"array\",\n                \"v\": [\n                  {\n                    \"t\": \"int\",\n                    \"v\": 1\n                  },\n                  {\n                    \"t\": \"bool\",\n                    \"v\": true\n                  },\n                  {\n                    \"t\": \"str\",\n                    \"v\": \"bar\"\n                  }\n                ]\n              }\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"table:{array=array:[int:1,bool:true,str:bar],bar=str:baz,foo=int:32,nil=none}\"\n    },\n    {\n      \"input\": {\n        \"op\": \"roundtrip\",\n        \"format\": \"A\",\n        \"values\": [\n          {\n            \"t\": \"array\",\n            \"v\": [\n              {\n                \"t\": \"str\",\n                \"v\": \"A\"\n              },\n              {\n                \"t\": \"int\",\n                \"v\": 1\n              },\n              {\n                \"t\": \"bool\",\n                \"v\": true\n              },\n              {\n                \"t\": \"float\",\n                \"v\": 33.3\n              },\n              {\n                \"t\": \"decimal\",\n                \"v\": \"55.5\"\n              },\n              {\n                \"t\": \"decimal\",\n                \"v\": \"-3.4\"\n              },\n              {\n                \"t\": \"datetime\",\n                \"v\": \"2015-03-13T10:23:00\"\n              },\n              {\n                \"t\": \"table\",\n                \"v\": {\n                  \"quick\": {\n                    \"t\": \"str\",\n                    \"v\": \"fox\"\n                  },\n                  \"amount\": {\n                    \"t\": \"int\",\n                    \"v\": 1\n                  }\n                }\n              },\n              {\n                \"t\": \"array\",\n                \"v\": [\n                  {\n                    \"t\": \"int\",\n                    \"v\": 3\n                  },\n                  {\n                    \"t\": \"str\",\n                    \"v\": \"hens\"\n                  }\n                ]\n              },\n              {\n                \"t\": \"none\"\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"array:[str:A,int:1,bool:true,float:33.3,decimal:55.5,decimal:-3.4,datetime:2015-03-13T10:23:00,table:{amount=int:1,quick=str:fox},array:[int:3,str:hens],none]\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_read_tagged_value",
+        "trigger_keywords": [
+          "test cases for feature3 read tagged value",
+          "show me feature3 read tagged value test cases",
+          "what are the feature3 read tagged value test inputs",
+          "give me the feature3_read_tagged_value test file",
+          "test cases for feature 3",
+          "feature3 read tagged value expected output",
+          "what does feature3 read tagged value expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_read_tagged_value:\n{\n  \"description\": \"Decode a single self-describing table entry from raw bytes. The first byte is a type tag selecting the value's wire encoding; the bytes that follow carry the value. Supported tags cover short and long strings, byte arrays, signed and unsigned 8/16/32-bit integers, 64-bit integers, single-precision floats, and the void/null marker. A long-string payload that is not valid UTF-8 is returned as raw bytes rather than text. Any trailing bytes beyond the value are ignored. The output renders the decoded value with an explicit type tag.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"read_item\",\n        \"wire\": \"7338746865717569636b\"\n      },\n      \"expected_output\": \"str:thequick\"\n    },\n    {\n      \"input\": {\n        \"op\": \"read_item\",\n        \"wire\": \"6201\"\n      },\n      \"expected_output\": \"int:1\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_float_roundtrip",
+        "trigger_keywords": [
+          "test cases for feature4 float roundtrip",
+          "show me feature4 float roundtrip test cases",
+          "what are the feature4 float roundtrip test inputs",
+          "give me the feature4_float_roundtrip test file",
+          "test cases for feature 4",
+          "feature4 float roundtrip expected output",
+          "what does feature4 float roundtrip expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_float_roundtrip:\n{\n  \"description\": \"Serialize and parse back a single-precision float field followed by a bit field, confirming the float value survives the round-trip within single-precision tolerance. The output renders the recovered values with explicit type tags.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"roundtrip\",\n        \"format\": \"fb\",\n        \"values\": [\n          {\n            \"t\": \"float\",\n            \"v\": 32.31\n          },\n          {\n            \"t\": \"bool\",\n            \"v\": false\n          }\n        ]\n      },\n      \"expected_output\": \"float:32.31\\nbool:false\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_invalid_types",
+        "trigger_keywords": [
+          "test cases for feature5 invalid types",
+          "show me feature5 invalid types test cases",
+          "what are the feature5 invalid types test inputs",
+          "give me the feature5_invalid_types test file",
+          "test cases for feature 5",
+          "feature5 invalid types expected output",
+          "what does feature5 invalid types expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_invalid_types:\n{\n  \"description\": \"Reject malformed serialization requests. Parsing a stream whose format string carries an unknown type code, or serializing a table or array that contains a value of an unsupported type, must fail with a normalized frame-syntax error rather than producing partial output. The output is a neutral error line naming the error category, with a field indicating where the rejection occurred.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"decode\",\n        \"format\": \"y\",\n        \"wire\": \"617364736164\"\n      },\n      \"expected_output\": \"error=frame_syntax\\nwhere=decode\"\n    },\n    {\n      \"input\": {\n        \"op\": \"encode\",\n        \"format\": \"F\",\n        \"values\": [\n          {\n            \"t\": \"table\",\n            \"v\": {\n              \"foo\": {\n                \"t\": \"unsupported\"\n              },\n              \"bar\": {\n                \"t\": \"str\",\n                \"v\": \"baz\"\n              },\n              \"nil\": {\n                \"t\": \"none\"\n              },\n              \"array\": {\n                \"t\": \"array\",\n                \"v\": [\n                  {\n                    \"t\": \"int\",\n                    \"v\": 1\n                  },\n                  {\n                    \"t\": \"bool\",\n                    \"v\": true\n                  },\n                  {\n                    \"t\": \"str\",\n                    \"v\": \"bar\"\n                  }\n                ]\n              }\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"error=frame_syntax\\nwhere=encode_table\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_message_properties",
+        "trigger_keywords": [
+          "test cases for feature6 message properties",
+          "show me feature6 message properties test cases",
+          "what are the feature6 message properties test inputs",
+          "give me the feature6_message_properties test file",
+          "test cases for feature 6",
+          "feature6 message properties expected output",
+          "what does feature6 message properties expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_message_properties:\n{\n  \"description\": \"Serialize a message's property set into the property-flags/property-list block of a content header and then parse it back. Each known property has a fixed slot and wire type (short strings for textual fields, octets for delivery mode and priority, an unsigned long for the timestamp, and a nested field table for application headers). Properties whose value is absent are not emitted and therefore do not reappear after parsing. The output reports the serialized block as hex followed by each recovered property (sorted by name) rendered with an explicit type tag.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"properties\",\n        \"properties\": {\n          \"content_type\": \"application/json\",\n          \"content_encoding\": \"utf-8\",\n          \"application_headers\": {\n            \"foo\": 1,\n            \"id\": \"id#1\"\n          },\n          \"delivery_mode\": 1,\n          \"priority\": 255,\n          \"correlation_id\": \"df31-142f-34fd-g42d\",\n          \"reply_to\": \"cosmo\",\n          \"expiration\": \"2015-12-23\",\n          \"message_id\": \"3312\",\n          \"timestamp\": 3912491234,\n          \"type\": \"generic\",\n          \"user_id\": \"george\",\n          \"app_id\": \"vandelay\",\n          \"cluster_id\": \"NYC\"\n        }\n      },\n      \"expected_output\": \"wire=fffc106170706c69636174696f6e2f6a736f6e057574662d380000001503666f6f490000000102696453000000046964233101ff13646633312d313432662d333466642d6734326405636f736d6f0a323031352d31322d3233043333313200000000e933e0e20767656e657269630667656f7267650876616e64656c6179034e5943\\napp_id=str:vandelay\\napplication_headers=table:{foo=int:1,id=str:id#1}\\ncluster_id=str:NYC\\ncontent_encoding=str:utf-8\\ncontent_type=str:application/json\\ncorrelation_id=str:df31-142f-34fd-g42d\\ndelivery_mode=int:1\\nexpiration=str:2015-12-23\\nmessage_id=str:3312\\npriority=int:255\\nreply_to=str:cosmo\\ntimestamp=int:3912491234\\ntype=str:generic\\nuser_id=str:george\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_content_header",
+        "trigger_keywords": [
+          "test cases for feature7 content header",
+          "show me feature7 content header test cases",
+          "what are the feature7 content header test inputs",
+          "give me the feature7_content_header test file",
+          "test cases for feature 7",
+          "feature7 content header expected output",
+          "what does feature7 content header expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_content_header:\n{\n  \"description\": \"Parse a content-frame header to recover the announced body size and the message properties, and report whether the message is already complete. The header begins with a class id, two reserved bytes, and an unsigned long body size, followed by the serialized property block. When the body size is zero the message is immediately ready (no body frames follow); otherwise it is not yet ready. The header may begin at a non-zero offset within the buffer. The output reports the body size, the readiness flag, and each recovered property (sorted by name).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"content_header\",\n        \"body_size\": 19,\n        \"pad\": 30,\n        \"properties\": {\n          \"content_type\": \"application/json\",\n          \"content_encoding\": \"utf-8\"\n        }\n      },\n      \"expected_output\": \"body_size=19\\nready=false\\ncontent_encoding=str:utf-8\\ncontent_type=str:application/json\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_content_body",
+        "trigger_keywords": [
+          "test cases for feature8 content body",
+          "show me feature8 content body test cases",
+          "what are the feature8 content body test inputs",
+          "give me the feature8_content_body test file",
+          "test cases for feature 8",
+          "feature8 content body expected output",
+          "what does feature8 content body expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_content_body:\n{\n  \"description\": \"Reassemble a message body delivered as a sequence of chunks. The consumer tracks how many body bytes have arrived against the announced body size, buffering partial chunks; the message becomes ready only once the accumulated length reaches the announced size, at which point the buffered chunks are concatenated in arrival order into the final body. The output reports the readiness flag after each chunk is fed and then the final assembled body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"content_body\",\n        \"body_size\": 16,\n        \"received\": 8,\n        \"pending\": [\n          \"746865\",\n          \"717569636b\"\n        ],\n        \"chunks\": [\n          \"62726f776e\",\n          \"666f78\"\n        ]\n      },\n      \"expected_output\": \"ready=false\\nready=true\\nbody_hex=746865717569636b62726f776e666f78\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_1_sasl_plain",
+        "trigger_keywords": [
+          "test cases for feature9 1 sasl plain",
+          "show me feature9 1 sasl plain test cases",
+          "what are the feature9 1 sasl plain test inputs",
+          "give me the feature9_1_sasl_plain test file",
+          "test cases for feature 9",
+          "feature9 1 sasl plain expected output",
+          "what does feature9 1 sasl plain expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_1_sasl_plain:\n{\n  \"description\": \"Produce the initial client response for the PLAIN authentication mechanism. The response is the NUL byte, the UTF-8 username, a NUL byte, and the UTF-8 password, concatenated. If either credential is absent, the mechanism declines to produce a response. The output reports the response bytes as hex, or a marker indicating no response was produced.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"sasl\",\n        \"mechanism\": \"PLAIN\",\n        \"username\": \"foo\",\n        \"password\": \"bar\"\n      },\n      \"expected_output\": \"response=00666f6f00626172\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_2_sasl_amqplain",
+        "trigger_keywords": [
+          "test cases for feature9 2 sasl amqplain",
+          "show me feature9 2 sasl amqplain test cases",
+          "what are the feature9 2 sasl amqplain test inputs",
+          "give me the feature9_2_sasl_amqplain test file",
+          "test cases for feature 9",
+          "feature9 2 sasl amqplain expected output",
+          "what does feature9 2 sasl amqplain expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_2_sasl_amqplain:\n{\n  \"description\": \"Produce the initial client response for the AMQPLAIN authentication mechanism. The response is a field table containing the LOGIN and PASSWORD entries serialized in the standard table wire format, but with the leading 4-byte table length prefix removed. If either credential is absent, the mechanism declines to produce a response. The output reports the response bytes as hex, or a marker indicating no response was produced.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"sasl\",\n        \"mechanism\": \"AMQPLAIN\",\n        \"username\": \"foo\",\n        \"password\": \"bar\"\n      },\n      \"expected_output\": \"response=054c4f47494e5300000003666f6f0850415353574f52445300000003626172\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_3_sasl_external",
+        "trigger_keywords": [
+          "test cases for feature9 3 sasl external",
+          "show me feature9 3 sasl external test cases",
+          "what are the feature9 3 sasl external test inputs",
+          "give me the feature9_3_sasl_external test file",
+          "test cases for feature 9",
+          "feature9 3 sasl external expected output",
+          "what does feature9 3 sasl external expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_3_sasl_external:\n{\n  \"description\": \"Produce the initial client response for the EXTERNAL authentication mechanism, which carries no authentication data of its own. The output reports the response bytes as hex (which is empty).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"sasl\",\n        \"mechanism\": \"EXTERNAL\"\n      },\n      \"expected_output\": \"response=\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_4_sasl_base",
+        "trigger_keywords": [
+          "test cases for feature9 4 sasl base",
+          "show me feature9 4 sasl base test cases",
+          "what are the feature9 4 sasl base test inputs",
+          "give me the feature9_4_sasl_base test file",
+          "test cases for feature 9",
+          "feature9 4 sasl base expected output",
+          "what does feature9 4 sasl base expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_4_sasl_base:\n{\n  \"description\": \"The abstract base authentication mechanism has no concrete behavior: requesting its initial response is unsupported and must be reported as a normalized not-implemented error rather than returning data.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"sasl\",\n        \"mechanism\": \"BASE\"\n      },\n      \"expected_output\": \"error=not_implemented\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "chunked body reassembly thing — large messages get split across multiple transport envelopes",
+        "actual_meaning": "Feature 8 content_body reassembly: track received bytes against announced body_size, buffer pending chunks, output `ready=false` per chunk until total received >= body_size, then output `ready=true` and `body_hex=<concatenated hex>` (feature8_content_body.json)"
+      },
+      {
+        "vague_reference": "the agreed line-oriented format",
+        "actual_meaning": "The JSON test case expected_output strings define the exact stdout contract: each field on its own line as `key=value` or `key:value`, with wire bytes as lowercase hex, properties sorted alphabetically, and error cases as `error=<category>\\nwhere=<location>`"
+      }
+    ],
+    "fallback_response": "That detail isn't something I can clarify directly — please check the test case files under rcb_tests/public_test_cases/ and the wire format specs in start.md for the authoritative contract. The expected_output fields in the JSON test cases are the ground truth for output format."
+  },
+  "public_test_cases": {
+    "feature10_1_error_string.json": {
+      "description": "Render the human-readable string of a base protocol error. With no details, the error renders a generic '<TypeName: unknown error>' form. When only a method signature (class id, method id) is given, the error renders the signature, its reply code, and its reply text. When a reply text is given, the error renders that text verbatim. The output reports the rendered string, the error type name, and the numeric reply code.",
+      "cases": [
+        {
+          "input": {
+            "op": "amqp_error",
+            "class": "AMQPError"
+          },
+          "expected_output": "str=<AMQPError: unknown error>\ntype=AMQPError\nreply_code=0"
+        },
+        {
+          "input": {
+            "op": "amqp_error",
+            "class": "AMQPError",
+            "method_sig": [
+              50,
+              60
+            ]
+          },
+          "expected_output": "str=(50, 60): (0) None\ntype=AMQPError\nreply_code=0"
+        }
+      ]
+    },
+    "feature10_2_error_subclasses.json": {
+      "description": "Render the string of each concrete protocol error type when constructed with no details. Each renders the generic '<TypeName: unknown error>' form. The output also reports the type name and the type's numeric reply code (zero for the abstract categories, the assigned AMQP code for the concrete conditions).",
+      "cases": [
+        {
+          "input": {
+            "op": "amqp_error",
+            "class": "NotFound"
+          },
+          "expected_output": "str=<NotFound: unknown error>\ntype=NotFound\nreply_code=404"
+        }
+      ]
+    },
+    "feature11_frame_writer.json": {
+      "description": "Encode an outbound frame (or sequence of frames) onto the transport byte stream. A method frame carries a 1-byte frame type, a 2-byte channel, a 4-byte payload length, the method signature plus arguments, and a 0xCE frame-end byte. A content message additionally emits a content-header frame (carrying the body length and serialized properties) and one or more body frames; when the total size exceeds the negotiated frame max the body is split across multiple body frames. A string body is encoded using the message's content encoding, defaulting to UTF-8 when none is set. The output reports the full transport byte stream as hex, the number of frames sent, and (for content frames) the resulting content encoding.",
+      "cases": [
+        {
+          "input": {
+            "op": "frame_writer",
+            "frame_max": 512,
+            "type": 1,
+            "channel": 1,
+            "method_sig": [
+              50,
+              10
+            ],
+            "args_hex": "787878787878787878787878787878787878787878787878787878787878",
+            "content": null
+          },
+          "expected_output": "wire=010001000000220032000a787878787878787878787878787878787878787878787878787878787878ce\nbytes_sent=1"
+        },
+        {
+          "input": {
+            "op": "frame_writer",
+            "frame_max": 512,
+            "type": 2,
+            "channel": 1,
+            "method_sig": [
+              60,
+              40
+            ],
+            "args_hex": "78787878787878787878",
+            "content": {
+              "body_hex": "79797979797979797979",
+              "properties": {
+                "content_type": "utf-8"
+              }
+            }
+          },
+          "expected_output": "wire=02000100000000ce02000100000014003c0000000000000000000a8000057574662d38ce0300010000000a79797979797979797979ce\nbytes_sent=1\ncontent_encoding=none"
+        }
+      ]
+    },
+    "feature12_frame_handler.json": {
+      "description": "Feed a sequence of inbound frames through the frame assembler and report what it dispatches. A standalone method frame for a non-content method is dispatched immediately. A content-bearing method (such as a delivery) is held until its content-header frame arrives; if the announced body size is zero the message is dispatched right away, otherwise the assembler waits for body frames and dispatches once the whole body has been collected. A heartbeat frame is consumed without dispatching anything. Receiving a frame whose type is not the one currently expected on a channel is a protocol violation, reported as a normalized error. For each frame the output reports whether it completed a dispatchable unit, and for each dispatch the channel, the method signature, and the message body (or that there was no content).",
+      "cases": [
+        {
+          "input": {
+            "op": "frame_handler",
+            "frames": [
+              {
+                "type": 1,
+                "channel": 1,
+                "payload_hex": "003c0033"
+              }
+            ]
+          },
+          "expected_output": "complete=true\ndispatch channel=1 method=60,51 content=no"
+        },
+        {
+          "input": {
+            "op": "frame_handler",
+            "frames": [
+              {
+                "type": 1,
+                "channel": 1,
+                "payload_hex": "003c003c"
+              },
+              {
+                "type": 2,
+                "channel": 1,
+                "payload_hex": "003c000000000000000000100000"
+              },
+              {
+                "type": 3,
+                "channel": 1,
+                "payload_hex": "746865717569636b"
+              },
+              {
+                "type": 3,
+                "channel": 1,
+                "payload_hex": "62726f776e666f78"
+              }
+            ]
+          },
+          "expected_output": "complete=false\ncomplete=false\ncomplete=false\ncomplete=true\ndispatch channel=1 method=60,60 body=bytes:746865717569636b62726f776e666f78"
+        }
+      ]
+    },
+    "feature1_serialize_fields.json": {
+      "description": "Serialize a positional list of AMQP method arguments into the protocol wire byte stream. The request supplies a type-code format string (one code per argument: bit, octet, short, long, long-long, float, short string, long string, byte array, timestamp) and the matching list of typed values. Consecutive bit arguments are packed together into shared octets, least-significant-bit first, while every other type is laid out in network byte order. The output is the resulting byte stream rendered as a lowercase hex string.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "format": "bobBlLbsbSTx",
+            "values": [
+              {
+                "t": "bool",
+                "v": true
+              },
+              {
+                "t": "int",
+                "v": 32
+              },
+              {
+                "t": "bool",
+                "v": false
+              },
+              {
+                "t": "int",
+                "v": 3415
+              },
+              {
+                "t": "int",
+                "v": 4513134
+              },
+              {
+                "t": "int",
+                "v": 13241923419
+              },
+              {
+                "t": "bool",
+                "v": true
+              },
+              {
+                "t": "bytes",
+                "v": "746865717569636b62726f776e666f78"
+              },
+              {
+                "t": "bool",
+                "v": false
+              },
+              {
+                "t": "str",
+                "v": "jumpsoverthelazydog"
+              },
+              {
+                "t": "datetime",
+                "v": "2015-03-13T10:23:00"
+              },
+              {
+                "t": "bytes",
+                "v": "746865717569636bff"
+              }
+            ]
+          },
+          "expected_output": "wire=0120000d570044dd6e000000031547b75b0110746865717569636b62726f776e666f7800000000136a756d70736f7665727468656c617a79646f67000000005502ba8400000009746865717569636bff"
+        }
+      ]
+    },
+    "feature2_table_array_roundtrip.json": {
+      "description": "Serialize a composite value (a field table or an array) and then parse it back, reporting the recovered value so the encoder and decoder can be checked as inverses. Tables map string keys to typed values; arrays hold an ordered sequence of typed values. Element types covered include strings, signed integers (including values beyond the 32-bit range, which must promote to a wider integer code), booleans, doubles, fixed-point decimals, timestamps, and nested tables/arrays, plus a void/null element. The output renders each recovered top-level value with an explicit type tag; table keys are reported in sorted order.",
+      "cases": [
+        {
+          "input": {
+            "op": "roundtrip",
+            "format": "F",
+            "values": [
+              {
+                "t": "table",
+                "v": {
+                  "foo": {
+                    "t": "int",
+                    "v": 32
+                  },
+                  "bar": {
+                    "t": "str",
+                    "v": "baz"
+                  },
+                  "nil": {
+                    "t": "none"
+                  },
+                  "array": {
+                    "t": "array",
+                    "v": [
+                      {
+                        "t": "int",
+                        "v": 1
+                      },
+                      {
+                        "t": "bool",
+                        "v": true
+                      },
+                      {
+                        "t": "str",
+                        "v": "bar"
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expected_output": "table:{array=array:[int:1,bool:true,str:bar],bar=str:baz,foo=int:32,nil=none}"
+        },
+        {
+          "input": {
+            "op": "roundtrip",
+            "format": "A",
+            "values": [
+              {
+                "t": "array",
+                "v": [
+                  {
+                    "t": "str",
+                    "v": "A"
+                  },
+                  {
+                    "t": "int",
+                    "v": 1
+                  },
+                  {
+                    "t": "bool",
+                    "v": true
+                  },
+                  {
+                    "t": "float",
+                    "v": 33.3
+                  },
+                  {
+                    "t": "decimal",
+                    "v": "55.5"
+                  },
+                  {
+                    "t": "decimal",
+                    "v": "-3.4"
+                  },
+                  {
+                    "t": "datetime",
+                    "v": "2015-03-13T10:23:00"
+                  },
+                  {
+                    "t": "table",
+                    "v": {
+                      "quick": {
+                        "t": "str",
+                        "v": "fox"
+                      },
+                      "amount": {
+                        "t": "int",
+                        "v": 1
+                      }
+                    }
+                  },
+                  {
+                    "t": "array",
+                    "v": [
+                      {
+                        "t": "int",
+                        "v": 3
+                      },
+                      {
+                        "t": "str",
+                        "v": "hens"
+                      }
+                    ]
+                  },
+                  {
+                    "t": "none"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "array:[str:A,int:1,bool:true,float:33.3,decimal:55.5,decimal:-3.4,datetime:2015-03-13T10:23:00,table:{amount=int:1,quick=str:fox},array:[int:3,str:hens],none]"
+        }
+      ]
+    },
+    "feature3_read_tagged_value.json": {
+      "description": "Decode a single self-describing table entry from raw bytes. The first byte is a type tag selecting the value's wire encoding; the bytes that follow carry the value. Supported tags cover short and long strings, byte arrays, signed and unsigned 8/16/32-bit integers, 64-bit integers, single-precision floats, and the void/null marker. A long-string payload that is not valid UTF-8 is returned as raw bytes rather than text. Any trailing bytes beyond the value are ignored. The output renders the decoded value with an explicit type tag.",
+      "cases": [
+        {
+          "input": {
+            "op": "read_item",
+            "wire": "7338746865717569636b"
+          },
+          "expected_output": "str:thequick"
+        },
+        {
+          "input": {
+            "op": "read_item",
+            "wire": "6201"
+          },
+          "expected_output": "int:1"
+        }
+      ]
+    },
+    "feature4_float_roundtrip.json": {
+      "description": "Serialize and parse back a single-precision float field followed by a bit field, confirming the float value survives the round-trip within single-precision tolerance. The output renders the recovered values with explicit type tags.",
+      "cases": [
+        {
+          "input": {
+            "op": "roundtrip",
+            "format": "fb",
+            "values": [
+              {
+                "t": "float",
+                "v": 32.31
+              },
+              {
+                "t": "bool",
+                "v": false
+              }
+            ]
+          },
+          "expected_output": "float:32.31\nbool:false"
+        }
+      ]
+    },
+    "feature5_invalid_types.json": {
+      "description": "Reject malformed serialization requests. Parsing a stream whose format string carries an unknown type code, or serializing a table or array that contains a value of an unsupported type, must fail with a normalized frame-syntax error rather than producing partial output. The output is a neutral error line naming the error category, with a field indicating where the rejection occurred.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode",
+            "format": "y",
+            "wire": "617364736164"
+          },
+          "expected_output": "error=frame_syntax\nwhere=decode"
+        },
+        {
+          "input": {
+            "op": "encode",
+            "format": "F",
+            "values": [
+              {
+                "t": "table",
+                "v": {
+                  "foo": {
+                    "t": "unsupported"
+                  },
+                  "bar": {
+                    "t": "str",
+                    "v": "baz"
+                  },
+                  "nil": {
+                    "t": "none"
+                  },
+                  "array": {
+                    "t": "array",
+                    "v": [
+                      {
+                        "t": "int",
+                        "v": 1
+                      },
+                      {
+                        "t": "bool",
+                        "v": true
+                      },
+                      {
+                        "t": "str",
+                        "v": "bar"
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expected_output": "error=frame_syntax\nwhere=encode_table"
+        }
+      ]
+    },
+    "feature6_message_properties.json": {
+      "description": "Serialize a message's property set into the property-flags/property-list block of a content header and then parse it back. Each known property has a fixed slot and wire type (short strings for textual fields, octets for delivery mode and priority, an unsigned long for the timestamp, and a nested field table for application headers). Properties whose value is absent are not emitted and therefore do not reappear after parsing. The output reports the serialized block as hex followed by each recovered property (sorted by name) rendered with an explicit type tag.",
+      "cases": [
+        {
+          "input": {
+            "op": "properties",
+            "properties": {
+              "content_type": "application/json",
+              "content_encoding": "utf-8",
+              "application_headers": {
+                "foo": 1,
+                "id": "id#1"
+              },
+              "delivery_mode": 1,
+              "priority": 255,
+              "correlation_id": "df31-142f-34fd-g42d",
+              "reply_to": "cosmo",
+              "expiration": "2015-12-23",
+              "message_id": "3312",
+              "timestamp": 3912491234,
+              "type": "generic",
+              "user_id": "george",
+              "app_id": "vandelay",
+              "cluster_id": "NYC"
+            }
+          },
+          "expected_output": "wire=fffc106170706c69636174696f6e2f6a736f6e057574662d380000001503666f6f490000000102696453000000046964233101ff13646633312d313432662d333466642d6734326405636f736d6f0a323031352d31322d3233043333313200000000e933e0e20767656e657269630667656f7267650876616e64656c6179034e5943\napp_id=str:vandelay\napplication_headers=table:{foo=int:1,id=str:id#1}\ncluster_id=str:NYC\ncontent_encoding=str:utf-8\ncontent_type=str:application/json\ncorrelation_id=str:df31-142f-34fd-g42d\ndelivery_mode=int:1\nexpiration=str:2015-12-23\nmessage_id=str:3312\npriority=int:255\nreply_to=str:cosmo\ntimestamp=int:3912491234\ntype=str:generic\nuser_id=str:george"
+        }
+      ]
+    },
+    "feature7_content_header.json": {
+      "description": "Parse a content-frame header to recover the announced body size and the message properties, and report whether the message is already complete. The header begins with a class id, two reserved bytes, and an unsigned long body size, followed by the serialized property block. When the body size is zero the message is immediately ready (no body frames follow); otherwise it is not yet ready. The header may begin at a non-zero offset within the buffer. The output reports the body size, the readiness flag, and each recovered property (sorted by name).",
+      "cases": [
+        {
+          "input": {
+            "op": "content_header",
+            "body_size": 19,
+            "pad": 30,
+            "properties": {
+              "content_type": "application/json",
+              "content_encoding": "utf-8"
+            }
+          },
+          "expected_output": "body_size=19\nready=false\ncontent_encoding=str:utf-8\ncontent_type=str:application/json"
+        }
+      ]
+    },
+    "feature8_content_body.json": {
+      "description": "Reassemble a message body delivered as a sequence of chunks. The consumer tracks how many body bytes have arrived against the announced body size, buffering partial chunks; the message becomes ready only once the accumulated length reaches the announced size, at which point the buffered chunks are concatenated in arrival order into the final body. The output reports the readiness flag after each chunk is fed and then the final assembled body.",
+      "cases": [
+        {
+          "input": {
+            "op": "content_body",
+            "body_size": 16,
+            "received": 8,
+            "pending": [
+              "746865",
+              "717569636b"
+            ],
+            "chunks": [
+              "62726f776e",
+              "666f78"
+            ]
+          },
+          "expected_output": "ready=false\nready=true\nbody_hex=746865717569636b62726f776e666f78"
+        }
+      ]
+    },
+    "feature9_1_sasl_plain.json": {
+      "description": "Produce the initial client response for the PLAIN authentication mechanism. The response is the NUL byte, the UTF-8 username, a NUL byte, and the UTF-8 password, concatenated. If either credential is absent, the mechanism declines to produce a response. The output reports the response bytes as hex, or a marker indicating no response was produced.",
+      "cases": [
+        {
+          "input": {
+            "op": "sasl",
+            "mechanism": "PLAIN",
+            "username": "foo",
+            "password": "bar"
+          },
+          "expected_output": "response=00666f6f00626172"
+        }
+      ]
+    },
+    "feature9_2_sasl_amqplain.json": {
+      "description": "Produce the initial client response for the AMQPLAIN authentication mechanism. The response is a field table containing the LOGIN and PASSWORD entries serialized in the standard table wire format, but with the leading 4-byte table length prefix removed. If either credential is absent, the mechanism declines to produce a response. The output reports the response bytes as hex, or a marker indicating no response was produced.",
+      "cases": [
+        {
+          "input": {
+            "op": "sasl",
+            "mechanism": "AMQPLAIN",
+            "username": "foo",
+            "password": "bar"
+          },
+          "expected_output": "response=054c4f47494e5300000003666f6f0850415353574f52445300000003626172"
+        }
+      ]
+    },
+    "feature9_3_sasl_external.json": {
+      "description": "Produce the initial client response for the EXTERNAL authentication mechanism, which carries no authentication data of its own. The output reports the response bytes as hex (which is empty).",
+      "cases": [
+        {
+          "input": {
+            "op": "sasl",
+            "mechanism": "EXTERNAL"
+          },
+          "expected_output": "response="
+        }
+      ]
+    },
+    "feature9_4_sasl_base.json": {
+      "description": "The abstract base authentication mechanism has no concrete behavior: requesting its initial response is unsupported and must be reported as a normalized not-implemented error rather than returning data.",
+      "cases": [
+        {
+          "input": {
+            "op": "sasl",
+            "mechanism": "BASE"
+          },
+          "expected_output": "error=not_implemented"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

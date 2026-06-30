@@ -1,0 +1,348 @@
+{
+  "fuzzy_prd": "hey team, we need to wrap up the HTTP/2 engine work we've been talking about. basically the idea is devs shouldn't have to touch raw frame bytes or worry about window accounting themselves — the library handles all that under the hood. think of it like what we did with the WebSocket abstraction layer back in Q2, same philosophy but for HTTP/2.\n\nthe main pain points we've heard from users: (1) people keep writing fragile connection code because they're manually tracking stream state and pseudo-headers, and (2) apps randomly break under load because nobody's doing proper flow-control bookkeeping. we want to fix both.\n\nscope includes: client side sending requests and reading back responses (including weird edge cases like informational responses before the real one, trailers-only responses, etc.), server side accepting requests and writing responses, ping/keepalive plumbing so we stay live without violating the protocol, some kind of raw frame inspection utility, and the window update / overflow protection stuff.\n\nthere also needs to be a test runner that someone can just kick off with a single bash command — outputs go into a specific folder structure so CI can diff them. the adapter that drives tests should be separate from the actual protocol logic, similar to how we isolated the JSON bridge in the auth service. make sure errors come back as clean category strings, not stack traces or class names.\n\none more pass on the test runner bits since folks asked how the files should land: each test case writes its raw stdout to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. For example, the first case in `feature1_1_client_request_target_normalization.json` run with `--cases-dir public_test_cases` produces `rcb_tests/stdout/public_test_cases/feature1_1_client_request_target_normalization@000.txt`. Output is namespaced by the cases-dir value so different runs never overwrite each other. The file contains only raw stdout — no PASS/FAIL annotations. Also, the test runner `rcb_tests/test.sh` defaults to `--cases-dir test_cases` when no flag is provided, and you pass `--cases-dir public_test_cases` explicitly when you want the public suite that ships with the repo.\n\nOn the windowing question, when capacity is released the engine emits both a connection-level and a stream-level WINDOW_UPDATE, and the adapter prints them in order: `window_update_stream=0\\nwindow_update_size=<n>\\nwindow_update_stream=1\\nwindow_update_size=<n>`. For the `release-capacity-window-update` operation the full expected output is `response_status=200\\nbytes_consumed=65536\\nwindow_update_stream=0\\nwindow_update_size=32768\\nwindow_update_stream=1\\nwindow_update_size=32768\\npayload_unit=16384\\n`.\n\nA couple request-shape clarifications too: a CONNECT request on the server side does not carry a path pseudo-header, and we should still accept it and expose an empty string for the path, so the adapter shows `accepted_path=` with nothing after the equals sign. If we get an origin-form request with a scheme pseudo-header but no authority pseudo-header, that is also accepted, and the adapter must output `authority_present=false` so it's clear the authority field was absent.\n\nFor request target normalization, an absolute URI like `https://example.com/foo` needs to be broken out so we get `sent_authority=example.com` and `sent_path=/foo`. An `OPTIONS` request with a `*` target keeps the asterisk exactly as-is: `sent_path=*`. And for a path-only HTTP/1.1 request, default to `sent_scheme=http` and `sent_authority=`. Related to that, a path-only request target like `uri: \"/\"` is accepted when the request declares `version: HTTP/1.1`, with that same defaulting behavior, but the same target should come back as `error=malformed_request_target` when the request is explicitly using HTTP/2 semantics, since in that mode we need an absolute URI or explicit authority on a real connection.\n\nLast thing, just reinforcing the architecture part because it came up in review: the JSON stdin/stdout adapter needs to stay physically and logically separate from the core protocol engine. Its whole job is just translating JSON command fields into idiomatic method calls on the core domain objects. The core engine should have zero dependency on JSON parsing or stdout formatting, and callers should be working with the higher-level request/response/body/ping/frame/capacity concepts while the engine handles the wire encoding underneath, same isolation pattern we used for the auth-service JSON bridge.",
+  "oracle_data": {
+    "task_id": "hyperium-h2-engine-001",
+    "golden_api_signature": "bash rcb_tests/test.sh [--cases-dir <subdir>]",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "connection-specific headers",
+          "which headers are forbidden in HTTP/2",
+          "header validation error format"
+        ],
+        "oracle_response": "Connection-specific headers (e.g., `Connection`, `Transfer-Encoding`, `Keep-Alive`) are invalid in HTTP/2 requests and must be rejected before opening a stream. The error output must be a normalized category string — never a host-language exception class name or runtime diagnostic suffix — and must include the rejected header name for header-validation failures."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "informational response handling",
+          "100-continue before final response",
+          "1xx response followed by 200"
+        ],
+        "oracle_response": "Informational (1xx) responses must not replace the final response. When a peer sends a 1xx response followed by a 2xx response, the engine must surface only the final status to the caller. The expected output for the `informational-then-final-response` operation is `final_status=200\\nbody=ok\\n`."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "trailer-only response",
+          "response with no body but has trailers",
+          "how to expose trailer count and value"
+        ],
+        "oracle_response": "A response that contains only trailers and no body data must expose zero body chunks and must surface the trailer count and the trailer value. No body chunk line should appear in the output for such a response."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "pending ping rejection",
+          "second ping before pong received",
+          "duplicate user ping error"
+        ],
+        "oracle_response": "If a user sends a second ping before the pong for the previous ping has been received, the engine must reject it with the neutral error category `error=pending_ping`. The previously outstanding pong must still be receivable after the rejection — the pending ping state is not cleared by the duplicate attempt."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "peer ping auto response",
+          "pong ack and payload format",
+          "how is the pong payload printed"
+        ],
+        "oracle_response": "When a peer sends a PING frame, the engine must automatically emit a PONG with the ACK flag set and the identical 8-byte payload. The adapter must print `pong_ack=true` and `pong_payload=[0, 0, 0, 0, 0, 0, 0, 0]` (space-separated integers inside square brackets) for a zero-filled payload."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "GOAWAY frame decoding",
+          "what fields are printed for a GOAWAY",
+          "debug data rendering in GOAWAY"
+        ],
+        "oracle_response": "A decoded GOAWAY frame must print: `frame_type=goaway`, the last processed stream identifier as `last_stream_id=<n>`, the protocol reason token (e.g., `reason=FLOW_CONTROL_ERROR`), and debug data bytes rendered as text. A decoded DATA frame must print `frame_type=data`, `stream_id=<n>`, `payload=<text>`, and `end_stream=<bool>`."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "flow control violation wire signal",
+          "what happens when peer exceeds connection window",
+          "GOAWAY reason for overflow"
+        ],
+        "oracle_response": "If a peer sends more DATA than the connection window allows, the engine must report the neutral category `flow_control_violation` on both the body and the connection, and the wire-level signal to the peer must be a GOAWAY frame with reason `FLOW_CONTROL_ERROR` and `last_stream_id=0`."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_1_client_request_target_normalization",
+        "trigger_keywords": [
+          "test cases for feature1 1 client request target normalization",
+          "show me feature1 1 client request target normalization test cases",
+          "what are the feature1 1 client request target normalization test inputs",
+          "give me the feature1_1_client_request_target_normalization test file",
+          "test cases for feature 1",
+          "feature1 1 client request target normalization expected output",
+          "what does feature1 1 client request target normalization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_client_request_target_normalization:\n{\n  \"description\": \"Client requests with permitted request-target forms are encoded into HTTP/2 pseudo-headers and receive the peer response.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"method\": \"GET\",\n        \"uri\": \"/\",\n        \"version\": \"HTTP/1.1\",\n        \"operation\": \"client-request-target\"\n      },\n      \"expected_output\": \"sent_method=GET\\nsent_path=/\\nsent_scheme=http\\nsent_authority=\\nend_stream=true\\nresponse_status=200\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_client_request_validation",
+        "trigger_keywords": [
+          "test cases for feature1 2 client request validation",
+          "show me feature1 2 client request validation test cases",
+          "what are the feature1 2 client request validation test inputs",
+          "give me the feature1_2_client_request_validation test file",
+          "test cases for feature 1",
+          "feature1 2 client request validation expected output",
+          "what does feature1 2 client request validation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_client_request_validation:\n{\n  \"description\": \"Client request creation rejects invalid HTTP/2 targets and connection-specific headers before sending a stream.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"http2-path-only-rejection\"\n      },\n      \"expected_output\": \"error=malformed_request_target\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_client_response_body_handling",
+        "trigger_keywords": [
+          "test cases for feature1 3 client response body handling",
+          "show me feature1 3 client response body handling test cases",
+          "what are the feature1 3 client response body handling test inputs",
+          "give me the feature1_3_client_response_body_handling test file",
+          "test cases for feature 1",
+          "feature1 3 client response body handling expected output",
+          "what does feature1 3 client response body handling expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_client_response_body_handling:\n{\n  \"description\": \"Client response handling preserves observable final response status, body data, empty body chunks, and trailers.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"informational-then-final-response\"\n      },\n      \"expected_output\": \"final_status=200\\nbody=ok\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_server_request_acceptance",
+        "trigger_keywords": [
+          "test cases for feature2 1 server request acceptance",
+          "show me feature2 1 server request acceptance test cases",
+          "what are the feature2 1 server request acceptance test inputs",
+          "give me the feature2_1_server_request_acceptance test file",
+          "test cases for feature 2",
+          "feature2 1 server request acceptance expected output",
+          "what does feature2 1 server request acceptance expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_server_request_acceptance:\n{\n  \"description\": \"Server-side handshakes surface accepted request method and path, then emit the configured response status on the wire.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"method\": \"GET\",\n        \"uri\": \"https://example.com/\",\n        \"operation\": \"server-request-response\"\n      },\n      \"expected_output\": \"accepted_method=GET\\naccepted_path=/\\nwire_response_status=200\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_ping_exchange",
+        "trigger_keywords": [
+          "test cases for feature3 1 ping exchange",
+          "show me feature3 1 ping exchange test cases",
+          "what are the feature3 1 ping exchange test inputs",
+          "give me the feature3_1_ping_exchange test file",
+          "test cases for feature 3",
+          "feature3 1 ping exchange expected output",
+          "what does feature3 1 ping exchange expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_ping_exchange:\n{\n  \"description\": \"Ping handling returns protocol pongs for peer pings and prevents a second user ping while the previous pong is pending.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"peer-ping-auto-pong\"\n      },\n      \"expected_output\": \"pong_ack=true\\npong_payload=[0, 0, 0, 0, 0, 0, 0, 0]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_frame_decoding",
+        "trigger_keywords": [
+          "test cases for feature4 1 frame decoding",
+          "show me feature4 1 frame decoding test cases",
+          "what are the feature4 1 frame decoding test inputs",
+          "give me the feature4_1_frame_decoding test file",
+          "test cases for feature 4",
+          "feature4 1 frame decoding expected output",
+          "what does feature4 1 frame decoding expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_frame_decoding:\n{\n  \"description\": \"Raw frame decoding exposes DATA and GOAWAY frame fields as protocol-level values.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"payload\": \"hello\",\n        \"end_stream\": false,\n        \"operation\": \"decode-data-frame\"\n      },\n      \"expected_output\": \"frame_type=data\\nstream_id=1\\npayload=hello\\nend_stream=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_flow_control_window_updates",
+        "trigger_keywords": [
+          "test cases for feature5 1 flow control window updates",
+          "show me feature5 1 flow control window updates test cases",
+          "what are the feature5 1 flow control window updates test inputs",
+          "give me the feature5_1_flow_control_window_updates test file",
+          "test cases for feature 5",
+          "feature5 1 flow control window updates expected output",
+          "what does feature5 1 flow control window updates expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_flow_control_window_updates:\n{\n  \"description\": \"Flow-control handling emits window updates after capacity release and reports protocol-visible flow-control violations.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"release-capacity-window-update\"\n      },\n      \"expected_output\": \"response_status=200\\nbytes_consumed=65536\\nwindow_update_stream=0\\nwindow_update_size=32768\\nwindow_update_stream=1\\nwindow_update_size=32768\\npayload_unit=16384\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "similar to how we isolated the JSON bridge in the auth service",
+        "actual_meaning": "The Execution/Test Adapter requirement: a physically separate entry-point file that reads JSON from stdin, calls core domain methods, and writes formatted strings to stdout — the core system must remain completely decoupled from JSON parsing (PRD Architecture Constraint #2, Deliverable #2)."
+      },
+      {
+        "vague_reference": "refer to the compatibility logic from that login module we did last time",
+        "actual_meaning": "The HTTP/1.1 vs HTTP/2 path-only target compatibility rule: path-only targets are accepted for HTTP/1.1 version requests (defaulting to scheme=http, empty authority) but are rejected with `error=malformed_request_target` for HTTP/2 explicit requests — see feature1_1 and feature1_2 test cases."
+      }
+    ],
+    "fallback_response": "I don't have specific details on that aspect. Please check the `start.md` PRD for architecture constraints, and review the test case JSON files under `rcb_tests/public_test_cases/` for the precise input/output contracts. The adapter entry point and the core engine should be kept in separate files — if something looks ambiguous, the test cases are the authoritative contract."
+  },
+  "public_test_cases": {
+    "feature1_1_client_request_target_normalization.json": {
+      "description": "Client requests with permitted request-target forms are encoded into HTTP/2 pseudo-headers and receive the peer response.",
+      "cases": [
+        {
+          "input": {
+            "method": "GET",
+            "uri": "/",
+            "version": "HTTP/1.1",
+            "operation": "client-request-target"
+          },
+          "expected_output": "sent_method=GET\nsent_path=/\nsent_scheme=http\nsent_authority=\nend_stream=true\nresponse_status=200\n"
+        }
+      ]
+    },
+    "feature1_2_client_request_validation.json": {
+      "description": "Client request creation rejects invalid HTTP/2 targets and connection-specific headers before sending a stream.",
+      "cases": [
+        {
+          "input": {
+            "operation": "http2-path-only-rejection"
+          },
+          "expected_output": "error=malformed_request_target\n"
+        }
+      ]
+    },
+    "feature1_3_client_response_body_handling.json": {
+      "description": "Client response handling preserves observable final response status, body data, empty body chunks, and trailers.",
+      "cases": [
+        {
+          "input": {
+            "operation": "informational-then-final-response"
+          },
+          "expected_output": "final_status=200\nbody=ok\n"
+        }
+      ]
+    },
+    "feature2_1_server_request_acceptance.json": {
+      "description": "Server-side handshakes surface accepted request method and path, then emit the configured response status on the wire.",
+      "cases": [
+        {
+          "input": {
+            "method": "GET",
+            "uri": "https://example.com/",
+            "operation": "server-request-response"
+          },
+          "expected_output": "accepted_method=GET\naccepted_path=/\nwire_response_status=200\n"
+        }
+      ]
+    },
+    "feature3_1_ping_exchange.json": {
+      "description": "Ping handling returns protocol pongs for peer pings and prevents a second user ping while the previous pong is pending.",
+      "cases": [
+        {
+          "input": {
+            "operation": "peer-ping-auto-pong"
+          },
+          "expected_output": "pong_ack=true\npong_payload=[0, 0, 0, 0, 0, 0, 0, 0]\n"
+        }
+      ]
+    },
+    "feature4_1_frame_decoding.json": {
+      "description": "Raw frame decoding exposes DATA and GOAWAY frame fields as protocol-level values.",
+      "cases": [
+        {
+          "input": {
+            "payload": "hello",
+            "end_stream": false,
+            "operation": "decode-data-frame"
+          },
+          "expected_output": "frame_type=data\nstream_id=1\npayload=hello\nend_stream=false\n"
+        }
+      ]
+    },
+    "feature5_1_flow_control_window_updates.json": {
+      "description": "Flow-control handling emits window updates after capacity release and reports protocol-visible flow-control violations.",
+      "cases": [
+        {
+          "input": {
+            "operation": "release-capacity-window-update"
+          },
+          "expected_output": "response_status=200\nbytes_consumed=65536\nwindow_update_stream=0\nwindow_update_size=32768\nwindow_update_stream=1\nwindow_update_size=32768\npayload_unit=16384\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C015",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 1,
+    "kept_cp": 2
+  }
+}

@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the AI client adapter work we've been scoping out. The core idea is that devs shouldn't have to hand-roll HTTP payloads every time they talk to the model service — we want them to just pass in their prompt or history or whatever resource operation they need, and get back something clean and predictable. 
+
+There are a bunch of input shapes we need to handle — plain strings, part arrays, full content objects, the works. Same for outputs: text rendering, tool calls, blocked response signals, all of it. We also need the cache and file resource flows to work properly end-to-end, including all the expiry/TTL stuff (just do it the same way we handled the media upload pipeline last quarter — you know the pattern). 
+
+One thing that keeps biting us in production: when devs pass reserved headers or hit backend errors, they get raw exception dumps instead of clean error categories. That needs to be fixed — errors should be normalized, no stack traces leaking out. 
+
+Also the conversation history validator needs to be strict — we've seen weird model behavior when histories start with the wrong role or have empty turns. And the streaming URL construction has some quirks depending on which model prefix is used. Make sure the whole thing is properly structured, not one giant file. Reach out if the expiration conflict handling isn't clear.
+
+One quick follow-up from the questions that came in: for plain input text, we should always wrap it as {"contents":[{"parts":[{"text":"<input>"}],"role":"user"}]}. If the input is an array with mixed strings and text-part objects, those all get normalized into individual text parts inside that same single user-role content. If the caller also sent extra top-level stuff like generationConfig, we keep that alongside contents instead of dropping it.
+
+On systemInstruction, we need to be flexible on what comes in but consistent on what goes out. It may show up as a plain string, an object with a top-level 'text' key, or an object with a 'parts' array, and in all three cases we normalize it to {"parts":[{"text":"<value>"}],"role":"system"} before it goes into the outgoing request.
+
+A couple file-flow specifics too: file names need the 'files/' prefix if they do not already have it. If metadata comes in without a mimeType field, return error 'missing_mime_type'. If delete or get is called with an empty or missing name, return error 'invalid_file_id'. For multipart uploads, the request needs upload-protocol set to 'multipart'. Also for the multipart upload flow described in feature9_file_resource_requests.json, it is POST to /upload/v1beta/files, set upload_protocol=multipart, and include mimeType/name/displayName in body metadata, as seen in the 'upload' operation test case.
+
+On cache creation, ttlSeconds needs to be converted to the 'ttl' wire field using the '<n>s' format, so 30 becomes '30s'. If both ttlSeconds and expireTime are provided together, reject it with error 'both_expiration_types_set'. If neither is provided, return error 'missing_expiration'. If model is missing, return error 'missing_model'. This is the same cache create validation called out in feature10_cache_resource_requests.json that rejects requests supplying both ttlSeconds and expireTime simultaneously with error 'both_expiration_types_set', and also rejects requests with neither field with error 'missing_expiration'.
+
+For cache operations more generally, list accepts pageSize and pageToken as query params. Get and delete build the URL path from the resource name, and update uses HTTP PATCH with a field mask based on whichever fields are being updated, ttl or expireTime. Cache resource names should also be normalized to include the 'cachedContents/' prefix.
+
+For the client header, we append the SDK identifier 'genai-js/__PACKAGE_VERSION__' after any caller-provided apiClient value, separated by a space. If there is no apiClient option, then it is just 'genai-js/__PACKAGE_VERSION__'. The literal string '__PACKAGE_VERSION__' is the placeholder we use in the contract.
+
+Last thing: token count should wrap content inside a generateContentRequest envelope. If model defaults include systemInstruction, tools, or a cachedContent object, merge those in too. For cachedContent, only the 'name' string gets forwarded, not the whole object. And the model string from modelDefaults should always be included.

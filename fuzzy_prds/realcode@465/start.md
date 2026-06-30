@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that document database client adapter we've been talking about. Basically devs on our side keep complaining that they're hand-rolling all these weird nested path strings and type envelopes every time they touch the database layer, and it's causing a ton of subtle bugs in production — wrong paths, broken type conversions, that kind of thing. We want a clean library that handles all of this for them.
+
+The library needs to cover the usual stuff: building and parsing those long resource name strings (you know, the wire prefix format we use), handling nested field paths safely (including the escaping logic — refer to how we handled special characters in the query builder from the last sprint), converting between our internal value types and what the wire actually expects, reading document snapshots without accidentally mutating them, navigating between collections and documents, putting together structured queries with filters/ordering/limits/cursors, and batching up write operations like creates, sets, updates, deletes, and transforms.
+
+The whole thing should be driven by a JSON command interface so we can black-box test it easily. Output needs to be pretty-printed JSON. Error cases should be handled gracefully, not just crash. Multi-file structure please, this is getting complex enough that a single god-file would be a nightmare to maintain. Python is fine.

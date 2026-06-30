@@ -1,0 +1,776 @@
+{
+  "fuzzy_prd": "# Format-String Rendering Engine - A C-style `printf` String Formatter\n\n## Project Goal\n\nBuild a small, self-contained string-formatting engine that turns a C-style format string plus a typed argument list into a rendered output string, so developers can produce precisely formatted text (numbers, strings, characters, addresses, floating-point values) without depending on a platform's standard-library `printf` family. The engine implements the classic conversion grammar — flags, field width, precision, length modifiers and conversion specifiers — with deterministic, portable output.\n\n---\n\n## Background & Problem\n\nWithout a dedicated engine, developers targeting constrained or freestanding environments are forced either to pull in a heavyweight standard-library formatter or to hand-roll ad-hoc number-to-text conversions for every call site. This leads to inconsistent padding/sign/precision behavior, subtle base-conversion bugs, and non-portable output that differs from one toolchain to the next.\n\nWith this engine, a single routine accepts a format string and a sequence of typed arguments and renders the exact result string, honoring the full classic conversion grammar uniformly across platforms.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. The core is a focused formatting engine (format-spec parsing, integer/float-to-text conversion, padding/justification, and an output sink). Keep the conversion logic cleanly separated from the request-decoding/output adapter; do not collapse unrelated responsibilities into a single god file, and do not over-engineer what is fundamentally one cohesive formatter.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases below are a **black-box testing contract** for the execution adapter, NOT the internal data model of the engine. The core formatting logic MUST remain completely decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for decoding a JSON request, marshaling the typed arguments, invoking the engine, and rendering the stdout contract.\n\n3. **Adherence to SOLID Design Principles:** Separate format-spec parsing, value conversion, justification/padding, and the output sink into distinct logical units. The engine must be open for extension (new conversions/sinks) but closed for modification, with small cohesive interfaces and high-level logic depending on an output-sink abstraction rather than concrete I/O.\n\n4. **Robustness & Interface Design:** The public entry point must be idiomatic for the target language and hide internal complexity. Edge cases (zero values with explicit precision, narrowing length modifiers, negative dynamic width/precision, non-finite floats, empty output) must be handled deterministically.\n\n---\n\n## Execution Contract (request → stdout)\n\nThe execution adapter reads ONE JSON request object from stdin:\n\n```json\n{ \"format\": \"<format string>\", \"args\": [ { \"t\": \"<type tag>\", \"v\": <number|string> }, ... ] }\n```\n\n`format` is a classic format string. `args` lists the values it consumes, in left-to-right order. Each argument carries a **type tag** `t` that fixes the width/category of the value, and (except for write-back destinations) a value `v`:\n\n- `i32` / `u32` — signed / unsigned 32-bit integer.\n- `i64` / `u64` — signed / unsigned 64-bit integer (used for `l`, `ll`, `j`, `z`, `t` length modifiers).\n- `f64` — double-precision float; `v` may be a number or one of the strings `\"inf\"`, `\"-inf\"`, `\"nan\"`.\n- `f80` — extended-precision float (used with the `L` length modifier); `v` as for `f64`.\n- `str` — a text string.\n- `ptr` — an opaque address, given as a decimal or `0x`-prefixed hex string.\n- `wb_int`, `wb_short`, `wb_long`, `wb_char`, `wb_llong`, `wb_intmax`, `wb_size`, `wb_ptrdiff` — a write-back destination of the named width (no `v`).\n\nThe adapter prints a language-neutral contract to stdout:\n\n```\n[the result line format and escape sequence specifics]<rendered string>\nlength=<integer return value: the number of characters the conversion produces>\n```\n\nIn `[the result line format and escape sequence specifics]`, every printable ASCII byte is emitted verbatim; any non-printable byte (and the backslash itself) is shown as a `\\xHH` escape so the rendered bytes are always representable. When the format contains one or more write-back conversions, one additional line `[a specific output prefix requiring doc review]<integer>` is printed per destination, in order.\n\nThe conversion grammar supported by every feature below is: an optional set of flags (`-` left-justify, `+` force sign, space reserve-sign-blank, `#` alternate form, `0` zero-pad), an optional minimum field width, an optional `.precision`, an optional length modifier (`hh`, `h`, `l`, `ll`, `j`, `z`, `t`, `L`), and a conversion specifier. Width and precision may be given literally or dynamically (see the dynamic-argument feature).\n\n---\n\n## Core Features\n\n### Feature 1: Literal Percent Sign\n\n**As a developer**, I want to emit a literal percent sign by escaping it, so I can include the character that otherwise introduces a conversion.\n\n**Expected Behavior / Usage:**\n\nA doubled percent sign renders as exactly one percent sign and consumes no argument. A single flag character placed between the two percent signs is tolerated and does not change the output. The reported length is the number of characters produced.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_percent_literal.json`\n\n```json\n{\n    \"description\": \"Render a format string in which a percent sign is escaped by doubling it, optionally with a flag character placed between the two percent signs. The engine emits a single literal percent sign and reports the number of characters produced.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%%\", \"args\": []}, \"expected_output\": \"[the result line format and escape sequence specifics]%\\nlength=1\\n\"},\n        {\"input\": {\"format\": \"%-%\", \"args\": []}, \"expected_output\": \"[the result line format and escape sequence specifics]%\\nlength=1\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Character Conversion\n\n**As a developer**, I want to render a single character from its integer code, so I can place individual bytes into formatted output.\n\n**Expected Behavior / Usage:**\n\nThe low byte of the integer argument is emitted verbatim; a code of zero produces no visible character (but still counts as one produced character). A field width pads the single character with leading spaces, or with trailing spaces when the left-justify flag is present. Sign-related flags have no effect on the emitted character. Non-printable bytes appear in `[the result line format and escape sequence specifics]` as `\\xHH` escapes.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_char.json`\n\n```json\n{\n    \"description\": \"Render a single character from its integer character code using the char conversion. The low byte of the code is emitted verbatim (a code of zero yields no visible character). Field width pads the single character with spaces on the left, or on the right when the left-justify flag is present; sign-related flags have no effect on the emitted character. The contract reports the rendered byte (non-printable bytes shown as a \\\\xHH escape) and the produced character count.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%c\", \"args\": [{\"t\": \"i32\", \"v\": 65}]}, \"expected_output\": \"[the result line format and escape sequence specifics]A\\nlength=1\\n\"},\n        {\"input\": {\"format\": \"%+c\", \"args\": [{\"t\": \"i32\", \"v\": 65}]}, \"expected_output\": \"[the result line format and escape sequence specifics]A\\nlength=1\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: String Conversion\n\n**As a developer**, I want to render text strings with optional width and precision, so I can align and truncate text fields.\n\n**Expected Behavior / Usage:**\n\nEach string conversion copies its argument; multiple conversions concatenate in order. A field width right-justifies the string within a minimum number of columns by padding with leading spaces. A precision caps the maximum number of characters copied from the source: a precision larger than the string copies it whole, and a precision of zero emits nothing. Width and precision may combine.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_string.json`\n\n```json\n{\n    \"description\": \"Render text strings using the string conversion. Multiple strings in one format are concatenated in order. A field width right-justifies the string within a minimum number of columns by padding with leading spaces. A precision caps the maximum number of characters copied from the source string; a precision larger than the string copies it whole and a precision of zero emits nothing. Width and precision may combine.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%s\", \"args\": [{\"t\": \"str\", \"v\": \"one\"}]}, \"expected_output\": \"[the result line format and escape sequence specifics]one\\nlength=3\\n\"},\n        {\"input\": {\"format\": \"%s%s%s\", \"args\": [{\"t\": \"str\", \"v\": \"one\"}, {\"t\": \"str\", \"v\": \"two\"}, {\"t\": \"str\", \"v\": \"three\"}]}, \"expected_output\": \"[the result line format and escape sequence specifics]onetwothree\\nlength=11\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Unsigned Decimal Integer\n\n**As a developer**, I want to render unsigned integers in base ten with width, precision and length modifiers, so I can format counts and sizes precisely.\n\n**Expected Behavior / Usage:**\n\nThe value is rendered in base ten with no sign. Length modifiers select the supplied value's width (default, short, char, long, long-long, and the maximum/size/pointer-difference widths); the short and char modifiers narrow the value before printing. A field width right-justifies with leading spaces, or with leading zeros under the zero flag. A precision sets a minimum digit count; a precision of zero renders the value zero as an empty string. Sign-related flags are ignored.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_unsigned_int.json`\n\n```json\n{\n    \"description\": \"Render an unsigned integer in base ten. Length modifiers select the width of the supplied value (default, short, char, long, long-long, and the maximum/size/pointer-difference widths), with the short and char modifiers narrowing the value before printing. Field width right-justifies with spaces and the zero flag pads with leading zeros; precision sets a minimum digit count, where a precision of zero renders the value zero as an empty string. Sign-related flags are ignored for unsigned values.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%u\", \"args\": [{\"t\": \"u32\", \"v\": 0}]}, \"expected_output\": \"[the result line format and escape sequence specifics]0\\nlength=1\\n\"},\n        {\"input\": {\"format\": \"%u\", \"args\": [{\"t\": \"u32\", \"v\": 4294967295}]}, \"expected_output\": \"[the result line format and escape sequence specifics]4294967295\\nlength=10\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Signed Decimal Integer\n\n**As a developer**, I want to render signed integers with sign control, width, precision and length modifiers, so I can format positive and negative numbers consistently.\n\n**Expected Behavior / Usage:**\n\nThe value is rendered in base ten with a leading minus for negatives. The plus flag forces a sign on non-negative values; the space flag reserves a leading blank for them. Length modifiers select the value width (default, char, long, long-long, and the maximum/size/pointer-difference widths); the char modifier narrows the value first. A field width right-justifies with leading spaces, or with leading zeros (placed after any sign) under the zero flag. A precision sets a minimum digit count; a precision of zero renders the value zero as an empty digit field, though a forced sign still appears. Width and precision combine.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_signed_int.json`\n\n```json\n{\n    \"description\": \"Render a signed integer in base ten. Length modifiers select the value width (default, char, long, long-long, and the maximum/size/pointer-difference widths), with the char modifier narrowing the value first. The plus flag forces a leading sign on non-negative values and the space flag reserves a leading blank for them. Field width right-justifies with spaces or, with the zero flag, with leading zeros placed after any sign. Precision sets a minimum digit count; a precision of zero renders the value zero as an empty digit field (a forced sign still appears). Width and precision combine.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%i\", \"args\": [{\"t\": \"i32\", \"v\": -2147483648}]}, \"expected_output\": \"[the result line format and escape sequence specifics]-2147483648\\nlength=11\\n\"},\n        {\"input\": {\"format\": \"%+i\", \"args\": [{\"t\": \"i32\", \"v\": 1}]}, \"expected_output\": \"[the result line format and escape sequence specifics]+1\\nlength=2\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Octal Integer\n\n**As a developer**, I want to render unsigned integers in base eight, so I can display values in octal notation.\n\n**Expected Behavior / Usage:**\n\nThe value is rendered in base eight. The alternate-form flag forces a leading zero prefix, except that the value zero already renders as a single zero. Length modifiers select and narrow the value width as for unsigned decimal. A field width right-justifies with leading spaces or zeros; a precision sets a minimum digit count, where precision zero renders zero as empty unless the alternate-form flag keeps a single zero. Sign-related flags are ignored.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_octal.json`\n\n```json\n{\n    \"description\": \"Render an unsigned integer in base eight. The alternate-form flag forces a leading zero prefix, except that the value zero already renders as a single zero. Length modifiers select and narrow the value width as for unsigned decimal. Field width right-justifies with spaces or, with the zero flag, leading zeros; precision sets a minimum digit count, where precision zero renders zero as empty unless the alternate-form flag keeps a single zero. Sign-related flags are ignored.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%o\", \"args\": [{\"t\": \"u32\", \"v\": 0}]}, \"expected_output\": \"[the result line format and escape sequence specifics]0\\nlength=1\\n\"},\n        {\"input\": {\"format\": \"%#o\", \"args\": [{\"t\": \"u32\", \"v\": 0}]}, \"expected_output\": \"[the result line format and escape sequence specifics]0\\nlength=1\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Hexadecimal Integer\n\n**As a developer**, I want to render unsigned integers in base sixteen in either letter case with an optional prefix, so I can display addresses, masks and raw values.\n\n**Expected Behavior / Usage:**\n\nThe value is rendered in base sixteen, using lowercase digits for the lowercase conversion and uppercase digits for the uppercase conversion. The alternate-form flag prepends a `0x` (or `0X`) prefix to non-zero values. Length modifiers select and narrow the value width as for unsigned decimal. A field width right-justifies with leading spaces or zeros; a precision sets a minimum digit count, where precision zero renders zero as empty. Sign flags are ignored.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_hex.json`\n\n```json\n{\n    \"description\": \"Render an unsigned integer in base sixteen, using lowercase digits for the lowercase conversion and uppercase digits for the uppercase conversion. The alternate-form flag prepends a 0x (or 0X) prefix to non-zero values. Length modifiers select and narrow the value width as for unsigned decimal. Field width right-justifies with spaces or leading zeros; precision sets a minimum digit count where precision zero renders zero as empty. Sign flags are ignored.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%x\", \"args\": [{\"t\": \"u32\", \"v\": 0}]}, \"expected_output\": \"[the result line format and escape sequence specifics]0\\nlength=1\\n\"},\n        {\"input\": {\"format\": \"%x\", \"args\": [{\"t\": \"u32\", \"v\": 305419896}]}, \"expected_output\": \"[the result line format and escape sequence specifics]12345678\\nlength=8\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 8: Pointer/Address Conversion\n\n**As a developer**, I want to render an opaque address value, so I can display memory locations in a canonical notation.\n\n**Expected Behavior / Usage:**\n\nThe pointer conversion renders the address in the engine's canonical pointer notation (a `0x`-prefixed hexadecimal form). A field width right-justifies the rendered address within a minimum number of columns by padding with leading spaces.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_pointer.json`\n\n```json\n{\n    \"description\": \"Render an opaque address value using the pointer conversion. The address is formatted in the engine's canonical pointer notation. A field width right-justifies the rendered address within a minimum number of columns by padding with leading spaces.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%p\", \"args\": [{\"t\": \"ptr\", \"v\": \"0x12345678\"}]}, \"expected_output\": \"[the result line format and escape sequence specifics]0x12345678\\nlength=10\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 9: Dynamic Width and Precision\n\n**As a developer**, I want to supply field width and/or precision as runtime arguments, so I can compute alignment dynamically.\n\n**Expected Behavior / Usage:**\n\nWhen the width and/or precision are given as `*` in the format, their values are taken from integer arguments that precede the value being formatted, consumed in left-to-right order. A negative dynamic width means left-justify within the absolute width; a negative dynamic precision is ignored (treated as absent).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_star_args.json`\n\n```json\n{\n    \"description\": \"Supply field width and/or precision dynamically as integer arguments rather than as literal digits in the format string, consumed in order before the value being formatted. A negative dynamic width means left-justify within the absolute width; a negative dynamic precision is ignored. Each dynamic value argument is read in left-to-right order.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%*c\", \"args\": [{\"t\": \"i32\", \"v\": 10}, {\"t\": \"i32\", \"v\": 90}]}, \"expected_output\": \"[the result line format and escape sequence specifics]         Z\\nlength=10\\n\"},\n        {\"input\": {\"format\": \"%*u\", \"args\": [{\"t\": \"i32\", \"v\": -6}, {\"t\": \"u32\", \"v\": 5}]}, \"expected_output\": \"[the result line format and escape sequence specifics]5     \\nlength=6\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 10: Fixed-Decimal Floating Point\n\n**As a developer**, I want to render floating-point values in fixed-decimal notation with precision, sign and padding control, so I can format measurements and ratios.\n\n**Expected Behavior / Usage:**\n\nThe value is rendered in fixed-decimal notation. The default precision is six fractional digits; an explicit precision sets the number of fractional digits, and a precision of zero drops the fractional part (the alternate-form flag then keeps a trailing decimal point). Positive and negative infinity render as the word \"infinity\" abbreviated (lowercase for the lowercase conversion, uppercase for the uppercase conversion). The plus and space flags control the leading sign of non-negative values; a field width right-justifies with leading spaces or, under the zero flag, leading zeros placed after the sign. An extended-precision length modifier is accepted on the value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_float.json`\n\n```json\n{\n    \"description\": \"Render a floating-point value in fixed-decimal notation. The default precision is six fractional digits; an explicit precision sets the number of fractional digits, and a precision of zero drops the fractional part (the alternate-form flag then keeps a trailing decimal point). Positive and negative infinity render as the word infinity (lowercase for the lowercase conversion, uppercase for the uppercase conversion). The plus and space flags control the leading sign of non-negative values; field width right-justifies with spaces or, with the zero flag, leading zeros placed after the sign. An extended-precision length modifier is accepted.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%f\", \"args\": [{\"t\": \"f64\", \"v\": \"inf\"}]}, \"expected_output\": \"[the result line format and escape sequence specifics]inf\\nlength=3\\n\"},\n        {\"input\": {\"format\": \"%f\", \"args\": [{\"t\": \"f64\", \"v\": 0.0}]}, \"expected_output\": \"[the result line format and escape sequence specifics]0.000000\\nlength=8\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 11: Not-a-Number Floating Point\n\n**As a developer**, I want not-a-number values to render as a recognizable word, so I can display the result of undefined floating-point operations.\n\n**Expected Behavior / Usage:**\n\nA not-a-number value renders as the not-a-number word: lowercase for the lowercase float conversion and uppercase for the uppercase conversion. An implementation-chosen sign character may precede the word.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_float_nan.json`\n\n```json\n{\n    \"description\": \"Render a not-a-number floating-point value. The lowercase conversion emits the lowercase not-a-number word and the uppercase conversion emits the uppercase form; an implementation-chosen sign character may precede it.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%f\", \"args\": [{\"t\": \"f64\", \"v\": \"nan\"}]}, \"expected_output\": \"[the result line format and escape sequence specifics]nan\\nlength=3\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 12: Character-Count Write-Back\n\n**As a developer**, I want a conversion that reports how many characters have been produced so far, so I can measure output length in place.\n\n**Expected Behavior / Usage:**\n\nThe write-back conversion emits no characters; instead it stores the number of characters produced so far into a caller-supplied destination. The destination's width is selected by the length modifier (default, short, char, long, long-long, and the maximum/size/pointer-difference widths). The stored count is reported on a `[a specific output prefix requiring doc review]` line, alongside the rendered text and its length.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_writeback.json`\n\n```json\n{\n    \"description\": \"Process a write-back conversion that emits no characters but stores, into a caller-supplied destination, the number of characters produced so far. The destination width is chosen by the length modifier (default, short, char, long, long-long, and the maximum/size/pointer-difference widths). The contract reports the rendered text, its length, and the stored count.\",\n    \"cases\": [\n        {\"input\": {\"format\": \"%n\", \"args\": [{\"t\": \"wb_int\"}]}, \"expected_output\": \"[the result line format and escape sequence specifics]\\nlength=0\\n[a specific output prefix requiring doc review]0\\n\"},\n        {\"input\": {\"format\": \"%s%n\", \"args\": [{\"t\": \"str\", \"v\": \"abcd\"}, {\"t\": \"wb_int\"}]}, \"expected_output\": \"[the result line format and escape sequence specifics]abcd\\nlength=4\\n[a specific output prefix requiring doc review]4\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured formatting engine implementing the conversion grammar and all conversions described above, with format-spec parsing, value-to-text conversion, justification/padding, and an output sink kept as distinct, decoupled units.\n\n2. **The Execution/Test Adapter:** A runnable program that reads ONE JSON request from stdin, marshals the typed argument list, invokes the engine, and prints the `[the result line format and escape sequence specifics]` / `length=` / `[a specific output prefix requiring doc review]` contract to stdout, strictly matching the per-feature contracts above. This adapter must be logically and physically separated from the core engine.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `public_test_cases`) to choose the directory. For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{stem}@{case_index:03d}.txt` containing **only** the raw stdout of the program under test, so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- default hex case behavior\n",
+  "oracle_data": {
+    "task_id": "charlesnicholson__nanoprintf-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C026",
+        "trigger_keywords": [
+          "what is the writeback prefix",
+          "writeback output format",
+          "how is writeback formatted",
+          "what do I see after writeback",
+          "exact writeback string"
+        ],
+        "oracle_response": "The output prefix is exactly 'writeback=' followed by the length value from the conversion."
+      },
+      {
+        "constraint_id": "C027",
+        "trigger_keywords": [
+          "how is the result line labeled",
+          "what is the escape sequence for non-printable bytes",
+          "result line format",
+          "escape sequence syntax for bytes",
+          "exact result prefix and escape style"
+        ],
+        "oracle_response": "Line 1 starts with 'result=' followed by the string. Non-printable bytes are escaped as a backslash-x pair (e.g., '\\xHH')."
+      },
+      {
+        "constraint_id": "TC_feature12_writeback",
+        "trigger_keywords": [
+          "test cases for feature12 writeback",
+          "show me feature12 writeback test cases",
+          "what are the feature12 writeback inputs and outputs",
+          "give me the feature12_writeback test file",
+          "feature12 writeback expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_writeback:\n{\n  \"description\": \"Process a write-back conversion that emits no characters but stores, into a caller-supplied destination, the number of characters produced so far. The destination width is chosen by the length modifier (default, short, char, long, long-long, and the maximum/size/pointer-difference widths). The contract reports the rendered text, its length, and the stored count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"format\": \"%n\",\n        \"args\": [\n          {\n            \"t\": \"wb_int\"\n          }\n        ]\n      },\n      \"expected_output\": \"result=\\nlength=0\\nwriteback=0\\n\"\n    },\n    {\n      \"input\": {\n        \"format\": \"%s%n\",\n        \"args\": [\n          {\n            \"t\": \"str\",\n            \"v\": \"abcd\"\n          },\n          {\n            \"t\": \"wb_int\"\n          }\n        ]\n      },\n      \"expected_output\": \"result=abcd\\nlength=4\\nwriteback=4\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "default hex case behavior",
+        "actual_meaning": "This refers to the standard lowercase alphabet (a-f) for hexadecimal digits when no explicit 'l' or 'L' casing flag is provided in the format specifier."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_float.json": {
+      "description": "Render a floating-point value in fixed-decimal notation. The default precision is six fractional digits; an explicit precision sets the number of fractional digits, and a precision of zero drops the fractional part (the alternate-form flag then keeps a trailing decimal point). Positive and negative infinity render as the word infinity (lowercase for the lowercase conversion, uppercase for the uppercase conversion). The plus and space flags control the leading sign of non-negative values; field width right-justifies with spaces or, with the zero flag, leading zeros placed after the sign. An extended-precision length modifier is accepted.",
+      "cases": [
+        {
+          "input": {
+            "format": "%f",
+            "args": [
+              {
+                "t": "f64",
+                "v": "inf"
+              }
+            ]
+          },
+          "expected_output": "result=inf\nlength=3\n"
+        },
+        {
+          "input": {
+            "format": "%f",
+            "args": [
+              {
+                "t": "f64",
+                "v": 0.0
+              }
+            ]
+          },
+          "expected_output": "result=0.000000\nlength=8\n"
+        }
+      ]
+    },
+    "feature11_float_nan.json": {
+      "description": "Render a not-a-number floating-point value. The lowercase conversion emits the lowercase not-a-number word and the uppercase conversion emits the uppercase form; an implementation-chosen sign character may precede it.",
+      "cases": [
+        {
+          "input": {
+            "format": "%f",
+            "args": [
+              {
+                "t": "f64",
+                "v": "nan"
+              }
+            ]
+          },
+          "expected_output": "result=nan\nlength=3\n"
+        }
+      ]
+    },
+    "feature12_writeback.json": {
+      "description": "Process a write-back conversion that emits no characters but stores, into a caller-supplied destination, the number of characters produced so far. The destination width is chosen by the length modifier (default, short, char, long, long-long, and the maximum/size/pointer-difference widths). The contract reports the rendered text, its length, and the stored count.",
+      "cases": [
+        {
+          "input": {
+            "format": "%n",
+            "args": [
+              {
+                "t": "wb_int"
+              }
+            ]
+          },
+          "expected_output": "result=\nlength=0\nwriteback=0\n"
+        },
+        {
+          "input": {
+            "format": "%s%n",
+            "args": [
+              {
+                "t": "str",
+                "v": "abcd"
+              },
+              {
+                "t": "wb_int"
+              }
+            ]
+          },
+          "expected_output": "result=abcd\nlength=4\nwriteback=4\n"
+        }
+      ]
+    },
+    "feature1_percent_literal.json": {
+      "description": "Render a format string in which a percent sign is escaped by doubling it, optionally with a flag character placed between the two percent signs. The engine emits a single literal percent sign and reports the number of characters produced.",
+      "cases": [
+        {
+          "input": {
+            "format": "%%",
+            "args": []
+          },
+          "expected_output": "result=%\nlength=1\n"
+        },
+        {
+          "input": {
+            "format": "%-%",
+            "args": []
+          },
+          "expected_output": "result=%\nlength=1\n"
+        }
+      ]
+    },
+    "feature2_char.json": {
+      "description": "Render a single character from its integer character code using the char conversion. The low byte of the code is emitted verbatim (a code of zero yields no visible character). Field width pads the single character with spaces on the left, or on the right when the left-justify flag is present; sign-related flags have no effect on the emitted character. The contract reports the rendered byte (non-printable bytes shown as a \\xHH escape) and the produced character count.",
+      "cases": [
+        {
+          "input": {
+            "format": "%c",
+            "args": [
+              {
+                "t": "i32",
+                "v": 65
+              }
+            ]
+          },
+          "expected_output": "result=A\nlength=1\n"
+        },
+        {
+          "input": {
+            "format": "%+c",
+            "args": [
+              {
+                "t": "i32",
+                "v": 65
+              }
+            ]
+          },
+          "expected_output": "result=A\nlength=1\n"
+        }
+      ]
+    },
+    "feature3_string.json": {
+      "description": "Render text strings using the string conversion. Multiple strings in one format are concatenated in order. A field width right-justifies the string within a minimum number of columns by padding with leading spaces. A precision caps the maximum number of characters copied from the source string; a precision larger than the string copies it whole and a precision of zero emits nothing. Width and precision may combine.",
+      "cases": [
+        {
+          "input": {
+            "format": "%s",
+            "args": [
+              {
+                "t": "str",
+                "v": "one"
+              }
+            ]
+          },
+          "expected_output": "result=one\nlength=3\n"
+        },
+        {
+          "input": {
+            "format": "%s%s%s",
+            "args": [
+              {
+                "t": "str",
+                "v": "one"
+              },
+              {
+                "t": "str",
+                "v": "two"
+              },
+              {
+                "t": "str",
+                "v": "three"
+              }
+            ]
+          },
+          "expected_output": "result=onetwothree\nlength=11\n"
+        }
+      ]
+    },
+    "feature4_unsigned_int.json": {
+      "description": "Render an unsigned integer in base ten. Length modifiers select the width of the supplied value (default, short, char, long, long-long, and the maximum/size/pointer-difference widths), with the short and char modifiers narrowing the value before printing. Field width right-justifies with spaces and the zero flag pads with leading zeros; precision sets a minimum digit count, where a precision of zero renders the value zero as an empty string. Sign-related flags are ignored for unsigned values.",
+      "cases": [
+        {
+          "input": {
+            "format": "%u",
+            "args": [
+              {
+                "t": "u32",
+                "v": 0
+              }
+            ]
+          },
+          "expected_output": "result=0\nlength=1\n"
+        },
+        {
+          "input": {
+            "format": "%u",
+            "args": [
+              {
+                "t": "u32",
+                "v": 4294967295
+              }
+            ]
+          },
+          "expected_output": "result=4294967295\nlength=10\n"
+        }
+      ]
+    },
+    "feature5_signed_int.json": {
+      "description": "Render a signed integer in base ten. Length modifiers select the value width (default, char, long, long-long, and the maximum/size/pointer-difference widths), with the char modifier narrowing the value first. The plus flag forces a leading sign on non-negative values and the space flag reserves a leading blank for them. Field width right-justifies with spaces or, with the zero flag, with leading zeros placed after any sign. Precision sets a minimum digit count; a precision of zero renders the value zero as an empty digit field (a forced sign still appears). Width and precision combine.",
+      "cases": [
+        {
+          "input": {
+            "format": "%i",
+            "args": [
+              {
+                "t": "i32",
+                "v": -2147483648
+              }
+            ]
+          },
+          "expected_output": "result=-2147483648\nlength=11\n"
+        },
+        {
+          "input": {
+            "format": "%+i",
+            "args": [
+              {
+                "t": "i32",
+                "v": 1
+              }
+            ]
+          },
+          "expected_output": "result=+1\nlength=2\n"
+        }
+      ]
+    },
+    "feature6_octal.json": {
+      "description": "Render an unsigned integer in base eight. The alternate-form flag forces a leading zero prefix, except that the value zero already renders as a single zero. Length modifiers select and narrow the value width as for unsigned decimal. Field width right-justifies with spaces or, with the zero flag, leading zeros; precision sets a minimum digit count, where precision zero renders zero as empty unless the alternate-form flag keeps a single zero. Sign-related flags are ignored.",
+      "cases": [
+        {
+          "input": {
+            "format": "%o",
+            "args": [
+              {
+                "t": "u32",
+                "v": 0
+              }
+            ]
+          },
+          "expected_output": "result=0\nlength=1\n"
+        },
+        {
+          "input": {
+            "format": "%#o",
+            "args": [
+              {
+                "t": "u32",
+                "v": 0
+              }
+            ]
+          },
+          "expected_output": "result=0\nlength=1\n"
+        }
+      ]
+    },
+    "feature7_hex.json": {
+      "description": "Render an unsigned integer in base sixteen, using lowercase digits for the lowercase conversion and uppercase digits for the uppercase conversion. The alternate-form flag prepends a 0x (or 0X) prefix to non-zero values. Length modifiers select and narrow the value width as for unsigned decimal. Field width right-justifies with spaces or leading zeros; precision sets a minimum digit count where precision zero renders zero as empty. Sign flags are ignored.",
+      "cases": [
+        {
+          "input": {
+            "format": "%x",
+            "args": [
+              {
+                "t": "u32",
+                "v": 0
+              }
+            ]
+          },
+          "expected_output": "result=0\nlength=1\n"
+        },
+        {
+          "input": {
+            "format": "%x",
+            "args": [
+              {
+                "t": "u32",
+                "v": 305419896
+              }
+            ]
+          },
+          "expected_output": "result=12345678\nlength=8\n"
+        }
+      ]
+    },
+    "feature8_pointer.json": {
+      "description": "Render an opaque address value using the pointer conversion. The address is formatted in the engine's canonical pointer notation. A field width right-justifies the rendered address within a minimum number of columns by padding with leading spaces.",
+      "cases": [
+        {
+          "input": {
+            "format": "%p",
+            "args": [
+              {
+                "t": "ptr",
+                "v": "0x12345678"
+              }
+            ]
+          },
+          "expected_output": "result=0x12345678\nlength=10\n"
+        }
+      ]
+    },
+    "feature9_star_args.json": {
+      "description": "Supply field width and/or precision dynamically as integer arguments rather than as literal digits in the format string, consumed in order before the value being formatted. A negative dynamic width means left-justify within the absolute width; a negative dynamic precision is ignored. Each dynamic value argument is read in left-to-right order.",
+      "cases": [
+        {
+          "input": {
+            "format": "%*c",
+            "args": [
+              {
+                "t": "i32",
+                "v": 10
+              },
+              {
+                "t": "i32",
+                "v": 90
+              }
+            ]
+          },
+          "expected_output": "result=         Z\nlength=10\n"
+        },
+        {
+          "input": {
+            "format": "%*u",
+            "args": [
+              {
+                "t": "i32",
+                "v": -6
+              },
+              {
+                "t": "u32",
+                "v": 5
+              }
+            ]
+          },
+          "expected_output": "result=5     \nlength=6\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "percent_literal",
+      "input_condition": "format string contains '%%'",
+      "output_rule": "Emits a single literal percent sign '%'. Does not consume arguments.",
+      "exact_values": [
+        "%"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "percent_literal",
+      "input_condition": "format contains flags between two percent signs (e.g. '%-%')",
+      "output_rule": "Flags between the escaped percent signs are ignored; only the resulting '%' is emitted.",
+      "exact_values": [
+        "%"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "char_conversion",
+      "input_condition": "conversion specifier is 'c'",
+      "output_rule": "Emits the low byte of the argument as a character. Code 0 emits no visible character but counts as 1 length.",
+      "exact_values": [
+        "c"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "char_conversion",
+      "input_condition": "flag '+' or ' ' is present with 'c'",
+      "output_rule": "Sign-related flags have no effect on the emitted character output.",
+      "exact_values": [
+        ""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "string_conversion",
+      "input_condition": "precision is 0",
+      "output_rule": "Emits an empty string for that conversion.",
+      "exact_values": [
+        "",
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "string_conversion",
+      "input_condition": "precision > string length",
+      "output_rule": "Copies the whole source string.",
+      "exact_values": [
+        ">",
+        "string_length"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "string_conversion",
+      "input_condition": "width > 0, default left-justify (no '-')",
+      "output_rule": "Pads with leading spaces to reach width.",
+      "exact_values": [
+        " ",
+        "left"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "string_conversion",
+      "input_condition": "flag '-' is present",
+      "output_rule": "Pads with trailing spaces (right-justify).",
+      "exact_values": [
+        "-"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "unsigned_int",
+      "input_condition": "length modifier 'hh' or specified",
+      "output_rule": "Narrows the value before printing (e.g., u8 from u32 arg).",
+      "exact_values": [
+        "hh",
+        "h"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "unsigned_int",
+      "input_condition": "precision is 0",
+      "output_rule": "Emits no visible characters; length is 0.",
+      "exact_values": [
+        "",
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "signed_int",
+      "input_condition": "flag '+' is present",
+      "output_rule": "Forces a leading sign on non-negative values.",
+      "exact_values": [
+        "+",
+        "non-negative"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "signed_int",
+      "input_condition": "flag ' ' is present",
+      "output_rule": "Reserves a leading blank for non-negative values.",
+      "exact_values": [
+        " "
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "signed_int",
+      "input_condition": "flag '0' is present",
+      "output_rule": "Pads with leading zeros placed AFTER any sign.",
+      "exact_values": [
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "signed_int",
+      "input_condition": "precision is 0",
+      "output_rule": "Emits an empty digit field, though the forced sign (+/-) still appears if flag is set.",
+      "exact_values": [
+        "",
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "octal_int",
+      "input_condition": "flag '#' is present and value is 0",
+      "output_rule": "Emits '0' (single zero).",
+      "exact_values": [
+        "#",
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "octal_int",
+      "input_condition": "precision is 0 and flag '#' is present",
+      "output_rule": "Emits '0' (keeps a single zero).",
+      "exact_values": [
+        "#",
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "hex_int",
+      "input_condition": "flag '#' is present and value is non-zero",
+      "output_rule": "Prepends '0x' prefix.",
+      "exact_values": [
+        "#",
+        "0x"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "hex_int",
+      "input_condition": "flag '#' is present and value is zero",
+      "output_rule": "Prepends '0x' prefix to '0' ('0x0').",
+      "exact_values": [
+        "#",
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "hex_int",
+      "input_condition": "precision is 0",
+      "output_rule": "Emits no visible characters for the number digits/shifts.",
+      "exact_values": [
+        "",
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "pointer",
+      "input_condition": "conversion specifier 'p'",
+      "output_rule": "Emits address as '0x' followed by hex string.",
+      "exact_values": [
+        "0x",
+        "hex"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "dynamic_args",
+      "input_condition": "width is '*', uses negated integer argument",
+      "output_rule": "Left-justifies the value within the absolute width.",
+      "exact_values": [
+        "-"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "dynamic_args",
+      "input_condition": "precision is '*', uses negated integer argument",
+      "output_rule": "Effectively ignored (treated as absent precision).",
+      "exact_values": [
+        "-"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "float_literal_inf",
+      "input_condition": "f64 argument is string 'inf'",
+      "output_rule": "Emits lowercase 'inf' (unless uppercase conversion is selected, not tested but implied).",
+      "exact_values": [
+        "inf"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "float_literal_nan",
+      "input_condition": "f64 argument is string 'nan'",
+      "output_rule": "Emits lowercase 'nan'.",
+      "exact_values": [
+        "nan"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "float_precision",
+      "input_condition": "precision is 0",
+      "output_rule": "Drops fractional part. If alternate form '#', keeps trailing decimal point.",
+      "exact_values": [
+        "",
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "writeback",
+      "input_condition": "conversion specifier 'n'",
+      "output_rule": "Emits nothing in result. Output 'writeback=<length_on_last_conv>'.",
+      "exact_values": [
+        "writeback=",
+        "length"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "stdout_contract",
+      "input_condition": "Conversion reflects successful render",
+      "output_rule": "Output line 1: 'result=<rendered_string>'. Escape non-printable bytes as '\\xHH'.",
+      "exact_values": [
+        "result=",
+        "\"\\xHH\"",
+        "result="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "stdout_contract",
+      "input_condition": "Conversion reflects length count",
+      "output_rule": "Output line 2: 'length=<integer>'.",
+      "exact_values": [
+        "length="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "stdout_contract",
+      "input_condition": "Write-back conversion present",
+      "output_rule": "Output line 3: 'writeback=<integer>'.",
+      "exact_values": [
+        "writeback="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "length_modifiers",
+      "input_condition": "Length modifier 'L' specified",
+      "output_rule": "Selects f80 for float conversion.",
+      "exact_values": [
+        "L"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "width_padding",
+      "input_condition": "width > actual_char_count, no alignment",
+      "output_rule": "Pads with spaces on the LEFT.",
+      "exact_values": [
+        " ",
+        "left"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "zero_padding",
+      "input_condition": "flag '0' specified",
+      "output_rule": "Pads with '0' instead of space.",
+      "exact_values": [
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "hex_case",
+      "input_condition": "case specifier not explicitly uppercase",
+      "output_rule": "Produces lowercase hex digits.",
+      "exact_values": [
+        "lowercase"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C026",
+        "replacement": "a specific output prefix requiring doc review",
+        "exact_values_to_replace": [
+          "writeback="
+        ],
+        "trigger_keywords": [
+          "what is the writeback prefix",
+          "writeback output format",
+          "how is writeback formatted",
+          "what do I see after writeback",
+          "exact writeback string"
+        ],
+        "oracle_response": "The output prefix is exactly 'writeback=' followed by the length value from the conversion."
+      },
+      {
+        "constraint_id": "C027",
+        "replacement": "the result line format and escape sequence specifics",
+        "exact_values_to_replace": [
+          "result=",
+          "\"\\xHH\"",
+          "result="
+        ],
+        "trigger_keywords": [
+          "how is the result line labeled",
+          "what is the escape sequence for non-printable bytes",
+          "result line format",
+          "escape sequence syntax for bytes",
+          "exact result prefix and escape style"
+        ],
+        "oracle_response": "Line 1 starts with 'result=' followed by the string. Non-printable bytes are escaped as a backslash-x pair (e.g., '\\xHH')."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C033",
+        "vague_phrase": "default hex case behavior",
+        "actual_meaning": "This refers to the standard lowercase alphabet (a-f) for hexadecimal digits when no explicit 'l' or 'L' casing flag is provided in the format specifier."
+      }
+    ]
+  }
+}

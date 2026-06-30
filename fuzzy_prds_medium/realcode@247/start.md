@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need to build out this mobile ads adapter layer that sits between our app code and the native ad SDKs. Basically right now every team that wants to show ads has to write all this boilerplate to talk to the platform channel, handle the async callbacks, track which ad is which, etc. It's a mess and every squad is doing it differently.
+
+The adapter should handle the full lifecycle — setting up targeting preferences (think privacy stuff, content ratings, test devices), kicking off the SDK init and reporting back what adapters came up, loading different ad formats with their own flavors of request data, and then dispatching the right callbacks when platform events come back in.
+
+One thing that came up in the Android vs iOS review — remember how we handled that unit normalization issue in the analytics pipeline last quarter? We need something similar here for the timing values that come back from the two platforms, they're in different units and need to be reconciled before surfacing to callers.
+
+Also the inline ad widgets have that double-mount footgun we've seen cause crashes in production — we need the adapter to guard against that cleanly without blowing up the host runtime.
+
+For the gateway codec piece, make sure all the structured types (requests, sizes, errors, reward payloads) survive a round-trip cleanly. The ad registry needs to hand out stable numeric IDs starting from zero and keep track of what's loaded. Full-screen ads that aren't loaded yet should fail gracefully. Ping me if the scope is unclear.
+
+Quick follow-up from the questions that came in: for the timing normalization, Android gateway returns latency as integer milliseconds, so divide by 1000 to get seconds, like 23 → 0.023. iOS gateway returns latency already in seconds as a float, so preserve it as-is, like 23 → 23.0. If latency is missing, it should render as the literal string 'null' on both platforms. Same deal anywhere we're surfacing adapter status data — the AdapterStatus codec logic should follow that exact behavior.
+
+On the registry side, the numeric integer IDs should start from 0 for the first loaded ad in a fresh session, and then each subsequent load in the same session increments by 1. We need lookup by id through registry_ad_id and an existence check through registry_has_ad. After disposal, registry_has_ad must be false and registry_ad_id must render as 'null'. Also for the event wiring, the ad needs to be loaded into the registry before the event is injected. For a loaded event, output 'callback=loaded', 'ad_id=N', 'ad_unit_id=...'. For a failed_to_load event, output 'callback=failed_to_load', 'ad_id=N', 'code=...', 'domain=...', 'message=...'. For a native_clicked event, output 'callback=native_clicked', 'ad_id=N', 'ad_unit_id=...'.
+
+For the codec output formatting, the AdRequest shape needs to come out in this order: payload=ad_request, keywords, content_url, birthday_year, gender, designed_for_families, child_directed, test_devices, non_personalized_ads. keywords and test_devices are comma-separated, and the booleans need to stay booleans rendered as lowercase 'true' or 'false', not integers. For request configuration, include 'channel=mobile_ad_gateway' and 'method=MobileAds#updateRequestConfiguration', and the fields should appear in this order: channel, method, max_content_rating, child_directed, under_age, test_device_ids. If there are multiple test device IDs, they should be comma-separated with no spaces.
+
+And for initialization output, include 'channel=mobile_ad_gateway', 'method=MobileAds#initialize', then 'adapter_count=N' where N is the number of adapter statuses returned, followed by the per-adapter fields adapter, state, description, latency_seconds. Again, if latency is missing, render the literal string 'null'.

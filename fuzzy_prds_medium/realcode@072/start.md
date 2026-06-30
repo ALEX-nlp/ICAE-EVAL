@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the autocomplete search widget thing we've been building. The basic idea is that there's a read-only field on the form, and when users tap it, a search overlay pops up so they can type and pick a value. We need this to work for both single-pick and multi-pick scenarios.
+
+A few things came up from user feedback recently: people are saying the overlay sometimes stays open when it shouldn't, or doesn't open at all when they tap the field — we need to make sure the open/close logic is solid and that we also support a mode where the parent screen controls the overlay manually (like we did with that modal pattern from the login flow).
+
+Also, the search results sometimes feel laggy or jumpy — we need the search wiring to handle both instant local data and async remote calls cleanly, including when the remote call fails.
+
+For display, selected values should show up correctly in the closed field — including when the data is a nested object, which has been a pain point. And when someone clears their selection, the field should go blank immediately.
+
+Finally, teams using this in different screens want to customize labels, button text, CSS state classes, and inject their own template content into the overlay. Make sure cleanup works too — no ghost overlays hanging around after the component is torn down.
+
+One other pass on the details the team asked about: if the caller doesn’t provide a placeholder, the search input inside the overlay should fall back to 'Click to enter a value...' and the outer field placeholder should just default to an empty string. For the close action in the overlay, the default button text is 'Done', and that button needs to carry both a button class and a clear-style class. If a team wants different copy there, they can override the default text.
+
+For multi-select, the overlay needs to show a caller-provided label for the section with already-selected items and a separate caller-provided label for the section with available search results. Also, that available-items divider/label should not be there when there are no results, and then appear once results are added. On the selected value side, if the bound model gets cleared and is set to null, undefined, or empty, the outer field needs to immediately show an empty string. Before the clear it shows the previously projected value; after the clear it shows nothing.
+
+On the overlay state styling, the container should use 'closed' by default when hidden and 'open' by default when visible. If a caller passes custom class names for those states, we should not apply the defaults at all and should only toggle the custom classes. And just to be explicit on the manual control behavior: when automatic opening is turned off with openOnClick set to false, tapping or otherwise activating the outer field should leave the overlay closed. In that setup the parent scope can open and close it through explicit open and close calls instead, which is the same manual modal-control pattern we’ve used elsewhere. This is the external overlay control mode implemented via the openOnClick=false configuration option, and it needs to coexist cleanly with the normal tap-to-open behavior along with the programmatic open/close API on the autocomplete directive.

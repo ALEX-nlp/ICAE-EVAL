@@ -1,0 +1,276 @@
+## Product Requirement Document
+
+# Documentation Knowledge-Pack Toolkit — HTML-to-Markdown Conversion, Generated-Content Cleanup, Resource Aggregation & Definition Parsing
+
+## Project Goal
+
+Build a reusable toolkit that turns scattered source documentation into clean, self-contained knowledge packs, so developers can assemble a single coherent Markdown corpus from many heterogeneous inputs without hand-cleaning each source. The toolkit converts raw HTML into Markdown, normalizes machine-generated text into ready-to-store content, aggregates a declared list of resources into one buffer (failing fast on any bad input), and parses a structured definition that ties a knowledge pack together.
+
+---
+
+## Background & Problem
+
+Teams that build reference material from existing web pages and generator output face the same recurring chores: web sources arrive as messy HTML that has to be flattened into Markdown; text produced by an upstream generator is frequently wrapped in stray code fences or front-matter that must be stripped before storage; a knowledge pack usually references several sources at once, and one missing or insecure source should abort the whole build rather than silently produce a half-empty result; and each pack is described by a small structured definition that names it, summarizes it, and lists its sources.
+
+Without a shared toolkit, every team re-implements these steps inconsistently, producing brittle converters, leaking generator artifacts into stored content, wasting effort on partially-fetched material, and inventing one-off config formats. This toolkit provides one well-defined contract for each step so the behavior is predictable, testable, and reusable.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.
+   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.
+   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single "god file". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.
+   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.
+
+3. **Adherence to SOLID Design Principles:**
+   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):
+   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.
+   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.
+
+---
+
+## Core Features
+
+### Feature 1: HTML-to-Markdown Conversion
+
+**As a developer**, I want to flatten arbitrary HTML documents into clean Markdown, so I can store heterogeneous web sources in one uniform text format.
+
+**Expected Behavior / Usage:**
+
+The converter parses an HTML fragment and walks its body, emitting Markdown. Text nodes pass through verbatim; recognized elements are rendered per the rules of each leaf below, and unrecognized elements simply contribute their inner content. The overall result is trimmed of leading and trailing whitespace. The request carries `action` `html_to_markdown` and the raw `html` string; the program prints the rendered Markdown.
+
+*1.1 Headings — the six heading levels map to hash-prefixed lines*
+
+Each heading level renders as a line that starts with as many hash characters as the heading depth, then a space, then the heading text. Adjacent headings keep the blank spacing the renderer inserts between blocks.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_1_headings.json`
+
+```json
+{
+    "description": "Convert HTML heading elements of all six levels into their Markdown equivalents. Each heading level maps to a line beginning with the matching number of hash characters followed by a space and the heading text. The input is an object carrying the raw HTML string to convert; the output is the rendered Markdown text.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<h1>Title</h1>"}, "expected_output": "# Title\n"},
+        {"input": {"action": "html_to_markdown", "html": "<h4>H4</h4><h5>H5</h5><h6>H6</h6>"}, "expected_output": "#### H4\n\n\n##### H5\n\n\n###### H6\n"}
+    ]
+}
+```
+
+*1.2 Inline emphasis — bold, italic, and strike-through spans*
+
+Strong-emphasis elements wrap their text in double asterisks, ordinary-emphasis elements wrap their text in single asterisks, and strike-through elements wrap their text in double tildes. Each emphasis kind accepts both of its common tag spellings.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_2_inline_emphasis.json`
+
+```json
+{
+    "description": "Convert inline text-emphasis HTML elements into Markdown. Strong-emphasis elements become text wrapped in double asterisks, ordinary-emphasis elements become text wrapped in single asterisks, and strike-through elements become text wrapped in double tildes. Both spellings of each emphasis kind are accepted. The input carries the raw HTML string; the output is the rendered Markdown.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<b>Bold</b>"}, "expected_output": "**Bold**\n"},
+        {"input": {"action": "html_to_markdown", "html": "<del>Deleted</del> <s>Struck</s> <strike>Strike</strike>"}, "expected_output": "~~Deleted~~ ~~Struck~~ ~~Strike~~\n"}
+    ]
+}
+```
+
+*1.3 Code — inline spans and preformatted blocks*
+
+Inline code spans wrap their text in single backticks. Preformatted blocks render as a fenced code block: a triple-backtick line, the literal block text on its own line(s), and a closing triple-backtick line.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_3_code.json`
+
+```json
+{
+    "description": "Convert HTML code markup into Markdown. Inline code spans become text wrapped in single backticks, while preformatted blocks become fenced code blocks delimited by triple-backtick lines with the literal text placed on its own lines between the fences. The input carries the raw HTML string; the output is the rendered Markdown.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<code>print(\"hello\")</code>"}, "expected_output": "`print(\"hello\")`\n"},
+        {"input": {"action": "html_to_markdown", "html": "<pre>void main() {}</pre>"}, "expected_output": "```\nvoid main() {}\n```\n"}
+    ]
+}
+```
+
+*1.4 Block structure — paragraphs, quotes, rules, breaks, and generic containers*
+
+Paragraphs render their text followed by a blank line; block quotes prefix the text with a greater-than marker; a thematic-break element renders as a three-dash horizontal rule; a hard line-break element renders as a newline inside the surrounding text; and generic structural containers (a division, a section, a main region, an article) pass their inner content through, preserving nested inline formatting.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_4_block_structure.json`
+
+```json
+{
+    "description": "Convert block-level and structural HTML into Markdown. Paragraphs render their text followed by a blank line; block quotes render the text prefixed with a greater-than marker; a thematic-break element renders as a horizontal rule of three dashes; a hard line-break element renders as a newline within the surrounding text; and generic structural containers (such as a division, a section, a main region, or an article) simply pass their inner content through, including any nested inline formatting. The input carries the raw HTML string; the output is the rendered Markdown.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<p>Hello World</p>"}, "expected_output": "Hello World\n"},
+        {"input": {"action": "html_to_markdown", "html": "<div><p>Paragraph <strong>Bold</strong></p></div>"}, "expected_output": "Paragraph **Bold**\n"}
+    ]
+}
+```
+
+*1.5 Lists — ordered and unordered items become a flat bullet list*
+
+Both unordered and ordered lists render as a flat bullet list: every item becomes a line introduced by a dash and a space, then the item text.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_5_lists.json`
+
+```json
+{
+    "description": "Convert HTML list markup into Markdown. Both unordered and ordered lists are rendered as a flat bullet list: every list item becomes a line introduced by a dash and a space followed by the item text. The input carries the raw HTML string; the output is the rendered Markdown.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<ul><li>Item 1</li><li>Item 2</li></ul>"}, "expected_output": "- Item 1\n- Item 2\n"},
+        {"input": {"action": "html_to_markdown", "html": "<ol><li>First</li><li>Second</li></ol>"}, "expected_output": "- First\n- Second\n"}
+    ]
+}
+```
+
+*1.6 Links and embedded media — hyperlinks, images, video, and inline frames*
+
+A hyperlink renders as the bracketed link text followed by the destination URL in parentheses. An image renders as an exclamation mark, the alternative text in brackets (empty when absent), then the source URL in parentheses. A video renders as a link whose label is its title (or a default label) and whose target is the direct source URL or the URL of a nested source element; with a poster image it renders as a clickable poster image linking to the video. An inline-frame element renders as a link using its title (or a default label) and its source URL.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_6_links_media.json`
+
+```json
+{
+    "description": "Convert HTML hyperlinks and embedded-media elements into Markdown. A hyperlink becomes the bracketed link text followed by the destination URL in parentheses. An image becomes an image reference: an exclamation mark, the alternative text in brackets (empty when absent), then the source URL in parentheses. A video becomes a link whose label is the supplied title (or a default label) and whose target is the direct source URL or the URL of a nested source element; when a poster image is supplied the video becomes a clickable poster image linking to the video. An inline-frame element becomes a link using its title (or a default label) and its source URL. The input carries the raw HTML string; the output is the rendered Markdown.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<a href=\"https://example.com\">Link</a>"}, "expected_output": "[Link](https://example.com)\n"},
+        {"input": {"action": "html_to_markdown", "html": "<img src=\"image.png\" alt=\"Alt Text\">"}, "expected_output": "![Alt Text](image.png)\n"},
+        {"input": {"action": "html_to_markdown", "html": "<video src=\"video.mp4\" title=\"Video Title\"></video>"}, "expected_output": "[Video Title](video.mp4)\n"}
+    ]
+}
+```
+
+*1.7 Tables — header row, divider, and body rows*
+
+A table renders as a Markdown pipe table: a pipe-delimited header row, a divider row of dashed segments (one per column), then one pipe-delimited row per body row. Header cells come from an explicit header section when present; otherwise the first row is promoted to act as the header. Cell text is trimmed.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_7_tables.json`
+
+```json
+{
+    "description": "Convert an HTML table into a Markdown pipe table. The header cells render as a pipe-delimited row, followed by a divider row of dashed segments (one per column), followed by one pipe-delimited row per body row. Header cells may come from an explicit header section; when none is present the first row is promoted to act as the header. Cell text is trimmed of surrounding whitespace. The input carries the raw HTML string; the output is the rendered Markdown.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<table>\n  <thead>\n    <tr>\n      <th>Header 1</th>\n      <th>Header 2</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <td>Cell 1</td>\n      <td>Cell 2</td>\n    </tr>\n  </tbody>\n</table>"}, "expected_output": "| Header 1 | Header 2 |\n|---|---|\n| Cell 1 | Cell 2 |\n"}
+    ]
+}
+```
+
+*1.8 Definition lists — terms and their definitions*
+
+A definition list renders each term as bold text on its own line, and each associated definition on its own line introduced by a colon and a space. Multiple term/definition pairs render in order.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_8_definition_lists.json`
+
+```json
+{
+    "description": "Convert an HTML definition list into Markdown. Each term renders as bold text on its own line, and each associated definition renders on its own line introduced by a colon and a space. Multiple term/definition pairs are rendered in order. The input carries the raw HTML string; the output is the rendered Markdown.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<dl>\n  <dt>Term 1</dt>\n  <dd>Definition 1</dd>\n  <dt>Term 2</dt>\n  <dd>Definition 2</dd>\n</dl>"}, "expected_output": "**Term 1**\n: Definition 1\n\n**Term 2**\n: Definition 2\n"}
+    ]
+}
+```
+
+*1.9 Collapsible sections — disclosure tags preserved verbatim*
+
+A collapsible-disclosure element keeps its disclosure and summary tags verbatim (because many Markdown renderers support raw HTML for collapsible sections) while its inner body content is converted to Markdown. The summary caption stays wrapped in its original tag, and the disclosure tags bracket the converted content.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_9_collapsible.json`
+
+```json
+{
+    "description": "Convert an HTML collapsible-disclosure element into output that preserves the disclosure and summary tags verbatim (because many Markdown renderers support raw HTML for collapsible sections) while converting the inner body content to Markdown. The summary caption is wrapped in its original tag, and the surrounding disclosure tags bracket the converted content. The input carries the raw HTML string; the output is the rendered result.",
+    "cases": [
+        {"input": {"action": "html_to_markdown", "html": "<details>\n  <summary>Summary</summary>\n  Details content\n</details>"}, "expected_output": "<details>\n\n  <summary>Summary</summary>\n  Details content\n\n</details>\n"}
+    ]
+}
+```
+
+---
+
+### Feature 2: Generated-Content Cleanup
+
+**As a developer**, I want to strip the wrapping artifacts an upstream generator tends to add, so the stored content is exactly the document body with no stray fences or front-matter.
+
+**Expected Behavior / Usage:**
+
+The cleanup takes a raw text string and normalizes it. If the whole text is wrapped in a single fenced code block — a fence line that may be tagged with a language name, may have surrounding whitespace, and may use any letter case — that outer fence is removed. If the text begins with, or has near its start, a delimited front-matter block (a section bracketed by triple-dash lines), everything up to and including that block is dropped. Code blocks that belong to the real content are left untouched. The result is trimmed and guaranteed to end with exactly one trailing newline. The request carries `action` `clean_content` and the raw `content` string; the program prints the cleaned text.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_clean_content.json`
+
+```json
+{
+    "description": "Clean up raw generated text so it is ready to be embedded as document content. If the text is wrapped in a single fenced code block (a fence line optionally tagged with a language, possibly with surrounding whitespace and in any letter case), the outer fence is stripped. If the text begins with — or contains near its start — a delimited front-matter block (a section bracketed by triple-dash lines), everything up to and including that block is removed. Any internal code blocks belonging to the real content are left intact. The result is trimmed and guaranteed to end with exactly one trailing newline. The input carries the raw text string; the output is the cleaned text.",
+    "cases": [
+        {"input": {"action": "clean_content", "content": "\n```markdown\n# Title\nSome content\n```\n"}, "expected_output": "# Title\nSome content\n"},
+        {"input": {"action": "clean_content", "content": "\n```markdown\n---\nkey: value\n---\n# Title\nContent with code:\n```dart\nprint('hello');\n```\n```\n"}, "expected_output": "# Title\nContent with code:\n```dart\nprint('hello');\n```\n"}
+    ]
+}
+```
+
+---
+
+### Feature 3: Resource Aggregation With Fail-Fast Validation
+
+**As a developer**, I want to aggregate a declared list of sources into one buffer and abort on the first bad source, so I never feed downstream steps partial or unsafe material.
+
+**Expected Behavior / Usage:**
+
+The aggregator walks a list of resource identifiers and appends each one's content to a single buffer, where every appended resource is introduced by a header line of the form `--- Raw content from <resource> ---` immediately followed by that resource's content. A resource that is a relative path is read from a provided base directory and appended verbatim. Validation is strict and fails fast on the first problem: a plain (non-secure) URL — one using the insecure scheme — is rejected outright; a relative path requested when no base directory is available is rejected; and a relative path that does not resolve to an existing file is rejected. A rejection is reported as a neutral error line `error=<category>` followed by a `resource=<identifier>` line, where `<category>` is one of `insecure_url`, `missing_config_dir`, or `local_file_not_found`. The request carries `action` `fetch_resources`, the `resources` list, a boolean `has_config_dir` indicating whether a base directory is available, and a `files` map of relative name to file content for any local files; the program prints the aggregated buffer or the normalized error.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature3_resource_fetching.json`
+
+```json
+{
+    "description": "Fetch a list of source resources and aggregate their textual content into a single buffer, failing fast on any problem so downstream processing is never fed partial or invalid material. Each resource that is a relative path is read from a provided base directory and appended verbatim; each appended resource is introduced by a header line naming the resource. Validation is strict: a plain (non-secure) URL is rejected outright; a relative path requested without any base directory is rejected; and a relative path that does not resolve to an existing file is rejected. Rejections surface as a neutral error category together with the offending resource identifier. The input carries the list of resources, whether a base directory is available, and the in-memory contents of any local files keyed by their relative name; the output is either the aggregated buffer or the normalized error.",
+    "cases": [
+        {"input": {"action": "fetch_resources", "resources": ["local_doc.md"], "has_config_dir": true, "files": {"local_doc.md": "# Local Doc\ncontent"}}, "expected_output": "--- Raw content from local_doc.md ---\n# Local Doc\ncontent\n"},
+        {"input": {"action": "fetch_resources", "resources": ["http://example.com/doc1"], "has_config_dir": false}, "expected_output": "[error code for scope violation ask DevOps]\nresource=http://example.com/doc1\n"}
+    ]
+}
+```
+
+---
+
+### Feature 4: Knowledge-Pack Definition Parsing
+
+**As a developer**, I want to parse the structured definition that ties a knowledge pack together, so I can read its name, summary, optional instructions, and ordered source list.
+
+**Expected Behavior / Usage:**
+
+A definition is a map that always carries a `name`, a `description`, and a `resources` list of identifiers, and may optionally carry an `instructions` string. Parsing exposes each field; the optional instructions field is treated as absent when the map omits it. The request carries `action` `parse_config` and the `config` map; the program reports each parsed field on its own line: `name=<name>`, `description=<description>`, `instructions=<instructions or the literal `<none>` when absent>`, `resource_count=<count>`, and then one `resource[<index>]=<identifier>` line per resource in order.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature4_config_parsing.json`
+
+```json
+{
+    "description": "Parse a skill definition from a configuration map and expose its fields. A definition always carries a name, a description, and a list of resource identifiers; it may optionally carry an instructions string, which is absent when the configuration omits it. The input carries the configuration map; the output reports each parsed field, including the resource count and the resources in order, with the instructions field shown as absent when not provided.",
+    "cases": [
+        {"input": {"action": "parse_config", "config": {"name": "test-skill", "description": "Test Description", "resources": ["http://example.com"]}}, "expected_output": "name=test-skill\ndescription=Test Description\ninstructions=<none>\nresource_count=1\nresource[0]=http://example.com\n"},
+        {"input": {"action": "parse_config", "config": {"name": "test-skill", "description": "Test Description", "instructions": "Do not hallucinate.", "resources": ["http://example.com"]}}, "expected_output": "name=test-skill\ndescription=Test Description\ninstructions=Do not hallucinate.\nresource_count=1\nresource[0]=http://example.com\n"}
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing the features above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the "Scale-Driven Code Organization" constraint. The core business logic (HTML conversion, content cleanup, resource aggregation, definition parsing) must be decoupled from standard I/O (stdin/stdout) and JSON parsing.
+
+2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin and prints the resulting output (or normalized error) to stdout, matching the per-feature contracts above. The request's `action` selects behavior: `html_to_markdown` converts the supplied `html`; `clean_content` cleans the supplied `content`; `fetch_resources` aggregates the supplied `resources` (using `has_config_dir` and `files`); and `parse_config` parses the supplied `config` map. Errors must be rendered as neutral `error=<category>` lines (with supporting fields such as `resource=<identifier>`) and must never leak host-language runtime details.
+
+3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- follow the [FENCE_HEADER_PATTERN] used in raw dumps

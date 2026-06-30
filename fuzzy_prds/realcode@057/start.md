@@ -1,0 +1,3 @@
+## Product Requirement Document
+
+We need the full assertion library behavior covered by the detailed contract. The adapter exposes checks for equality and non-equality, existence and non-existence, type membership and non-membership, numeric comparisons including less/greater and inclusive variants, pattern match and not-match, containment and exclusion for strings/arrays/object subsets, invalid operand handling, negated assertions, and deterministic human-readable diagnostics. Preserve exact pass/fail stdout from the public cases and hidden constraints.

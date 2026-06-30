@@ -1,0 +1,9 @@
+## Product Requirement Document
+
+We need a reusable toolkit that lets developers define a closed set of named values once and then interact with them throughout an application without scattering raw literals everywhere. Each entry in a set should have a symbolic identifier, a stored value, and a human-readable display text. When only a value is given, the display text should be derived automatically from the identifier. Display texts must support per-language overrides so the same set can be presented in multiple locales without duplicating data.
+
+The toolkit should expose the full set in several formats: an ordered list of values, a count, a minimum-to-maximum range, the full key-value-label breakdown, and a widget-ready list of label-value pairs. It should also allow lookups in both directions (identifier-to-value and value-to-identifier) returning a neutral absent marker rather than crashing on misses.
+
+Beyond the set itself, the toolkit should let a developer bind one of a host object's fields to such a set. Once bound, the field should automatically gain: a human description of its current value, optional per-entry boolean state helpers, optional per-entry mutation helpers, optional per-entry query-scope helpers (only when the host supports scoping), optional strategy-object dispatch, and validation rules. Validation defaults to an inclusion check allowing blank; a presence rule is added only when explicitly requested; all validation can be suppressed. Look at the helper-generation and scope-creation sections of the binding module to understand the prefix convention and how strategy classes are located by title-casing the entry identifier.
+
+No additional clarifications right now. The original ticket stands as written.

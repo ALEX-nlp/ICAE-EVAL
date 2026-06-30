@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a fixed-point math library for embedded targets that can't rely on hardware floating-point. The idea is that every number has a scaling factor baked into its type so the compiler tracks precision automatically instead of us doing it by hand everywhere. We had something like this in the signal processing module a while back but it was all ad-hoc — please don't repeat that mess.
+
+Basically we need: storing real numbers as scaled integers, printing them back as readable decimals, the usual math operators that behave like normal machine integers (fast, predictable), but also 'safer' named versions that don't silently lose bits when results get big. We'll also need sin/cos/sqrt for some geometry work, and the ability to pick what happens when a number doesn't fit — sometimes we want it to wrap, sometimes clamp, sometimes just blow up loudly. Oh, and some users are working with astronomically large numbers so we need a big number mode too. Finally there was that leading-bit counting thing from the DSP pipeline — include that.
+
+The code should NOT be one giant file, please keep things separated sensibly. The JSON test harness is just for validation, the actual library should be usable without any of that JSON stuff. Reach out if anything is unclear, there are a few details I probably glossed over.

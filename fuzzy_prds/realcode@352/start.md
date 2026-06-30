@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to get the embedded device build pipeline sorted out properly. Right now devs are manually copying engine binaries and plugin libraries around and it keeps going wrong on-device because things end up in the wrong place or the wrong variant gets picked. We talked about this in the last sprint retro and everyone agreed it's a time sink.
+
+Basically we need a pipeline that takes a compiled app and its native plugins and produces whatever the device runtime actually needs — the right layout, the right files, signed and ready to install. There are a few different flavors depending on whether you're doing a managed or native app, and whether you want a final installable thing or a flat module you can embed into a host app. We also need it to handle that whole situation with prebuilt libraries where only some of them are valid for your target — like what we did for the compatibility filtering in that login SDK integration a while back, same idea but for arch and api version.
+
+Also important: if someone tries to package without a signing cert set up, it should fail gracefully with a clear message rather than just blowing up. Each stage should report back exactly which files were produced so you can inspect what happened. Can someone pick this up? The JSON contract for the adapter is already roughed out somewhere in the test cases folder.

@@ -1,0 +1,854 @@
+{
+  "fuzzy_prd": "# Replica Read-Routing Library - Send Database Reads to Replicas Safely\n\n## Project Goal\n\nBuild a read-routing library for applications backed by a primary/replica database topology that lets developers send selected read queries to a replica node instead of the primary, with explicit, predictable rules for when a replica is used, when execution falls back to the primary, and when an error is raised. The library wraps a unit of work in a *distribution scope*; reads issued inside that scope are eligible for the replica while writes and transactional work continue to target the primary.\n\n---\n\n## Background & Problem\n\nWithout this library, every database read hits the primary node, even though most reads are perfectly happy to be served slightly-stale data from a replica. Developers who try to route reads manually must thread connection-selection logic through every query, reason about replication lag by hand, and remember to send writes and transactions back to the primary. This leads to error-prone boilerplate, accidental stale reads after a write, and primary nodes overloaded by traffic that could have been offloaded.\n\nWith this library, a developer wraps a block of work in a distribution scope and the routing happens automatically: reads in the scope go to a replica, writes and transactions stay on the primary, and configurable guards decide what happens when the replica is lagging or unavailable. A global mode can flip the default so that reads are distributed everywhere unless explicitly pinned back to the primary.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This system has several distinct responsibilities (scope/context state management, pool selection, lag measurement, failover policy, background-job integration, logging). It MUST NOT be a single \"god file\"; lay it out as a clear multi-file tree (core domain modules plus a separate execution/test adapter). Do not over-engineer, but do not collapse genuinely separate concerns either.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below are a **black-box contract for the execution adapter only**, not the internal data model. The core routing logic must be completely decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for translating JSON scenarios into idiomatic calls to the core domain and rendering results to stdout.\n\n3. **Adherence to SOLID Design Principles:**\n   - **SRP:** Separate scenario parsing, scope/context management, pool selection, lag measurement, failover policy, and output formatting into distinct units.\n   - **OCP:** The selection engine must be open to new routing/failover policies without modifying existing ones.\n   - **LSP:** Connection/pool abstractions must be substitutable.\n   - **ISP:** Keep the scope interface small and cohesive.\n   - **DIP:** Core logic depends on abstractions (a pool selector, a lag source), not on concrete I/O.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public entry point should be an elegant block/scope construct idiomatic to the target language, hiding pool-selection internals.\n   - **Resilience:** Edge cases (lag exceeded, lag unknown, no replicas available, invalid options) must be modeled as explicit error categories rather than generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Default Primary Routing\n\n**As a developer**, I want reads to go to the primary by default, so I can adopt the library without changing existing behavior until I opt in.\n\n**Expected Behavior / Usage:**\n\nWhen default-distribution mode is off and no distribution scope is active, every read is served by the primary node. The adapter emits one `read=<node>` line per read, where `<node>` is `primary` or `replica`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_default_routing.json`\n\n```json\n{\n    \"description\": \"With no distribution scope active and default mode off, a read is served by the primary database.\",\n    \"cases\": [\n        { \"input\": { \"program\": [ { \"op\": \"read\" } ] }, \"expected_output\": \"read=primary\\n\" }\n    ]\n}\n```\n\n---\n\n### Feature 2: Scoped Read Distribution\n\n**As a developer**, I want to wrap a block of work in a distribution scope, so that reads inside it use a replica while writes and transactions stay on the primary.\n\n**Expected Behavior / Usage:**\n\n*2.1 Reads inside a scope use the replica — writes inside the scope do not pin later reads*\n\nA read outside any scope uses the primary. Inside a distribution scope, reads use the replica. A write performed inside a plain scope does NOT pin subsequent reads back to the primary; later reads in the same scope still use the replica. Each read emits `read=primary` or `read=replica`; a `write` step produces no output.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_block_reads_replica.json`\n\n```json\n{\n    \"description\": \"A read executed outside any scope uses the primary; inside a distribution scope reads use the replica, and a write performed inside the scope does not pin later reads back to the primary.\",\n    \"cases\": [\n        {\n            \"input\": { \"program\": [\n                { \"op\": \"write\" },\n                { \"op\": \"read\" },\n                { \"op\": \"scope\", \"options\": {}, \"body\": [ { \"op\": \"read\" }, { \"op\": \"write\" }, { \"op\": \"read\" } ] }\n            ] },\n            \"expected_output\": \"read=primary\\nread=replica\\nread=replica\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Transactions inside a scope use the primary*\n\nA read wrapped in a transaction, even inside a distribution scope, is served by the primary, because transactional work must run on the writable node.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_transaction_primary.json`\n\n```json\n{\n    \"description\": \"A read wrapped in a transaction inside a distribution scope is served by the primary, because transactional work must stay on the writable node.\",\n    \"cases\": [\n        {\n            \"input\": { \"program\": [\n                { \"op\": \"scope\", \"options\": {}, \"body\": [ { \"op\": \"transaction\", \"body\": [ { \"op\": \"read\" } ] } ] }\n            ] },\n            \"expected_output\": \"read=primary\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Default-Distribution Mode\n\n**As a developer**, I want a global switch that distributes reads everywhere by default, so I can offload the primary across the whole application while keeping write-consistency guarantees.\n\n**Expected Behavior / Usage:**\n\n*3.1 Reads use the replica by default; a write pins later reads to the primary*\n\nWhen default-distribution mode is on, a plain read (outside any explicit scope) uses the replica. After a write, subsequent reads are pinned to the primary so a caller never reads its own write from a stale replica.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_by_default_sticky.json`\n\n```json\n{\n    \"description\": \"When default-distribution mode is on, a plain read uses the replica; after a write, subsequent reads are pinned to the primary for consistency.\",\n    \"cases\": [\n        {\n            \"input\": { \"by_default\": true, \"program\": [ { \"op\": \"read\" }, { \"op\": \"write\" }, { \"op\": \"read\" } ] },\n            \"expected_output\": \"read=replica\\nread=primary\\n\"\n        }\n    ]\n}\n```\n\n*3.2 A scope inside default mode keeps reads on the replica; pinning resumes after the scope*\n\nWith default-distribution mode on, reads inside an explicit distribution scope stay on the replica even after a write within that scope. Once the scope exits, the earlier write pins the next plain read to the primary.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_block_inside_default.json`\n\n```json\n{\n    \"description\": \"With default-distribution mode on, reads inside a distribution scope stay on the replica even after a write within the scope; once the scope exits, an earlier write pins the next read to the primary.\",\n    \"cases\": [\n        {\n            \"input\": { \"by_default\": true, \"program\": [\n                { \"op\": \"scope\", \"options\": {}, \"body\": [ { \"op\": \"read\" }, { \"op\": \"write\" }, { \"op\": \"read\" } ] },\n                { \"op\": \"read\" }\n            ] },\n            \"expected_output\": \"read=replica\\nread=replica\\nread=primary\\n\"\n        }\n    ]\n}\n```\n\n*3.3 Forcing the primary inside default mode*\n\nWith default-distribution mode on, opening a scope that forces the primary (`\"primary\": true`) routes that scope's reads back to the primary.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_primary_override.json`\n\n```json\n{\n    \"description\": \"With default-distribution mode on, opening a scope that forces the primary routes its reads back to the primary.\",\n    \"cases\": [\n        {\n            \"input\": { \"by_default\": true, \"program\": [\n                { \"op\": \"scope\", \"options\": { \"primary\": true }, \"body\": [ { \"op\": \"read\" } ] }\n            ] },\n            \"expected_output\": \"read=primary\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Replica-Lag Guard\n\n**As a developer**, I want to refuse (or down-route) replica reads when replication lag is too high, so I never serve dangerously stale data.\n\n**Expected Behavior / Usage:**\n\nA scope may declare a maximum acceptable lag in seconds (`\"max_lag\": N`). Before running, the library measures the replica lag and compares it to the threshold. The threshold may also be configured globally via `default_options`. In these contracts the measured lag is supplied by the scenario via the `\"lag\"` field (a number, or `null` when the lag cannot be determined); when `\"lag\"` is absent, the live value is measured.\n\n*4.1 Lag over threshold raises*\n\nWhen the measured lag exceeds the threshold, opening the scope raises a lag-exceeded error before any read runs. The error renders as `error=too_much_lag` plus a `message=` line stating the threshold. The same outcome holds whether the threshold is supplied per scope or via global defaults.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_max_lag_exceeded.json`\n\n```json\n{\n    \"description\": \"When a maximum replica-lag threshold is set and the measured lag exceeds it, opening the scope raises a lag-exceeded error before any read runs. The threshold may be supplied per scope or via global defaults.\",\n    \"cases\": [\n        {\n            \"input\": { \"lag\": 2, \"program\": [ { \"op\": \"scope\", \"options\": { \"max_lag\": 1 }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"error=too_much_lag\\nmessage=[the default message for replica lag errors on the tree] 1 seconds\\n\"\n        }\n    ]\n}\n```\n\n*4.2 Lag at or below threshold proceeds on the replica*\n\nWhen the measured lag is at or below the threshold (whether supplied low or measured live), reads proceed on the replica with no error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_max_lag_under.json`\n\n```json\n{\n    \"description\": \"When a maximum replica-lag threshold is set and the measured lag is at or below it (whether stubbed low or measured live), reads proceed on the replica.\",\n    \"cases\": [\n        {\n            \"input\": { \"lag\": 0, \"program\": [ { \"op\": \"scope\", \"options\": { \"max_lag\": 1 }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"read=replica\\n\"\n        }\n    ]\n}\n```\n\n*4.3 Unknown lag raises and names the connection*\n\nWhen the replica lag cannot be determined (`\"lag\": null`) and a threshold is set, opening the scope raises a lag-exceeded error whose message states the lag is unknown on the named connection (the default connection renders as `default`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_lag_unknown.json`\n\n```json\n{\n    \"description\": \"When the replica lag cannot be determined (unknown/nil) and a lag threshold is set, opening the scope raises a lag-exceeded error naming the connection.\",\n    \"cases\": [\n        {\n            \"input\": { \"lag\": null, \"program\": [ { \"op\": \"scope\", \"options\": { \"max_lag\": 1 }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"error=too_much_lag\\nmessage=Replica lag is nil on default\\n\"\n        }\n    ]\n}\n```\n\n*4.4 Lag failover routes to the primary instead of raising*\n\nWhen lag failover is enabled (`\"lag_failover\": true`), exceeding the threshold — or being unable to measure lag — does not raise. Instead a message is logged (rendered as a `log=` line) and reads fall back to the primary for that scope.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_4_lag_failover.json`\n\n```json\n{\n    \"description\": \"When lag failover is enabled, exceeding the lag threshold (or being unable to measure lag) does not raise; instead a message is logged and reads fall back to the primary.\",\n    \"cases\": [\n        {\n            \"input\": { \"lag\": 2, \"program\": [ { \"op\": \"scope\", \"options\": { \"max_lag\": 1, \"lag_failover\": true }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"log=[the default message for replica lag errors on the tree] 1 seconds. Falling back to master pool.\\nread=primary\\n\"\n        },\n        {\n            \"input\": { \"lag\": null, \"program\": [ { \"op\": \"scope\", \"options\": { \"max_lag\": 1, \"lag_failover\": true }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"log=Replica lag is nil on default. Falling back to master pool.\\nread=primary\\n\"\n        }\n    ]\n}\n```\n\n*4.5 Lag checked against a named connection*\n\nThe lag check may be targeted at a specific named connection (`\"lag_on\": \"<name>\"`, or a list of names). When that connection's lag exceeds the threshold, the raised error names the connection.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_5_lag_on_connection.json`\n\n```json\n{\n    \"description\": \"When the lag threshold is checked against a named connection (supplied singly or as a list) and that connection's lag exceeds the threshold, the raised error names that connection.\",\n    \"cases\": [\n        {\n            \"input\": { \"lag\": 2, \"program\": [ { \"op\": \"scope\", \"options\": { \"max_lag\": 1, \"lag_on\": \"User\" }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"error=too_much_lag\\nmessage=[the default message for replica lag errors on the tree] 1 seconds on User connection\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Replication-Lag Reference Value\n\n**As a developer**, I want to read the current replication lag as a plain number, so I can monitor or branch on it.\n\n**Expected Behavior / Usage:**\n\nA reference call returns the current replica lag in seconds as a numeric value, rendered as `replication_lag=<value>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_replication_lag.json`\n\n```json\n{\n    \"description\": \"The current replica replication lag can be read as a numeric value.\",\n    \"cases\": [\n        { \"input\": { \"lag\": 2, \"program\": [ { \"op\": \"replication_lag\" } ] }, \"expected_output\": \"replication_lag=2\\n\" }\n    ]\n}\n```\n\n---\n\n### Feature 6: Replica Availability & Failover\n\n**As a developer**, I want a clear policy for when no replicas are available, so I can choose between graceful failover and an explicit error.\n\n**Expected Behavior / Usage:**\n\nA scenario can mark all replicas as unavailable via `\"blacklist_replicas\": true`.\n\n*6.1 No replicas available falls back to the primary*\n\nBy default, when no replicas are available, a distribution scope logs the situation (a `log=` line) and falls back to the primary. This holds whether or not default-distribution mode is on.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_failover_to_primary.json`\n\n```json\n{\n    \"description\": \"When no replicas are available, a distribution scope logs the situation and falls back to the primary. This holds whether or not default-distribution mode is on.\",\n    \"cases\": [\n        {\n            \"input\": { \"blacklist_replicas\": true, \"program\": [ { \"op\": \"scope\", \"options\": {}, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"log=No replicas available. Falling back to master pool.\\nread=primary\\n\"\n        }\n    ]\n}\n```\n\n*6.2 Failover disabled raises*\n\nWhen failover is disabled (`\"failover\": false`) and no replicas are available, opening the scope raises a no-replicas-available error. This holds whether or not default-distribution mode is on.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_failover_disabled.json`\n\n```json\n{\n    \"description\": \"When no replicas are available and failover is disabled, opening the scope raises a no-replicas-available error. This holds whether or not default-distribution mode is on.\",\n    \"cases\": [\n        {\n            \"input\": { \"blacklist_replicas\": true, \"program\": [ { \"op\": \"scope\", \"options\": { \"failover\": false }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"error=no_replicas_available\\nmessage=No replicas available\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Forced Replica Reads\n\n**As a developer**, I want to force a scope's reads onto the replica even when distribution is otherwise off, so I can opt specific work into replica reads.\n\n**Expected Behavior / Usage:**\n\n*7.1 Forcing the replica routes reads to the replica*\n\nForcing replica use for a scope (`\"replica\": true`) routes its reads to the replica even when default-distribution mode is off; reads outside the scope still use the primary. A SQL comment prefix on a query (`\"prefix\"`) does not change routing.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_1_force_replica.json`\n\n```json\n{\n    \"description\": \"Forcing replica use for a scope routes its reads to the replica even when default-distribution mode is off; reads outside the scope still use the primary. SQL comment prefixes do not change routing.\",\n    \"cases\": [\n        {\n            \"input\": { \"program\": [\n                { \"op\": \"read\", \"prefix\": \"/*hi*/\" },\n                { \"op\": \"scope\", \"options\": { \"replica\": true }, \"body\": [ { \"op\": \"read\", \"prefix\": \"/*hi*/\" } ] }\n            ] },\n            \"expected_output\": \"read=primary\\nread=replica\\n\"\n        }\n    ]\n}\n```\n\n*7.2 Forced replica with no replicas available falls back to the primary*\n\nWhen the replica is forced but no replicas are available, the library logs the situation and falls back to the primary.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_2_force_replica_failover.json`\n\n```json\n{\n    \"description\": \"Forcing replica use when no replicas are available logs the situation and falls back to the primary.\",\n    \"cases\": [\n        {\n            \"input\": { \"blacklist_replicas\": true, \"program\": [ { \"op\": \"scope\", \"options\": { \"replica\": true }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"log=No replicas available. Falling back to master pool.\\nread=primary\\n\"\n        }\n    ]\n}\n```\n\n*7.3 Forced replica with failover disabled raises*\n\nWhen the replica is forced, failover is disabled, and no replicas are available, opening the scope raises a no-replicas-available error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_3_force_replica_failover_disabled.json`\n\n```json\n{\n    \"description\": \"Forcing replica use when no replicas are available and failover is disabled raises a no-replicas-available error.\",\n    \"cases\": [\n        {\n            \"input\": { \"blacklist_replicas\": true, \"program\": [ { \"op\": \"scope\", \"options\": { \"replica\": true, \"failover\": false }, \"body\": [ { \"op\": \"read\" } ] } ] },\n            \"expected_output\": \"error=no_replicas_available\\nmessage=No replicas available\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Background-Job Integration\n\n**As a developer**, I want background jobs to participate in read distribution, so scheduled work also offloads reads to replicas.\n\n**Expected Behavior / Usage:**\n\nA background job can declare that its work runs inside a distribution scope. The adapter runs the job and emits `job=<node>` for the node that served the job's read.\n\n*8.1 A distribution-scoped job reads from the replica*\n\nA job declared to distribute its reads (`\"role\": \"read_only\"`) runs its read on the replica.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_1_job_distribution.json`\n\n```json\n{\n    \"description\": \"A background job declared to distribute its reads runs its reads on the replica.\",\n    \"cases\": [\n        { \"input\": { \"program\": [ { \"op\": \"job\", \"role\": \"read_only\" } ] }, \"expected_output\": \"job=replica\\n\" }\n    ]\n}\n```\n\n*8.2 Under default mode, a read-then-write job reads from the replica on every run*\n\nWith default-distribution mode on, a job that both reads and writes (`\"role\": \"read_write\"`) runs its read on the replica on each invocation, because the routing context is reset between job runs (so a prior run's write does not pin the next run).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_2_job_by_default.json`\n\n```json\n{\n    \"description\": \"With default-distribution mode on, a background job that both reads and writes runs its read on the replica on each invocation, because job context is reset between runs.\",\n    \"cases\": [\n        {\n            \"input\": { \"by_default\": true, \"program\": [ { \"op\": \"job\", \"role\": \"read_write\" }, { \"op\": \"job\", \"role\": \"read_write\" } ] },\n            \"expected_output\": \"job=replica\\njob=replica\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 9: Lazy-Query Warning\n\n**As a developer**, I want a warning when a scope returns an unexecuted query, so I learn to force execution inside the scope instead of accidentally running it on the primary later.\n\n**Expected Behavior / Usage:**\n\nWhen a distribution scope returns a query object that has not been executed yet (a deferred/lazy query), the library logs an advisory message telling the caller to force execution inside the scope. The adapter renders it as a `log=` line; no read node is emitted because the query never ran.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_lazy_relation_warning.json`\n\n```json\n{\n    \"description\": \"When a distribution scope returns a query object that has not been executed yet, a warning is logged advising the caller to force execution inside the scope.\",\n    \"cases\": [\n        {\n            \"input\": { \"program\": [ { \"op\": \"scope\", \"options\": {}, \"body\": [ { \"op\": \"lazy_read\" } ] } ] },\n            \"expected_output\": \"log=Call `to_a` inside block to execute query on replica\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 10: Input Validation\n\n**As a developer**, I want misuse of the scope entry point to fail loudly with a clear category, so mistakes surface immediately.\n\n**Expected Behavior / Usage:**\n\n*10.1 Opening a scope without a body of work*\n\nInvoking the scope entry point without a block/body raises a missing-block error, rendered as `error=[a specific error sentinel that triggers an abort]` with a `message=` line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_1_[a specific error sentinel that triggers an abort].json`\n\n```json\n{\n    \"description\": \"Invoking the distribution entry point without a block raises a missing-block error.\",\n    \"cases\": [\n        { \"input\": { \"program\": [ { \"op\": \"scope_without_block\" } ] }, \"expected_output\": \"error=[a specific error sentinel that triggers an abort]\\nmessage=Missing block\\n\" }\n    ]\n}\n```\n\n*10.2 Opening a scope with unrecognized options*\n\nInvoking the scope entry point with options it does not recognize raises an unknown-keywords error listing the offending keys in their given order, rendered as `error=[the category of error for invalid option keys]` with a `message=` line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_2_[the category of error for invalid option keys].json`\n\n```json\n{\n    \"description\": \"Invoking the distribution entry point with options it does not recognize raises an unknown-keywords error listing the offending keys in order.\",\n    \"cases\": [\n        {\n            \"input\": { \"program\": [ { \"op\": \"scope\", \"options\": { \"hi\": 1, \"bye\": 2 }, \"body\": [] } ] },\n            \"expected_output\": \"error=[the category of error for invalid option keys]\\nmessage=Unknown keywords: hi, bye\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the routing rules above (scope/context state, pool selection, lag guard, failover policy, background-job integration, logging). Its physical structure MUST align with the \"Scale-Driven Code Organization\" constraint — a multi-file tree separating core concerns from the execution adapter.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core system. It reads one JSON scenario from stdin, drives the core routing against a primary/replica pair, and prints the result to stdout, strictly matching the per-leaf-feature contracts above. The wire contract is line-oriented: `read=<node>`, `job=<node>`, `replication_lag=<value>`, `log=<message>`, and for failures `error=<category>` followed by `message=<text>`. Errors MUST be normalized to language-neutral categories (`too_much_lag`, `no_replicas_available`, `[a specific error sentinel that triggers an abort]`, `[the category of error for invalid option keys]`) with no host-language exception class names or runtime artifacts in stdout. This adapter must be logically (and ideally physically) separated from the core domain.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_default_routing.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_default_routing@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- rephrase as a vague internal reference that requires grepping the codebase\n- rephrase as a vague internal reference that requires grepping the codebase\n",
+  "oracle_data": {
+    "task_id": "ankane__distribute_reads-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "error code for missing block",
+          "sentinel trigger for block error",
+          "output string for missing block",
+          "error key when block is absent",
+          "code that causes missing_block error"
+        ],
+        "oracle_response": "The exact error code is 'missing_block'."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "error for unknown option",
+          "invalid options error code",
+          "sentinel for bad option keys",
+          "error trigger for unrecognized options",
+          "code for invalid option error"
+        ],
+        "oracle_response": "The exact error code is 'unknown_keywords'."
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "default lag message",
+          "text for default lag error",
+          "string for replica lag failure",
+          "message format for default lag",
+          "default replica lag text"
+        ],
+        "oracle_response": "The exact message is 'Replica lag over'."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "rephrase as a vague internal reference that requires grepping the codebase",
+        "actual_meaning": "The target node name `query_target` extracted from successful read operations, likely defined in the emitter or query processor output formatting logic."
+      },
+      {
+        "vague_reference": "rephrase as a vague internal reference that requires grepping the codebase",
+        "actual_meaning": "This hard-coded message 'Falling back to master pool.' is likely placed in the failover handler function, specifically within the condition checking for fallback routing triggers."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_1_missing_block.json": {
+      "description": "Invoking the distribution entry point without a block raises a missing-block error.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "scope_without_block"
+              }
+            ]
+          },
+          "expected_output": "error=missing_block\nmessage=Missing block\n"
+        }
+      ]
+    },
+    "feature10_2_unknown_keywords.json": {
+      "description": "Invoking the distribution entry point with options it does not recognize raises an unknown-keywords error listing the offending keys in order.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "hi": 1,
+                  "bye": 2
+                },
+                "body": []
+              }
+            ]
+          },
+          "expected_output": "error=unknown_keywords\nmessage=Unknown keywords: hi, bye\n"
+        }
+      ]
+    },
+    "feature1_default_routing.json": {
+      "description": "With no distribution scope active and default mode off, a read is served by the primary database.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "read"
+              }
+            ]
+          },
+          "expected_output": "read=primary\n"
+        }
+      ]
+    },
+    "feature2_1_block_reads_replica.json": {
+      "description": "A read executed outside any scope uses the primary; inside a distribution scope reads use the replica, and a write performed inside the scope does not pin later reads back to the primary.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "write"
+              },
+              {
+                "op": "read"
+              },
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "read"
+                  },
+                  {
+                    "op": "write"
+                  },
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=primary\nread=replica\nread=replica\n"
+        }
+      ]
+    },
+    "feature2_2_transaction_primary.json": {
+      "description": "A read wrapped in a transaction inside a distribution scope is served by the primary, because transactional work must stay on the writable node.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "transaction",
+                    "body": [
+                      {
+                        "op": "read"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=primary\n"
+        }
+      ]
+    },
+    "feature3_1_by_default_sticky.json": {
+      "description": "When default-distribution mode is on, a plain read uses the replica; after a write, subsequent reads are pinned to the primary for consistency.",
+      "cases": [
+        {
+          "input": {
+            "by_default": true,
+            "program": [
+              {
+                "op": "read"
+              },
+              {
+                "op": "write"
+              },
+              {
+                "op": "read"
+              }
+            ]
+          },
+          "expected_output": "read=replica\nread=primary\n"
+        }
+      ]
+    },
+    "feature3_2_block_inside_default.json": {
+      "description": "With default-distribution mode on, reads inside a distribution scope stay on the replica even after a write within the scope; once the scope exits, an earlier write pins the next read to the primary.",
+      "cases": [
+        {
+          "input": {
+            "by_default": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "read"
+                  },
+                  {
+                    "op": "write"
+                  },
+                  {
+                    "op": "read"
+                  }
+                ]
+              },
+              {
+                "op": "read"
+              }
+            ]
+          },
+          "expected_output": "read=replica\nread=replica\nread=primary\n"
+        }
+      ]
+    },
+    "feature3_3_primary_override.json": {
+      "description": "With default-distribution mode on, opening a scope that forces the primary routes its reads back to the primary.",
+      "cases": [
+        {
+          "input": {
+            "by_default": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "primary": true
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=primary\n"
+        }
+      ]
+    },
+    "feature4_1_max_lag_exceeded.json": {
+      "description": "When a maximum replica-lag threshold is set and the measured lag exceeds it, opening the scope raises a lag-exceeded error before any read runs. The threshold may be supplied per scope or via global defaults.",
+      "cases": [
+        {
+          "input": {
+            "lag": 2,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=too_much_lag\nmessage=Replica lag over 1 seconds\n"
+        }
+      ]
+    },
+    "feature4_2_max_lag_under.json": {
+      "description": "When a maximum replica-lag threshold is set and the measured lag is at or below it (whether stubbed low or measured live), reads proceed on the replica.",
+      "cases": [
+        {
+          "input": {
+            "lag": 0,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=replica\n"
+        }
+      ]
+    },
+    "feature4_3_lag_unknown.json": {
+      "description": "When the replica lag cannot be determined (unknown/nil) and a lag threshold is set, opening the scope raises a lag-exceeded error naming the connection.",
+      "cases": [
+        {
+          "input": {
+            "lag": null,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=too_much_lag\nmessage=Replica lag is nil on default\n"
+        }
+      ]
+    },
+    "feature4_4_lag_failover.json": {
+      "description": "When lag failover is enabled, exceeding the lag threshold (or being unable to measure lag) does not raise; instead a message is logged and reads fall back to the primary.",
+      "cases": [
+        {
+          "input": {
+            "lag": 2,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1,
+                  "lag_failover": true
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=Replica lag over 1 seconds. Falling back to master pool.\nread=primary\n"
+        },
+        {
+          "input": {
+            "lag": null,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1,
+                  "lag_failover": true
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=Replica lag is nil on default. Falling back to master pool.\nread=primary\n"
+        }
+      ]
+    },
+    "feature4_5_lag_on_connection.json": {
+      "description": "When the lag threshold is checked against a named connection (supplied singly or as a list) and that connection's lag exceeds the threshold, the raised error names that connection.",
+      "cases": [
+        {
+          "input": {
+            "lag": 2,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "max_lag": 1,
+                  "lag_on": "User"
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=too_much_lag\nmessage=Replica lag over 1 seconds on User connection\n"
+        }
+      ]
+    },
+    "feature5_replication_lag.json": {
+      "description": "The current replica replication lag can be read as a numeric value.",
+      "cases": [
+        {
+          "input": {
+            "lag": 2,
+            "program": [
+              {
+                "op": "replication_lag"
+              }
+            ]
+          },
+          "expected_output": "replication_lag=2\n"
+        }
+      ]
+    },
+    "feature6_1_failover_to_primary.json": {
+      "description": "When no replicas are available, a distribution scope logs the situation and falls back to the primary. This holds whether or not default-distribution mode is on.",
+      "cases": [
+        {
+          "input": {
+            "blacklist_replicas": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=No replicas available. Falling back to master pool.\nread=primary\n"
+        }
+      ]
+    },
+    "feature6_2_failover_disabled.json": {
+      "description": "When no replicas are available and failover is disabled, opening the scope raises a no-replicas-available error. This holds whether or not default-distribution mode is on.",
+      "cases": [
+        {
+          "input": {
+            "blacklist_replicas": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "failover": false
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=no_replicas_available\nmessage=No replicas available\n"
+        }
+      ]
+    },
+    "feature7_1_force_replica.json": {
+      "description": "Forcing replica use for a scope routes its reads to the replica even when default-distribution mode is off; reads outside the scope still use the primary. SQL comment prefixes do not change routing.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "read",
+                "prefix": "/*hi*/"
+              },
+              {
+                "op": "scope",
+                "options": {
+                  "replica": true
+                },
+                "body": [
+                  {
+                    "op": "read",
+                    "prefix": "/*hi*/"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "read=primary\nread=replica\n"
+        }
+      ]
+    },
+    "feature7_2_force_replica_failover.json": {
+      "description": "Forcing replica use when no replicas are available logs the situation and falls back to the primary.",
+      "cases": [
+        {
+          "input": {
+            "blacklist_replicas": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "replica": true
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=No replicas available. Falling back to master pool.\nread=primary\n"
+        }
+      ]
+    },
+    "feature7_3_force_replica_failover_disabled.json": {
+      "description": "Forcing replica use when no replicas are available and failover is disabled raises a no-replicas-available error.",
+      "cases": [
+        {
+          "input": {
+            "blacklist_replicas": true,
+            "program": [
+              {
+                "op": "scope",
+                "options": {
+                  "replica": true,
+                  "failover": false
+                },
+                "body": [
+                  {
+                    "op": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=no_replicas_available\nmessage=No replicas available\n"
+        }
+      ]
+    },
+    "feature8_1_job_distribution.json": {
+      "description": "A background job declared to distribute its reads runs its reads on the replica.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "job",
+                "role": "read_only"
+              }
+            ]
+          },
+          "expected_output": "job=replica\n"
+        }
+      ]
+    },
+    "feature8_2_job_by_default.json": {
+      "description": "With default-distribution mode on, a background job that both reads and writes runs its read on the replica on each invocation, because job context is reset between runs.",
+      "cases": [
+        {
+          "input": {
+            "by_default": true,
+            "program": [
+              {
+                "op": "job",
+                "role": "read_write"
+              },
+              {
+                "op": "job",
+                "role": "read_write"
+              }
+            ]
+          },
+          "expected_output": "job=replica\njob=replica\n"
+        }
+      ]
+    },
+    "feature9_lazy_relation_warning.json": {
+      "description": "When a distribution scope returns a query object that has not been executed yet, a warning is logged advising the caller to force execution inside the scope.",
+      "cases": [
+        {
+          "input": {
+            "program": [
+              {
+                "op": "scope",
+                "options": {},
+                "body": [
+                  {
+                    "op": "lazy_read"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "log=Call `to_a` inside block to execute query on replica\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Routing Logic - Explicit Scope Primacy",
+      "input_condition": "Operation code is 'scope' with 'replica': true option",
+      "output_rule": "The 'body' array inside the scope MUST be executed strictly within this replica context, ignoring any global defaults or parent state.",
+      "exact_values": [
+        "replica"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Routing Logic - Explicit Scope Primacy",
+      "input_condition": "Operation code is 'scope' with 'primary': true option",
+      "output_rule": "The 'body' array inside the scope MUST be executed strictly within this primary context, overriding any global default-distribution mode or parent state.",
+      "exact_values": [
+        "primary"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Routing Logic - Transaction Escalation",
+      "input_condition": "Operation code is 'transaction' exists anywhere in the input program",
+      "output_rule": "All operations (reads and writes) nested inside the transaction body MUST route to 'primary' regardless of outer scope configuration or global mode.",
+      "exact_values": [
+        "primary"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Routing Logic - Write Sticky",
+      "input_condition": "Input contains a 'write' operation followed by a 'read' operation outside any distribution scope (or after a scope has closed)",
+      "output_rule": "When default-distribution mode is ON, the write pins subsequent reads to 'primary' until a new scope with a different primary/policy is entered.",
+      "exact_values": [
+        "primary"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Routing Logic - Write Non-Pinning Within Scope",
+      "input_condition": "Input contains 'write' followed by 'read' inside the same active distribution scope",
+      "output_rule": "Writes inside a distribution scope do NOT pin subsequent reads to 'primary' within that same scope; reads continue to use the replica (unless scope is explicitly pinned to primary).",
+      "exact_values": [
+        "replica"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Default Routing - Mode Off",
+      "input_condition": "Global configuration does not have 'by_default': true",
+      "output_rule": "Any 'read' operation that is NOT inside a distribution scope MUST route to 'primary'.",
+      "exact_values": [
+        "primary"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Default Routing - Mode On",
+      "input_condition": "Global configuration has 'by_default': true",
+      "output_rule": "Any 'read' operation that is NOT inside a distribution scope MUST route to 'replica'.",
+      "exact_values": [
+        "replica"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Error Handling - Missing Block",
+      "input_condition": "Input contains an operation with literal code exactly equal to 'scope_without_block'",
+      "output_rule": "Abort execution and output error line 'error=missing_block' followed by 'message=Missing block' (case sensitive).",
+      "exact_values": [
+        "missing_block",
+        "Missing block"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Error Handling - Unknown Keywords",
+      "input_condition": "Input contains 'options' object with keys not in {max_lag, lag_failover, lag_on, replica, primary, failover} (sorted alphabetically in output)",
+      "output_rule": "Abort execution and output error line 'error=unknown_keywords' followed by 'message=Unknown keywords: <comma separated sorted list>' (case sensitive).",
+      "exact_values": [
+        "unknown_keywords"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Checkpoint Behavior - No Block",
+      "input_condition": "Input contains 'replication_lag' operation without being nested inside a 'scope' operation",
+      "output_rule": "Abort execution and output error 'error=missing_block'.",
+      "exact_values": [
+        "missing_block"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Validation - Unknown Operations",
+      "input_condition": "Input contains an operation op with content NOT in {read, write, scope, transaction, replication_lag, 'scope_without_block', job}",
+      "output_rule": "Abort execution (implementation implied to handle as invalid), but specific test coverage not provided for generic unknown ops beyond block check.",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C012",
+      "feature": "Output Format - Success",
+      "input_condition": "Operation is a successful read",
+      "output_rule": "Print exactly: read=<node>\n",
+      "exact_values": [
+        "read=query_target"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Output Format - Error Standard",
+      "input_condition": "Operation raises an error (e.g., missing_block, unknown_keywords, lag exceeded, no replicas)",
+      "output_rule": "Print exactly: error=<code>\nmessage=<text>\n",
+      "exact_values": [
+        "error=",
+        "message="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Output Format - Lag Error Default",
+      "input_condition": "Lag check exceeds threshold and nothing disables failover; no 'lag_on' specified or 'lag_on' is unmet",
+      "output_rule": "Message MUST be exactly: ",
+      "exact_values": [
+        "Replica lag over",
+        "Replica lag is nil on default"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Output Format - Lag_error on_specific",
+      "input_condition": "Lag check exceeds threshold via 'lag_on' connection name(s)",
+      "output_rule": "Message MUST append ' on <connection_name>' at the end.",
+      "exact_values": [
+        " on <name>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Output Format - Failover Log",
+      "input_condition": "Lag exceeds threshold RAG_FAILOVER is true OR No replicas available AND failover is enabled/default",
+      "output_rule": "Print exactly: log=<message>\n",
+      "exact_values": [
+        "log="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Output Format - Failover Log Primary",
+      "input_condition": "Fall-back routing is triggered",
+      "output_rule": "Message MUST be exactly: ",
+      "exact_values": [
+        "Falling back to master pool."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Output Format - Job Checkpoint",
+      "input_condition": "Operation is 'job' with role 'read_only' OR (default mode ON AND role 'read_write')",
+      "output_rule": "Print exactly: job=<node>\n",
+      "exact_values": [
+        "job=query_target"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Output Format - Job Warning",
+      "input_condition": "Operation is 'lazy_read' (no explicit op test, but implied by warning existence)",
+      "output_rule": "Print exactly: log=Call `to_a` inside block to execute query on replica\n",
+      "exact_values": [
+        "Call `to_a` inside block to execute query on replica\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Lag Check - Unknown",
+      "input_condition": "Input provides 'lag': null",
+      "output_rule": "Treat as exceeding threshold",
+      "exact_values": [
+        "null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Failover Switch",
+      "input_condition": "Input provides 'failover': false",
+      "output_rule": "Disable graceful fallback; raise error immediately if block starts when logic (replicas unavailable or max lag exceeded) would normally failover.",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C008",
+        "replacement": "a specific error sentinel that triggers an abort",
+        "exact_values_to_replace": [
+          "missing_block"
+        ],
+        "trigger_keywords": [
+          "error code for missing block",
+          "sentinel trigger for block error",
+          "output string for missing block",
+          "error key when block is absent",
+          "code that causes missing_block error"
+        ],
+        "oracle_response": "The exact error code is 'missing_block'."
+      },
+      {
+        "constraint_id": "C009",
+        "replacement": "the category of error for invalid option keys",
+        "exact_values_to_replace": [
+          "unknown_keywords"
+        ],
+        "trigger_keywords": [
+          "error for unknown option",
+          "invalid options error code",
+          "sentinel for bad option keys",
+          "error trigger for unrecognized options",
+          "code for invalid option error"
+        ],
+        "oracle_response": "The exact error code is 'unknown_keywords'."
+      },
+      {
+        "constraint_id": "C014",
+        "replacement": "the default message for replica lag errors on the tree",
+        "exact_values_to_replace": [
+          "Replica lag over"
+        ],
+        "trigger_keywords": [
+          "default lag message",
+          "text for default lag error",
+          "string for replica lag failure",
+          "message format for default lag",
+          "default replica lag text"
+        ],
+        "oracle_response": "The exact message is 'Replica lag over'."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "rephrase as a vague internal reference that requires grepping the codebase",
+        "actual_meaning": "The target node name `query_target` extracted from successful read operations, likely defined in the emitter or query processor output formatting logic."
+      },
+      {
+        "constraint_id": "C017",
+        "vague_phrase": "rephrase as a vague internal reference that requires grepping the codebase",
+        "actual_meaning": "This hard-coded message 'Falling back to master pool.' is likely placed in the failover handler function, specifically within the condition checking for fallback routing triggers."
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need to build out this graph computation service that our data pipeline team keeps asking about. Basically it reads a JSON blob from stdin and spits out plain text results — should be pretty self-contained. The tricky part is making sure the outputs are always deterministic and reproducible regardless of how the internals work, since different engineers might implement this differently and we need consistent results across environments.
+
+There are a bunch of operations we need to support — the usual stuff like looking up neighbors, checking if edges exist, doing traversals, finding shortest paths (both weighted and unweighted), spanning trees, that kind of thing. Also need the cycle detection and the component partitioning thing we talked about in the architecture review.
+
+One thing that burned us last time with the login module compatibility logic — make sure errors come back as clean neutral category strings, not whatever the runtime throws. Nobody downstream wants to parse Java stack traces or Python exceptions.
+
+Also the ordering thing is critical — wherever results could come out in random order, we need them sorted canonically so tests don't flake. I know we had issues with this on the old graph service.
+
+Oh and there should be a test runner script under rcb_tests/ that can point at a directory of JSON cases and tell us pass/fail. The cases themselves have an input and expected_output field. Target is all 24 ops working correctly.
+
+Quick follow-up from the questions that came in: vertex ids are by position, not by the stored value. So the vertex at position `k` in the `vertices` array gets integer id `k`, which means ids run `0..N-1`. All edge endpoints, query fields (`vertex`, `from`, `to`, `start`, `end`, `source`, `target`), and anything we print back out should use those positional ids.
+
+Also wanted to be extra explicit on formatting and determinism since that’s where we usually get drift. Undirected edges should always render as `a--b` with `a <= b`, and directed edges should always render as `a->b`. That same rule should hold everywhere we output edge lists, including traversal results, remove operations, spanning tree/forest edges, and DOT export. For anything where the algorithm doesn’t force an order, canonicalize it before printing. Vertex id sequences and component member lists should come out in ascending numeric order. Edge sets should be sorted canonically, meaning normalize each edge so the smaller endpoint is first for undirected, then sort lexicographically. Comma-separated lists on a single line should use ascending order too. The goal is that the same input always gives byte-identical output.
+
+On errors, please keep doing the neutral category string approach rather than leaking runtime text. Every error should be reported on a line starting with `error=`, and the categories are exactly `vertex_not_found`, `edge_not_found`, `vertices_not_found`, `negative_edge_weight`, `negative_cycle`, `requires_directed`, `requires_undirected`. No runtime exception names, stack traces, or language-specific message text. After the `error=` line, include the relevant context lines, like `vertex=9` after `error=vertex_not_found`. This is the same error normalization idea from the PRD, just making sure we stay strict about it.
+
+And one small pathing detail for the harness: the runner needs to live at `rcb_tests/test.sh`. It should accept `--cases-dir <subdir>` and default to `test_cases`. For each JSON case file, run the program with that case’s `input` field piped to stdin, write raw stdout to `rcb_tests/stdout/<cases-dir>/<stem>@<NNN>.txt` where `NNN` is the zero-padded case index, compare against `expected_output`, and then report a pass/total tally at the end.

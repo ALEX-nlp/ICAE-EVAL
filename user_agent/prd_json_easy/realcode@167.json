@@ -1,0 +1,570 @@
+{
+  "fuzzy_prd": "# Container-Update Targeting & Registry Access Toolkit — Selection Filters, Credential Encoding, and Option Resolution\n\n## Project Goal\n\nBuild a reusable toolkit that decides *which* running containers an automated update agent should act on, prepares the *credentials and server address* needed to talk to an image registry, and *resolves runtime options* (including secrets) from the command line and the environment — so an update agent can be configured deterministically and safely without re-implementing this plumbing.\n\n---\n\n## Background & Problem\n\nAn agent that automatically refreshes running containers must answer several pure-logic questions before it ever touches a daemon or a network: Given a fleet of candidate containers and a user's configuration, which ones are in scope? Given an image reference and ambient credentials, what auth token and server address should be used? Given a mix of command-line flags, environment variables, and secret files, what is the effective configuration?\n\nWithout a shared toolkit, each integration re-implements this glue with subtle inconsistencies — mishandling opt-in versus opt-out markers, leaking secrets, or mis-parsing references. This toolkit centralizes the deterministic decision logic into small, composable, well-specified functions that operate purely on in-memory inputs, leaving the side-effecting work (dialing the daemon, pulling images) to other layers.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Container Selection Filtering\n\n**As a developer**, I want composable predicates that decide whether each candidate container is in scope for an automated update, so I can combine name allow-lists, opt-in/opt-out markers, and scopes into one selection rule.\n\n**Expected Behavior / Usage:**\n\nA candidate container is described by a `name`, a self-identification flag `is_self_agent`, an enable marker `enabled` (a pair of a boolean `value` and a `present` flag), and a `scope` (a pair of a string `value` and a `present` flag). A selector is a predicate that, given a candidate, decides admission. The adapter applies a chosen selector to a list of candidates and, for each one, emits a line `container=<name> included=<bool>` in input order. The sub-features below specify each selector independently.\n\n*1.1 Name Allow-List — admit containers whose name matches a configured list*\n\nA name selector is built from a list of target names layered over a base selector that admits everything. A candidate is admitted only when its name equals one of the target names; the equality check also succeeds when the target equals the candidate name with its first character removed (to tolerate a leading path separator on the reported name). If the target list is empty, the selector imposes no restriction and the base (admit-all) decision stands.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_filter_by_name.json`\n\n```json\n{\n    \"description\": \"Selecting containers by an explicit allow-list of names. A candidate is admitted only when its name equals one of the target names (the comparison also succeeds against the candidate name with its first character removed). An empty target list imposes no restriction. Output lists each candidate as its name and whether it was admitted.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"filter\", \"mode\": \"names\", \"names\": [\"test\"], \"containers\": [{\"name\": \"test\"}]}, \"expected_output\": \"container=test included=true\\n\"},\n        {\"input\": {\"action\": \"filter\", \"mode\": \"names\", \"names\": [\"test\"], \"containers\": [{\"name\": \"NoTest\"}]}, \"expected_output\": \"container=NoTest included=false\\n\"}\n    ]\n}\n```\n\n*1.2 Require Opt-In Marker — admit only containers that explicitly set the enable marker*\n\nThe selector admits a candidate only when its enable marker is present, regardless of whether the marker's value is true or false; an absent marker causes rejection.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_2_filter_by_enable_label.json`\n\n```json\n{\n    \"description\": \"Restricting selection to containers that explicitly carry an opt-in enable marker. The selector admits a candidate only when the marker is present (value irrelevant); an absent marker is rejected. Output lists each candidate as its name and whether it was admitted.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"filter\", \"mode\": \"enable_label\", \"containers\": [{\"name\": \"a\", \"enabled\": {\"value\": true, \"present\": true}}]}, \"expected_output\": \"container=a included=true\\n\"},\n        {\"input\": {\"action\": \"filter\", \"mode\": \"enable_label\", \"containers\": [{\"name\": \"c\", \"enabled\": {\"value\": false, \"present\": false}}]}, \"expected_output\": \"container=c included=false\\n\"}\n    ]\n}\n```\n\n*1.3 Honor Opt-Out Marker — reject only containers that explicitly opt out*\n\nThe selector rejects a candidate only when its enable marker is present and its value is the opt-out value (false); in every other case (marker present and true, or marker absent) the candidate is admitted.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_3_filter_by_disabled_label.json`\n\n```json\n{\n    \"description\": \"Excluding only containers that explicitly opt out via the enable marker. A candidate is rejected only when the marker is present with the opt-out value; otherwise it is admitted. Output lists each candidate as its name and whether it was admitted.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"filter\", \"mode\": \"disabled_label\", \"containers\": [{\"name\": \"b\", \"enabled\": {\"value\": false, \"present\": true}}]}, \"expected_output\": \"container=b included=false\\n\"},\n        {\"input\": {\"action\": \"filter\", \"mode\": \"disabled_label\", \"containers\": [{\"name\": \"c\", \"enabled\": {\"value\": false, \"present\": false}}]}, \"expected_output\": \"container=c included=true\\n\"}\n    ]\n}\n```\n\n*1.4 Scope Match — admit only containers in a configured scope*\n\nA scope selector is built from a target scope string. A candidate is admitted only when it has a scope present whose value equals the target scope; a mismatched or absent scope causes rejection.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_4_filter_by_scope.json`\n\n```json\n{\n    \"description\": \"Restricting selection to containers that belong to a specific named scope. A candidate is admitted only when its scope is present and equals the target scope; mismatch or absence is rejected. Output lists each candidate as its name and whether it was admitted.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"filter\", \"mode\": \"scope\", \"scope\": \"testscope\", \"containers\": [{\"name\": \"a\", \"scope\": {\"value\": \"testscope\", \"present\": true}}]}, \"expected_output\": \"container=a included=true\\n\"},\n        {\"input\": {\"action\": \"filter\", \"mode\": \"scope\", \"scope\": \"testscope\", \"containers\": [{\"name\": \"b\", \"scope\": {\"value\": \"nottestscope\", \"present\": true}}]}, \"expected_output\": \"container=b included=false\\n\"}\n    ]\n}\n```\n\n*1.5 Composite Selector — combine name, optional opt-in requirement, optional scope, and always-on opt-out exclusion*\n\nThe composite selector is assembled from layers: a name allow-list, an optional requirement that the opt-in marker be present, an optional scope restriction, and an always-applied exclusion of containers that explicitly opt out. The opt-out exclusion is evaluated first, so a container that explicitly opts out is rejected before any other layer is consulted. The example below configures a name allow-list only.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_5_composite_filter.json`\n\n```json\n{\n    \"description\": \"The composite selector used to choose update targets: a name allow-list, an optional opt-in requirement, an optional scope, and an always-applied opt-out exclusion evaluated first. This case configures a name allow-list only. Output lists each candidate as its name and whether it survived the full chain.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"filter\", \"mode\": \"build\", \"names\": [\"test\"], \"enable_label\": false, \"scope\": \"\", \"containers\": [{\"name\": \"Invalid\", \"enabled\": {\"value\": false, \"present\": false}}, {\"name\": \"test\", \"enabled\": {\"value\": false, \"present\": false}}, {\"name\": \"Invalid\", \"enabled\": {\"value\": true, \"present\": true}}, {\"name\": \"test\", \"enabled\": {\"value\": true, \"present\": true}}, {\"name\": \"x\", \"enabled\": {\"value\": false, \"present\": true}}]}, \"expected_output\": \"container=Invalid included=false\\ncontainer=test included=true\\ncontainer=Invalid included=false\\ncontainer=test included=true\\ncontainer=x included=false\\n\"}\n    ]\n}\n```\n\n*1.6 Base Predicates — admit-all and self-identification*\n\nTwo trivial building-block predicates underlie the others: an unconditional admit-all predicate that accepts every candidate, and a self-identification predicate that admits a candidate only when it reports itself as an instance of the update agent.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_6_base_predicates.json`\n\n```json\n{\n    \"description\": \"The two base predicates: an unconditional admit-all, and a self-identification predicate that admits only candidates reporting themselves as the update agent. Output lists each candidate as its name and whether it was admitted.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"filter\", \"mode\": \"no_filter\", \"containers\": [{\"name\": \"anything\"}]}, \"expected_output\": \"container=anything included=true\\n\"},\n        {\"input\": {\"action\": \"filter\", \"mode\": \"self_agent\", \"containers\": [{\"name\": \"agent\", \"is_self_agent\": true}]}, \"expected_output\": \"container=agent included=true\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Registry Credentials & Image Reference\n\n**As a developer**, I want to derive the auth token and server address needed to reach an image registry from ambient inputs, so the agent can authenticate without bespoke parsing in each call site.\n\n**Expected Behavior / Usage:**\n\n*2.1 Environment Credential Token — encode user/password from the environment*\n\nWhen both a user name and a password are supplied through their environment variables, the toolkit assembles an auth object and emits its transport encoding: the Base64 of a compact JSON document carrying a `username` and a `password` field (in that order, with no extra fields). When either credential is missing, no token is produced and a neutral missing-credentials error category is reported. Output is either `token=<base64>` or `error=missing_credentials`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_env_credentials.json`\n\n```json\n{\n    \"description\": \"Building an encoded registry credential token from environment-supplied credentials. With both user name and password present, emit the Base64 of a compact JSON document carrying the username and password fields; if either is missing, report a neutral missing-credentials error. Output is the encoded token or the neutral error line.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"env_auth\", \"user\": \"user-a\", \"pass\": \"pass-a\"}, \"expected_output\": \"token=eyJ1c2VybmFtZSI6InVzZXItYSIsInBhc3N3b3JkIjoicGFzcy1hIn0=\\n\"},\n        {\"input\": {\"action\": \"env_auth\", \"user\": \"\", \"pass\": \"\"}, \"expected_output\": \"error=missing_credentials\\n\"}\n    ]\n}\n```\n\n*2.2 Server Address Extraction — derive the registry server from an image reference*\n\nThe image reference is parsed, then the server component is taken as the substring up to the first path separator of the parsed reference. A fully qualified reference whose leading component is a host name yields that host name; a reference whose leading component is an organization (no host) yields that organization name. An input that cannot be parsed as a reference (such as the empty string) reports a neutral invalid-reference error category. Output is either `server=<server>` or `[a specific sentinel value for invalid references]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_server_address.json`\n\n```json\n{\n    \"description\": \"Extracting the registry server component from an image reference: parse the reference, then take the substring up to the first path separator. A leading host component yields the host; a leading organization component yields the organization. An unparseable input (e.g. empty string) reports a neutral invalid-reference error. Output is the extracted server or the neutral error line.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"parse_server\", \"ref\": \"example.com/lib/app\"}, \"expected_output\": \"server=example.com\\n\"},\n        {\"input\": {\"action\": \"parse_server\", \"ref\": \"\"}, \"expected_output\": \"[a specific sentinel value for invalid references]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Runtime Option Resolution\n\n**As a developer**, I want command-line options, environment variables, and secret files reconciled into the effective configuration, so the agent behaves predictably regardless of how operators supply settings.\n\n**Expected Behavior / Usage:**\n\n*3.1 Daemon Connection Mapping — translate connection options into client environment variables*\n\nThree options may be supplied: a daemon host address, a boolean verify-TLS switch, and an API version. With no options supplied, the host falls back to its built-in default socket address and the verify-TLS variable is left unset (empty string). When a custom host is supplied it is propagated verbatim; when the verify-TLS switch is enabled, the corresponding variable is set to the string `1`. Output reports `docker_host=<value>` then `docker_tls_verify=<value>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_docker_env.json`\n\n```json\n{\n    \"description\": \"Translating connection options into client environment variables. With no options, the host defaults to the built-in socket address and verify-TLS is empty; a supplied host is propagated verbatim, and an enabled verify-TLS switch sets its variable to the string flag value. Output reports the resolved host and the resolved verify-TLS variable.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"docker_env\"}, \"expected_output\": \"docker_host=[the magic default path for docker sockets]\\ndocker_tls_verify=\\n\"},\n        {\"input\": {\"action\": \"docker_env\", \"host\": \"some-custom-docker-host\", \"tlsverify\": true, \"api_version\": \"1.99\"}, \"expected_output\": \"docker_host=some-custom-docker-host\\ndocker_tls_verify=1\\n\"}\n    ]\n}\n```\n\n*3.2 Secret Resolution — accept a secret inline or as a file reference*\n\nA sensitive option value may be supplied either inline or as a reference to a file holding the secret. The resolver inspects the configured value: if it names an existing file on disk, the value is replaced by the trimmed contents of that file; otherwise the inline string is kept as-is. Output reports `secret=<resolved value>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_secret_from_file.json`\n\n```json\n{\n    \"description\": \"Resolving a sensitive option value supplied either inline or via a file reference. If the configured value names an existing file, it is replaced by the trimmed file contents; otherwise the inline string is kept. Output reports the resolved secret value.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"secret_resolve\", \"value\": \"supersecretstring\"}, \"expected_output\": \"secret=supersecretstring\\n\"},\n        {\"input\": {\"action\": \"secret_resolve\", \"file_content\": \"megasecretstring\"}, \"expected_output\": \"secret=megasecretstring\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the selection predicates, the credential/reference helpers, and the option-resolution logic described above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin and prints the result to stdout, matching the per-feature contracts above. The request's `action` selects behavior: `filter` (with a `mode` of `names`, `enable_label`, `disabled_label`, `scope`, `build`, `no_filter`, or `self_agent`) applies a selector to a list of `containers`; `env_auth` encodes environment credentials; `parse_server` extracts a server from a `ref`; `docker_env` maps connection options to client environment variables; `secret_resolve` resolves an inline or file-backed secret. Native error conditions MUST be rendered as neutral `error=<category>` lines, never leaking host-language runtime identities.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- the candidate must pass the strict scope validation logic\n- composites filter sequence ensures chain of custody first\n",
+  "oracle_data": {
+    "task_id": "containrrr__watchtower-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what happens on bad reference",
+          "parse server error message",
+          "invalid ref output",
+          "error when ref is empty",
+          "pattern for server parse failure"
+        ],
+        "oracle_response": "The output string is exactly 'error=invalid_reference' when the 'ref' input is empty, contains no slash, or is otherwise malformed."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "docker default socket",
+          "docker host default value",
+          "what is the default docker path",
+          "docker env fallback",
+          "socket path if no host provided"
+        ],
+        "oracle_response": "The default output string for the 'docker_host' field is exactly 'unix:///var/run/docker.sock'."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "output line terminator",
+          "format spec arrow",
+          "colon vs angle bracket output",
+          "stream line format regex",
+          "how are output lines joined"
+        ],
+        "oracle_response": "Output lines strictly follow the format `<prefix><value>` where `<` and `>` are literal angle brackets, and the line terminates with a newline (`\\n`)."
+      },
+      {
+        "constraint_id": "TC_feature3_1_docker_env",
+        "trigger_keywords": [
+          "test cases for feature3 1 docker env",
+          "show me feature3 1 docker env test cases",
+          "what are the feature3 1 docker env inputs and outputs",
+          "give me the feature3_1_docker_env test file",
+          "feature3 1 docker env expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_docker_env:\n{\n  \"description\": \"Translating command-line connection options into the environment variables that configure the daemon API client. Three options may be supplied: a daemon host address, a boolean verify-TLS switch, and an API version. With no options supplied the host falls back to its built-in default socket address and the verify-TLS variable is left unset (empty). When a custom host is supplied it is propagated verbatim, and when the verify-TLS switch is enabled the corresponding variable is set to the string flag value. Output reports the resolved host and the resolved verify-TLS variable.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"docker_env\"\n      },\n      \"expected_output\": \"docker_host=unix:///var/run/docker.sock\\ndocker_tls_verify=\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"docker_env\",\n        \"host\": \"some-custom-docker-host\",\n        \"tlsverify\": true,\n        \"api_version\": \"1.99\"\n      },\n      \"expected_output\": \"docker_host=some-custom-docker-host\\ndocker_tls_verify=1\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the candidate must pass the strict scope validation logic",
+        "actual_meaning": "index_of_scope_definition_in_candidate_object"
+      },
+      {
+        "vague_reference": "composites filter sequence ensures chain of custody first",
+        "actual_meaning": "list_of_modes_with_evaluation_order[0]"
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_filter_by_name.json": {
+      "description": "Selecting containers by an explicit allow-list of names. A name selector is built from a list of target names layered on top of a base selector that admits everything. A candidate is admitted only when its name equals one of the target names, where the comparison also succeeds against the candidate name with its first character removed (to tolerate a leading path separator on the reported name). When the target name list is empty the selector imposes no name restriction and the base selector decides alone (admitting every candidate). Output lists each candidate as its name and whether it was admitted.",
+      "cases": [
+        {
+          "input": {
+            "action": "filter",
+            "mode": "names",
+            "names": [
+              "test"
+            ],
+            "containers": [
+              {
+                "name": "test"
+              }
+            ]
+          },
+          "expected_output": "container=test included=true\n"
+        },
+        {
+          "input": {
+            "action": "filter",
+            "mode": "names",
+            "names": [
+              "test"
+            ],
+            "containers": [
+              {
+                "name": "NoTest"
+              }
+            ]
+          },
+          "expected_output": "container=NoTest included=false\n"
+        }
+      ]
+    },
+    "feature1_2_filter_by_enable_label.json": {
+      "description": "Restricting selection to containers that explicitly carry an opt-in enable marker. Each candidate exposes an enable state as a pair: a boolean value plus a presence flag indicating whether the marker was set at all. The selector admits a candidate only when the marker is present, regardless of whether its value is true or false; when the marker is absent the candidate is rejected. Output lists each candidate as its name and whether it was admitted.",
+      "cases": [
+        {
+          "input": {
+            "action": "filter",
+            "mode": "enable_label",
+            "containers": [
+              {
+                "name": "a",
+                "enabled": {
+                  "value": true,
+                  "present": true
+                }
+              }
+            ]
+          },
+          "expected_output": "container=a included=true\n"
+        },
+        {
+          "input": {
+            "action": "filter",
+            "mode": "enable_label",
+            "containers": [
+              {
+                "name": "c",
+                "enabled": {
+                  "value": false,
+                  "present": false
+                }
+              }
+            ]
+          },
+          "expected_output": "container=c included=false\n"
+        }
+      ]
+    },
+    "feature1_3_filter_by_disabled_label.json": {
+      "description": "Excluding only containers that explicitly opt out via the enable marker. Each candidate exposes an enable state as a pair: a boolean value plus a presence flag. The selector rejects a candidate only when the marker is present and its value is the opt-out value (false); in every other situation (marker present and true, or marker absent entirely) the candidate is admitted. Output lists each candidate as its name and whether it was admitted.",
+      "cases": [
+        {
+          "input": {
+            "action": "filter",
+            "mode": "disabled_label",
+            "containers": [
+              {
+                "name": "b",
+                "enabled": {
+                  "value": false,
+                  "present": true
+                }
+              }
+            ]
+          },
+          "expected_output": "container=b included=false\n"
+        },
+        {
+          "input": {
+            "action": "filter",
+            "mode": "disabled_label",
+            "containers": [
+              {
+                "name": "c",
+                "enabled": {
+                  "value": false,
+                  "present": false
+                }
+              }
+            ]
+          },
+          "expected_output": "container=c included=true\n"
+        }
+      ]
+    },
+    "feature1_4_filter_by_scope.json": {
+      "description": "Restricting selection to containers that belong to a specific named scope. A scope selector is built from a target scope string. Each candidate exposes its scope as a pair: a string value plus a presence flag indicating whether a scope was assigned. The selector admits a candidate only when the candidate has a scope present and that scope equals the target scope; a mismatched scope or an absent scope causes rejection. Output lists each candidate as its name and whether it was admitted.",
+      "cases": [
+        {
+          "input": {
+            "action": "filter",
+            "mode": "scope",
+            "scope": "testscope",
+            "containers": [
+              {
+                "name": "a",
+                "scope": {
+                  "value": "testscope",
+                  "present": true
+                }
+              }
+            ]
+          },
+          "expected_output": "container=a included=true\n"
+        },
+        {
+          "input": {
+            "action": "filter",
+            "mode": "scope",
+            "scope": "testscope",
+            "containers": [
+              {
+                "name": "b",
+                "scope": {
+                  "value": "nottestscope",
+                  "present": true
+                }
+              }
+            ]
+          },
+          "expected_output": "container=b included=false\n"
+        }
+      ]
+    },
+    "feature1_5_composite_filter.json": {
+      "description": "The composite selector used to choose update targets, assembled from several layers: an explicit name allow-list, an optional requirement that the opt-in enable marker be present, an optional scope restriction, and an always-applied exclusion of containers whose enable marker explicitly opts out. The opt-out exclusion is evaluated first, so a container that explicitly opts out is rejected before any other layer is consulted. Each candidate exposes a name and an enable state (value plus presence flag). This case configures the selector with a name allow-list only. Output lists each candidate as its name and whether it survived the full chain.",
+      "cases": [
+        {
+          "input": {
+            "action": "filter",
+            "mode": "build",
+            "names": [
+              "test"
+            ],
+            "enable_label": false,
+            "scope": "",
+            "containers": [
+              {
+                "name": "Invalid",
+                "enabled": {
+                  "value": false,
+                  "present": false
+                }
+              },
+              {
+                "name": "test",
+                "enabled": {
+                  "value": false,
+                  "present": false
+                }
+              },
+              {
+                "name": "Invalid",
+                "enabled": {
+                  "value": true,
+                  "present": true
+                }
+              },
+              {
+                "name": "test",
+                "enabled": {
+                  "value": true,
+                  "present": true
+                }
+              },
+              {
+                "name": "x",
+                "enabled": {
+                  "value": false,
+                  "present": true
+                }
+              }
+            ]
+          },
+          "expected_output": "container=Invalid included=false\ncontainer=test included=true\ncontainer=Invalid included=false\ncontainer=test included=true\ncontainer=x included=false\n"
+        }
+      ]
+    },
+    "feature1_6_base_predicates.json": {
+      "description": "The two base selection predicates that the larger selectors are built upon. One is an unconditional admit-all predicate that accepts every candidate regardless of its attributes. The other is a self-identification predicate that admits a candidate only when it reports itself as an instance of the update agent. Each candidate reports a name plus a self-identification flag. Output lists each candidate as its name and whether it was admitted.",
+      "cases": [
+        {
+          "input": {
+            "action": "filter",
+            "mode": "no_filter",
+            "containers": [
+              {
+                "name": "anything"
+              }
+            ]
+          },
+          "expected_output": "container=anything included=true\n"
+        },
+        {
+          "input": {
+            "action": "filter",
+            "mode": "self_agent",
+            "containers": [
+              {
+                "name": "agent",
+                "is_self_agent": true
+              }
+            ]
+          },
+          "expected_output": "container=agent included=true\n"
+        }
+      ]
+    },
+    "feature2_1_env_credentials.json": {
+      "description": "Building an encoded registry credential token from credentials supplied through the environment. When both a user name and a password are provided through their respective environment variables, the toolkit assembles an auth object and emits its transport encoding: the Base64 of a compact JSON document carrying the user name and password fields. When either the user name or the password is missing, no token can be produced and a neutral missing-credentials error category is reported instead. Output is either the encoded token or the neutral error line.",
+      "cases": [
+        {
+          "input": {
+            "action": "env_auth",
+            "user": "user-a",
+            "pass": "pass-a"
+          },
+          "expected_output": "token=eyJ1c2VybmFtZSI6InVzZXItYSIsInBhc3N3b3JkIjoicGFzcy1hIn0=\n"
+        },
+        {
+          "input": {
+            "action": "env_auth",
+            "user": "",
+            "pass": ""
+          },
+          "expected_output": "error=missing_credentials\n"
+        }
+      ]
+    },
+    "feature2_2_server_address.json": {
+      "description": "Extracting the registry server component from a container image reference. The reference is first parsed; the server component is then taken to be the substring up to the first path separator of the parsed reference. A fully qualified reference whose leading component is a host name yields that host name; a reference whose leading component is an organization (no host) yields that organization name. An input that cannot be parsed as a reference (for example, the empty string) reports a neutral invalid-reference error category. Output is either the extracted server component or the neutral error line.",
+      "cases": [
+        {
+          "input": {
+            "action": "parse_server",
+            "ref": "example.com/lib/app"
+          },
+          "expected_output": "server=example.com\n"
+        },
+        {
+          "input": {
+            "action": "parse_server",
+            "ref": ""
+          },
+          "expected_output": "error=invalid_reference\n"
+        }
+      ]
+    },
+    "feature3_1_docker_env.json": {
+      "description": "Translating command-line connection options into the environment variables that configure the daemon API client. Three options may be supplied: a daemon host address, a boolean verify-TLS switch, and an API version. With no options supplied the host falls back to its built-in default socket address and the verify-TLS variable is left unset (empty). When a custom host is supplied it is propagated verbatim, and when the verify-TLS switch is enabled the corresponding variable is set to the string flag value. Output reports the resolved host and the resolved verify-TLS variable.",
+      "cases": [
+        {
+          "input": {
+            "action": "docker_env"
+          },
+          "expected_output": "docker_host=unix:///var/run/docker.sock\ndocker_tls_verify=\n"
+        },
+        {
+          "input": {
+            "action": "docker_env",
+            "host": "some-custom-docker-host",
+            "tlsverify": true,
+            "api_version": "1.99"
+          },
+          "expected_output": "docker_host=some-custom-docker-host\ndocker_tls_verify=1\n"
+        }
+      ]
+    },
+    "feature3_2_secret_from_file.json": {
+      "description": "Resolving a sensitive option value that may be supplied either inline or as a reference to a file holding the secret. The resolver inspects the configured value: if it names an existing file on disk, the value is replaced by the trimmed contents of that file; otherwise the inline string is kept as-is. The first case supplies the secret directly as a literal string. The second case supplies the secret indirectly through a file whose contents become the resolved value. Output reports the resolved secret value.",
+      "cases": [
+        {
+          "input": {
+            "action": "secret_resolve",
+            "value": "supersecretstring"
+          },
+          "expected_output": "secret=supersecretstring\n"
+        },
+        {
+          "input": {
+            "action": "secret_resolve",
+            "file_content": "megasecretstring"
+          },
+          "expected_output": "secret=megasecretstring\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "filter_by_name",
+      "input_condition": "mode is 'names' with a non-empty 'names' list",
+      "output_rule": "A candidate is admitted ('included=true') if its name exactly matches any name in the 'names' list, OR if the candidate name equals the target name with the first character removed. Otherwise, 'included=false'.",
+      "exact_values": [
+        "included=true",
+        "included=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "filter_by_enable_label",
+      "input_condition": "mode is 'enable_label'",
+      "output_rule": "A candidate is admitted ('included=true') only if the 'enabled' marker has the 'present' flag set to true. If 'enabled' is absent or 'present' is false, 'included=false'. The value of the marker is ignored.",
+      "exact_values": [
+        "included=true",
+        "included=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "filter_by_disabled_label",
+      "input_condition": "mode is 'disabled_label'",
+      "output_rule": "A candidate is admitted ('included=true') if 'enabled' is absent OR ('present' is false OR 'value' is true). A candidate is rejected ('included=false') ONLY if 'enabled' is present AND 'value' is false.",
+      "exact_values": [
+        "included=true",
+        "included=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "filter_by_scope",
+      "input_condition": "mode is 'scope' with a string 'scope' value",
+      "output_rule": "A candidate is admitted ('included=true') ONLY if its 'scope' marker is present ('present': true) and its 'value' exactly matches the target 'scope' string. In all other cases, 'included=false'.",
+      "exact_values": [
+        "included=true",
+        "included=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "composite_filter",
+      "input_condition": "mode is 'build' (or similar composite mode)",
+      "output_rule": "Admission logic is evaluated in this specific order:\n1. 'disabled_label' (opt-out) is evaluated FIRST. If rejected, stop.\n2. 'enable_label' (opt-in) is evaluated next (optional).\n3. 'scope' is evaluated next (optional).\n4. 'names' (allow-list) is evaluated LAST.\nOnly candidates passing ALL applied filters are admitted.",
+      "exact_values": [
+        "included=true",
+        "included=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "env_auth",
+      "input_condition": "mode is 'env_auth'",
+      "output_rule": "If both 'user' and 'pass' strings are non-empty, output 'token=<base64_encoded_json>'. The JSON structure must be compact with keys 'username' and 'password' in that order. If either is empty, output 'error=missing_credentials'.",
+      "exact_values": [
+        "token=",
+        "error=missing_credentials"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "parse_server",
+      "input_condition": "mode is 'parse_server' with input 'ref'",
+      "output_rule": "Parse the 'ref' string. Extract the component before the first '/' as the server. If 'ref' is empty or invalid, output 'error=invalid_reference'. Otherwise, output 'server=<extracted_component>'.",
+      "exact_values": [
+        "error=invalid_reference",
+        "server="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "docker_env",
+      "input_condition": "mode is 'docker_env'",
+      "output_rule": "Output 'docker_host' using the provided 'host' string if given, otherwise default to 'unix:///var/run/docker.sock'. Output 'docker_tls_verify' as the string '1' if 'tlsverify' is boolean true, otherwise output an empty string.",
+      "exact_values": [
+        "docker_tls_verify=1",
+        "docker_tls_verify=",
+        "docker_host="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "secret_resolve",
+      "input_condition": "mode is 'secret_resolve'",
+      "output_rule": "Check if the input format indicates a file path. If the input contains a 'file_content' key, use its value. If the input contains a 'value' key, use that string (treating it as the resolved value directly in the provided test cases, ignoring potential file logic described in abstract). Output 'secret=<resolved_value>'.",
+      "exact_values": [
+        "secret="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "output_format",
+      "input_condition": "All filter and action modes",
+      "output_rule": "All output lines must be terminated with a newline character. The format is a stream of lines where each line is `<prefix><value>\\n`.",
+      "exact_values": [
+        "\\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "filter_base_no_filter",
+      "input_condition": "mode is 'no_filter'",
+      "output_rule": "Every candidate container is admitted ('included=true') regardless of its attributes.",
+      "exact_values": [
+        "included=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "filter_self_agent",
+      "input_condition": "mode is 'self_agent'",
+      "output_rule": "A candidate is admitted ('included=true') ONLY if the field 'is_self_agent' is present and set to true. Otherwise, 'included=false'.",
+      "exact_values": [
+        "included=true",
+        "included=false"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific sentinel value for invalid references",
+        "exact_values_to_replace": [
+          "error=invalid_reference"
+        ],
+        "trigger_keywords": [
+          "what happens on bad reference",
+          "parse server error message",
+          "invalid ref output",
+          "error when ref is empty",
+          "pattern for server parse failure"
+        ],
+        "oracle_response": "The output string is exactly 'error=invalid_reference' when the 'ref' input is empty, contains no slash, or is otherwise malformed."
+      },
+      {
+        "constraint_id": "C008",
+        "replacement": "the magic default path for docker sockets",
+        "exact_values_to_replace": [
+          "unix:///var/run/docker.sock"
+        ],
+        "trigger_keywords": [
+          "docker default socket",
+          "docker host default value",
+          "what is the default docker path",
+          "docker env fallback",
+          "socket path if no host provided"
+        ],
+        "oracle_response": "The default output string for the 'docker_host' field is exactly 'unix:///var/run/docker.sock'."
+      },
+      {
+        "constraint_id": "C010",
+        "replacement": "the exact arrow character used in line prefixes",
+        "exact_values_to_replace": [
+          "<prefix><value>\\n"
+        ],
+        "trigger_keywords": [
+          "output line terminator",
+          "format spec arrow",
+          "colon vs angle bracket output",
+          "stream line format regex",
+          "how are output lines joined"
+        ],
+        "oracle_response": "Output lines strictly follow the format `<prefix><value>` where `<` and `>` are literal angle brackets, and the line terminates with a newline (`\\n`)."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C004",
+        "vague_phrase": "the candidate must pass the strict scope validation logic",
+        "actual_meaning": "index_of_scope_definition_in_candidate_object"
+      },
+      {
+        "constraint_id": "C005",
+        "vague_phrase": "composites filter sequence ensures chain of custody first",
+        "actual_meaning": "list_of_modes_with_evaluation_order[0]"
+      }
+    ]
+  }
+}

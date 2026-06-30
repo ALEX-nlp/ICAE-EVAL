@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from a few power users who sync their note vaults and keep running into weird situations — stuff like emoji or Chinese characters in filenames getting mangled, binary images coming back corrupted, and occasionally their workspace config files getting silently overwritten when they pull from remote. It's basically the same kind of mess we ran into with that login module compatibility stuff, so hopefully we can reuse some of that thinking here.
+
+The core ask is a sync engine library that handles the whole lifecycle: reading local files, comparing against a remote snapshot, figuring out what changed, safely applying updates in both directions, and surfacing conflicts in a way that doesn't just dump a stack trace on the user. There's also a thing where if the sync fails halfway through (network drops, auth expires, etc.), the next retry should pick up everything from where the last *successful* sync left off — not from the failed attempt.
+
+One thing that came up in the retro: certain workspace paths should never be silently overwritten — they need to go into some kind of staging area instead. Same deal for files that exist locally but we've never tracked before.
+
+We need a clean adapter layer so the engine itself isn't tangled up with I/O. Error messages should read like human sentences, not exception class names. Rough priority: get the encoding/path/state stuff solid first, then the conflict/retry behavior.
+
+A couple more specifics from the questions that came in. For text/content handling, we should treat UTF-8 bytes as the in-between form before any base64 conversion. If we’re encoding a text string, the output is just one line, `base64=<value>`. If we’re decoding a base64 string, the output is `text=<value>`. If the base64 input is bad in any way, normalize that to `error=invalid_encoded_content` and don’t leak whatever lower-level exception text happened underneath. Also, any whitespace in base64 input needs to be stripped before processing.
+
+For file content, we do need the explicit `encoding` field and it can only be `plaintext` or `base64`. The output format here is fixed and should always be four lines in this exact order: `encoding=`, `plain=`, `base64=`, and `size=`. The `size` is the number of UTF-8 bytes in the plaintext form, so that should stay tied to the text version of the content, not the encoded length.
+
+On the sync step output, the shape needs to stay predictable. Each step returns fields in this order: `step`, then `notice`, then `success`. `step` is a 0-indexed integer. `notice` is always a 2D JSON array of message groups, basically a list of lists where each inner list is the messages from one phase. If a step fails, after `success` we return `error_message`, and then optionally `local_files`, `remote_files`, `store` depending on how far we got. If a step succeeds, after `success` we return `local_ops`, `remote_ops`, `clashes`, `local_files`, `remote_files`, `store`.
+
+On the hashing side, `lastFetchedCommitSha` after a successful sync should be a SHA-1 hash derived deterministically from the remote file state at the time of sync. The per-file values in `lastFetchedRemoteSha` and `localSha` are also SHA-1 hashes, specifically of the raw UTF-8 bytes of the file content. Main thing is these are stable and reproducible for the same content every time.
+
+For path analysis, normalize to NFC before doing anything else. The output fields need to appear in this exact order: `path`, `name`, `extension`, `hidden`, `is_nfc`, `is_nfd`, `has_non_ascii`, `char_length`, and `byte_length`. `extension` is the final extension without dot, or `null` if none. `hidden` is true if any segment starts with a dot. `char_length` is character count and `byte_length` is UTF-8 byte count. Also, the Unicode NFC/NFD normalization and path hidden-segment detection logic should match the same `is_nfc`, `is_nfd`, and `hidden` behavior already described for the path analysis command.
+
+For state comparison, it’s just comparing a `current` map and a `baseline` map of path-to-hash entries. Paths only in `current` are ADDED, paths in both with different hashes are MODIFIED, and paths only in `baseline` are REMOVED. Output is one line per changed path in deterministic sorted path order, in the format `<path>=ADDED|MODIFIED|REMOVED`. If the snapshots are equal, output should be empty.
+
+And on the overwrite/staging behavior, to be extra clear, protected paths and untracked-but-existing local paths whose remote changes are redirected should land under the `_fit/` conflict area prefix instead of going back into their original workspace location.

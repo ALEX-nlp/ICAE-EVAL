@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out the time-tracking plain-text engine we've been talking about. The core idea is that people write their work days in a simple text file — date at the top, some notes, then a list of time entries underneath — and the system can parse all of that, validate it, compute totals, and spit it back out in a clean format. Think of it like how we handled the structured-input parsing in that invoicing module we shipped last quarter, but for time logs.
+
+The tricky parts are around the clock time handling — people write times in all sorts of ways (12h, 24h, crossing midnight, etc.) and we need to support all of that gracefully. There's also the question of what happens when someone leaves a timer running and never closes it — we need to handle that 'open' state sensibly depending on the current time. Date grouping (weeks, months, quarters, years) needs to work correctly even at year boundaries. We also want to flag likely mistakes — duplicate open timers, overlapping time blocks, future-dated entries, that kind of thing.
+
+Outputs should include parsed structure, totals, diffs against targets, filtered views by date range or tag, and sorted listings. The whole thing should be well-organized code, not one giant file. We'll have a thin JSON adapter for testing but the core logic should be totally separate from that.

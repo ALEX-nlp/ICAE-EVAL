@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need a small text utility library — basically something that cleans up indented blocks of text that developers embed inside already-indented code. The core idea is: when you write a multi-line string inside a function or class, all those lines pick up the surrounding indentation, and we want to strip that shared prefix out automatically so the output is clean and left-aligned. Relative indentation between lines should stay intact though — if one line is deeper than another, it should stay that way after processing.
+
+We also need this to work on raw binary buffers, not just decoded strings, similar to how we handled the binary path in that old encoding module. And there's a Windows line-ending thing — if the content uses CRLF, those carriage returns need to survive the transformation.
+
+A few edge cases I know about: blank lines and whitespace-only lines should be handled gracefully (they shouldn't blow things up or count toward the indent calculation). Also there's something about the first line being special — I think if the block starts immediately on the first line vs. starting after a line break changes the behavior slightly, but I'm fuzzy on the exact rule there.
+
+Need a CLI adapter for testing, plus an automated test harness that runs JSON-based test cases. Keep the core logic separate from the I/O stuff please.
+
+One detail to lock down: the shared indent is figured out from only the lines after the first line. On top of that, lines that are entirely empty or contain only whitespace characters are excluded from that calculation entirely. The minimum is taken across all remaining lines; if no such lines exist, zero characters are removed. Relative indentation still stays intact the same way described before.
+
+Also, the first line is never unindented. If content shares the opening line, meaning there is no leading line break before the first word, that content is emitted verbatim with no leading whitespace removed. The only time the first-line behavior changes is when the text begins with a line-feed character (\n). In that case, that leading empty line is dropped entirely from the output, and unindentation begins from what was the second line. Put another way, when the input text begins with a line-feed character (\n), the empty line that would appear as the first line of output is dropped. The effective first line of output becomes what was the second line of the input. This is the mechanism that lets developers start a block on its own line without getting a blank first line in the result.
+
+One more whitespace edge case: if a line contains only whitespace characters (spaces and/or tabs) and that whitespace run is shorter than the computed common indentation amount, emit it as a completely empty line in the output. Its whitespace is consumed entirely rather than leaving a partial prefix behind. And for line endings, a trailing line-feed character in the input produces a trailing empty line in the output, effectively a final newline. The transformation does not strip or add terminal line breaks beyond what the indentation removal requires.
+
+For the binary side, Feature 2 (unindent_bytes) should use the exact same line-splitting and indentation-removal behavior, just at the raw byte level using byte values for line-feed (0x0A), space (0x20), and tab (0x09). The input there comes in as a sequence of integers 0–255 passed as JSON array under key 'data' with mode 'bytes'.

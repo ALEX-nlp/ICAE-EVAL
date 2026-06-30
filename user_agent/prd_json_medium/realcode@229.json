@@ -1,0 +1,941 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out that vector search utility we've been talking about. Basically developers should be able to throw a bunch of high-dimensional numeric arrays at it, search for the closest ones using a few different distance flavors, and get ranked results back. Think of it like what we did with the recommendation engine similarity layer, but standalone and reusable.\n\nA few things I know we need: people should be able to tag their vectors with their own IDs instead of relying on internal slot numbers, search should work both in a fast approximate mode and a slow-but-exact mode, and results should survive a process restart — so some kind of save/load story is required.\n\nWe also had complaints from the data team about wasted space after they remove old entries — apparently once you delete something the slot just sits there. We need to let people reuse that capacity. And the index should be resizable if someone underestimates how many vectors they'll need upfront.\n\nOn the error side, if someone tries to pull vectors out before anything has been added, or passes in a single ID instead of a list, they should get a clean, human-readable error — not some Python stack trace or internal exception name leaking through.\n\nOutput format should be consistent and parseable — similar to the key=value style we standardized on in the metrics pipeline. Distances should be shown to 6 decimal places.\n\nOne more pass with a couple specifics the team asked for. The metric gets chosen when the index is constructed, and it has to be one of 'l2', 'ip', or 'cosine'. For 'l2' we mean squared Euclidean, so ranking is by the sum of squared coordinate differences. For 'ip' we mean inner product with distance = 1 - dot_product, so bigger dot products rank closer. For 'cosine' it’s cosine distance = 1 - cosine_similarity. One important gotcha on 'ip': because the reported distance is (1 - dot_product), vectors with large positive dot products can show up with negative distance values. That is expected. Example: querying [1,1,1] against itself gives distance -3.0, and that should be displayed as -3.000000.\n\nAlso, when I say approximate vs exact, the concrete classes here are the hnswlib Python bindings providing HierarchicalNSW (approximate) and BFIndex (brute-force exhaustive) index classes with add_items, knn_query, save_index, load_index, mark_deleted, unmark_deleted, resize_index, and get_items methods. For persistence, the HNSW side is saved with save_index(filepath) and loaded with load_index(filepath, max_elements=..., space=...). After loading, it still needs to accept more vectors through add_items. In the 'save_load_append' flow we save after first_batch_size vectors, then load and add the rest, and we expect 100% self-recall across all vectors. The loaded_then_count must equal the total vector count. BFIndex also supports save_index(filepath) and load_index(filepath), and after reload it should return identical labels and distances for the same query. On top of that, for 'replace_deleted_after_reload', it also needs to support Python pickle serialization via pickle.dumps / pickle.loads and still produce the same neighbor results after unpickling.\n\nOn the output contract, keep it very literal. Stdout is key=value lines, and each output line is a 'key=value\\n' pair. For vector retrieval, the first line is either 'format=array' or 'format=list', then 'row_count=N', then 'items=[[v1,v2];[v3,v4]]'. Both 'array' and 'list' use the exact same items layout in stdout; the label just reflects what the caller asked for. Rows are semicolon-separated bracketed lists inside the outer brackets, and all float values are formatted to 6 decimal places. Same idea for neighbor results: label arrays look like [[a,b,c]] with no spaces, integer labels only, and distance arrays look like [[0.000000,1.000000]] with 6 decimal places. If there are multiple query rows in one batch, separate those rows with semicolons inside the outer brackets, like [[v1,v2];[v3,v4]].\n\nLast thing, since self-recall came up: it is the fraction of queries where the query’s own label appears as the top-1 nearest neighbor. The calculation is (number of queries where result[0] == query_label) / total_query_count, formatted to 6 decimal places, so perfect recall is 1.000000. In both 'save_load_append' and 'resize_capacity', every stored vector is used as its own query, so perfect self-recall just means every vector retrieves itself.",
+  "oracle_data": {
+    "task_id": "nmslib__hnswlib-001",
+    "golden_api_signature": "def run(input_data: dict) -> str",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "what connectivity and construction width defaults should I use",
+          "what are the default HNSW graph parameters",
+          "what M and ef_construction values are expected"
+        ],
+        "oracle_response": "The default connectivity (M) is 16 and the default construction search width (ef_construction) is 100. The metadata output must report these as 'connectivity=16' and 'construction_width=100'. If a test case supplies a 'connectivity' field in input, that value overrides the default; construction_width always defaults to 100 unless otherwise specified."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "what error is returned when no vectors have been added yet",
+          "how should empty store retrieval be handled",
+          "what happens if get_items is called on an empty index"
+        ],
+        "oracle_response": "When retrieval is attempted before any vectors have been inserted, the output must be exactly 'error=items_unavailable\\nstage=empty_store\\n'. The error key must be 'items_unavailable' and the stage key must be 'empty_store'. No Python exception names, tracebacks, or runtime messages may appear in the output."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what error is raised when a scalar label is passed instead of a list",
+          "how should a single integer label input be handled for retrieval",
+          "what is the invalid label collection error format"
+        ],
+        "oracle_response": "When the caller passes a single scalar value where a collection of labels is required, the output must be exactly 'error=invalid_label_collection\\nlabel=<value>\\n' where <value> is the raw integer that was supplied. For example, if requested_label=5, output is 'error=invalid_label_collection\\nlabel=5\\n'. No exception class names may be exposed."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "how does filtered search work",
+          "how do I restrict nearest-neighbor results to specific labels",
+          "what predicate format does the filter use"
+        ],
+        "oracle_response": "Filtered search accepts a Python callable (predicate function) that takes a label integer and returns True to allow it. The scenario 'filtered_even_search' uses a predicate that allows only even-numbered labels (label % 2 == 0). Both the approximate HNSW index and the brute-force index must support this predicate argument. Output reports approximate_labels, bruteforce_labels, the fraction of queries whose own label was selectable (exact_self_fraction), and odd_label_count which must be 0 when the even predicate is applied."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "how does delete and restore work",
+          "can I undelete a vector after marking it deleted",
+          "what is the restore/undelete API"
+        ],
+        "oracle_response": "The HNSW index supports marking labels as deleted via mark_deleted(label) which excludes them from search results. They can be restored via unmark_deleted(label) which makes them searchable again. The 'delete_restore' scenario deletes labels [1,3], verifies they don't appear in neighbors, then unmarks them and confirms 100% recall. The overlap count between deleted labels and post-delete neighbors must be 0."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "how do I reuse slots after deletion",
+          "how does replace_deleted work for inserting into freed capacity",
+          "can I insert new vectors at full capacity after deleting old ones"
+        ],
+        "oracle_response": "When the HNSW index is initialized with allow_replace_deleted=True, new vectors can be added to an index at full capacity by occupying previously deleted slots. The add_items call should pass replace_deleted=True. After replacement, the index count stays at capacity, and the newly added vectors are findable by their new labels. This is demonstrated in 'replace_deleted' and 'replace_deleted_after_reload' scenarios."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "how does index resizing work",
+          "can the capacity be increased after construction",
+          "what method resizes the index"
+        ],
+        "oracle_response": "The HNSW index exposes resize_index(new_capacity) to increase maximum element capacity after construction. The 'resize_capacity' scenario creates an index with first_capacity=3, inserts 3 vectors, calls resize_index(6), then inserts 3 more vectors. Output must report capacity_before=3, capacity_after=6, count=6, all label IDs, and self_recall=1.000000."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_1_metric_distance_ranking",
+        "trigger_keywords": [
+          "test cases for feature1 1 metric distance ranking",
+          "show me feature1 1 metric distance ranking test cases",
+          "what are the feature1 1 metric distance ranking test inputs",
+          "give me the feature1_1_metric_distance_ranking test file",
+          "test cases for feature 1",
+          "feature1 1 metric distance ranking expected output",
+          "what does feature1 1 metric distance ranking expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_metric_distance_ranking:\n{\n  \"description\": \"A small vector collection is queried under each supported distance interpretation, and the nearest labels and distance values are reported in ranked order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"nearest_distances\",\n        \"metric\": \"l2\",\n        \"vectors\": [\n          [\n            1,\n            0,\n            0\n          ],\n          [\n            0,\n            1,\n            0\n          ],\n          [\n            0,\n            0,\n            1\n          ],\n          [\n            1,\n            0,\n            1\n          ],\n          [\n            1,\n            1,\n            1\n          ]\n        ],\n        \"query\": [\n          [\n            1,\n            1,\n            1\n          ]\n        ],\n        \"k\": 5\n      },\n      \"expected_output\": \"metric=l2\\nquery_count=1\\nneighbors=[[4,3,0,1,2]]\\ndistances=[[0.000000,1.000000,2.000000,2.000000,2.000000]]\\n\"\n    },\n    {\n      \"input\": {\n        \"scenario\": \"nearest_distances\",\n        \"metric\": \"ip\",\n        \"vectors\": [\n          [\n            1,\n            0,\n            0\n          ],\n          [\n            0,\n            1,\n            0\n          ],\n          [\n            0,\n            0,\n            1\n          ],\n          [\n            1,\n            0,\n            1\n          ],\n          [\n            1,\n            1,\n            1\n          ]\n        ],\n        \"query\": [\n          [\n            1,\n            1,\n            1\n          ]\n        ],\n        \"k\": 5\n      },\n      \"expected_output\": \"metric=ip\\nquery_count=1\\nneighbors=[[4,3,0,1,2]]\\ndistances=[[-2.000000,-1.000000,0.000000,0.000000,0.000000]]\\n\"\n    },\n    {\n      \"input\": {\n        \"scenario\": \"nearest_distances\",\n        \"metric\": \"cosine\",\n        \"vectors\": [\n          [\n            1,\n            0,\n            0\n          ],\n          [\n            0,\n            1,\n            0\n          ],\n          [\n            0,\n            0,\n            1\n          ],\n          [\n            1,\n            0,\n            1\n          ],\n          [\n            1,\n            1,\n            1\n          ]\n        ],\n        \"query\": [\n          [\n            1,\n            1,\n            1\n          ]\n        ],\n        \"k\": 5\n      },\n      \"expected_output\": \"metric=cosine\\nquery_count=1\\nneighbors=[[4,3,0,1,2]]\\ndistances=[[0.000000,0.183503,0.422650,0.422650,0.422650]]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_filtered_search",
+        "trigger_keywords": [
+          "test cases for feature1 2 filtered search",
+          "show me feature1 2 filtered search test cases",
+          "what are the feature1 2 filtered search test inputs",
+          "give me the feature1_2_filtered_search test file",
+          "test cases for feature 1",
+          "feature1 2 filtered search expected output",
+          "what does feature1 2 filtered search expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_filtered_search:\n{\n  \"description\": \"A nearest-neighbor query is executed with a predicate that permits only even-numbered labels, and both approximate and exhaustive search results must honor the predicate.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"filtered_even_search\",\n        \"metric\": \"l2\",\n        \"vectors\": [\n          [\n            0\n          ],\n          [\n            10\n          ],\n          [\n            20\n          ],\n          [\n            30\n          ],\n          [\n            40\n          ],\n          [\n            50\n          ],\n          [\n            60\n          ],\n          [\n            70\n          ],\n          [\n            80\n          ],\n          [\n            90\n          ]\n        ]\n      },\n      \"expected_output\": \"metric=l2\\nquery_count=10\\napproximate_labels=[0,0,2,4,4,4,6,8,8,8]\\nbruteforce_labels=[0,0,2,2,4,4,6,6,8,8]\\napproximate_exact_self_fraction=0.500000\\nbruteforce_exact_self_fraction=0.500000\\napproximate_odd_label_count=0\\nbruteforce_odd_label_count=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_retrieve_stored_vectors",
+        "trigger_keywords": [
+          "test cases for feature2 1 retrieve stored vectors",
+          "show me feature2 1 retrieve stored vectors test cases",
+          "what are the feature2 1 retrieve stored vectors test inputs",
+          "give me the feature2_1_retrieve_stored_vectors test file",
+          "test cases for feature 2",
+          "feature2 1 retrieve stored vectors expected output",
+          "what does feature2 1 retrieve stored vectors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_retrieve_stored_vectors:\n{\n  \"description\": \"Stored vectors are retrieved by their external labels, preserving requested order and supporting array-shaped and list-shaped output renderings.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"retrieve_vectors\",\n        \"metric\": \"l2\",\n        \"vectors\": [\n          [\n            0.1,\n            0.2\n          ],\n          [\n            0.3,\n            0.4\n          ],\n          [\n            0.5,\n            0.6\n          ]\n        ],\n        \"labels\": [\n          101,\n          102,\n          103\n        ],\n        \"requested_labels\": [\n          103,\n          101\n        ],\n        \"format\": \"array\"\n      },\n      \"expected_output\": \"format=array\\nrow_count=2\\nitems=[[0.500000,0.600000];[0.100000,0.200000]]\\n\"\n    },\n    {\n      \"input\": {\n        \"scenario\": \"retrieve_vectors\",\n        \"metric\": \"l2\",\n        \"vectors\": [\n          [\n            0.1,\n            0.2\n          ],\n          [\n            0.3,\n            0.4\n          ],\n          [\n            0.5,\n            0.6\n          ]\n        ],\n        \"labels\": [\n          101,\n          102,\n          103\n        ],\n        \"requested_labels\": [\n          102,\n          103\n        ],\n        \"format\": \"list\"\n      },\n      \"expected_output\": \"format=list\\nrow_count=2\\nitems=[[0.300000,0.400000];[0.500000,0.600000]]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_retrieval_error_conditions",
+        "trigger_keywords": [
+          "test cases for feature2 2 retrieval error conditions",
+          "show me feature2 2 retrieval error conditions test cases",
+          "what are the feature2 2 retrieval error conditions test inputs",
+          "give me the feature2_2_retrieval_error_conditions test file",
+          "test cases for feature 2",
+          "feature2 2 retrieval error conditions expected output",
+          "what does feature2 2 retrieval error conditions expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_retrieval_error_conditions:\n{\n  \"description\": \"Retrieval requests that cannot identify a collection of stored labels are reported as normalized domain errors without exposing host-runtime exception names.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"retrieve_before_add\",\n        \"metric\": \"l2\",\n        \"dim\": 2,\n        \"capacity\": 3,\n        \"requested_labels\": [\n          1,\n          2\n        ]\n      },\n      \"expected_output\": \"error=items_unavailable\\nstage=empty_store\\n\"\n    },\n    {\n      \"input\": {\n        \"scenario\": \"retrieve_scalar_label_error\",\n        \"metric\": \"l2\",\n        \"vectors\": [\n          [\n            0.1,\n            0.2\n          ],\n          [\n            0.3,\n            0.4\n          ]\n        ],\n        \"labels\": [\n          5,\n          6\n        ],\n        \"requested_label\": 5\n      },\n      \"expected_output\": \"error=invalid_label_collection\\nlabel=5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_index_metadata",
+        "trigger_keywords": [
+          "test cases for feature3 1 index metadata",
+          "show me feature3 1 index metadata test cases",
+          "what are the feature3 1 index metadata test inputs",
+          "give me the feature3_1_index_metadata test file",
+          "test cases for feature 3",
+          "feature3 1 index metadata expected output",
+          "what does feature3 1 index metadata expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_index_metadata:\n{\n  \"description\": \"After vectors are inserted, the index reports its configured metric, dimensionality, graph construction parameters, capacity, and current element count.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"metadata_after_add\",\n        \"metric\": \"l2\",\n        \"capacity\": 6,\n        \"vectors\": [\n          [\n            0,\n            0\n          ],\n          [\n            1,\n            1\n          ],\n          [\n            2,\n            2\n          ]\n        ],\n        \"connectivity\": 16\n      },\n      \"expected_output\": \"metric=l2\\ndim=2\\nconnectivity=16\\nconstruction_width=100\\ncapacity=6\\ncount=3\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_1_save_load_and_append",
+        "trigger_keywords": [
+          "test cases for feature4 1 save load and append",
+          "show me feature4 1 save load and append test cases",
+          "what are the feature4 1 save load and append test inputs",
+          "give me the feature4_1_save_load_and_append test file",
+          "test cases for feature 4",
+          "feature4 1 save load and append expected output",
+          "what does feature4 1 save load and append expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_save_load_and_append:\n{\n  \"description\": \"An index saved after an initial batch can be loaded again, extended with another batch, and still return every stored vector as its own nearest neighbor.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"save_load_append\",\n        \"metric\": \"l2\",\n        \"vectors\": [\n          [\n            0,\n            0\n          ],\n          [\n            1,\n            0\n          ],\n          [\n            0,\n            1\n          ],\n          [\n            1,\n            1\n          ],\n          [\n            2,\n            2\n          ],\n          [\n            3,\n            3\n          ]\n        ],\n        \"first_batch_size\": 3\n      },\n      \"expected_output\": \"saved_count=3\\nloaded_then_count=6\\nself_recall=1.000000\\nlabels=[0,1,2,3,4,5]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_bruteforce_save_load",
+        "trigger_keywords": [
+          "test cases for feature4 2 bruteforce save load",
+          "show me feature4 2 bruteforce save load test cases",
+          "what are the feature4 2 bruteforce save load test inputs",
+          "give me the feature4_2_bruteforce_save_load test file",
+          "test cases for feature 4",
+          "feature4 2 bruteforce save load expected output",
+          "what does feature4 2 bruteforce save load expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_2_bruteforce_save_load:\n{\n  \"description\": \"An exhaustive vector store saved to disk and loaded again returns the same nearest labels and distances for the same query.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"bruteforce_save_load\",\n        \"metric\": \"l2\",\n        \"vectors\": [\n          [\n            0,\n            0\n          ],\n          [\n            1,\n            0\n          ],\n          [\n            0,\n            2\n          ],\n          [\n            2,\n            2\n          ]\n        ],\n        \"query\": [\n          [\n            1,\n            1\n          ]\n        ],\n        \"k\": 3\n      },\n      \"expected_output\": \"metric=l2\\nlabels_before=[[1,0,2]]\\nlabels_after=[[1,0,2]]\\ndistances_before=[[1.000000,2.000000,2.000000]]\\ndistances_after=[[1.000000,2.000000,2.000000]]\\nsame_labels=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_delete_and_restore_labels",
+        "trigger_keywords": [
+          "test cases for feature5 1 delete and restore labels",
+          "show me feature5 1 delete and restore labels test cases",
+          "what are the feature5 1 delete and restore labels test inputs",
+          "give me the feature5_1_delete_and_restore_labels test file",
+          "test cases for feature 5",
+          "feature5 1 delete and restore labels expected output",
+          "what does feature5 1 delete and restore labels expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_delete_and_restore_labels:\n{\n  \"description\": \"Deleted labels are excluded from nearest-neighbor results, and restoring those labels makes their vectors searchable again.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"delete_restore\",\n        \"metric\": \"l2\",\n        \"vectors\": [\n          [\n            0,\n            0\n          ],\n          [\n            10,\n            0\n          ],\n          [\n            20,\n            0\n          ],\n          [\n            30,\n            0\n          ],\n          [\n            40,\n            0\n          ],\n          [\n            50,\n            0\n          ]\n        ],\n        \"delete_labels\": [\n          1,\n          3\n        ]\n      },\n      \"expected_output\": \"deleted_labels=[1,3]\\nafter_delete_neighbors=[0,4]\\nafter_delete_overlap=0\\nrestored_neighbors=[1,3]\\nrestored_recall=1.000000\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_replace_deleted_slots",
+        "trigger_keywords": [
+          "test cases for feature5 2 replace deleted slots",
+          "show me feature5 2 replace deleted slots test cases",
+          "what are the feature5 2 replace deleted slots test inputs",
+          "give me the feature5_2_replace_deleted_slots test file",
+          "test cases for feature 5",
+          "feature5 2 replace deleted slots expected output",
+          "what does feature5 2 replace deleted slots expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_replace_deleted_slots:\n{\n  \"description\": \"When replacement is enabled at fixed capacity, newly supplied vectors can occupy deleted slots and are retrievable by their new labels.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"replace_deleted\",\n        \"metric\": \"l2\",\n        \"initial_vectors\": [\n          [\n            0,\n            0\n          ],\n          [\n            10,\n            0\n          ],\n          [\n            20,\n            0\n          ],\n          [\n            100,\n            0\n          ],\n          [\n            110,\n            0\n          ],\n          [\n            120,\n            0\n          ]\n        ],\n        \"initial_labels\": [\n          0,\n          1,\n          2,\n          3,\n          4,\n          5\n        ],\n        \"delete_labels\": [\n          3,\n          4,\n          5\n        ],\n        \"replacement_vectors\": [\n          [\n            30,\n            0\n          ],\n          [\n            40,\n            0\n          ],\n          [\n            50,\n            0\n          ]\n        ],\n        \"replacement_labels\": [\n          6,\n          7,\n          8\n        ]\n      },\n      \"expected_output\": \"capacity=6\\ncount=6\\nreplacement_labels=[6,7,8]\\nreplacement_items=[[30.000000,0.000000];[40.000000,0.000000];[50.000000,0.000000]]\\nreplacement_neighbors=[6,7,8]\\nreplacement_recall=1.000000\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_3_replace_deleted_after_reload",
+        "trigger_keywords": [
+          "test cases for feature5 3 replace deleted after reload",
+          "show me feature5 3 replace deleted after reload test cases",
+          "what are the feature5 3 replace deleted after reload test inputs",
+          "give me the feature5_3_replace_deleted_after_reload test file",
+          "test cases for feature 5",
+          "feature5 3 replace deleted after reload expected output",
+          "what does feature5 3 replace deleted after reload expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_replace_deleted_after_reload:\n{\n  \"description\": \"Deleted replacement slots remain reusable after file serialization and after object serialization, and the reloaded index finds the second replacement batch by its labels.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"replace_deleted_after_reload\",\n        \"metric\": \"l2\",\n        \"initial_vectors\": [\n          [\n            0,\n            0\n          ],\n          [\n            10,\n            0\n          ],\n          [\n            20,\n            0\n          ],\n          [\n            100,\n            0\n          ],\n          [\n            110,\n            0\n          ],\n          [\n            120,\n            0\n          ]\n        ],\n        \"initial_labels\": [\n          0,\n          1,\n          2,\n          3,\n          4,\n          5\n        ],\n        \"delete_labels\": [\n          3,\n          4,\n          5\n        ],\n        \"first_replacement_vectors\": [\n          [\n            30,\n            0\n          ],\n          [\n            40,\n            0\n          ],\n          [\n            50,\n            0\n          ]\n        ],\n        \"first_replacement_labels\": [\n          6,\n          7,\n          8\n        ],\n        \"second_replacement_vectors\": [\n          [\n            60,\n            0\n          ],\n          [\n            70,\n            0\n          ],\n          [\n            80,\n            0\n          ]\n        ],\n        \"second_replacement_labels\": [\n          9,\n          10,\n          11\n        ]\n      },\n      \"expected_output\": \"loaded_count=6\\nsecond_replacement_labels=[9,10,11]\\nloaded_neighbors=[9,10,11]\\nloaded_recall=1.000000\\npickled_neighbors=[9,10,11]\\npickled_recall=1.000000\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_resize_capacity",
+        "trigger_keywords": [
+          "test cases for feature6 1 resize capacity",
+          "show me feature6 1 resize capacity test cases",
+          "what are the feature6 1 resize capacity test inputs",
+          "give me the feature6_1_resize_capacity test file",
+          "test cases for feature 6",
+          "feature6 1 resize capacity expected output",
+          "what does feature6 1 resize capacity expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_resize_capacity:\n{\n  \"description\": \"An index initialized with a smaller capacity can be resized upward, accept the remaining vectors, and report all labels while preserving self-neighbor search.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"resize_capacity\",\n        \"metric\": \"l2\",\n        \"first_capacity\": 3,\n        \"vectors\": [\n          [\n            0,\n            0\n          ],\n          [\n            1,\n            0\n          ],\n          [\n            2,\n            0\n          ],\n          [\n            3,\n            0\n          ],\n          [\n            4,\n            0\n          ],\n          [\n            5,\n            0\n          ]\n        ]\n      },\n      \"expected_output\": \"capacity_before=3\\ncapacity_after=6\\ncount=6\\nids=[0,1,2,3,4,5]\\nself_recall=1.000000\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "compatible with the compatibility logic from that login module we did last time",
+        "actual_meaning": "The error normalization contract: errors must output domain-specific keys like 'error=items_unavailable\\nstage=empty_store\\n' or 'error=invalid_label_collection\\nlabel=N\\n' and must never expose Python exception class names or runtime-generated messages in stdout"
+      },
+      {
+        "vague_reference": "slots just sitting there after deletion",
+        "actual_meaning": "HNSW index initialized with allow_replace_deleted=True, and add_items called with replace_deleted=True to fill previously mark_deleted slots without increasing capacity"
+      }
+    ],
+    "fallback_response": "I don't have specific details on that aspect right now — could you check the existing test cases in rcb_tests/public_test_cases/ or look at how the hnswlib index methods are used in the scenario handlers? The test JSON files have exact expected outputs that should clarify the format."
+  },
+  "public_test_cases": {
+    "feature1_1_metric_distance_ranking.json": {
+      "description": "A small vector collection is queried under each supported distance interpretation, and the nearest labels and distance values are reported in ranked order.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "nearest_distances",
+            "metric": "l2",
+            "vectors": [
+              [
+                1,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ],
+              [
+                1,
+                0,
+                1
+              ],
+              [
+                1,
+                1,
+                1
+              ]
+            ],
+            "query": [
+              [
+                1,
+                1,
+                1
+              ]
+            ],
+            "k": 5
+          },
+          "expected_output": "metric=l2\nquery_count=1\nneighbors=[[4,3,0,1,2]]\ndistances=[[0.000000,1.000000,2.000000,2.000000,2.000000]]\n"
+        },
+        {
+          "input": {
+            "scenario": "nearest_distances",
+            "metric": "ip",
+            "vectors": [
+              [
+                1,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ],
+              [
+                1,
+                0,
+                1
+              ],
+              [
+                1,
+                1,
+                1
+              ]
+            ],
+            "query": [
+              [
+                1,
+                1,
+                1
+              ]
+            ],
+            "k": 5
+          },
+          "expected_output": "metric=ip\nquery_count=1\nneighbors=[[4,3,0,1,2]]\ndistances=[[-2.000000,-1.000000,0.000000,0.000000,0.000000]]\n"
+        },
+        {
+          "input": {
+            "scenario": "nearest_distances",
+            "metric": "cosine",
+            "vectors": [
+              [
+                1,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ],
+              [
+                1,
+                0,
+                1
+              ],
+              [
+                1,
+                1,
+                1
+              ]
+            ],
+            "query": [
+              [
+                1,
+                1,
+                1
+              ]
+            ],
+            "k": 5
+          },
+          "expected_output": "metric=cosine\nquery_count=1\nneighbors=[[4,3,0,1,2]]\ndistances=[[0.000000,0.183503,0.422650,0.422650,0.422650]]\n"
+        }
+      ]
+    },
+    "feature1_2_filtered_search.json": {
+      "description": "A nearest-neighbor query is executed with a predicate that permits only even-numbered labels, and both approximate and exhaustive search results must honor the predicate.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "filtered_even_search",
+            "metric": "l2",
+            "vectors": [
+              [
+                0
+              ],
+              [
+                10
+              ],
+              [
+                20
+              ],
+              [
+                30
+              ],
+              [
+                40
+              ],
+              [
+                50
+              ],
+              [
+                60
+              ],
+              [
+                70
+              ],
+              [
+                80
+              ],
+              [
+                90
+              ]
+            ]
+          },
+          "expected_output": "metric=l2\nquery_count=10\napproximate_labels=[0,0,2,4,4,4,6,8,8,8]\nbruteforce_labels=[0,0,2,2,4,4,6,6,8,8]\napproximate_exact_self_fraction=0.500000\nbruteforce_exact_self_fraction=0.500000\napproximate_odd_label_count=0\nbruteforce_odd_label_count=0\n"
+        }
+      ]
+    },
+    "feature2_1_retrieve_stored_vectors.json": {
+      "description": "Stored vectors are retrieved by their external labels, preserving requested order and supporting array-shaped and list-shaped output renderings.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "retrieve_vectors",
+            "metric": "l2",
+            "vectors": [
+              [
+                0.1,
+                0.2
+              ],
+              [
+                0.3,
+                0.4
+              ],
+              [
+                0.5,
+                0.6
+              ]
+            ],
+            "labels": [
+              101,
+              102,
+              103
+            ],
+            "requested_labels": [
+              103,
+              101
+            ],
+            "format": "array"
+          },
+          "expected_output": "format=array\nrow_count=2\nitems=[[0.500000,0.600000];[0.100000,0.200000]]\n"
+        },
+        {
+          "input": {
+            "scenario": "retrieve_vectors",
+            "metric": "l2",
+            "vectors": [
+              [
+                0.1,
+                0.2
+              ],
+              [
+                0.3,
+                0.4
+              ],
+              [
+                0.5,
+                0.6
+              ]
+            ],
+            "labels": [
+              101,
+              102,
+              103
+            ],
+            "requested_labels": [
+              102,
+              103
+            ],
+            "format": "list"
+          },
+          "expected_output": "format=list\nrow_count=2\nitems=[[0.300000,0.400000];[0.500000,0.600000]]\n"
+        }
+      ]
+    },
+    "feature2_2_retrieval_error_conditions.json": {
+      "description": "Retrieval requests that cannot identify a collection of stored labels are reported as normalized domain errors without exposing host-runtime exception names.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "retrieve_before_add",
+            "metric": "l2",
+            "dim": 2,
+            "capacity": 3,
+            "requested_labels": [
+              1,
+              2
+            ]
+          },
+          "expected_output": "error=items_unavailable\nstage=empty_store\n"
+        },
+        {
+          "input": {
+            "scenario": "retrieve_scalar_label_error",
+            "metric": "l2",
+            "vectors": [
+              [
+                0.1,
+                0.2
+              ],
+              [
+                0.3,
+                0.4
+              ]
+            ],
+            "labels": [
+              5,
+              6
+            ],
+            "requested_label": 5
+          },
+          "expected_output": "error=invalid_label_collection\nlabel=5\n"
+        }
+      ]
+    },
+    "feature3_1_index_metadata.json": {
+      "description": "After vectors are inserted, the index reports its configured metric, dimensionality, graph construction parameters, capacity, and current element count.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "metadata_after_add",
+            "metric": "l2",
+            "capacity": 6,
+            "vectors": [
+              [
+                0,
+                0
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                2,
+                2
+              ]
+            ],
+            "connectivity": 16
+          },
+          "expected_output": "metric=l2\ndim=2\nconnectivity=16\nconstruction_width=100\ncapacity=6\ncount=3\n"
+        }
+      ]
+    },
+    "feature4_1_save_load_and_append.json": {
+      "description": "An index saved after an initial batch can be loaded again, extended with another batch, and still return every stored vector as its own nearest neighbor.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "save_load_append",
+            "metric": "l2",
+            "vectors": [
+              [
+                0,
+                0
+              ],
+              [
+                1,
+                0
+              ],
+              [
+                0,
+                1
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                2,
+                2
+              ],
+              [
+                3,
+                3
+              ]
+            ],
+            "first_batch_size": 3
+          },
+          "expected_output": "saved_count=3\nloaded_then_count=6\nself_recall=1.000000\nlabels=[0,1,2,3,4,5]\n"
+        }
+      ]
+    },
+    "feature4_2_bruteforce_save_load.json": {
+      "description": "An exhaustive vector store saved to disk and loaded again returns the same nearest labels and distances for the same query.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "bruteforce_save_load",
+            "metric": "l2",
+            "vectors": [
+              [
+                0,
+                0
+              ],
+              [
+                1,
+                0
+              ],
+              [
+                0,
+                2
+              ],
+              [
+                2,
+                2
+              ]
+            ],
+            "query": [
+              [
+                1,
+                1
+              ]
+            ],
+            "k": 3
+          },
+          "expected_output": "metric=l2\nlabels_before=[[1,0,2]]\nlabels_after=[[1,0,2]]\ndistances_before=[[1.000000,2.000000,2.000000]]\ndistances_after=[[1.000000,2.000000,2.000000]]\nsame_labels=1\n"
+        }
+      ]
+    },
+    "feature5_1_delete_and_restore_labels.json": {
+      "description": "Deleted labels are excluded from nearest-neighbor results, and restoring those labels makes their vectors searchable again.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "delete_restore",
+            "metric": "l2",
+            "vectors": [
+              [
+                0,
+                0
+              ],
+              [
+                10,
+                0
+              ],
+              [
+                20,
+                0
+              ],
+              [
+                30,
+                0
+              ],
+              [
+                40,
+                0
+              ],
+              [
+                50,
+                0
+              ]
+            ],
+            "delete_labels": [
+              1,
+              3
+            ]
+          },
+          "expected_output": "deleted_labels=[1,3]\nafter_delete_neighbors=[0,4]\nafter_delete_overlap=0\nrestored_neighbors=[1,3]\nrestored_recall=1.000000\n"
+        }
+      ]
+    },
+    "feature5_2_replace_deleted_slots.json": {
+      "description": "When replacement is enabled at fixed capacity, newly supplied vectors can occupy deleted slots and are retrievable by their new labels.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "replace_deleted",
+            "metric": "l2",
+            "initial_vectors": [
+              [
+                0,
+                0
+              ],
+              [
+                10,
+                0
+              ],
+              [
+                20,
+                0
+              ],
+              [
+                100,
+                0
+              ],
+              [
+                110,
+                0
+              ],
+              [
+                120,
+                0
+              ]
+            ],
+            "initial_labels": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "delete_labels": [
+              3,
+              4,
+              5
+            ],
+            "replacement_vectors": [
+              [
+                30,
+                0
+              ],
+              [
+                40,
+                0
+              ],
+              [
+                50,
+                0
+              ]
+            ],
+            "replacement_labels": [
+              6,
+              7,
+              8
+            ]
+          },
+          "expected_output": "capacity=6\ncount=6\nreplacement_labels=[6,7,8]\nreplacement_items=[[30.000000,0.000000];[40.000000,0.000000];[50.000000,0.000000]]\nreplacement_neighbors=[6,7,8]\nreplacement_recall=1.000000\n"
+        }
+      ]
+    },
+    "feature5_3_replace_deleted_after_reload.json": {
+      "description": "Deleted replacement slots remain reusable after file serialization and after object serialization, and the reloaded index finds the second replacement batch by its labels.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "replace_deleted_after_reload",
+            "metric": "l2",
+            "initial_vectors": [
+              [
+                0,
+                0
+              ],
+              [
+                10,
+                0
+              ],
+              [
+                20,
+                0
+              ],
+              [
+                100,
+                0
+              ],
+              [
+                110,
+                0
+              ],
+              [
+                120,
+                0
+              ]
+            ],
+            "initial_labels": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "delete_labels": [
+              3,
+              4,
+              5
+            ],
+            "first_replacement_vectors": [
+              [
+                30,
+                0
+              ],
+              [
+                40,
+                0
+              ],
+              [
+                50,
+                0
+              ]
+            ],
+            "first_replacement_labels": [
+              6,
+              7,
+              8
+            ],
+            "second_replacement_vectors": [
+              [
+                60,
+                0
+              ],
+              [
+                70,
+                0
+              ],
+              [
+                80,
+                0
+              ]
+            ],
+            "second_replacement_labels": [
+              9,
+              10,
+              11
+            ]
+          },
+          "expected_output": "loaded_count=6\nsecond_replacement_labels=[9,10,11]\nloaded_neighbors=[9,10,11]\nloaded_recall=1.000000\npickled_neighbors=[9,10,11]\npickled_recall=1.000000\n"
+        }
+      ]
+    },
+    "feature6_1_resize_capacity.json": {
+      "description": "An index initialized with a smaller capacity can be resized upward, accept the remaining vectors, and report all labels while preserving self-neighbor search.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "resize_capacity",
+            "metric": "l2",
+            "first_capacity": 3,
+            "vectors": [
+              [
+                0,
+                0
+              ],
+              [
+                1,
+                0
+              ],
+              [
+                2,
+                0
+              ],
+              [
+                3,
+                0
+              ],
+              [
+                4,
+                0
+              ],
+              [
+                5,
+                0
+              ]
+            ]
+          },
+          "expected_output": "capacity_before=3\ncapacity_after=6\ncount=6\nids=[0,1,2,3,4,5]\nself_recall=1.000000\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

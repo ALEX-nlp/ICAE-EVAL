@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need a small browser-side helper for our OAuth flows. basically we keep running into issues where different apps are assembling the redirect URLs differently and then can't parse them back properly on return. also the PKCE values sometimes break because of encoding inconsistencies. we had something similar in that config-override pattern we used for the login module — same idea where a platform-specific section should win over the base config, so just follow that same precedence logic.
+
+the helper should handle: building the URL you send to the provider, reading back what comes in on the redirect (could be in the hash or the query string, need to handle both), config merging where the platform block takes priority, and the base64 stuff for PKCE. keep it dependency-free and make sure it's easy to test in isolation.
+
+one thing that keeps biting us is that when the platform override block has a nested object like extra params, teams assume it merges with the base — it doesn't, and that causes subtle bugs. also the URL encoding for spaces in scope strings has been inconsistent across implementations. the test harness should write each case output to its own file (one case per file) so we can diff them cleanly, namespaced so different test runs don't stomp on each other.

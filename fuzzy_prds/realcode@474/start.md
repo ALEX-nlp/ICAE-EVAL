@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we've been getting some complaints from internal devs that the new HTTP service scaffold we're building doesn't behave consistently across a few scenarios they care about. Specifically there are issues around how shared service instances behave when multiple things depend on them — like, does changing a setting in one place actually reflect everywhere else that uses the same object? Also someone mentioned the 'same pattern we used for the login module' when talking about how beans get wired into non-JAX-RS components, but I'm not 100% sure what they meant by that, you'd probably need to dig through the existing resource setup to figure it out.
+
+Also we need to make sure that when things go wrong inside a resource handler, the error gets translated into a clean HTTP response rather than blowing up in some ugly way. There were a few notes about filtering too — apparently a post-processing step should run exactly once per response and add something to it, but it's been flaky.
+
+Finally, the team wants to deploy two versions of the app side by side under different URL prefixes and confirm their internal wiring stays completely separate. This came up because someone saw context bleed between environments in staging and it caused some weird data issues. We're on port 9998 for all of this. Can someone make sure all these behaviors are locked down properly?

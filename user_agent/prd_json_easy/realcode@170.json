@@ -1,0 +1,1275 @@
+{
+  "fuzzy_prd": "# Clickstream Event Collection, Mapping & Sink Engine\n\n## Project Goal\n\nBuild the server-side core of a clickstream data-collection platform. The system\nreceives raw browser/web events over HTTP, turns each event into a strongly typed\nstructured record according to a declarative mapping, and durably writes batches of\nthose records to a file-based sink for downstream analytics.\n\nThe engine must be deterministic, schema-driven, and configurable at runtime through\na hierarchical configuration document, without code changes. It is composed of four\ncooperating capabilities:\n\n1. A compact, self-verifying **identity token** codec used to label visitors,\n   sessions, and page views.\n2. A small **optional-configuration** access layer that reads typed values from a\n   hierarchical configuration document and degrades gracefully when values are\n   absent.\n3. A **record mapper** that transforms an incoming HTTP event into a typed record\n   using a declarative field-mapping configuration (flat copies, user-agent\n   parsing, regular-expression extraction, query-string/path/cookie extraction,\n   type casting, custom event parameters, and optional geo-IP enrichment).\n4. A **file sink** that buffers records into files using pluggable rolling\n   strategies (time-based rolling and session-window binning), publishing finished\n   files atomically and keeping unfinished files in-flight.\n\n## Background & Problem\n\nA clickstream collector sits on the hot path of a website: every page view and\ncustom event becomes an HTTP request. To be useful for analytics, those requests\nmust be normalized into a uniform, typed schema and stored efficiently. Several\nrecurring problems must be solved together:\n\n- **Stable identities.** Visitors and sessions need opaque identifiers that are\n  globally unique, carry their creation time so windows can be derived, and survive\n  a round trip (serialize → store in a cookie → read back) without loss.\n- **Configuration that may be incomplete.** Operators describe mappings and runtime\n  options in a configuration document. Lookups for optional settings must not crash\n  the server; they must report presence/absence and support fallbacks, required\n  semantics, filtering, and transformation.\n- **Declarative, type-safe mapping.** The shape of the output record is fixed by a\n  schema; the mapping from HTTP signals to record fields is data-driven. Values\n  arrive as strings and must be coerced to the schema's types, falling back to\n  schema defaults when coercion fails or a source value is missing. Invalid mapping\n  configurations must be rejected early with clear diagnostics.\n- **Durable, windowed output.** Records must be written to files that can be safely\n  published only once complete. Two strategies are required: rolling files on a time\n  interval, and binning events into per-session-window files (where an event sticks\n  to the window in which its session began, as long as that window is still open).\n\n## Architecture & Engineering Constraints\n\n### Component boundaries\n\n- **Identity token codec** — encodes a millisecond timestamp plus random bits into a\n  fixed-width, opaque, hex-like string; decodes it back to recover the timestamp;\n  defines value-based equality.\n- **Optional configuration accessor** — wraps a typed read against a hierarchical\n  configuration document; an unreadable/absent path yields an \"absent\" result\n  instead of throwing; supports value, fallback (eager and lazy), required,\n  predicate-filter, and transform operations.\n- **Record mapper** — validated against the output schema at construction time;\n  produces one typed record per HTTP event from a declarative mapping.\n- **File sink** — accepts a stream of encoded records and routes them to files via a\n  configurable strategy; finished files are published to an output area, unfinished\n  files remain in a working area with a distinct in-flight suffix.\n\n### Engineering constraints\n\n- **Deterministic contract.** All observable behavior is exposed as plain\n  `key=value` lines (one per line, in a fixed order). Collections render as\n  `[a, b, c]`; absent values render as `null`.\n- **Schema-driven typing.** Output field types come from the record schema; string\n  inputs are cast to integer/long/double/boolean as required, and a failed cast or\n  missing source falls back to the schema's declared default for that field.\n- **Fail-fast validation.** A mapping configuration with an unsupported version, a\n  mapped field that does not exist in the schema, or a cookie/event-parameter\n  mapping that omits its required name is rejected when the mapper is built. Errors\n  are surfaced as neutral, categorized codes (not host-language exceptions).\n- **Atomic publication.** A file is only readable once finalized; an in-flight file\n  is not yet a valid container and must not be treated as durable.\n- **Window semantics for binning.** Session windows are fixed-width; an event is\n  filed under the window in which its session started if that window's file is still\n  open, otherwise it moves to the current window's file. On a clean shutdown,\n  in-flight binning files are finalized in place but not published.\n\n### Execution adapter contract (for the test harness)\n\nA thin adapter reads exactly **one JSON command object** from standard input,\nperforms the requested operation against the engine, and writes the rendered\n`key=value` contract to standard output. The command's `op` field selects the\noperation; remaining fields are operation-specific inputs. This is the interface the\nhidden and public test cases drive.\n\n## Core Features\n\n### Feature 1: Identity token codec\n\nOpaque, time-bearing, unique identifiers with value equality.\n\n#### Feature 1.1: Encode/decode round-trip\n\nA timestamp encoded into a token is recovered exactly on decode, and the token has a\nfixed width regardless of the timestamp.\n\n```json\n{\n  \"description\": \"Identity token codec: a timestamp encoded into an opaque fixed-width token is recovered intact on decode.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"token_encode_decode\", \"timestamp\": 42 },\n      \"expected_output\": \"timestamp=42\\nlength=32\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 1.2: Value equality and hashing\n\nA decoded token equals the original it was parsed from (and shares its hash); an\nindependently generated token for the same timestamp is not equal (random bits\ndiffer).\n\n```json\n{\n  \"description\": \"Token value equality: a decoded token equals its original (same value and hash); an independently generated token for the same timestamp does not.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"token_identity\", \"timestamp\": 42 },\n      \"expected_output\": \"reparsed_equals=true\\nhashcode_equals=true\\nindependent_equals=false\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 1.3: Uniqueness at scale\n\nA large batch of freshly generated tokens contains no collisions.\n\n```json\n{\n  \"description\": \"Token uniqueness: a large batch of freshly generated tokens are all distinct.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"token_unique\", \"count\": 100000 },\n      \"expected_output\": \"generated=100000\\ndistinct=100000\\n\"\n    }\n  ]\n}\n```\n\n### Feature 2: Optional configuration access\n\nTyped, null-safe access to a hierarchical configuration document.\n\n#### Feature 2.1: Presence lookup\n\nA present typed value reports `present` with its rendered value; an absent path\nreports `absent` instead of raising.\n\n```json\n{\n  \"description\": \"Optional config lookup: present typed values report present with their value; an absent path reports absent rather than raising.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"config_presence\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"type\": \"string\", \"path\": \"some.existing.str\" },\n      \"expected_output\": \"state=present\\nvalue=Existing\\n\"\n    },\n    {\n      \"input\": { \"op\": \"config_presence\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"type\": \"string\", \"path\": \"some.nonexisting.str\" },\n      \"expected_output\": \"state=absent\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 2.2: Fallback values\n\nA present value is returned as-is; an absent path yields the supplied fallback,\nwhether resolved eagerly or lazily.\n\n```json\n{\n  \"description\": \"Optional config with fallback: a present value is returned; an absent path yields the supplied fallback, whether resolved eagerly or lazily.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"config_fallback\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"type\": \"string\", \"path\": \"some.existing.str\", \"fallback\": \"theOtherOne\" },\n      \"expected_output\": \"value=Existing\\n\"\n    },\n    {\n      \"input\": { \"op\": \"config_fallback\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"type\": \"string\", \"path\": \"some.nonexisting.str\", \"fallback\": \"theOtherOne\" },\n      \"expected_output\": \"value=theOtherOne\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 2.3: Required values\n\nA present value is returned; an absent path surfaces a neutral missing-value error.\n\n```json\n{\n  \"description\": \"Optional config required: a present value is returned; an absent path surfaces a neutral missing-value error.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"config_required\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"type\": \"string\", \"path\": \"some.existing.str\" },\n      \"expected_output\": \"value=Existing\\n\"\n    },\n    {\n      \"input\": { \"op\": \"config_required\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"type\": \"string\", \"path\": \"some.nonexisting.str\" },\n      \"expected_output\": \"error=absent_value\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 2.4: Predicate filtering\n\nA present list that satisfies the predicate stays present; one that fails the\npredicate, or an absent path, becomes absent.\n\n```json\n{\n  \"description\": \"Optional config filtering: a present list that satisfies the predicate stays present; one that fails the predicate or is absent becomes absent.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"config_filter\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"path\": \"some.existing.arr\", \"contains\": \"val1\" },\n      \"expected_output\": \"state=present\\nsize=2\\nitems=val1,val2\\n\"\n    },\n    {\n      \"input\": { \"op\": \"config_filter\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"path\": \"some.existing.arr\", \"contains\": \"missing\" },\n      \"expected_output\": \"state=absent\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 2.5: Value transformation\n\nA present value is mapped through a function (here, string length); an absent path\nstays absent without applying the function.\n\n```json\n{\n  \"description\": \"Optional config transformation: a present value is mapped through a function (here string length); an absent path stays absent without applying the function.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"config_map\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"path\": \"some.existing.str\" },\n      \"expected_output\": \"state=present\\nvalue=8\\n\"\n    },\n    {\n      \"input\": { \"op\": \"config_map\", \"config\": { \"some\": { \"existing\": { \"str\": \"Existing\", \"int\": 42, \"bool\": true, \"arr\": [\"val1\", \"val2\"] } } }, \"path\": \"some.nonexisting.str\" },\n      \"expected_output\": \"state=absent\\n\"\n    }\n  ]\n}\n```\n\n### Feature 3: HTTP event → typed record mapping\n\nA declarative mapper that builds one typed record per HTTP event. For every mapping\ncase the request carries a default cookie header\n(`[the default session cookie payload used by the mapper when no headers are found]`) and\nfixed identity tokens, so derived fields are deterministic.\n\n#### Feature 3.1: Standard field copies\n\nSimple request signals (location, referer, user agent, viewport, event type) and the\nrequest's identity tokens are copied into the record, together with the derived\nsession-start flag and the event timestamp.\n\n```json\n{\n  \"description\": \"Event mapping of standard fields: simple request signals (location, referer, user agent, viewport, event type) and the request's identity tokens are copied into the record, with the derived session-start flag and event timestamp.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"flat_fields\", \"page_view_id\": \"the_page_view_id\", \"location\": \"https://example.com/\", \"referer\": \"http://example.com/\", \"screen_width\": \"1024\", \"screen_height\": \"768\", \"viewport_width\": \"640\", \"viewport_height\": \"480\", \"event_type\": \"pageView\", \"fields\": [\"sessionStart\", \"ts\", \"location\", \"referer\", \"userAgentString\", \"eventType\", \"viewportWidth\", \"viewportHeight\", \"client\", \"session\", \"pageview\"] },\n      \"expected_output\": \"sessionStart=true\\nts=42\\nlocation=https://example.com/\\nreferer=http://example.com/\\nuserAgentString=Divolte/Test\\neventType=pageView\\nviewportWidth=640\\nviewportHeight=480\\n[explicit hardcoded hex strings generated from the input identity tokens]\\n[explicit hardcoded hex strings generated from the input identity tokens]\\n[explicit hardcoded hex strings generated from the input identity tokens]\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.2: User-agent parsing\n\nThe raw user-agent header is decomposed into browser, vendor, type, version, device\ncategory, and operating-system attributes.\n\n```json\n{\n  \"description\": \"User-agent parsing: the raw user-agent header is decomposed into browser, vendor, type, version, device category and operating-system attributes.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"user_agent\", \"user_agent\": \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/36.0.1985.125 Safari/537.36\", \"fields\": [\"userAgentName\", \"userAgentFamily\", \"userAgentVendor\", \"userAgentType\", \"userAgentVersion\", \"userAgentDeviceCategory\", \"userAgentOsFamily\", \"userAgentOsVersion\", \"userAgentOsVendor\"] },\n      \"expected_output\": \"[direct mappings from the parsed Chrome User Agent string]\\nuserAgentFamily=Chrome\\n[direct mappings from the parsed Chrome User Agent string]\\nuserAgentType=Browser\\nuserAgentVersion=36.0.1985.125\\nuserAgentDeviceCategory=Personal computer\\n[direct mappings from the parsed Chrome User Agent string]\\nuserAgentOsVersion=10.9.4\\nuserAgentOsVendor=Apple Computer, Inc.\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.3: Regular-expression named mapping\n\nA field is populated by the named capture of a regular expression applied to a\nrequest signal (here, the URL protocol of the location and referer).\n\n```json\n{\n  \"description\": \"Regex named-mapping: a field is populated by the named capture of a regular expression applied to a request signal (here the URL protocol of location and referer).\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"regex_match\", \"location\": \"http://example.com/\", \"referer\": \"https://www.example.com/bla/\", \"fields\": [\"locationProtocol\", \"refererProtocol\"] },\n      \"expected_output\": \"locationProtocol=http\\nrefererProtocol=https\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.4: Regular-expression capture groups\n\nMultiple fields are populated from positional capture groups of regular expressions\napplied to the location and referer.\n\n```json\n{\n  \"description\": \"Regex capture-group mapping: multiple fields are populated from positional capture groups of regular expressions applied to the location and referer.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"regex_capture\", \"location\": \"http://example.com/part1/part2/part3/ABA_C12_X3B\", \"referer\": \"https://www.example.com/about.html\", \"fields\": [\"toplevelCategory\", \"subCategory\", \"contentPage\"] },\n      \"expected_output\": \"toplevelCategory=ABA\\nsubCategory=C12\\ncontentPage=about\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.5: Query-string parameter mapping\n\nA field is set from a named parameter of the location URL; when the parameter is\nabsent the schema default is used.\n\n```json\n{\n  \"description\": \"Query-string parameter mapping: a field is set from a named parameter of the location URL; when the parameter is absent the schema default is used.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"query_param\", \"location\": \"http://ci-website-elb-1121474138.eu-west-1.elb.amazonaws.com/search?q=fiets+lamp+rood\", \"referer\": \"https://www.example.com/about.html\", \"fields\": [\"queryparam\"] },\n      \"expected_output\": \"queryparam=fiets lamp rood\\n\"\n    },\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"query_param\", \"location\": \"http://ci-website-elb-1121474138.eu-west-1.elb.amazonaws.com/search?other=wrong+param+name\", \"referer\": \"https://www.example.com/about.html\", \"fields\": [\"queryparam\"] },\n      \"expected_output\": \"queryparam=not set\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.6: Type casting with default fallback\n\nString signals from query, URL path, and cookie are cast to the schema's integer,\nboolean, double, and long types; a value that cannot be parsed falls back to the\nschema default.\n\n```json\n{\n  \"description\": \"Type casting of mapped values: string-typed signals from query, URL path and cookie are cast to the schema's integer, boolean, double and long types; a value that cannot be parsed falls back to the schema default.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"type_cast\", \"location\": \"http://example.com/42/false/3.14159265359/34359738368/whatever?i=-42&b=true&d=3.14159265359&l=34359738368\", \"referer\": \"https://www.example.com/about.html\", \"fields\": [\"queryparamInteger\", \"queryparamBoolean\", \"queryparamDouble\", \"queryparamLong\", \"pathInteger\", \"pathBoolean\", \"pathDouble\", \"pathLong\", \"cookieInteger\", \"cookieBoolean\"] },\n      \"expected_output\": \"queryparamInteger=-42\\nqueryparamBoolean=true\\nqueryparamDouble=3.14159265359\\nqueryparamLong=34359738368\\npathInteger=42\\npathBoolean=false\\npathDouble=3.14159265359\\npathLong=34359738368\\ncookieInteger=42\\ncookieBoolean=true\\n\"\n    },\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"type_cast\", \"location\": \"http://example.com/NotAnInt/false/3.14159265359/34359738368/whatever?i=-42&b=true&d=3.14159265359&l=34359738368\", \"referer\": \"https://www.example.com/about.html\", \"fields\": [\"pathInteger\"] },\n      \"expected_output\": \"pathInteger=-1\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.7: Custom cookie mapping\n\nA field is populated from the value of a named request cookie.\n\n```json\n{\n  \"description\": \"Custom cookie mapping: a field is populated from the value of a named request cookie.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"custom_cookie\", \"fields\": [\"customCookie\"] },\n      \"expected_output\": \"customCookie=custom_cookie_value\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.8: Custom event-parameter mapping\n\nA field is populated from a named custom event parameter carried on the request,\npreserving punctuation in the value.\n\n```json\n{\n  \"description\": \"Custom event-parameter mapping: a field is populated from a named custom event parameter carried on the request, preserving punctuation in the value.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"custom_event_param\", \"event_params\": { \"abba\": \"Honey, Honey\" }, \"fields\": [\"customEventParameter\"] },\n      \"expected_output\": \"customEventParameter=Honey, Honey\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.9: Geo-IP enrichment\n\nWhen a geo lookup yields a full result every geo field is populated; an empty lookup\nresult yields neutral defaults (false booleans, empty lists, null scalars); no lookup\nresult leaves every geo field null.\n\n```json\n{\n  \"description\": \"Geo-IP enrichment: when a geo lookup yields a full result every geo field is populated; an empty result yields neutral defaults (false booleans, empty lists, null scalars); no lookup result leaves every geo field null.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"geo\", \"geo\": \"with-everything\", \"user_agent\": \"Arbitrary User Agent\", \"fields\": [\"geoCityId\", \"geoCityName\", \"geoContinentCode\", \"geoContinentId\", \"geoContinentName\", \"geoCountryCode\", \"geoCountryId\", \"geoCountryName\", \"geoLatitude\", \"geoLongitude\", \"geoMetroCode\", \"geoTimeZone\", \"geoMostSpecificSubdivisionCode\", \"geoMostSpecificSubdivisionId\", \"geoMostSpecificSubdivisionName\", \"geoPostalCode\", \"geoRegisteredCountryCode\", \"geoRegisteredCountryId\", \"geoRegisteredCountryName\", \"geoRepresentedCountryCode\", \"geoRepresentedCountryId\", \"geoRepresentedCountryName\", \"geoAutonomousSystemNumber\", \"geoAutonomousSystemOrganization\", \"geoDomain\", \"geoIsp\", \"geoOrganisation\", \"geoAnonymousProxy\", \"geoSatelliteProvider\", \"geoSubdivisionCodes\", \"geoSubdivisionIds\", \"geoSubdivisionNames\"] },\n      \"expected_output\": \"geoCityId=2758064\\ngeoCityName=Bussum\\ngeoContinentCode=EU\\ngeoContinentId=6255148\\ngeoContinentName=Europe\\ngeoCountryCode=NL\\ngeoCountryId=2750405\\ngeoCountryName=Netherlands\\ngeoLatitude=52.27333\\ngeoLongitude=5.16111\\ngeoMetroCode=37331\\ngeoTimeZone=Europe/Amsterdam\\ngeoMostSpecificSubdivisionCode=YC\\ngeoMostSpecificSubdivisionId=2333\\ngeoMostSpecificSubdivisionName=Subdivision2\\ngeoPostalCode=1403RM\\ngeoRegisteredCountryCode=AB\\ngeoRegisteredCountryId=12\\ngeoRegisteredCountryName=Name1\\ngeoRepresentedCountryCode=CD\\ngeoRepresentedCountryId=14\\ngeoRepresentedCountryName=Name2\\ngeoAutonomousSystemNumber=42\\ngeoAutonomousSystemOrganization=Level Communications\\ngeoDomain=divolte.io\\ngeoIsp=An ISP\\ngeoOrganisation=The Organization\\ngeoAnonymousProxy=true\\ngeoSatelliteProvider=false\\ngeoSubdivisionCodes=[WN, YC]\\ngeoSubdivisionIds=[2331, 2333]\\ngeoSubdivisionNames=[Subdivision1, Subdivision2]\\n\"\n    },\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"geo\", \"geo\": \"none\", \"user_agent\": \"Arbitrary User Agent\", \"fields\": [\"geoCityId\", \"geoCityName\", \"geoContinentCode\", \"geoContinentId\", \"geoContinentName\", \"geoCountryCode\", \"geoCountryId\", \"geoCountryName\", \"geoLatitude\", \"geoLongitude\", \"geoMetroCode\", \"geoTimeZone\", \"geoMostSpecificSubdivisionCode\", \"geoMostSpecificSubdivisionId\", \"geoMostSpecificSubdivisionName\", \"geoPostalCode\", \"geoRegisteredCountryCode\", \"geoRegisteredCountryId\", \"geoRegisteredCountryName\", \"geoRepresentedCountryCode\", \"geoRepresentedCountryId\", \"geoRepresentedCountryName\", \"geoAutonomousSystemNumber\", \"geoAutonomousSystemOrganization\", \"geoDomain\", \"geoIsp\", \"geoOrganisation\", \"geoAnonymousProxy\", \"geoSatelliteProvider\", \"geoSubdivisionCodes\", \"geoSubdivisionIds\", \"geoSubdivisionNames\"] },\n      \"expected_output\": \"geoCityId=null\\ngeoCityName=null\\ngeoContinentCode=null\\ngeoContinentId=null\\ngeoContinentName=null\\ngeoCountryCode=null\\ngeoCountryId=null\\ngeoCountryName=null\\ngeoLatitude=null\\ngeoLongitude=null\\ngeoMetroCode=null\\ngeoTimeZone=null\\ngeoMostSpecificSubdivisionCode=null\\ngeoMostSpecificSubdivisionId=null\\ngeoMostSpecificSubdivisionName=null\\ngeoPostalCode=null\\ngeoRegisteredCountryCode=null\\ngeoRegisteredCountryId=null\\ngeoRegisteredCountryName=null\\ngeoRepresentedCountryCode=null\\ngeoRepresentedCountryId=null\\ngeoRepresentedCountryName=null\\ngeoAutonomousSystemNumber=null\\ngeoAutonomousSystemOrganization=null\\ngeoDomain=null\\ngeoIsp=null\\ngeoOrganisation=null\\ngeoAnonymousProxy=null\\ngeoSatelliteProvider=null\\ngeoSubdivisionCodes=null\\ngeoSubdivisionIds=null\\ngeoSubdivisionNames=null\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 3.10: Mapping configuration validation\n\nAn unsupported mapping version, a mapped field missing from the schema, a cookie\nmapping without a name, and an event-parameter mapping without a name are each\nrejected at construction with a descriptive, categorized error.\n\n```json\n{\n  \"description\": \"Mapping configuration validation: an unsupported mapping version, a mapped field missing from the schema, a cookie mapping without a name, and an event-parameter mapping without a name are each rejected at construction with a descriptive, categorized error.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"unsupported_version\", \"fields\": [] },\n      \"expected_output\": \"error=unsupported_mapping_version\\nversion=42\\n\"\n    },\n    {\n      \"input\": { \"op\": \"map_event\", \"scenario\": \"missing_field\", \"fields\": [] },\n      \"expected_output\": \"error=missing_schema_field\\nfield=fieldThatIsMissingFromSchema\\n\"\n    }\n  ]\n}\n```\n\n### Feature 4: File sink strategies\n\nBuffer records into files; publish completed files, keep unfinished files in-flight.\nOutput reports the number of published and in-flight files and, per file, the event\ntimestamps it contains (in file order). A `.avro` suffix denotes a published file;\na `.avro.partial` suffix denotes an in-flight file. An in-flight file that has not\nbeen finalized is reported as `<unreadable>` because it is not yet a valid container.\n\n#### Feature 4.1: Time-based rolling\n\nRecords accumulate in a single in-flight file that is published on clean shutdown;\nan in-flight file left unfinalized is not yet readable; forcing rolls between\nbatches publishes one file per interval.\n\n```json\n{\n  \"description\": \"Rolling file sink: records written under a time-based rolling strategy accumulate in a single in-flight file, published on clean shutdown; an in-flight file that has not been finalized is not yet a readable container; forcing rolls between batches publishes one file per interval.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"sink\", \"strategy\": \"simple\", \"roll_every\": \"1 day\", \"records\": [{ \"ts\": 0 }, { \"ts\": 1 }, { \"ts\": 2 }, { \"ts\": 3 }, { \"ts\": 4 }, { \"ts\": 5 }, { \"ts\": 6 }, { \"ts\": 7 }, { \"ts\": 8 }, { \"ts\": 9 }] },\n      \"expected_output\": \"published_files=1\\ninflight_files=0\\npublished[0]=.avro|0,1,2,3,4,5,6,7,8,9\\n\"\n    },\n    {\n      \"input\": { \"op\": \"sink\", \"strategy\": \"simple\", \"roll_every\": \"1 day\", \"cleanup\": false, \"records\": [{ \"ts\": 0 }, { \"ts\": 1 }, { \"ts\": 2 }] },\n      \"expected_output\": \"published_files=0\\ninflight_files=1\\ninflight[0]=.avro.partial|<unreadable>\\n\"\n    },\n    {\n      \"input\": { \"op\": \"sink\", \"strategy\": \"simple\", \"roll_every\": \"1 second\", \"records\": [{ \"ts\": 0 }, { \"ts\": 1 }], \"rolls\": 2, \"records2\": [{ \"ts\": 2 }, { \"ts\": 3 }] },\n      \"expected_output\": \"published_files=2\\ninflight_files=0\\npublished[0]=.avro|0,1\\npublished[1]=.avro|2,3\\n\"\n    }\n  ]\n}\n```\n\n#### Feature 4.2: Session-window binning\n\nEvents are routed to per-session-window files. Events from distinct windows land in\nseparate files; an event whose session opened in an earlier window sticks to that\nwindow's file while it is still open; once a window is no longer current a later\nevent opens the next window's file; a lone event yields a single in-flight file.\n\n```json\n{\n  \"description\": \"Session-binning file sink: events are routed to per-session-window files. Events from distinct windows land in separate files; an event whose session opened in an earlier window sticks to that window's file; once a window is no longer current a later event opens the next window's file; a lone event yields a single in-flight file.\",\n  \"cases\": [\n    {\n      \"input\": { \"op\": \"sink\", \"strategy\": \"binning\", \"records\": [{ \"ts\": 100 }, { \"ts\": 1100 }, { \"ts\": 2100 }, { \"ts\": 3100 }, { \"ts\": 4100 }] },\n      \"expected_output\": \"published_files=2\\ninflight_files=3\\npublished[0]=.avro|100\\npublished[1]=.avro|1100\\ninflight[0]=.avro.partial|2100\\ninflight[1]=.avro.partial|3100\\ninflight[2]=.avro.partial|4100\\n\"\n    },\n    {\n      \"input\": { \"op\": \"sink\", \"strategy\": \"binning\", \"records\": [{ \"ts\": 100, \"session_start\": 100 }, { \"ts\": 1100, \"session_start\": 1100 }, { \"ts\": 2100, \"session_start\": 2100 }, { \"ts\": 3100, \"session_start\": 3100 }, { \"ts\": 3150, \"session_start\": 100 }, { \"ts\": 3160, \"session_start\": 1100 }, { \"ts\": 3170, \"session_start\": 2100 }, { \"ts\": 3180, \"session_start\": 3100 }] },\n      \"expected_output\": \"published_files=1\\ninflight_files=3\\npublished[0]=.avro|100\\ninflight[0]=.avro.partial|1100,3150,3160\\ninflight[1]=.avro.partial|2100,3170\\ninflight[2]=.avro.partial|3100,3180\\n\"\n    }\n  ]\n}\n```\n\n## Deliverables\n\n- An **identity token codec** providing encode/decode round-trip, value equality and\n  hashing, and uniqueness at scale (Feature 1).\n- An **optional configuration accessor** over a hierarchical configuration document,\n  supporting presence, fallback (eager and lazy), required, predicate-filter, and\n  transform operations (Feature 2).\n- A **declarative record mapper** that turns an HTTP event into a typed record:\n  standard field copies, user-agent parsing, regex named/group extraction,\n  query/path/cookie extraction with type casting and schema defaults, custom event\n  parameters, geo-IP enrichment, and fail-fast mapping-configuration validation\n  (Feature 3).\n- A **file sink** with pluggable strategies — time-based rolling and session-window\n  binning — that publishes completed files atomically and keeps unfinished files\n  in-flight (Feature 4).\n- A **single test entry point** (`rcb_tests/test.sh`) that builds the engine, runs\n  every JSON case in a chosen directory through the execution adapter, captures raw\n  program stdout, and compares it to each case's expected output. It supports\n  `--cases-dir <subdir>` (default `test_cases`) and writes captured stdout to\n  `rcb_tests/stdout/<subdir>/<stem>@<NNN>.txt`.\n- A hidden evaluation set under `rcb_tests/test_cases/` and a public mirror under\n  `rcb_tests/public_test_cases/`, one JSON file per leaf feature.\n\n### Acceptance\n\nRunning `bash rcb_tests/test.sh --cases-dir test_cases` must report `0` failures\nagainst the engine, and likewise for `--cases-dir public_test_cases`.\n\n\n---\n**Implementation notes:**\n- verify the provider supports this specific mapping version\n- inspect the partial file name and timestamp\n",
+  "oracle_data": {
+    "task_id": "divolte__divolte-collector-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C018",
+        "trigger_keywords": [
+          "what are the specific hex strings for client",
+          "hex string values for session field",
+          "pageview hex value in output",
+          "token identity hex response",
+          "hardcoded hex client session",
+          "2a1111111111111111 session hex"
+        ],
+        "oracle_response": "The client field is \"000000000000002a1111111111111111\", the session field is \"000000000000002a2222222222222222\", and the pageview field is \"000000000000002a3333333333333333\"."
+      },
+      {
+        "constraint_id": "C019",
+        "trigger_keywords": [
+          "what is the exact userAgentName value",
+          "userAgentVendor string result",
+          "userAgentOsFamily hex",
+          "Chrome user agent vendor",
+          "Google Inc vendor string",
+          "OS X ua family exact"
+        ],
+        "oracle_response": "The user agent name is \"Chrome\", the vendor is \"Google Inc.\", and the OS family is \"OS X\"."
+      },
+      {
+        "constraint_id": "C037",
+        "trigger_keywords": [
+          "default cookie header content",
+          "exact string in standard cookie header",
+          "typed_cookie_int default value",
+          "default session params string",
+          "what is the full cookie header",
+          "semityped_cookie default"
+        ],
+        "oracle_response": "The default cookie header is \"custom_cookie=custom_cookie_value;typed_cookie_int=42;typed_cookie_bool=true\"."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "verify the provider supports this specific mapping version",
+        "actual_meaning": "The mapping version must be exactly 2; any integer other than 2 triggers an 'unsupported_mapping_version' error."
+      },
+      {
+        "vague_reference": "inspect the partial file name and timestamp",
+        "actual_meaning": "The file remains named \".avro.partial\" with a timestamp string consisting of exactly 13 digits representing the current Unix timestamp in milliseconds."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_encode_decode.json": {
+      "description": "Identity token codec: a timestamp encoded into an opaque fixed-width token is recovered intact on decode.",
+      "cases": [
+        {
+          "input": {
+            "op": "token_encode_decode",
+            "timestamp": 42
+          },
+          "expected_output": "timestamp=42\nlength=32\n"
+        }
+      ]
+    },
+    "feature1_2_identity.json": {
+      "description": "Token value equality: a decoded token equals its original (same value and hash); an independently generated token for the same timestamp does not.",
+      "cases": [
+        {
+          "input": {
+            "op": "token_identity",
+            "timestamp": 42
+          },
+          "expected_output": "reparsed_equals=true\nhashcode_equals=true\nindependent_equals=false\n"
+        }
+      ]
+    },
+    "feature1_3_uniqueness.json": {
+      "description": "Token uniqueness: a large batch of freshly generated tokens are all distinct.",
+      "cases": [
+        {
+          "input": {
+            "op": "token_unique",
+            "count": 100000
+          },
+          "expected_output": "generated=100000\ndistinct=100000\n"
+        }
+      ]
+    },
+    "feature2_1_presence.json": {
+      "description": "Optional config lookup: present typed values report present with their value; an absent path reports absent rather than raising.",
+      "cases": [
+        {
+          "input": {
+            "op": "config_presence",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "type": "string",
+            "path": "some.existing.str"
+          },
+          "expected_output": "state=present\nvalue=Existing\n"
+        },
+        {
+          "input": {
+            "op": "config_presence",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "type": "string",
+            "path": "some.nonexisting.str"
+          },
+          "expected_output": "state=absent\n"
+        }
+      ]
+    },
+    "feature2_2_fallback.json": {
+      "description": "Optional config with fallback: a present value is returned; an absent path yields the supplied fallback, whether resolved eagerly or lazily.",
+      "cases": [
+        {
+          "input": {
+            "op": "config_fallback",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "type": "string",
+            "path": "some.existing.str",
+            "fallback": "theOtherOne"
+          },
+          "expected_output": "value=Existing\n"
+        },
+        {
+          "input": {
+            "op": "config_fallback",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "type": "string",
+            "path": "some.nonexisting.str",
+            "fallback": "theOtherOne"
+          },
+          "expected_output": "value=theOtherOne\n"
+        }
+      ]
+    },
+    "feature2_3_required.json": {
+      "description": "Optional config required: a present value is returned; an absent path surfaces a neutral missing-value error.",
+      "cases": [
+        {
+          "input": {
+            "op": "config_required",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "type": "string",
+            "path": "some.existing.str"
+          },
+          "expected_output": "value=Existing\n"
+        },
+        {
+          "input": {
+            "op": "config_required",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "type": "string",
+            "path": "some.nonexisting.str"
+          },
+          "expected_output": "error=absent_value\n"
+        }
+      ]
+    },
+    "feature2_4_filter.json": {
+      "description": "Optional config filtering: a present list that satisfies the predicate stays present; one that fails the predicate or is absent becomes absent.",
+      "cases": [
+        {
+          "input": {
+            "op": "config_filter",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "path": "some.existing.arr",
+            "contains": "val1"
+          },
+          "expected_output": "state=present\nsize=2\nitems=val1,val2\n"
+        },
+        {
+          "input": {
+            "op": "config_filter",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "path": "some.existing.arr",
+            "contains": "missing"
+          },
+          "expected_output": "state=absent\n"
+        }
+      ]
+    },
+    "feature2_5_map.json": {
+      "description": "Optional config transformation: a present value is mapped through a function (here string length); an absent path stays absent without applying the function.",
+      "cases": [
+        {
+          "input": {
+            "op": "config_map",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "path": "some.existing.str"
+          },
+          "expected_output": "state=present\nvalue=8\n"
+        },
+        {
+          "input": {
+            "op": "config_map",
+            "config": {
+              "some": {
+                "existing": {
+                  "str": "Existing",
+                  "int": 42,
+                  "bool": true,
+                  "arr": [
+                    "val1",
+                    "val2"
+                  ]
+                }
+              }
+            },
+            "path": "some.nonexisting.str"
+          },
+          "expected_output": "state=absent\n"
+        }
+      ]
+    },
+    "feature3_10_mapping_errors.json": {
+      "description": "Mapping configuration validation: an unsupported mapping version, a mapped field missing from the schema, a cookie mapping without a name, and an event-parameter mapping without a name are each rejected at construction with a descriptive, categorized error.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "unsupported_version",
+            "fields": []
+          },
+          "expected_output": "error=unsupported_mapping_version\nversion=42\n"
+        },
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "missing_field",
+            "fields": []
+          },
+          "expected_output": "error=missing_schema_field\nfield=fieldThatIsMissingFromSchema\n"
+        }
+      ]
+    },
+    "feature3_1_standard_fields.json": {
+      "description": "Event mapping of standard fields: simple request signals (location, referer, user agent, viewport, event type) and the request's identity tokens are copied into the record, with the derived session-start flag and event timestamp.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "flat_fields",
+            "page_view_id": "the_page_view_id",
+            "location": "https://example.com/",
+            "referer": "http://example.com/",
+            "screen_width": "1024",
+            "screen_height": "768",
+            "viewport_width": "640",
+            "viewport_height": "480",
+            "event_type": "pageView",
+            "fields": [
+              "sessionStart",
+              "ts",
+              "location",
+              "referer",
+              "userAgentString",
+              "eventType",
+              "viewportWidth",
+              "viewportHeight",
+              "client",
+              "session",
+              "pageview"
+            ]
+          },
+          "expected_output": "sessionStart=true\nts=42\nlocation=https://example.com/\nreferer=http://example.com/\nuserAgentString=Divolte/Test\neventType=pageView\nviewportWidth=640\nviewportHeight=480\nclient=000000000000002a1111111111111111\nsession=000000000000002a2222222222222222\npageview=000000000000002a3333333333333333\n"
+        }
+      ]
+    },
+    "feature3_2_user_agent.json": {
+      "description": "User-agent parsing: the raw user-agent header is decomposed into browser, vendor, type, version, device category and operating-system attributes.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "user_agent",
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/36.0.1985.125 Safari/537.36",
+            "fields": [
+              "userAgentName",
+              "userAgentFamily",
+              "userAgentVendor",
+              "userAgentType",
+              "userAgentVersion",
+              "userAgentDeviceCategory",
+              "userAgentOsFamily",
+              "userAgentOsVersion",
+              "userAgentOsVendor"
+            ]
+          },
+          "expected_output": "userAgentName=Chrome\nuserAgentFamily=Chrome\nuserAgentVendor=Google Inc.\nuserAgentType=Browser\nuserAgentVersion=36.0.1985.125\nuserAgentDeviceCategory=Personal computer\nuserAgentOsFamily=OS X\nuserAgentOsVersion=10.9.4\nuserAgentOsVendor=Apple Computer, Inc.\n"
+        }
+      ]
+    },
+    "feature3_3_regex_name.json": {
+      "description": "Regex named-mapping: a field is populated by the named capture of a regular expression applied to a request signal (here the URL protocol of location and referer).",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "regex_match",
+            "location": "http://example.com/",
+            "referer": "https://www.example.com/bla/",
+            "fields": [
+              "locationProtocol",
+              "refererProtocol"
+            ]
+          },
+          "expected_output": "locationProtocol=http\nrefererProtocol=https\n"
+        }
+      ]
+    },
+    "feature3_4_regex_group.json": {
+      "description": "Regex capture-group mapping: multiple fields are populated from positional capture groups of regular expressions applied to the location and referer.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "regex_capture",
+            "location": "http://example.com/part1/part2/part3/ABA_C12_X3B",
+            "referer": "https://www.example.com/about.html",
+            "fields": [
+              "toplevelCategory",
+              "subCategory",
+              "contentPage"
+            ]
+          },
+          "expected_output": "toplevelCategory=ABA\nsubCategory=C12\ncontentPage=about\n"
+        }
+      ]
+    },
+    "feature3_5_query_param.json": {
+      "description": "Query-string parameter mapping: a field is set from a named parameter of the location URL; when the parameter is absent the schema default is used.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "query_param",
+            "location": "http://ci-website-elb-1121474138.eu-west-1.elb.amazonaws.com/search?q=fiets+lamp+rood",
+            "referer": "https://www.example.com/about.html",
+            "fields": [
+              "queryparam"
+            ]
+          },
+          "expected_output": "queryparam=fiets lamp rood\n"
+        },
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "query_param",
+            "location": "http://ci-website-elb-1121474138.eu-west-1.elb.amazonaws.com/search?other=wrong+param+name",
+            "referer": "https://www.example.com/about.html",
+            "fields": [
+              "queryparam"
+            ]
+          },
+          "expected_output": "queryparam=not set\n"
+        }
+      ]
+    },
+    "feature3_6_type_casting.json": {
+      "description": "Type casting of mapped values: string-typed signals from query, URL path and cookie are cast to the schema's integer, boolean, double and long types; a value that cannot be parsed falls back to the schema default.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "type_cast",
+            "location": "http://example.com/42/false/3.14159265359/34359738368/whatever?i=-42&b=true&d=3.14159265359&l=34359738368",
+            "referer": "https://www.example.com/about.html",
+            "fields": [
+              "queryparamInteger",
+              "queryparamBoolean",
+              "queryparamDouble",
+              "queryparamLong",
+              "pathInteger",
+              "pathBoolean",
+              "pathDouble",
+              "pathLong",
+              "cookieInteger",
+              "cookieBoolean"
+            ]
+          },
+          "expected_output": "queryparamInteger=-42\nqueryparamBoolean=true\nqueryparamDouble=3.14159265359\nqueryparamLong=34359738368\npathInteger=42\npathBoolean=false\npathDouble=3.14159265359\npathLong=34359738368\ncookieInteger=42\ncookieBoolean=true\n"
+        },
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "type_cast",
+            "location": "http://example.com/NotAnInt/false/3.14159265359/34359738368/whatever?i=-42&b=true&d=3.14159265359&l=34359738368",
+            "referer": "https://www.example.com/about.html",
+            "fields": [
+              "pathInteger"
+            ]
+          },
+          "expected_output": "pathInteger=-1\n"
+        }
+      ]
+    },
+    "feature3_7_custom_cookie.json": {
+      "description": "Custom cookie mapping: a field is populated from the value of a named request cookie.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "custom_cookie",
+            "fields": [
+              "customCookie"
+            ]
+          },
+          "expected_output": "customCookie=custom_cookie_value\n"
+        }
+      ]
+    },
+    "feature3_8_event_parameter.json": {
+      "description": "Custom event-parameter mapping: a field is populated from a named custom event parameter carried on the request, preserving punctuation in the value.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "custom_event_param",
+            "event_params": {
+              "abba": "Honey, Honey"
+            },
+            "fields": [
+              "customEventParameter"
+            ]
+          },
+          "expected_output": "customEventParameter=Honey, Honey\n"
+        }
+      ]
+    },
+    "feature3_9_geoip.json": {
+      "description": "Geo-IP enrichment: when a geo lookup yields a full result every geo field is populated; an empty result yields neutral defaults (false booleans, empty lists, null scalars); no lookup result leaves every geo field null.",
+      "cases": [
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "geo",
+            "geo": "with-everything",
+            "user_agent": "Arbitrary User Agent",
+            "fields": [
+              "geoCityId",
+              "geoCityName",
+              "geoContinentCode",
+              "geoContinentId",
+              "geoContinentName",
+              "geoCountryCode",
+              "geoCountryId",
+              "geoCountryName",
+              "geoLatitude",
+              "geoLongitude",
+              "geoMetroCode",
+              "geoTimeZone",
+              "geoMostSpecificSubdivisionCode",
+              "geoMostSpecificSubdivisionId",
+              "geoMostSpecificSubdivisionName",
+              "geoPostalCode",
+              "geoRegisteredCountryCode",
+              "geoRegisteredCountryId",
+              "geoRegisteredCountryName",
+              "geoRepresentedCountryCode",
+              "geoRepresentedCountryId",
+              "geoRepresentedCountryName",
+              "geoAutonomousSystemNumber",
+              "geoAutonomousSystemOrganization",
+              "geoDomain",
+              "geoIsp",
+              "geoOrganisation",
+              "geoAnonymousProxy",
+              "geoSatelliteProvider",
+              "geoSubdivisionCodes",
+              "geoSubdivisionIds",
+              "geoSubdivisionNames"
+            ]
+          },
+          "expected_output": "geoCityId=2758064\ngeoCityName=Bussum\ngeoContinentCode=EU\ngeoContinentId=6255148\ngeoContinentName=Europe\ngeoCountryCode=NL\ngeoCountryId=2750405\ngeoCountryName=Netherlands\ngeoLatitude=52.27333\ngeoLongitude=5.16111\ngeoMetroCode=37331\ngeoTimeZone=Europe/Amsterdam\ngeoMostSpecificSubdivisionCode=YC\ngeoMostSpecificSubdivisionId=2333\ngeoMostSpecificSubdivisionName=Subdivision2\ngeoPostalCode=1403RM\ngeoRegisteredCountryCode=AB\ngeoRegisteredCountryId=12\ngeoRegisteredCountryName=Name1\ngeoRepresentedCountryCode=CD\ngeoRepresentedCountryId=14\ngeoRepresentedCountryName=Name2\ngeoAutonomousSystemNumber=42\ngeoAutonomousSystemOrganization=Level Communications\ngeoDomain=divolte.io\ngeoIsp=An ISP\ngeoOrganisation=The Organization\ngeoAnonymousProxy=true\ngeoSatelliteProvider=false\ngeoSubdivisionCodes=[WN, YC]\ngeoSubdivisionIds=[2331, 2333]\ngeoSubdivisionNames=[Subdivision1, Subdivision2]\n"
+        },
+        {
+          "input": {
+            "op": "map_event",
+            "scenario": "geo",
+            "geo": "none",
+            "user_agent": "Arbitrary User Agent",
+            "fields": [
+              "geoCityId",
+              "geoCityName",
+              "geoContinentCode",
+              "geoContinentId",
+              "geoContinentName",
+              "geoCountryCode",
+              "geoCountryId",
+              "geoCountryName",
+              "geoLatitude",
+              "geoLongitude",
+              "geoMetroCode",
+              "geoTimeZone",
+              "geoMostSpecificSubdivisionCode",
+              "geoMostSpecificSubdivisionId",
+              "geoMostSpecificSubdivisionName",
+              "geoPostalCode",
+              "geoRegisteredCountryCode",
+              "geoRegisteredCountryId",
+              "geoRegisteredCountryName",
+              "geoRepresentedCountryCode",
+              "geoRepresentedCountryId",
+              "geoRepresentedCountryName",
+              "geoAutonomousSystemNumber",
+              "geoAutonomousSystemOrganization",
+              "geoDomain",
+              "geoIsp",
+              "geoOrganisation",
+              "geoAnonymousProxy",
+              "geoSatelliteProvider",
+              "geoSubdivisionCodes",
+              "geoSubdivisionIds",
+              "geoSubdivisionNames"
+            ]
+          },
+          "expected_output": "geoCityId=null\ngeoCityName=null\ngeoContinentCode=null\ngeoContinentId=null\ngeoContinentName=null\ngeoCountryCode=null\ngeoCountryId=null\ngeoCountryName=null\ngeoLatitude=null\ngeoLongitude=null\ngeoMetroCode=null\ngeoTimeZone=null\ngeoMostSpecificSubdivisionCode=null\ngeoMostSpecificSubdivisionId=null\ngeoMostSpecificSubdivisionName=null\ngeoPostalCode=null\ngeoRegisteredCountryCode=null\ngeoRegisteredCountryId=null\ngeoRegisteredCountryName=null\ngeoRepresentedCountryCode=null\ngeoRepresentedCountryId=null\ngeoRepresentedCountryName=null\ngeoAutonomousSystemNumber=null\ngeoAutonomousSystemOrganization=null\ngeoDomain=null\ngeoIsp=null\ngeoOrganisation=null\ngeoAnonymousProxy=null\ngeoSatelliteProvider=null\ngeoSubdivisionCodes=null\ngeoSubdivisionIds=null\ngeoSubdivisionNames=null\n"
+        }
+      ]
+    },
+    "feature4_1_rolling.json": {
+      "description": "Rolling file sink: records written under a time-based rolling strategy accumulate in a single in-flight file, published on clean shutdown; an in-flight file that has not been finalized is not yet a readable container; forcing rolls between batches publishes one file per interval.",
+      "cases": [
+        {
+          "input": {
+            "op": "sink",
+            "strategy": "simple",
+            "roll_every": "1 day",
+            "records": [
+              {
+                "ts": 0
+              },
+              {
+                "ts": 1
+              },
+              {
+                "ts": 2
+              },
+              {
+                "ts": 3
+              },
+              {
+                "ts": 4
+              },
+              {
+                "ts": 5
+              },
+              {
+                "ts": 6
+              },
+              {
+                "ts": 7
+              },
+              {
+                "ts": 8
+              },
+              {
+                "ts": 9
+              }
+            ]
+          },
+          "expected_output": "published_files=1\ninflight_files=0\npublished[0]=.avro|0,1,2,3,4,5,6,7,8,9\n"
+        },
+        {
+          "input": {
+            "op": "sink",
+            "strategy": "simple",
+            "roll_every": "1 day",
+            "cleanup": false,
+            "records": [
+              {
+                "ts": 0
+              },
+              {
+                "ts": 1
+              },
+              {
+                "ts": 2
+              }
+            ]
+          },
+          "expected_output": "published_files=0\ninflight_files=1\ninflight[0]=.avro.partial|<unreadable>\n"
+        },
+        {
+          "input": {
+            "op": "sink",
+            "strategy": "simple",
+            "roll_every": "1 second",
+            "records": [
+              {
+                "ts": 0
+              },
+              {
+                "ts": 1
+              }
+            ],
+            "rolls": 2,
+            "records2": [
+              {
+                "ts": 2
+              },
+              {
+                "ts": 3
+              }
+            ]
+          },
+          "expected_output": "published_files=2\ninflight_files=0\npublished[0]=.avro|0,1\npublished[1]=.avro|2,3\n"
+        }
+      ]
+    },
+    "feature4_2_session_binning.json": {
+      "description": "Session-binning file sink: events are routed to per-session-window files. Events from distinct windows land in separate files; an event whose session opened in an earlier window sticks to that window's file; once a window is no longer current a later event opens the next window's file; a lone event yields a single in-flight file.",
+      "cases": [
+        {
+          "input": {
+            "op": "sink",
+            "strategy": "binning",
+            "records": [
+              {
+                "ts": 100
+              },
+              {
+                "ts": 1100
+              },
+              {
+                "ts": 2100
+              },
+              {
+                "ts": 3100
+              },
+              {
+                "ts": 4100
+              }
+            ]
+          },
+          "expected_output": "published_files=2\ninflight_files=3\npublished[0]=.avro|100\npublished[1]=.avro|1100\ninflight[0]=.avro.partial|2100\ninflight[1]=.avro.partial|3100\ninflight[2]=.avro.partial|4100\n"
+        },
+        {
+          "input": {
+            "op": "sink",
+            "strategy": "binning",
+            "records": [
+              {
+                "ts": 100,
+                "session_start": 100
+              },
+              {
+                "ts": 1100,
+                "session_start": 1100
+              },
+              {
+                "ts": 2100,
+                "session_start": 2100
+              },
+              {
+                "ts": 3100,
+                "session_start": 3100
+              },
+              {
+                "ts": 3150,
+                "session_start": 100
+              },
+              {
+                "ts": 3160,
+                "session_start": 1100
+              },
+              {
+                "ts": 3170,
+                "session_start": 2100
+              },
+              {
+                "ts": 3180,
+                "session_start": 3100
+              }
+            ]
+          },
+          "expected_output": "published_files=1\ninflight_files=3\npublished[0]=.avro|100\ninflight[0]=.avro.partial|1100,3150,3160\ninflight[1]=.avro.partial|2100,3170\ninflight[2]=.avro.partial|3100,3180\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Command Protocol",
+      "input_condition": "The adapter reads exactly one JSON command object from standard input.",
+      "output_rule": "The command contains an 'op' field and any operation-specific fields.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Identity Token Encoding",
+      "input_condition": "A request provides 'op': 'token_encode_decode' and a timestamp.",
+      "output_rule": "The engine must produce an opaque fixed-width hex-like string encoding the timestamp.",
+      "exact_values": [
+        "length=32"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Identity Token Round-trip",
+      "input_condition": "The timestamp is encoded and then decoded back.",
+      "output_rule": "The decoded value must exactly match the original timestamp.",
+      "exact_values": [
+        "timestamp=<original_value>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Token Identity",
+      "input_condition": "The 'op': 'token_identity' command is issued for a specific timestamp.",
+      "output_rule": "The decoded token must equal the original token generated for that timestamp.",
+      "exact_values": [
+        "reparsed_equals=true",
+        "hashcode_equals=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Token Independence",
+      "input_condition": "Two tokens are generated independently for the same timestamp.",
+      "output_rule": "The two tokens must differ because random bits differ.",
+      "exact_values": [
+        "independent_equals=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Token Uniqueness",
+      "input_condition": "A batch of N fresh tokens is generated (e.g., N=100000).",
+      "output_rule": "All generated tokens must be distinct (no collisions).",
+      "exact_values": [
+        "generated=<N>",
+        "distinct=<N>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Config Presence",
+      "input_condition": "The 'op': 'config_presence' lookup follows 'path' 'some.existing.str' in the provided 'config'.",
+      "output_rule": "The state must be 'present' and the value must be the actual value.",
+      "exact_values": [
+        "state=present",
+        "value=Existing"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Config Absence",
+      "input_condition": "The 'op': 'config_presence' lookup follows a non-existent path.",
+      "output_rule": "The state must be 'absent' and no other output is generated.",
+      "exact_values": [
+        "state=absent"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Config Fallback (Existing)",
+      "input_condition": "The 'op': 'config_fallback' path exists and has a value.",
+      "output_rule": "The value returned is the present value, ignoring the 'fallback' parameter.",
+      "exact_values": [
+        "value=Existing"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Config Fallback (Missing)",
+      "input_condition": "The 'op': 'config_fallback' path is absent.",
+      "output_rule": "The value returned is the string provided in the 'fallback' parameter.",
+      "exact_values": [
+        "value=theOtherOne"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Config Required (Existing)",
+      "input_condition": "The 'op': 'config_required' path exists.",
+      "output_rule": "The value is returned as the actual string value.",
+      "exact_values": [
+        "value=Existing"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Config Required (Missing)",
+      "input_condition": "The 'op': 'config_required' path is absent.",
+      "output_rule": "An error is reported stating the value is absent.",
+      "exact_values": [
+        "error=absent_value"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Config Filter (Match)",
+      "input_condition": "The 'op': 'config_filter' path is a list and 'contains' matches at least one item.",
+      "output_rule": "The state is 'present' with the list size and all items joined by commas.",
+      "exact_values": [
+        "state=present",
+        "size=2",
+        "items=val1,val2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Config Filter (No Match)",
+      "input_condition": "The 'op': 'config_filter' path is a list and 'contains' does not match any item.",
+      "output_rule": "The state is 'absent'.",
+      "exact_values": [
+        "state=absent"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Config Map (Existing)",
+      "input_condition": "The 'op': 'config_map' path is a present string value.",
+      "output_rule": "The state is 'present' and the value is the result of applying the default transformation (string length).",
+      "exact_values": [
+        "state=present",
+        "value=8"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Config Map (Missing)",
+      "input_condition": "The 'op': 'config_map' path is absent.",
+      "output_rule": "The state is 'absent' without applying transformation.",
+      "exact_values": [
+        "state=absent"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Event Mapping Standard Fields",
+      "input_condition": "The 'op': 'map_event' scenario is 'flat_fields' with specific input values for location, referer, etc.",
+      "output_rule": "Fields are copied as-is, but 'viewportWidth' and 'viewportHeight' are cast to integers.",
+      "exact_values": [
+        "viewportWidth=640",
+        "viewportHeight=480"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Event Mapping Session Identity",
+      "input_condition": "The 'op': 'map_event' includes input identity tokens for client, session, and page view.",
+      "output_rule": "The record must output 'client', 'session', 'pageview' fields with specific hardcoded hex strings derived from inputs.",
+      "exact_values": [
+        "client=000000000000002a1111111111111111",
+        "session=000000000000002a2222222222222222",
+        "pageview=000000000000002a3333333333333333"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Event Mapping User Agent",
+      "input_condition": "The 'op': 'map_event' scenario is 'user_agent' with a specific Chrome UA.",
+      "output_rule": "The UA string is parsed and mapped to 'userAgentName', 'userAgentFamily', etc. specifically 'userAgentName=Chrome' and 'userAgentVendor=Google Inc.'.",
+      "exact_values": [
+        "userAgentName=Chrome",
+        "userAgentVendor=Google Inc.",
+        "userAgentOsFamily=OS X"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Event Mapping Regex Named",
+      "input_condition": "The 'op': 'map_event' scenario is 'regex_match' with a URL matching /protocol://.../.",
+      "output_rule": "A regex extracts the protocol name (e.g., 'http', 'https') into 'locationProtocol'.",
+      "exact_values": [
+        "locationProtocol=http",
+        "refererProtocol=https"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Event Mapping Regex Capture Groups",
+      "input_condition": "The 'op': 'map_event' scenario is 'regex_capture' with path segments matching regex groups.",
+      "output_rule": "Multiple fields are populated from positional capture groups.",
+      "exact_values": [
+        "toplevelCategory=ABA",
+        "subCategory=C12",
+        "contentPage=about"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Event Mapping Query Param",
+      "input_condition": "The 'op': 'map_event' scenario is 'query_param' with a '?q=...' in the location.",
+      "output_rule": "The value of the named parameter is copied to the field.",
+      "exact_values": [
+        "queryparam=fiets lamp rood"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Event Mapping Query Param (Missing)",
+      "input_condition": "The 'op': 'map_event' scenario is 'query_param' but the named parameter is absent in the URL.",
+      "output_rule": "The field is set to the schema default.",
+      "exact_values": [
+        "queryparam=not set"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Event Mapping Type Cast (Present)",
+      "input_condition": "The 'op': 'map_event' scenario is 'type_cast' with valid integer/double/long/boolean strings in query/path/cookie.",
+      "output_rule": "The value is cast to the target type (scenario 'type_cast' case 1 shows successful casting).",
+      "exact_values": [
+        "queryparamInteger=-42",
+        "queryparamBoolean=true",
+        "cookieInteger=42"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Event Mapping Type Cast (Missing/Invalid)",
+      "input_condition": "The 'op': 'map_event' scenario is 'type_cast' with a non-numeric string in a path position for an integer field.",
+      "output_rule": "The cast fails, and the value falls back to the schema default for that type.",
+      "exact_values": [
+        "pathInteger=-1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "Event Mapping Cookie",
+      "input_condition": "The 'op': 'map_event' scenario is 'custom_cookie' with a specific 'custom_cookie_value' in the request.",
+      "output_rule": "The cookie value is copied to the field.",
+      "exact_values": [
+        "customCookie=custom_cookie_value"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Event Mapping Event Parameter",
+      "input_condition": "The 'op': 'map_event' scenario is 'custom_event_param' with specific event_params.",
+      "output_rule": "The value from the custom event parameter is copied to the field, preserving punctuation.",
+      "exact_values": [
+        "customEventParameter=Honey, Honey"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Event Mapping Geo (Full Result)",
+      "input_condition": "The 'op': 'map_event' scenario is 'geo' with geo='with-everything' and a specific UA.",
+      "output_rule": "All geo fields are populated with the specific values provided in the test case (e.g., Bussum, NL).",
+      "exact_values": [
+        "geoCityId=2758064",
+        "geoCityName=Bussum",
+        "geoCountryCode=NL"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "Event Mapping Mapping Errors (Version)",
+      "input_condition": "The 'op': 'map_event' scenario uses an invalid mapping version (e.g., 42).",
+      "output_rule": "Construction is rejected with an error.",
+      "exact_values": [
+        "error=unsupported_mapping_version",
+        "version=42"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Event Mapping Mapping Errors (Missing Field)",
+      "input_condition": "The 'op': 'map_event' scenario tries to map a field that does not exist in the schema.",
+      "output_rule": "Construction is rejected with an error.",
+      "exact_values": [
+        "error=missing_schema_field",
+        "field=fieldThatIsMissingFromSchema"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "Sink Rolling Files (Single Duration)",
+      "input_condition": "The 'op': 'sink' strategy is 'simple' with 'roll_every' > max record timestamp.",
+      "output_rule": "All records are published in a single file (inflight_files=0 after publish).",
+      "exact_values": [
+        "published_files=1",
+        "inflight_files=0",
+        "published[0]=.avro|0,1,2,3,4,5,6,7,8,9"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "Sink In-flight (Cleanup Disabled)",
+      "input_condition": "The 'op': 'sink' strategy is 'simple' with 'cleanup' false and records < roll_every.",
+      "output_rule": "The file remains in-flight (inflight_files=1, published_files=0).",
+      "exact_values": [
+        "inflight_files=1",
+        "published_files=0",
+        "inflight[0]=.avro.partial|<unreadable>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "Sink Rolling Files (Multiple Rollovers)",
+      "input_condition": "The 'op': 'sink' strategy is 'simple' with 'rolls' > 0 and time-based intervals.",
+      "output_rule": "Records are split into multiple published files based on the count.",
+      "exact_values": [
+        "published_files=2",
+        "published[0]=.avro|0,1",
+        "published[1]=.avro|2,3"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "Sink Binning (Distinct Sessions)",
+      "input_condition": "The 'op': 'sink' strategy is 'binning' with distinct session_start timestamps for all records.",
+      "output_rule": "Records are written to separate files; session_start determines the file.",
+      "exact_values": [
+        "published_files=2",
+        "published[0]=.avro|100",
+        "published[1]=.avro|1100"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "Sink Binning (Window Continuity)",
+      "input_condition": "The 'op': 'sink' strategy is 'binning' with mixed session_start timestamps.",
+      "output_rule": "Records are grouped; those from the same session_start go to the same file; later records with new session_start open new files.",
+      "exact_values": [
+        "published[0]=.avro|100",
+        "inflight[0]=.avro.partial|1100,3150,3160"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "Schema Default Fallback",
+      "input_condition": "A type cast fails (e.g., 'NotAnInt' to integer) or a source value is missing in 'type_cast' scenario case 2.",
+      "output_rule": "The output must match the rendered default for that type (e.g., -1 for integer cast fallback).",
+      "exact_values": [
+        "pathInteger=-1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "Standard Cookie Header",
+      "input_condition": "The test harness sends events.",
+      "output_rule": "The mapper assumes a default default cookie header containing 'custom_cookie=custom_cookie_value;typed_cookie_int=42;typed_cookie_bool=true' for derived fields.",
+      "exact_values": [
+        "custom_cookie_value",
+        "typed_cookie_int=42",
+        "typed_cookie_bool=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "Standard Fields Fixed Timing",
+      "input_condition": "The 'flat_fields' test case runs.",
+      "output_rule": "The 'ts' field is fixed to 42 and 'sessionStart' is fixed to true across all relevant output lines for that case.",
+      "exact_values": [
+        "ts=42",
+        "sessionStart=true"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C018",
+        "replacement": "explicit hardcoded hex strings generated from the input identity tokens",
+        "exact_values_to_replace": [
+          "client=000000000000002a1111111111111111",
+          "session=000000000000002a2222222222222222",
+          "pageview=000000000000002a3333333333333333"
+        ],
+        "trigger_keywords": [
+          "what are the specific hex strings for client",
+          "hex string values for session field",
+          "pageview hex value in output",
+          "token identity hex response",
+          "hardcoded hex client session",
+          "2a1111111111111111 session hex"
+        ],
+        "oracle_response": "The client field is \"000000000000002a1111111111111111\", the session field is \"000000000000002a2222222222222222\", and the pageview field is \"000000000000002a3333333333333333\"."
+      },
+      {
+        "constraint_id": "C019",
+        "replacement": "direct mappings from the parsed Chrome User Agent string",
+        "exact_values_to_replace": [
+          "userAgentName=Chrome",
+          "userAgentVendor=Google Inc.",
+          "userAgentOsFamily=OS X"
+        ],
+        "trigger_keywords": [
+          "what is the exact userAgentName value",
+          "userAgentVendor string result",
+          "userAgentOsFamily hex",
+          "Chrome user agent vendor",
+          "Google Inc vendor string",
+          "OS X ua family exact"
+        ],
+        "oracle_response": "The user agent name is \"Chrome\", the vendor is \"Google Inc.\", and the OS family is \"OS X\"."
+      },
+      {
+        "constraint_id": "C037",
+        "replacement": "the default session cookie payload used by the mapper when no headers are found",
+        "exact_values_to_replace": [
+          "custom_cookie=custom_cookie_value;typed_cookie_int=42;typed_cookie_bool=true"
+        ],
+        "trigger_keywords": [
+          "default cookie header content",
+          "exact string in standard cookie header",
+          "typed_cookie_int default value",
+          "default session params string",
+          "what is the full cookie header",
+          "semityped_cookie default"
+        ],
+        "oracle_response": "The default cookie header is \"custom_cookie=custom_cookie_value;typed_cookie_int=42;typed_cookie_bool=true\"."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C029",
+        "vague_phrase": "verify the provider supports this specific mapping version",
+        "actual_meaning": "The mapping version must be exactly 2; any integer other than 2 triggers an 'unsupported_mapping_version' error."
+      },
+      {
+        "constraint_id": "C032",
+        "vague_phrase": "inspect the partial file name and timestamp",
+        "actual_meaning": "The file remains named \".avro.partial\" with a timestamp string consisting of exactly 13 digits representing the current Unix timestamp in milliseconds."
+      }
+    ]
+  }
+}

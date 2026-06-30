@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a small encryption utility — basically something that wraps up sensitive short strings (tokens, passwords, that sort of thing) so we can store or pass them around safely without developers having to deal with all the low-level crypto plumbing themselves. Think of it like that token-vault thing we scoped out a while back but much simpler — just two operations, lock it up and unlock it.
+
+The big thing here is that we want to support two modes of operation. In the first mode everyone shares the same underlying secret, so any caller can read any other caller's data. In the second mode each 'tenant' or caller identity gets its own cryptographic isolation — if you try to read someone else's locked data with the wrong identity it should just fail cleanly, no messy runtime crashes or stack traces leaking out, just a simple machine-readable error signal.
+
+The output of locking something needs to be a plain text string that's safe to put in a database column or JSON field. On the ops side we're worried about two things: first, that the format stays stable so something encrypted today can still be decrypted six months from now; second, that the error messages we surface are neutral and don't expose internals. The adapter that drives this from our test harness reads a JSON blob from stdin and writes results to stdout. Let me know if you need more context on the tenant isolation piece specifically.

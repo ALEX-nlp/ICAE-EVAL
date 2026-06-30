@@ -1,0 +1,11 @@
+## Product Requirement Document
+
+Hey team, we need to update how the NetworkResponseAdapter handles incoming API responses and failures for the new dashboard. Basically, the system needs to take a JSON input with an 'action' field and route it correctly. If the action is 'map_response', we need to check the status code: 2xx with a body should result in a success output showing the payload, while non-2xx codes with a body should flag a server error with the status and message. For 'map_failure' actions, IO issues should map to network errors, and HTTP failures with a code and body should map to server errors. Also, when extracting values from a successful response, just output the payload. 
+
+A couple of specific formatting rules: please handle headers exactly as the legacy auth middleware does, ensuring they appear in the output correctly. Also, make sure the final output follows the standard stream termination protocol used in the logging module so our downstream parsers don't choke. We'll test with standard success and error scenarios first. Let me know if you need clarification on the routing logic.
+
+One quick follow-up after the team questions: for 'map_response', if the status is 2xx, the body is absent, and 'success_type' is 'empty', please treat that as a success case and output 'result=success' followed by 'body=<empty>'. On the error side, if action is 'map_response', the status is non-2xx, and the body is absent, we should still return 'result=server_error', 'code=<status>', and 'body=' with the empty string.
+
+Also, on the header formatting, yes, we do want headers included in output in all of these mapped cases. The format should be 'header.<name>=<value>' for each header, sorted by name ascending, so it stays consistent with what downstream is expecting.
+
+And one last edge case for failures: if action is 'map_failure' and 'kind' is 'other' (or neither 'io' nor 'http'), don't try to force it into the existing buckets. Just output 'result=unknown_error' then 'error=unknown'. Same deal there on headers too: include them in output, formatted as 'header.<name>=<value>' for each header, sorted by name ascending.

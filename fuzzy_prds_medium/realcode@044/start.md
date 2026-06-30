@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the AWS lambda adapter thing we've been talking about. The basic idea is that devs should be able to take their existing fastify app and just... plug it into lambda without rewriting anything. The gateway sends us these weird event blobs and we need to turn them into something fastify understands, run the request through the app, and then package up the response in whatever shape lambda expects back.
+
+There are a bunch of annoying edge cases around how the path gets computed — remember how we handled that stage-prefix stripping thing in the routing module? Same kind of logic applies here. Also the query string situation is a mess because different event versions encode things differently, and there's that comma thing for v2 payloads we discussed.
+
+On the response side, cookies behave differently depending on which payload version we're dealing with, and we need to handle binary payloads correctly — the caller should be able to plug in their own logic for deciding when to base64 encode, not just rely on a static list.
+
+Also important: the handler needs to work both as a promise and with the old callback style. And if something blows up internally, we absolutely cannot let a raw exception bubble up to the caller — it has to degrade gracefully. Oh and multipart uploads need to work too. Ping me if anything's unclear.
+
+A couple follow-ups from the questions that came in. On the request body side, if the event shows `isBase64Encoded: true`, we need to decode that body from Base64 to its raw bytes before handing it to the framework. And if the gateway didn’t give us a `content-length` header, we should compute it from the decoded byte length and inject it so the body parser sees the right raw bytes and length.
+
+For path and method picking, the order matters. If `pathParameterUsedAsPath` is configured and that named path parameter exists on the event, we use that value prefixed with `/`. If not, we prefer the explicit `path` field on the event, and if that’s not there we fall back to `rawPath`. Method comes from `httpMethod` when it exists, otherwise from `requestContext.http.method`. Also on the stage-prefix thing, default behavior is still to strip the leading stage segment when `requestContext.stage` prefixes the `path` but the resource path does not start with that segment. If `options.retainStage: true` is set, we do not strip it and just leave the path alone. Same rule applies in the core path resolution bit as discussed.
+
+On invocation style, the returned handler needs to work the same whether someone is awaiting it as a promise or calling it the old node way where the third argument is a function. Both modes should produce identical result shapes. If `options.callbackWaitsForEmptyEventLoop` is defined, write that boolean onto the invocation context object before request processing begins. And if something unexpected blows up internally during request processing, we still do not leak the raw exception. We return, or pass to the callback, a well-formed error result with `status: 500` and an empty body, with no response headers, in both promise and callback modes.
+
+A few response details too. Non-string response header values need to be coerced to strings in the result. If the handler explicitly removes the Content-Type header, it should stay absent in the result and not get defaulted back in. And if the handler response body is empty, the returned body should be an empty string with a `content-length` of `0`.
+
+For multipart, when a multipart/form-data parser is registered, uploaded file parts need to come through with `fieldname`, `filename`, `encoding`, `mimetype`, and `content`, where `content` is the file content as a string. Text fields should come through with `fieldname`, `encoding`, `mimetype`, and `value`. We need this to work for both plain raw string multipart bodies and Base64-encoded multipart bodies.
+
+One other thing the team asked about: every incoming request should be decorated with `awsLambdaEvent` and `awsLambdaContext` directly on the request object, and that needs to be available not just in route handlers but also in lifecycle hooks like `onRequest`. There’s also an optional `decorateRequest` option if someone wants to customize that behavior a bit further.
+
+And on binary responses, the custom hook for the encoding decision is `enforceBase64`, which is a caller-supplied predicate function `(headers) => boolean` checked during response encoding selection. That’s the extension point we want people using instead of baking in more fixed rules.

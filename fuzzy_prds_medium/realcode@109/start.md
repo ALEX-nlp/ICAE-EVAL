@@ -1,0 +1,27 @@
+## Product Requirement Document
+
+Hey team, we need to build out this developer stat card toolkit thing — basically a system that takes in some GitHub profile data and spits out embeddable SVG cards. There are a few different card types: a general profile summary, a languages breakdown, and a single repo card. We also need some utility stuff underneath like number formatting for big counts, text sanitization so user names don't break the markup, a way to arrange card elements in a row or column evenly, and color theming so people can customize their cards or fall back to a default look.
+
+For the scoring piece, refer to how we handled weighted metric normalization in that ranking module we discussed — it should map activity numbers into a letter grade, similar to what the analytics team outlined last quarter.
+
+The whole thing should be structured cleanly, not one giant file. Each concern should live in its own module. There's also an adapter layer that reads JSON from stdin and writes results to stdout — that part should stay totally separate from the actual logic.
+
+One tricky bit: possessive names on the profile card header need to handle the grammar edge case correctly (you know, names ending in certain letters). Also the card heights need to adjust dynamically based on what's hidden, but with a floor so it never gets too small.
+
+We have some test cases already written up so you can validate against those. Let me know if anything's unclear.
+
+A couple extra specifics from the questions that came in. For the number formatter, numbers with magnitude greater than 999 are divided by 1000, fixed to one decimal place, and suffixed with a lowercase 'k', with the sign preserved. Numbers with magnitude 999 or less are rendered as plain integers. The examples to match are 500 → '500', 12345 → '12.3k', -12345 → '-12.3k', and on the repo card the same compact formatting applies for big counts too, so 38000 → '38k'.
+
+On the text escaping side, the HTML escaper should replace angle brackets (<, >), ampersand (&), double quote ("), and any non-ASCII character, meaning any code point outside the standard printable ASCII range, with a decimal numeric character reference in the form &#<code>; — but only when that character is not already the start of a numeric entity. Ordinary printable ASCII characters should pass through unchanged.
+
+For the languages card, the height should grow with however many languages are actually shown. With 3 languages the height is 205, and with 2 languages, like after hiding one, it is 165. The language items group y offset is 55. Languages are ordered by descending byte size, and the hide option filters by name case-insensitively. Each language progress bar width is the language byte size as a percentage of the total visible languages' combined size, formatted with two decimal places and a '%' suffix, with the same descending-size order as the language names. The examples to keep in mind are '40%', '66.67%', and '33.33%', and whole numbers can stay whole when exact, like '40%'.
+
+For the repo card, the description trimming is a fixed cutoff with the two-dot ellipsis style ' ..'. The example from the test is 'Help us take over the world! React + TS + GraphQL Chat App' becomes 'Help us take over the world! React + TS + GraphQL Chat ..'. Also, star and fork counts only render when the value is greater than zero. If either one is zero or absent, omit it entirely rather than showing a blank. The output signals there are 'stargazers' and 'forkcount', and when not shown they should be '<absent>'.
+
+One more fallback detail on repos: if there’s no primary language in the repo object, the language name falls back to 'Unspecified' and the color falls back to a neutral color. The output signals lang_name and lang_color_fill should reflect those fallback values. If language is present, lang_name and lang_color_fill just use the provided values directly. And for badges, if isArchived=true show 'Archived', if isTemplate=true show 'Template'. The output signal 'badge' carries that text, or '<none>' when neither applies, so normal repos should end up with badge=<none>.
+
+On the adapter behavior, it reads one JSON object from stdin. For single-scalar operations, specifically abbreviate_number, escape_html, and layout_group, print just the result followed by a single trailing newline. For multi-signal operations, specifically resolve_colors, score_rank, error_card, stats_card, languages_card, and repo_card, print one key=value line per signal, sorted in ascending order by key, each terminated by a newline. When something is absent or not applicable, use the placeholder token the feature calls for, so either '<absent>' or '<none>'.
+
+For the error card, the output is exactly two key=value lines, sorted: 'class=text small' and 'text=<the supplied message>'. The message element uses the styling class 'text small', and the text content is the raw message string that came in.
+
+And finally on the scoring bit, the rank scorer uses fixed per-metric weights, normalizes against a fixed reference distribution into a 0–100 percentile, and maps to the discrete rank level strings S+, S, A++, A+, B+. The exact weights and reference distribution constants live in the scorer unit rather than the PRD. The seven input metrics are totalRepos, totalCommits, contributions, followers, prs, issues, stargazers, and for the reference case the expected output is score=49.16605417270399, which is the value to preserve when lining up the exact weight and normalization behavior.

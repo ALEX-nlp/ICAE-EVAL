@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need to build a small memory allocation inspection tool — basically a CLI adapter that takes JSON over stdin and spits out normalized text so our CI pipelines can validate allocator behavior without relying on raw pointer values or platform-specific output. We've been burned too many times by flaky tests that break just because addresses changed between machines.
+
+The tool needs to handle the usual stuff: looking up how a byte count maps to an internal bucket (including that weird edge case for zero — check how we handled the sentinel in that allocator prototype we did a while back), rounding sizes up for alignment, doing basic allocs, zeroed array-style allocs, resizes (including the null-initial case and the 'impossibly large' case), explicitly aligned allocs, and some lifecycle checks to make sure live allocations are all unique and the pool drains cleanly after freeing everything.
+
+One thing that kept biting us before: the alignment rules for the aligned-alloc path are stricter than you'd expect — not just any power-of-two works, there's a minimum threshold. Make sure invalid alignments come back as a proper normalized error string, not a crash.
+
+The adapter should be cleanly separated from the core logic — don't bake I/O into the domain. We want a test harness script too so the whole suite runs with a single bash command. Output files should be organized by case file and index. Ask me if anything is unclear on the bucketing ranges or the sentinel index.
+
+Quick follow-up since a couple folks asked about the edge behavior. For the zero-size case, requested_bytes=0 maps to the sentinel class_index=235. In that path we do not print any byte range details at all, so no range_start or usable_bytes lines — just requested_bytes=0 followed by class_index=235. This is that special fixed index outside the normal 0–234 range in snmalloc's sizeclass table, same thing referenced in feature1_1_size_class_ranges.json case 0 and the SIZE_CLASS_ZERO_SIZE constant in the core domain.
+
+Also wanted to be extra clear on the explicitly aligned allocation path in feature 2.4, because this is where people usually make assumptions. The alignment has to be both a power of two AND at least 8 bytes. So alignments of 0, 4, or any non-power-of-two like 9 should all come back as error=invalid_argument with result=null. Same idea if it is a power of two but still below the minimum. Alignment of 1 is only valid for the basic/resize paths, not the explicit aligned-alloc path. Put differently for aligned_alloc (feature 2.4), alignment must be a power of two AND >= 8 bytes, and that minimum of 8 matches snmalloc's MALLOC_ALIGNMENT / minimum chunk alignment constraint.
+
+For the large-size sentinel input, if target_bytes or requested_bytes is the string "max", that means 18446744073709551615 exactly. We should print it literally as requested_bytes=18446744073709551615, and the outcome there is error=out_of_memory with result=null.
+
+One more resize nuance: when target_bytes=0, that is defined behavior, not a failure. The result should be result=null with error=none, and we should not print usable_bytes or alignment_remainder lines in that case. Separately, if initial_allocation_bytes is the string "none", that means there was no initial block. Resizing from none to a nonzero size should behave like a fresh allocation, still print initial_allocation=none, and then return a normal allocated block with usable_bytes and alignment_remainder=0.

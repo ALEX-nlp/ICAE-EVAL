@@ -1,0 +1,995 @@
+{
+  "fuzzy_prd": "Hey team, we need to wrap up the speech coordinator work we've been scoping out. The gist is: we want a clean interface that handles the whole lifecycle of a voice recognition session — starting it up, feeding it audio events from the underlying platform, and shutting it down gracefully. Think of it like that channel-wrapper pattern we used in the notification module a while back, but for speech.\n\nThe tricky parts are around state management: the coordinator should know whether it's been set up yet, whether it's actively listening, and it should track the last thing it heard plus some basic audio level info. We also need it to handle errors smartly — some errors are 'just retry' situations and others are 'something is broken, stop everything' situations, and the behavior when a session is already cancelled is a bit nuanced (the team had opinions about this in the last standup).\n\nThere's also a locale/language selection piece — the platform hands us a raw list and we need to parse it into something usable, sorted in a sensible way for display, but the 'default' choice follows a different rule than the display order.\n\nPlease make sure the value objects (transcription candidates, results, errors) all support proper equality checks and can round-trip through the wire format. The confidence scoring logic has a special case for when the platform doesn't give us a score at all — make sure that edge case is handled consistently everywhere.",
+  "oracle_data": {
+    "task_id": "SPEECH-COORD-001",
+    "golden_api_signature": "SpeechRecognitionCoordinator(platform_channel, cancel_on_error=False)",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "missing confidence sentinel value",
+          "what value means no confidence was provided",
+          "how is absent confidence score represented"
+        ],
+        "oracle_response": "The reserved sentinel value for a missing confidence score is -1. A candidate with confidence -1 means the platform did not report a confidence score. Such a candidate always returns has_rating=false and is always treated as confident regardless of any acceptance threshold."
+      },
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "default confidence threshold",
+          "what is the acceptance threshold for confident",
+          "minimum score to be considered confident"
+        ],
+        "oracle_response": "The default acceptance threshold is 0.8. A candidate is considered confident when its confidence score is >= 0.8 (or when the confidence is the missing sentinel -1). A caller may supply a different threshold to override the default."
+      },
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "locale sort order",
+          "how are locales ordered in the returned list",
+          "display order of supported locales"
+        ],
+        "oracle_response": "The parsed locale list returned to callers is sorted alphabetically by display name. However, the system (default) locale is always the first well-formed entry from the ORIGINAL unsorted platform order — not the first entry after sorting. These two may differ when the platform list is not already sorted."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "malformed locale entries",
+          "invalid locale string handling",
+          "locale parsing rejects bad entries"
+        ],
+        "oracle_response": "Locale entries are colon-separated 'identifier:display name' strings. Any entry that does not have exactly one identifier and one display name (i.e., not exactly one colon producing two non-empty parts) is silently dropped. Only well-formed entries are included in the parsed list."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "initialization idempotency",
+          "calling initialize twice",
+          "does init invoke platform again if already initialized"
+        ],
+        "oracle_response": "Initialization is idempotent. Once the coordinator has been successfully initialized, calling initialize again returns success immediately without re-invoking the platform initialize operation (invoked=false on the second call). If the first initialization failed, the platform would be retried on a subsequent call."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "listen before initialization",
+          "start listening without init",
+          "what error when not yet initialized"
+        ],
+        "oracle_response": "Attempting to start listening (or query locales) before the coordinator has been successfully initialized is rejected with a normalized 'not_initialized' error. The platform listen operation is never invoked in this case."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "cancel on error behavior",
+          "permanent error stops session",
+          "when does error end the session automatically"
+        ],
+        "oracle_response": "A permanent error only causes an automatic session cancellation when the session was started with cancel-on-error enabled. Without cancel-on-error, even a permanent error is forwarded to the error callback but the session keeps listening. A transient error never stops the session regardless of the cancel-on-error setting."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "error after explicit cancel",
+          "suppress error when cancelled",
+          "deliver error to already-cancelled session"
+        ],
+        "oracle_response": "Once a session has been explicitly cancelled by the user, any subsequently delivered error from the platform is suppressed — it is not forwarded to the error callback. However, when a cancel was triggered implicitly by cancel-on-error, further delivered errors are still forwarded normally."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "wire format for recognition candidate",
+          "JSON field names for candidate serialization",
+          "how is a candidate represented on the wire"
+        ],
+        "oracle_response": "A recognition candidate's wire (JSON) shape uses 'recognizedWords' for the transcribed phrase and 'confidence' for the score. Example: {\"recognizedWords\":\"hello\",\"confidence\":0.85}. Deserialization reads those fields; serialization produces the identical shape."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "recognition result wire format",
+          "JSON fields for result serialization",
+          "finalResult field name in wire payload"
+        ],
+        "oracle_response": "A recognition result's wire (JSON) shape uses 'alternates' (an array of candidate wire objects) and 'finalResult' (boolean). Example: {\"alternates\":[{\"recognizedWords\":\"hello\",\"confidence\":0.85}],\"finalResult\":false}. The field is named 'finalResult' on the wire, not 'final'."
+      },
+      {
+        "constraint_id": "C011",
+        "trigger_keywords": [
+          "result equality rule",
+          "what determines two results being equal",
+          "do all alternates affect result equality"
+        ],
+        "oracle_response": "Two recognition results are equal when their best transcription (the first alternate's phrase) and their final flag match. The remaining alternates beyond the first do not affect equality or hashing. Equal results must also produce equal hash codes."
+      },
+      {
+        "constraint_id": "C012",
+        "trigger_keywords": [
+          "empty alternates result",
+          "result with no candidates",
+          "what is best transcription when alternates list is empty"
+        ],
+        "oracle_response": "When a recognition result has no alternates, the best transcription is the empty string, the confidence is zero (0.0), the result is not considered confident, and it has no confidence rating (has_rating=false)."
+      },
+      {
+        "constraint_id": "C013",
+        "trigger_keywords": [
+          "recognition event kinds",
+          "what types of events exist on the stream",
+          "tagged envelope event types"
+        ],
+        "oracle_response": "There are four recognition event kinds: 'status' (exposes a listening boolean), 'final_result' or 'result' (exposes a RecognitionResult), 'error' (exposes a RecognitionError), and 'sound_level' (exposes a float loudness level). Each event carries only the payload relevant to its kind."
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "initial coordinator state",
+          "snapshot before any setup",
+          "what are the default field values before initialization"
+        ],
+        "oracle_response": "Before any initialization or listening, the coordinator's state snapshot is: listening=false, recognized=false, available=false, has_error=false, last_recognized='' (empty string), last_status='' (empty string), last_level=0.0."
+      },
+      {
+        "constraint_id": "C015",
+        "trigger_keywords": [
+          "stop vs cancel difference",
+          "what is the difference between stop and cancel",
+          "does cancel change listening state"
+        ],
+        "oracle_response": "Both stop and cancel invoke their respective platform operations only when the coordinator is initialized. Cancel additionally marks the session as no longer listening (listening=false in the state snapshot). Stop invokes the platform stop but does not necessarily change the listening state in the same way — the state update for stop may depend on subsequent platform notifications."
+      },
+      {
+        "constraint_id": "C016",
+        "trigger_keywords": [
+          "listen locale parameter",
+          "forwarding locale to platform",
+          "optional locale in start listening"
+        ],
+        "oracle_response": "The listen/start-listening operation accepts an optional locale identifier. When provided, it is forwarded to the platform listen call. When absent, the platform is called without a locale (reported as locale=none). A platform listen failure is translated into a normalized 'listen_failed' error that carries the platform-supplied failure detail string."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid op field values",
+          "what values can op take",
+          "list all supported op values",
+          "what actions does the dispatcher handle",
+          "which op strings does the adapter support",
+          "what are the possible op inputs",
+          "tell me all the op names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'op' field. Valid values are: 'candidate_confidence', 'candidate_json', 'candidate_equality', 'result_summary', 'result_json', 'result_equality', 'error_json', 'error_equality', 'event', 'locales', 'locales_uninitialized', 'session'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature1_1_candidate_confidence",
+        "trigger_keywords": [
+          "test cases for feature1 1 candidate confidence",
+          "show me feature1 1 candidate confidence test cases",
+          "what are the feature1 1 candidate confidence test inputs",
+          "give me the feature1_1_candidate_confidence test file",
+          "test cases for feature 1",
+          "feature1 1 candidate confidence expected output",
+          "what does feature1 1 candidate confidence expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_candidate_confidence:\n{\n  \"description\": \"A recognition candidate pairs a transcribed phrase with a confidence score. Evaluate whether the candidate should be treated as confident. A candidate is confident when its confidence score meets or exceeds an acceptance threshold (defaulting to a standard value when none is supplied), or when its confidence is the reserved 'missing' sentinel (meaning the platform did not provide a score, in which case the candidate is always treated as confident). The output reports the transcribed phrase, the numeric confidence, whether a real confidence rating is present (false only for the missing sentinel), and the confident verdict.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"candidate_confidence\",\n        \"words\": \"hello\",\n        \"confidence\": 0.85\n      },\n      \"expected_output\": \"recognized=hello\\nconfidence=0.85\\nhas_rating=true\\nconfident=true\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"candidate_confidence\",\n        \"words\": \"hello\",\n        \"confidence\": -1\n      },\n      \"expected_output\": \"recognized=hello\\nconfidence=-1.0\\nhas_rating=false\\nconfident=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_candidate_serialization",
+        "trigger_keywords": [
+          "test cases for feature1 2 candidate serialization",
+          "show me feature1 2 candidate serialization test cases",
+          "what are the feature1 2 candidate serialization test inputs",
+          "give me the feature1_2_candidate_serialization test file",
+          "test cases for feature 1",
+          "feature1 2 candidate serialization expected output",
+          "what does feature1 2 candidate serialization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_candidate_serialization:\n{\n  \"description\": \"A recognition candidate is reconstructed from its wire payload, a JSON object carrying the transcribed phrase and confidence score, and can be serialized back to the same wire shape. The output reports the parsed phrase and confidence and the re-serialized JSON object, demonstrating a lossless round trip.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"candidate_json\",\n        \"json\": \"{\\\"recognizedWords\\\":\\\"hello\\\",\\\"confidence\\\":0.85}\"\n      },\n      \"expected_output\": \"recognized=hello\\nconfidence=0.85\\njson={\\\"recognizedWords\\\":\\\"hello\\\",\\\"confidence\\\":0.85}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_candidate_equality",
+        "trigger_keywords": [
+          "test cases for feature1 3 candidate equality",
+          "show me feature1 3 candidate equality test cases",
+          "what are the feature1 3 candidate equality test inputs",
+          "give me the feature1_3_candidate_equality test file",
+          "test cases for feature 1",
+          "feature1 3 candidate equality expected output",
+          "what does feature1 3 candidate equality expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_candidate_equality:\n{\n  \"description\": \"Recognition candidates compare equal when both their transcribed phrase and their confidence score match, and equal candidates hash alike. The output reports whether two candidates are equal and whether their hashes agree.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"candidate_equality\",\n        \"first\": {\n          \"words\": \"hello\",\n          \"confidence\": 0.85\n        },\n        \"second\": {\n          \"words\": \"hello\",\n          \"confidence\": 0.85\n        }\n      },\n      \"expected_output\": \"equal=true\\nhash_equal=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_result_summary",
+        "trigger_keywords": [
+          "test cases for feature2 1 result summary",
+          "show me feature2 1 result summary test cases",
+          "what are the feature2 1 result summary test inputs",
+          "give me the feature2_1_result_summary test file",
+          "test cases for feature 2",
+          "feature2 1 result summary expected output",
+          "what does feature2 1 result summary expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_result_summary:\n{\n  \"description\": \"A recognition result holds an ordered list of alternative candidate transcriptions plus a flag marking whether it is the final result for the utterance. The best transcription and its confidence are derived from the first alternate; when there are no alternates the best transcription is the empty string, the confidence is zero, the result is not considered confident, and it has no confidence rating. The output reports the best transcription, derived confidence, final flag, confident verdict, rating presence, the number of alternates, and each alternate's phrase and confidence in order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"result_summary\",\n        \"alternates\": [\n          {\n            \"words\": \"hello\",\n            \"confidence\": 0.85\n          },\n          {\n            \"words\": \"hello there\",\n            \"confidence\": 0.62\n          }\n        ],\n        \"final\": true\n      },\n      \"expected_output\": \"recognized=hello\\nconfidence=0.85\\nfinal=true\\nconfident=true\\nhas_rating=true\\nalternate_count=2\\nalternate[0]=hello@0.85\\nalternate[1]=hello there@0.62\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_result_serialization",
+        "trigger_keywords": [
+          "test cases for feature2 2 result serialization",
+          "show me feature2 2 result serialization test cases",
+          "what are the feature2 2 result serialization test inputs",
+          "give me the feature2_2_result_serialization test file",
+          "test cases for feature 2",
+          "feature2 2 result serialization expected output",
+          "what does feature2 2 result serialization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_result_serialization:\n{\n  \"description\": \"A recognition result is reconstructed from its wire payload, a JSON object carrying the ordered alternates array and the final flag, and can be serialized back to the same wire shape. The output reports the derived best transcription, its confidence, the final flag, and the re-serialized JSON object.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"result_json\",\n        \"json\": \"{\\\"alternates\\\":[{\\\"recognizedWords\\\":\\\"hello\\\",\\\"confidence\\\":0.85}],\\\"finalResult\\\":false}\"\n      },\n      \"expected_output\": \"recognized=hello\\nconfidence=0.85\\nfinal=false\\njson={\\\"alternates\\\":[{\\\"recognizedWords\\\":\\\"hello\\\",\\\"confidence\\\":0.85}],\\\"finalResult\\\":false}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_result_equality",
+        "trigger_keywords": [
+          "test cases for feature2 3 result equality",
+          "show me feature2 3 result equality test cases",
+          "what are the feature2 3 result equality test inputs",
+          "give me the feature2_3_result_equality test file",
+          "test cases for feature 2",
+          "feature2 3 result equality expected output",
+          "what does feature2 3 result equality expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_result_equality:\n{\n  \"description\": \"Recognition results compare equal when their best transcription (the first alternate's phrase) and their final flag match; the remaining alternates do not affect equality, and equal results hash alike. The output reports whether two results are equal and whether their hashes agree.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"result_equality\",\n        \"first\": {\n          \"alternates\": [\n            {\n              \"words\": \"hello\",\n              \"confidence\": 0.85\n            }\n          ],\n          \"final\": true\n        },\n        \"second\": {\n          \"alternates\": [\n            {\n              \"words\": \"hello\",\n              \"confidence\": 0.85\n            }\n          ],\n          \"final\": true\n        }\n      },\n      \"expected_output\": \"equal=true\\nhash_equal=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_error_serialization",
+        "trigger_keywords": [
+          "test cases for feature3 1 error serialization",
+          "show me feature3 1 error serialization test cases",
+          "what are the feature3 1 error serialization test inputs",
+          "give me the feature3_1_error_serialization test file",
+          "test cases for feature 3",
+          "feature3 1 error serialization expected output",
+          "what does feature3 1 error serialization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_error_serialization:\n{\n  \"description\": \"A recognition error carries a short error identifier and a permanence flag that states whether recognition can continue (transient) or is blocked until the condition is resolved (permanent). It is reconstructed from its wire payload, a JSON object with the identifier and permanence flag, and serialized back to the same shape. The output reports the identifier, the permanence flag, and the re-serialized JSON object.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error_json\",\n        \"json\": \"{\\\"errorMsg\\\":\\\"network\\\",\\\"permanent\\\":true}\"\n      },\n      \"expected_output\": \"error_msg=network\\npermanent=true\\njson={\\\"errorMsg\\\":\\\"network\\\",\\\"permanent\\\":true}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_error_equality",
+        "trigger_keywords": [
+          "test cases for feature3 2 error equality",
+          "show me feature3 2 error equality test cases",
+          "what are the feature3 2 error equality test inputs",
+          "give me the feature3_2_error_equality test file",
+          "test cases for feature 3",
+          "feature3 2 error equality expected output",
+          "what does feature3 2 error equality expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_error_equality:\n{\n  \"description\": \"Recognition errors compare equal when both their error identifier and permanence flag match, and equal errors hash alike. The output reports whether two errors are equal and whether their hashes agree.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"error_equality\",\n        \"first\": {\n          \"msg\": \"msg1\",\n          \"permanent\": false\n        },\n        \"second\": {\n          \"msg\": \"msg1\",\n          \"permanent\": false\n        }\n      },\n      \"expected_output\": \"equal=true\\nhash_equal=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_recognition_event",
+        "trigger_keywords": [
+          "test cases for feature4 recognition event",
+          "show me feature4 recognition event test cases",
+          "what are the feature4 recognition event test inputs",
+          "give me the feature4_recognition_event test file",
+          "test cases for feature 4",
+          "feature4 recognition event expected output",
+          "what does feature4 recognition event expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_recognition_event:\n{\n  \"description\": \"A recognition event is a tagged envelope delivered on the event stream. Its kind selects which payload is meaningful: a status event exposes the listening flag, a final-result event exposes the recognition result, an error event exposes the recognition error, and a sound-level event exposes the input loudness level. The output reports the event kind and the accessor relevant to that kind.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"event\",\n        \"type\": \"status\",\n        \"listening\": true\n      },\n      \"expected_output\": \"type=status\\nlistening=true\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"event\",\n        \"type\": \"sound\",\n        \"level\": 0.5\n      },\n      \"expected_output\": \"type=sound_level\\nlevel=0.5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_locale_parsing",
+        "trigger_keywords": [
+          "test cases for feature5 1 locale parsing",
+          "show me feature5 1 locale parsing test cases",
+          "what are the feature5 1 locale parsing test inputs",
+          "give me the feature5_1_locale_parsing test file",
+          "test cases for feature 5",
+          "feature5 1 locale parsing expected output",
+          "what does feature5 1 locale parsing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_locale_parsing:\n{\n  \"description\": \"The set of supported recognition locales is supplied by the platform as a list of colon-separated 'identifier:display name' strings. Each well-formed entry becomes a locale with an identifier and a display name; entries that are not exactly one identifier and one name are dropped. The returned list is ordered by display name. The system (default) locale is the first well-formed entry in the ORIGINAL platform order (before the display-name sort). The output reports the count of parsed locales, each parsed locale's identifier and display name in returned order, and the system locale's identifier.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"locales\",\n        \"raw\": [\n          \"en_US:English US\",\n          \"fr_CA:French Canada\"\n        ]\n      },\n      \"expected_output\": \"count=2\\nlocale[0]=en_US|English US\\nlocale[1]=fr_CA|French Canada\\nsystem=en_US\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"locales\",\n        \"raw\": [\n          \"fr_CA:Zebra\",\n          \"en_US:Apple\"\n        ]\n      },\n      \"expected_output\": \"count=2\\nlocale[0]=en_US|Apple\\nlocale[1]=fr_CA|Zebra\\nsystem=fr_CA\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_locale_requires_init",
+        "trigger_keywords": [
+          "test cases for feature5 2 locale requires init",
+          "show me feature5 2 locale requires init test cases",
+          "what are the feature5 2 locale requires init test inputs",
+          "give me the feature5_2_locale_requires_init test file",
+          "test cases for feature 5",
+          "feature5 2 locale requires init expected output",
+          "what does feature5 2 locale requires init expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_locale_requires_init:\n{\n  \"description\": \"Querying the supported locales before the coordinator has been initialized is rejected: the operation reports a normalized not-initialized error rather than reaching the platform.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"locales_uninitialized\"\n      },\n      \"expected_output\": \"error=not_initialized\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_permission",
+        "trigger_keywords": [
+          "test cases for feature6 1 permission",
+          "show me feature6 1 permission test cases",
+          "what are the feature6 1 permission test inputs",
+          "give me the feature6_1_permission test file",
+          "test cases for feature 6",
+          "feature6 1 permission expected output",
+          "what does feature6 1 permission expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_permission:\n{\n  \"description\": \"The coordinator can report whether microphone permission has already been granted by querying the platform, without prompting the user. The output reports the permission verdict returned by the platform.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {\n          \"has_permission\": true\n        },\n        \"steps\": [\n          {\n            \"do\": \"permission\"\n          }\n        ]\n      },\n      \"expected_output\": \"has_permission=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_2_initialization",
+        "trigger_keywords": [
+          "test cases for feature6 2 initialization",
+          "show me feature6 2 initialization test cases",
+          "what are the feature6 2 initialization test inputs",
+          "give me the feature6_2_initialization test file",
+          "test cases for feature 6",
+          "feature6 2 initialization expected output",
+          "what does feature6 2 initialization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_2_initialization:\n{\n  \"description\": \"Initialization prepares the coordinator and returns whether it succeeded. It is idempotent: once it has succeeded, calling it again returns success WITHOUT re-invoking the platform initialize operation. When the platform reports failure, initialization returns failure and the coordinator remains unavailable. The output reports, per initialize call, the returned result and whether the platform initialize was invoked, followed by an availability snapshot.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {\n          \"init_result\": true\n        },\n        \"steps\": [\n          {\n            \"do\": \"initialize\"\n          },\n          {\n            \"do\": \"initialize\"\n          },\n          {\n            \"do\": \"state\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\ninit result=true invoked=false\\nlistening=false recognized=false available=true has_error=false last_recognized= last_status= last_level=0.0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_3_listen",
+        "trigger_keywords": [
+          "test cases for feature6 3 listen",
+          "show me feature6 3 listen test cases",
+          "what are the feature6 3 listen test inputs",
+          "give me the feature6_3_listen test file",
+          "test cases for feature 6",
+          "feature6 3 listen expected output",
+          "what does feature6 3 listen expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_3_listen:\n{\n  \"description\": \"Starting a listening session requires a prior successful initialization; otherwise it is rejected with a normalized not-initialized error and the platform listen is never invoked. After successful initialization, listening invokes the platform listen operation; an optional locale identifier is forwarded to the platform when provided, and is absent otherwise. If the platform raises a listen failure, it is translated into a normalized listen-failed error that carries the platform-supplied failure detail. The output reports, per step, the initialize result and the listen outcome (invoked flag and forwarded locale, or the normalized error).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"initialize\"\n          },\n          {\n            \"do\": \"listen\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nlisten invoked=true locale=none\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {\n          \"listen_throws\": true\n        },\n        \"steps\": [\n          {\n            \"do\": \"initialize\"\n          },\n          {\n            \"do\": \"listen\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nlisten error=listen_failed details=Device Listen Failure\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_4_recognition_callback",
+        "trigger_keywords": [
+          "test cases for feature6 4 recognition callback",
+          "show me feature6 4 recognition callback test cases",
+          "what are the feature6 4 recognition callback test inputs",
+          "give me the feature6_4_recognition_callback test file",
+          "test cases for feature 6",
+          "feature6 4 recognition callback expected output",
+          "what does feature6 4 recognition callback expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_4_recognition_callback:\n{\n  \"description\": \"While listening, each recognition payload delivered by the platform is parsed into a recognition result and handed to the registered result callback, and the coordinator remembers the most recently recognized phrase. Multiple deliveries invoke the callback once each in order, and the remembered phrase tracks the latest delivery. The output reports each callback invocation (recognized phrase and final flag) followed by a state snapshot whose remembered phrase reflects the last delivery.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"initialize\"\n          },\n          {\n            \"do\": \"listen\",\n            \"onResult\": true\n          },\n          {\n            \"do\": \"deliver\",\n            \"method\": \"recognition\",\n            \"payload\": \"{\\\"alternates\\\":[{\\\"recognizedWords\\\":\\\"hello\\\",\\\"confidence\\\":0.85}],\\\"finalResult\\\":false}\"\n          },\n          {\n            \"do\": \"state\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nlisten invoked=true locale=none\\nresult recognized=hello final=false\\nlistening=true recognized=true available=true has_error=false last_recognized=hello last_status=listening last_level=0.0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_5_status_callback",
+        "trigger_keywords": [
+          "test cases for feature6 5 status callback",
+          "show me feature6 5 status callback test cases",
+          "what are the feature6 5 status callback test inputs",
+          "give me the feature6_5_status_callback test file",
+          "test cases for feature 6",
+          "feature6 5 status callback expected output",
+          "what does feature6 5 status callback expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_5_status_callback:\n{\n  \"description\": \"A status update delivered by the platform is forwarded to the registered status callback with the new status string. The output reports the forwarded status.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"initialize\",\n            \"onStatus\": true\n          },\n          {\n            \"do\": \"deliver\",\n            \"method\": \"status\",\n            \"payload\": \"listening\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nstatus listening\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_6_sound_level_callback",
+        "trigger_keywords": [
+          "test cases for feature6 6 sound level callback",
+          "show me feature6 6 sound level callback test cases",
+          "what are the feature6 6 sound level callback test inputs",
+          "give me the feature6_6_sound_level_callback test file",
+          "test cases for feature 6",
+          "feature6 6 sound level callback expected output",
+          "what does feature6 6 sound level callback expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_6_sound_level_callback:\n{\n  \"description\": \"While a listening session is active, a sound-level update delivered by the platform is forwarded to the registered sound-level callback and recorded as the last sound level. The output reports the forwarded level followed by a state snapshot whose last sound level reflects the delivery.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"initialize\"\n          },\n          {\n            \"do\": \"listen\",\n            \"onSound\": true\n          },\n          {\n            \"do\": \"deliver\",\n            \"method\": \"sound\",\n            \"payload\": 0.5\n          },\n          {\n            \"do\": \"state\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nlisten invoked=true locale=none\\nsound_level 0.5\\nlistening=true recognized=false available=true has_error=false last_recognized= last_status=listening last_level=0.5\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_7_stop_cancel",
+        "trigger_keywords": [
+          "test cases for feature6 7 stop cancel",
+          "show me feature6 7 stop cancel test cases",
+          "what are the feature6 7 stop cancel test inputs",
+          "give me the feature6_7_stop_cancel test file",
+          "test cases for feature 6",
+          "feature6 7 stop cancel expected output",
+          "what does feature6 7 stop cancel expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_7_stop_cancel:\n{\n  \"description\": \"Stopping or cancelling does nothing when the coordinator was never initialized: the corresponding platform operation is not invoked. After a successful initialization and an active listening session, stopping invokes the platform stop operation, and cancelling invokes the platform cancel operation and leaves the session no longer listening. The output reports whether the platform operation was invoked, and a state snapshot where relevant.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"initialize\"\n          },\n          {\n            \"do\": \"listen\"\n          },\n          {\n            \"do\": \"cancel\"\n          },\n          {\n            \"do\": \"state\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nlisten invoked=true locale=none\\ncancel invoked=true\\nlistening=false recognized=false available=true has_error=false last_recognized= last_status=listening last_level=0.0\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"initialize\"\n          },\n          {\n            \"do\": \"listen\"\n          },\n          {\n            \"do\": \"stop\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nlisten invoked=true locale=none\\nstop invoked=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_8_error_handling",
+        "trigger_keywords": [
+          "test cases for feature6 8 error handling",
+          "show me feature6 8 error handling test cases",
+          "what are the feature6 8 error handling test inputs",
+          "give me the feature6_8_error_handling test file",
+          "test cases for feature 6",
+          "feature6 8 error handling expected output",
+          "what does feature6 8 error handling expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_8_error_handling:\n{\n  \"description\": \"An error delivered by the platform during an active session is forwarded to the registered error callback. A transient error does not stop the session. A permanent error stops the session ONLY when the session was started with cancel-on-error enabled; otherwise the session keeps listening. Once the session has been explicitly cancelled by the user, a subsequently delivered error is suppressed (not forwarded). When cancel-on-error triggers an implicit cancel, a further delivered error is still forwarded. The output reports each forwarded error (identifier and permanence) interleaved with state snapshots as specified by the steps.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"initialize\",\n            \"onError\": true\n          },\n          {\n            \"do\": \"listen\"\n          },\n          {\n            \"do\": \"deliver\",\n            \"method\": \"error\",\n            \"payload\": \"{\\\"errorMsg\\\":\\\"network\\\",\\\"permanent\\\":true}\"\n          },\n          {\n            \"do\": \"state\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nlisten invoked=true locale=none\\nerror msg=network permanent=true\\nlistening=true recognized=false available=true has_error=true last_recognized= last_status=listening last_level=0.0\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"initialize\",\n            \"onError\": true\n          },\n          {\n            \"do\": \"listen\"\n          },\n          {\n            \"do\": \"cancel\"\n          },\n          {\n            \"do\": \"deliver\",\n            \"method\": \"error\",\n            \"payload\": \"{\\\"errorMsg\\\":\\\"network\\\",\\\"permanent\\\":true}\"\n          },\n          {\n            \"do\": \"state\"\n          }\n        ]\n      },\n      \"expected_output\": \"init result=true invoked=true\\nlisten invoked=true locale=none\\ncancel invoked=true\\nlistening=false recognized=false available=true has_error=false last_recognized= last_status=listening last_level=0.0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_9_initial_state",
+        "trigger_keywords": [
+          "test cases for feature6 9 initial state",
+          "show me feature6 9 initial state test cases",
+          "what are the feature6 9 initial state test inputs",
+          "give me the feature6_9_initial_state test file",
+          "test cases for feature 6",
+          "feature6 9 initial state expected output",
+          "what does feature6 9 initial state expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_9_initial_state:\n{\n  \"description\": \"Before any initialization or listening, the coordinator exposes a well-defined starting snapshot: it is not listening, has recognized nothing, is unavailable, has no error, has an empty remembered phrase, an empty last status, and a zero last sound level.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"session\",\n        \"config\": {},\n        \"steps\": [\n          {\n            \"do\": \"state\"\n          }\n        ]\n      },\n      \"expected_output\": \"listening=false recognized=false available=false has_error=false last_recognized= last_status= last_level=0.0\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "that channel-wrapper pattern we used in the notification module a while back",
+        "actual_meaning": "The SpeechRecognitionCoordinator class that wraps the async platform message channel, managing session state and routing platform notifications (recognition, status, sound, error) to registered callbacks"
+      },
+      {
+        "vague_reference": "the team had opinions about this in the last standup (cancelled session error suppression)",
+        "actual_meaning": "The rule in feature6_8_error_handling: explicitly user-cancelled sessions suppress subsequent platform errors, but implicitly cancelled sessions (via cancel-on-error) do NOT suppress further errors"
+      },
+      {
+        "vague_reference": "the 'default' choice follows a different rule than the display order",
+        "actual_meaning": "feature5_1_locale_parsing: system locale = first well-formed entry in original platform order; display list = sorted by display name — these are two independent orderings"
+      },
+      {
+        "vague_reference": "confidence scoring logic has a special case for when the platform doesn't give us a score",
+        "actual_meaning": "The missing sentinel value -1 in RecognitionCandidate: confidence == -1 means has_rating=false and is_confident=true unconditionally, bypassing the threshold comparison"
+      }
+    ],
+    "fallback_response": "I don't have specific details on that aspect — please check the existing codebase (especially the coordinator's session state tracking and the platform channel handler) and the test cases under rcb_tests/public_test_cases/ for the authoritative behavior. If something still isn't clear, flag it and the team can clarify in the next sync."
+  },
+  "public_test_cases": {
+    "feature1_1_candidate_confidence.json": {
+      "description": "A recognition candidate pairs a transcribed phrase with a confidence score. Evaluate whether the candidate should be treated as confident. A candidate is confident when its confidence score meets or exceeds an acceptance threshold (defaulting to a standard value when none is supplied), or when its confidence is the reserved 'missing' sentinel (meaning the platform did not provide a score, in which case the candidate is always treated as confident). The output reports the transcribed phrase, the numeric confidence, whether a real confidence rating is present (false only for the missing sentinel), and the confident verdict.",
+      "cases": [
+        {
+          "input": {
+            "op": "candidate_confidence",
+            "words": "hello",
+            "confidence": 0.85
+          },
+          "expected_output": "recognized=hello\nconfidence=0.85\nhas_rating=true\nconfident=true\n"
+        },
+        {
+          "input": {
+            "op": "candidate_confidence",
+            "words": "hello",
+            "confidence": -1
+          },
+          "expected_output": "recognized=hello\nconfidence=-1.0\nhas_rating=false\nconfident=true\n"
+        }
+      ]
+    },
+    "feature1_2_candidate_serialization.json": {
+      "description": "A recognition candidate is reconstructed from its wire payload, a JSON object carrying the transcribed phrase and confidence score, and can be serialized back to the same wire shape. The output reports the parsed phrase and confidence and the re-serialized JSON object, demonstrating a lossless round trip.",
+      "cases": [
+        {
+          "input": {
+            "op": "candidate_json",
+            "json": "{\"recognizedWords\":\"hello\",\"confidence\":0.85}"
+          },
+          "expected_output": "recognized=hello\nconfidence=0.85\njson={\"recognizedWords\":\"hello\",\"confidence\":0.85}\n"
+        }
+      ]
+    },
+    "feature1_3_candidate_equality.json": {
+      "description": "Recognition candidates compare equal when both their transcribed phrase and their confidence score match, and equal candidates hash alike. The output reports whether two candidates are equal and whether their hashes agree.",
+      "cases": [
+        {
+          "input": {
+            "op": "candidate_equality",
+            "first": {
+              "words": "hello",
+              "confidence": 0.85
+            },
+            "second": {
+              "words": "hello",
+              "confidence": 0.85
+            }
+          },
+          "expected_output": "equal=true\nhash_equal=true\n"
+        }
+      ]
+    },
+    "feature2_1_result_summary.json": {
+      "description": "A recognition result holds an ordered list of alternative candidate transcriptions plus a flag marking whether it is the final result for the utterance. The best transcription and its confidence are derived from the first alternate; when there are no alternates the best transcription is the empty string, the confidence is zero, the result is not considered confident, and it has no confidence rating. The output reports the best transcription, derived confidence, final flag, confident verdict, rating presence, the number of alternates, and each alternate's phrase and confidence in order.",
+      "cases": [
+        {
+          "input": {
+            "op": "result_summary",
+            "alternates": [
+              {
+                "words": "hello",
+                "confidence": 0.85
+              },
+              {
+                "words": "hello there",
+                "confidence": 0.62
+              }
+            ],
+            "final": true
+          },
+          "expected_output": "recognized=hello\nconfidence=0.85\nfinal=true\nconfident=true\nhas_rating=true\nalternate_count=2\nalternate[0]=hello@0.85\nalternate[1]=hello there@0.62\n"
+        }
+      ]
+    },
+    "feature2_2_result_serialization.json": {
+      "description": "A recognition result is reconstructed from its wire payload, a JSON object carrying the ordered alternates array and the final flag, and can be serialized back to the same wire shape. The output reports the derived best transcription, its confidence, the final flag, and the re-serialized JSON object.",
+      "cases": [
+        {
+          "input": {
+            "op": "result_json",
+            "json": "{\"alternates\":[{\"recognizedWords\":\"hello\",\"confidence\":0.85}],\"finalResult\":false}"
+          },
+          "expected_output": "recognized=hello\nconfidence=0.85\nfinal=false\njson={\"alternates\":[{\"recognizedWords\":\"hello\",\"confidence\":0.85}],\"finalResult\":false}\n"
+        }
+      ]
+    },
+    "feature2_3_result_equality.json": {
+      "description": "Recognition results compare equal when their best transcription (the first alternate's phrase) and their final flag match; the remaining alternates do not affect equality, and equal results hash alike. The output reports whether two results are equal and whether their hashes agree.",
+      "cases": [
+        {
+          "input": {
+            "op": "result_equality",
+            "first": {
+              "alternates": [
+                {
+                  "words": "hello",
+                  "confidence": 0.85
+                }
+              ],
+              "final": true
+            },
+            "second": {
+              "alternates": [
+                {
+                  "words": "hello",
+                  "confidence": 0.85
+                }
+              ],
+              "final": true
+            }
+          },
+          "expected_output": "equal=true\nhash_equal=true\n"
+        }
+      ]
+    },
+    "feature3_1_error_serialization.json": {
+      "description": "A recognition error carries a short error identifier and a permanence flag that states whether recognition can continue (transient) or is blocked until the condition is resolved (permanent). It is reconstructed from its wire payload, a JSON object with the identifier and permanence flag, and serialized back to the same shape. The output reports the identifier, the permanence flag, and the re-serialized JSON object.",
+      "cases": [
+        {
+          "input": {
+            "op": "error_json",
+            "json": "{\"errorMsg\":\"network\",\"permanent\":true}"
+          },
+          "expected_output": "error_msg=network\npermanent=true\njson={\"errorMsg\":\"network\",\"permanent\":true}\n"
+        }
+      ]
+    },
+    "feature3_2_error_equality.json": {
+      "description": "Recognition errors compare equal when both their error identifier and permanence flag match, and equal errors hash alike. The output reports whether two errors are equal and whether their hashes agree.",
+      "cases": [
+        {
+          "input": {
+            "op": "error_equality",
+            "first": {
+              "msg": "msg1",
+              "permanent": false
+            },
+            "second": {
+              "msg": "msg1",
+              "permanent": false
+            }
+          },
+          "expected_output": "equal=true\nhash_equal=true\n"
+        }
+      ]
+    },
+    "feature4_recognition_event.json": {
+      "description": "A recognition event is a tagged envelope delivered on the event stream. Its kind selects which payload is meaningful: a status event exposes the listening flag, a final-result event exposes the recognition result, an error event exposes the recognition error, and a sound-level event exposes the input loudness level. The output reports the event kind and the accessor relevant to that kind.",
+      "cases": [
+        {
+          "input": {
+            "op": "event",
+            "type": "status",
+            "listening": true
+          },
+          "expected_output": "type=status\nlistening=true\n"
+        },
+        {
+          "input": {
+            "op": "event",
+            "type": "sound",
+            "level": 0.5
+          },
+          "expected_output": "type=sound_level\nlevel=0.5\n"
+        }
+      ]
+    },
+    "feature5_1_locale_parsing.json": {
+      "description": "The set of supported recognition locales is supplied by the platform as a list of colon-separated 'identifier:display name' strings. Each well-formed entry becomes a locale with an identifier and a display name; entries that are not exactly one identifier and one name are dropped. The returned list is ordered by display name. The system (default) locale is the first well-formed entry in the ORIGINAL platform order (before the display-name sort). The output reports the count of parsed locales, each parsed locale's identifier and display name in returned order, and the system locale's identifier.",
+      "cases": [
+        {
+          "input": {
+            "op": "locales",
+            "raw": [
+              "en_US:English US",
+              "fr_CA:French Canada"
+            ]
+          },
+          "expected_output": "count=2\nlocale[0]=en_US|English US\nlocale[1]=fr_CA|French Canada\nsystem=en_US\n"
+        },
+        {
+          "input": {
+            "op": "locales",
+            "raw": [
+              "fr_CA:Zebra",
+              "en_US:Apple"
+            ]
+          },
+          "expected_output": "count=2\nlocale[0]=en_US|Apple\nlocale[1]=fr_CA|Zebra\nsystem=fr_CA\n"
+        }
+      ]
+    },
+    "feature5_2_locale_requires_init.json": {
+      "description": "Querying the supported locales before the coordinator has been initialized is rejected: the operation reports a normalized not-initialized error rather than reaching the platform.",
+      "cases": [
+        {
+          "input": {
+            "op": "locales_uninitialized"
+          },
+          "expected_output": "error=not_initialized\n"
+        }
+      ]
+    },
+    "feature6_1_permission.json": {
+      "description": "The coordinator can report whether microphone permission has already been granted by querying the platform, without prompting the user. The output reports the permission verdict returned by the platform.",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {
+              "has_permission": true
+            },
+            "steps": [
+              {
+                "do": "permission"
+              }
+            ]
+          },
+          "expected_output": "has_permission=true\n"
+        }
+      ]
+    },
+    "feature6_2_initialization.json": {
+      "description": "Initialization prepares the coordinator and returns whether it succeeded. It is idempotent: once it has succeeded, calling it again returns success WITHOUT re-invoking the platform initialize operation. When the platform reports failure, initialization returns failure and the coordinator remains unavailable. The output reports, per initialize call, the returned result and whether the platform initialize was invoked, followed by an availability snapshot.",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {
+              "init_result": true
+            },
+            "steps": [
+              {
+                "do": "initialize"
+              },
+              {
+                "do": "initialize"
+              },
+              {
+                "do": "state"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\ninit result=true invoked=false\nlistening=false recognized=false available=true has_error=false last_recognized= last_status= last_level=0.0\n"
+        }
+      ]
+    },
+    "feature6_3_listen.json": {
+      "description": "Starting a listening session requires a prior successful initialization; otherwise it is rejected with a normalized not-initialized error and the platform listen is never invoked. After successful initialization, listening invokes the platform listen operation; an optional locale identifier is forwarded to the platform when provided, and is absent otherwise. If the platform raises a listen failure, it is translated into a normalized listen-failed error that carries the platform-supplied failure detail. The output reports, per step, the initialize result and the listen outcome (invoked flag and forwarded locale, or the normalized error).",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "initialize"
+              },
+              {
+                "do": "listen"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nlisten invoked=true locale=none\n"
+        },
+        {
+          "input": {
+            "op": "session",
+            "config": {
+              "listen_throws": true
+            },
+            "steps": [
+              {
+                "do": "initialize"
+              },
+              {
+                "do": "listen"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nlisten error=listen_failed details=Device Listen Failure\n"
+        }
+      ]
+    },
+    "feature6_4_recognition_callback.json": {
+      "description": "While listening, each recognition payload delivered by the platform is parsed into a recognition result and handed to the registered result callback, and the coordinator remembers the most recently recognized phrase. Multiple deliveries invoke the callback once each in order, and the remembered phrase tracks the latest delivery. The output reports each callback invocation (recognized phrase and final flag) followed by a state snapshot whose remembered phrase reflects the last delivery.",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "initialize"
+              },
+              {
+                "do": "listen",
+                "onResult": true
+              },
+              {
+                "do": "deliver",
+                "method": "recognition",
+                "payload": "{\"alternates\":[{\"recognizedWords\":\"hello\",\"confidence\":0.85}],\"finalResult\":false}"
+              },
+              {
+                "do": "state"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nlisten invoked=true locale=none\nresult recognized=hello final=false\nlistening=true recognized=true available=true has_error=false last_recognized=hello last_status=listening last_level=0.0\n"
+        }
+      ]
+    },
+    "feature6_5_status_callback.json": {
+      "description": "A status update delivered by the platform is forwarded to the registered status callback with the new status string. The output reports the forwarded status.",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "initialize",
+                "onStatus": true
+              },
+              {
+                "do": "deliver",
+                "method": "status",
+                "payload": "listening"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nstatus listening\n"
+        }
+      ]
+    },
+    "feature6_6_sound_level_callback.json": {
+      "description": "While a listening session is active, a sound-level update delivered by the platform is forwarded to the registered sound-level callback and recorded as the last sound level. The output reports the forwarded level followed by a state snapshot whose last sound level reflects the delivery.",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "initialize"
+              },
+              {
+                "do": "listen",
+                "onSound": true
+              },
+              {
+                "do": "deliver",
+                "method": "sound",
+                "payload": 0.5
+              },
+              {
+                "do": "state"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nlisten invoked=true locale=none\nsound_level 0.5\nlistening=true recognized=false available=true has_error=false last_recognized= last_status=listening last_level=0.5\n"
+        }
+      ]
+    },
+    "feature6_7_stop_cancel.json": {
+      "description": "Stopping or cancelling does nothing when the coordinator was never initialized: the corresponding platform operation is not invoked. After a successful initialization and an active listening session, stopping invokes the platform stop operation, and cancelling invokes the platform cancel operation and leaves the session no longer listening. The output reports whether the platform operation was invoked, and a state snapshot where relevant.",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "initialize"
+              },
+              {
+                "do": "listen"
+              },
+              {
+                "do": "cancel"
+              },
+              {
+                "do": "state"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nlisten invoked=true locale=none\ncancel invoked=true\nlistening=false recognized=false available=true has_error=false last_recognized= last_status=listening last_level=0.0\n"
+        },
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "initialize"
+              },
+              {
+                "do": "listen"
+              },
+              {
+                "do": "stop"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nlisten invoked=true locale=none\nstop invoked=true\n"
+        }
+      ]
+    },
+    "feature6_8_error_handling.json": {
+      "description": "An error delivered by the platform during an active session is forwarded to the registered error callback. A transient error does not stop the session. A permanent error stops the session ONLY when the session was started with cancel-on-error enabled; otherwise the session keeps listening. Once the session has been explicitly cancelled by the user, a subsequently delivered error is suppressed (not forwarded). When cancel-on-error triggers an implicit cancel, a further delivered error is still forwarded. The output reports each forwarded error (identifier and permanence) interleaved with state snapshots as specified by the steps.",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "initialize",
+                "onError": true
+              },
+              {
+                "do": "listen"
+              },
+              {
+                "do": "deliver",
+                "method": "error",
+                "payload": "{\"errorMsg\":\"network\",\"permanent\":true}"
+              },
+              {
+                "do": "state"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nlisten invoked=true locale=none\nerror msg=network permanent=true\nlistening=true recognized=false available=true has_error=true last_recognized= last_status=listening last_level=0.0\n"
+        },
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "initialize",
+                "onError": true
+              },
+              {
+                "do": "listen"
+              },
+              {
+                "do": "cancel"
+              },
+              {
+                "do": "deliver",
+                "method": "error",
+                "payload": "{\"errorMsg\":\"network\",\"permanent\":true}"
+              },
+              {
+                "do": "state"
+              }
+            ]
+          },
+          "expected_output": "init result=true invoked=true\nlisten invoked=true locale=none\ncancel invoked=true\nlistening=false recognized=false available=true has_error=false last_recognized= last_status=listening last_level=0.0\n"
+        }
+      ]
+    },
+    "feature6_9_initial_state.json": {
+      "description": "Before any initialization or listening, the coordinator exposes a well-defined starting snapshot: it is not listening, has recognized nothing, is unavailable, has no error, has an empty remembered phrase, an empty last status, and a zero last sound level.",
+      "cases": [
+        {
+          "input": {
+            "op": "session",
+            "config": {},
+            "steps": [
+              {
+                "do": "state"
+              }
+            ]
+          },
+          "expected_output": "listening=false recognized=false available=false has_error=false last_recognized= last_status= last_level=0.0\n"
+        }
+      ]
+    }
+  }
+}

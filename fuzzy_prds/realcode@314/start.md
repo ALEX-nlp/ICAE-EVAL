@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need to build out that server-side HTML manipulation thing we discussed last sprint. basically it should work like the browser DOM stuff we already use on the frontend but headless — parse markup, let you poke around and change things, then spit it back out as a string. the input/output should be over stdin/stdout as JSON so it's easy to wire up from any language.
+
+the big use cases are scraping pipelines and our post-processing templates. users have been complaining that the current regex-based approach keeps breaking on nested tables and auto-closed tags — the swiss chocolate page was the one that broke last week btw, something about data attributes with camelCase keys. also someone from the forms team flagged that serialization needs to handle disabled fields and multi-selects correctly, which the old thing never did.
+
+for error cases, we want clean predictable output — no stack traces leaking into the response, just a simple category label. there's also the XML vs HTML thing, refer to how we handled strict mode in the config parser module from the auth team, similar idea. oh and fragment loading should skip the full document wrapper scaffolding. if there's time, tree traversal (parents, siblings, find) would be great too. let me know if anything is unclear, happy to jump on a call.

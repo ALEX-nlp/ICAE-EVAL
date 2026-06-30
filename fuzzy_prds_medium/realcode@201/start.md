@@ -1,0 +1,25 @@
+## Product Requirement Document
+
+hey team, we need to wrap up that container command builder thing we've been talking about. basically the idea is that ops people shouldn't have to hand-write all those long docker invocations every time they deploy something — it's causing too many incidents where someone forgets a flag or mis-quotes a secret and the whole routing breaks silently. we already have something similar to what we did with the login module credential handling, so let's stay consistent with that pattern for secrets.
+
+the core of it: given a config object describing a service (image, servers grouped by role, env vars including secrets pulled from the host, healthcheck stuff, logging, volumes, ssh settings), we should be able to ask for any named operation — launching a container, stopping it, reading logs, running one-off commands, querying container state — and get back the exact shell string, properly escaped, ready to run or pass over ssh.
+
+important: secrets need to be handled carefully — if a secret env var isn't present in the host environment that should be a real error, not just an empty string. also we need to be able to produce a safe/redacted version of any command for logging purposes.
+
+the whole thing should be organized cleanly across multiple files, not one giant script. different roles (web vs background workers) behave differently — web gets routing labels, others don't. ssh wrapping, proxy jump hosts, container naming with optional destination segments — all needs to work. please make sure the multi-file structure actually separates concerns properly.
+
+quick follow-up after the questions that came in: for secret env handling, if the secret name is not present as a key in the host environment dict, that is still a typed failure and not a silent empty string. when that gets rendered by the adapter, it should come out as the neutral string 'error=missing_env' rather than throwing or substituting an empty value. same deal anywhere this comes up — it should mirror the same Result/Either-style handling we talked about before, just rendered as 'error=missing_env' at the edge.
+
+also, the container name formatting is fixed and should be used consistently in both places that care about it. with no destination set, it's {service}-{role}-{version}. if a destination is configured, it's {service}-{role}-{destination}-{version}. that exact name is what goes in the --name flag for docker run, and it's also the value injected into MRSK_CONTAINER_NAME.
+
+for version lookup, the extraction is based on this pipeline: docker ps --filter label=service={service} --filter label=role={role} [--filter status=running --latest for current_running_version] --format "{{.Names}}" | grep -oE "\-[^-]+$" | cut -c 2-. the grep step is intentionally pulling the last dash-delimited segment, and cut -c 2- strips the leading dash.
+
+one more nuance on servers shape: if 'servers' is just a flat array, treat that as one implicit 'web' role owning all hosts, and that implicit role has no startup command. if 'servers' is a map, then each key is a role name, and that role value can either be a plain array of hosts or an object with a 'hosts' key plus optional 'cmd', 'env', 'labels', 'options', 'healthcheck'. and yes, if the web role is given as a plain array inside that map form, it still gets routing labels.
+
+for logs, follow_logs should always build an SSH-wrapped command. the remote side is: docker ps --quiet --filter label=service={service} --filter label=role={role} --filter status=running --latest | xargs docker logs --timestamps --tail 10 --follow 2>&1. if grep text is provided, just append | grep "{text}" inside the single-quoted remote command.
+
+for one-off execution, the split is straightforward: execute_in_new_container is docker run --rm -e {env_args} {image}:{version} {command}, and execute_in_existing_container is docker exec {container_name} {command}. the interactive SSH forms prepend -it to the docker run/exec flags and wrap the whole thing in ssh -t {user}@{host} '...'. also worth calling out that the new-container path does NOT include --name, restart policy, healthcheck, or labels.
+
+on labels, deployment-level custom labels from the 'labels' key apply to every role. if a role-level 'labels' map defines the same key, the role-level value wins. and if a custom label uses the same key as one of the default routing labels, that custom value overrides the default too. the role.label action should return the final resolved key=value string for the specific requested label key.
+
+last piece: only the 'web' role, or any role explicitly opted into routing, should get the full reverse-proxy routing label set. that set is exactly traefik.http.services.{service}-{role}.loadbalancer.server.scheme="http", traefik.http.routers.{service}-{role}.rule="PathPrefix(`/`)", traefik.http.middlewares.{service}-{role}-retry.retry.attempts="5", traefik.http.middlewares.{service}-{role}-retry.retry.initialinterval="500ms", traefik.http.routers.{service}-{role}.middlewares="{service}-{role}-retry@docker". non-web roles should only get the basic service and role labels.

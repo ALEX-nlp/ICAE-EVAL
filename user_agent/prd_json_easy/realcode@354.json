@@ -1,0 +1,582 @@
+{
+  "fuzzy_prd": "# Decision-Tree Ensemble Compiler & Predictor — Functional Requirements\n\n## Project Goal\n\nBuild a toolkit that turns a *trained* decision-tree ensemble (a gradient-boosted forest exported by a training framework) into a fast, standalone native predictor, and that lets developers introspect, prune, serialize and run that ensemble through one consistent interface. Developers should be able to load a model, ask what it expects and produces, compile it into a runnable artifact, and score data — without re-implementing tree-traversal logic or hand-writing prediction code for each model.\n\n---\n\n## Background & Problem\n\nWithout this toolkit, developers who want to deploy a trained tree ensemble must either ship the original training framework into production (heavy, slow, dependency-laden) or hand-translate each model's split structure into bespoke scoring code (tedious, error-prone, and impossible to keep in sync as models change). They also lack a uniform way to inspect a model's shape, trim it to fewer trees, convert between on-disk formats, or guarantee that an optimized build produces the same numbers as a naive one.\n\nWith this toolkit, a trained ensemble becomes a black box with a small, predictable contract: load it, query its metadata, compile it once into a native predictor, and score either whole batches or single rows. Models from different training frameworks (gradient-boosted forests and ensembles using categorical splits) are normalized into one internal representation, can be round-tripped through a portable interchange buffer, and can be tuned for build size/speed without ever changing the predictions.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a non-trivial system spanning model loading, an internal model representation, a compiler that emits native code, a runtime predictor, and (de)serialization. It MUST be organized as a multi-module repository with clear separation between the model representation, the compiler, the runtime predictor, the (de)serializer, and the I/O adapter. Do not collapse these responsibilities into a single file.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases in \"Core Features\" are a **black-box contract for the execution adapter only**, not the core data model. The compiler, runtime and model representation MUST be fully decoupled from stdin/stdout and JSON. The adapter alone translates JSON commands into idiomatic calls on the core objects and renders results to stdout.\n\n3. **Adherence to SOLID Design Principles:** Separate parsing, routing, validation, core execution, and output formatting into distinct units. The compiler must be open for extension (new output formats / tuning options) but closed for modification; substitutable model and predictor abstractions; small cohesive interfaces; high-level flows depend on abstractions, not on the concrete I/O layer.\n\n4. **Robustness & Interface Design:** The public interface must be idiomatic and hide internal complexity. Edge cases — too-wide input, invalid prune limits, missing-value encodings — must be handled deterministically and modeled as explicit error categories rather than generic faults. Error reporting is a rendering concern of the adapter; the core may raise idiomatic errors, but the externally visible contract uses neutral, language-independent error categories.\n\n---\n\n## Core Features\n\nThe execution adapter reads one JSON object from stdin describing an action and its operands, performs it against the core system, and prints a small set of `key=value` lines to stdout (one per line, trailing newline). Numeric output is rendered with fixed 6-decimal precision. Errors are rendered as a neutral `error=<category>` line plus supporting fields — never as host-language exception text.\n\nThree reference ensembles are referenced by neutral identifiers throughout:\n- `binary_mushroom` — a small binary classifier (sigmoid output).\n- `multiclass_dermatology` — a 6-class classifier (softmax output).\n- `categorical_toy` — a single-output regressor whose trees use categorical (set-membership) splits.\n\n---\n\n### Feature 1: Ensemble Metadata\n\n**As a developer**, I want to load a trained ensemble and read back its structural metadata, so I can verify I loaded the right model and know how many features it expects before feeding it data.\n\n**Expected Behavior / Usage:**\n\nGiven a request naming a model, the system loads the serialized ensemble and reports three facts: the number of trees in the ensemble (`num_tree`), the number of input features the model expects (`num_feature`), and the number of output groups it produces (`num_output_group`, 1 for a binary classifier or single-output regressor, one-per-class for a multiclass classifier). Output is exactly three lines, `num_tree=<int>` then `num_feature=<int>` then `num_output_group=<int>`. Loading uses the format implied by the model identifier; the caller does not need to specify it.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_ensemble_metadata.json`\n\n```json\n{\n    \"description\": \"Load a serialized gradient-boosted tree ensemble and report its tree count, the number of input features it expects, and the number of output groups it produces.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"model_metadata\", \"dataset\": \"binary_mushroom\"},\n            \"expected_output\": \"num_tree=2\\nnum_feature=127\\nnum_output_group=1\\n\"\n        },\n        {\n            \"input\": {\"action\": \"model_metadata\", \"dataset\": \"multiclass_dermatology\"},\n            \"expected_output\": \"num_tree=60\\nnum_feature=33\\nnum_output_group=6\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Tree-Limit Pruning\n\n**As a developer**, I want to truncate an ensemble to only its first N trees, so I can trade a small amount of accuracy for faster scoring or study how many trees are actually needed.\n\n**Expected Behavior / Usage:**\n\nGiven a model and an integer `limit`, the system keeps only the first `limit` trees and reports the resulting active tree count as `num_tree=<int>`. A `limit` is valid when it is at least 1 and does not exceed the model's current tree count. An invalid limit (zero, negative, or larger than the available trees) is rejected: the ensemble is left unchanged and the output is the neutral category `error=invalid_tree_limit`, followed by the requested limit and the model's actual tree count. The error path never leaks any host-language exception type.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_tree_limit.json`\n\n```json\n{\n    \"description\": \"Truncate an ensemble to keep only its first N trees. Valid limits in the range 1..tree_count update the active tree count; a limit of zero or a limit exceeding the available trees is rejected as invalid.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"set_tree_limit\", \"dataset\": \"multiclass_dermatology\", \"limit\": 30},\n            \"expected_output\": \"num_tree=30\\n\"\n        },\n        {\n            \"input\": {\"action\": \"set_tree_limit\", \"dataset\": \"binary_mushroom\", \"limit\": 1},\n            \"expected_output\": \"num_tree=1\\n\"\n        },\n        {\n            \"input\": {\"action\": \"set_tree_limit\", \"dataset\": \"binary_mushroom\", \"limit\": 0},\n            \"expected_output\": \"error=invalid_tree_limit\\nrequested=0\\nmodel_tree_count=2\\n\"\n        },\n        {\n            \"input\": {\"action\": \"set_tree_limit\", \"dataset\": \"binary_mushroom\", \"limit\": 3},\n            \"expected_output\": \"error=invalid_tree_limit\\nrequested=3\\nmodel_tree_count=2\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Compiled Predictor Metadata\n\n**As a developer**, I want to compile a loaded ensemble into a runnable predictor and inspect the predictor's runtime properties, so I can confirm its input width, output shape, and the post-processing transform that turns raw scores into final outputs.\n\n**Expected Behavior / Usage:**\n\nThe system compiles the ensemble into a native predictor and reports five properties: the feature count (`num_feature`), the number of output groups / classes (`num_output_group`, 1 for binary or single-output regression), the name of the post-processing transform applied to raw margins (`pred_transform`, e.g. `sigmoid` for a binary classifier, `softmax` for a multiclass one), the global bias added to every margin (`global_bias`), and the sigmoid steepness parameter (`sigmoid_alpha`). Numeric properties are rendered with 6-decimal precision; `-0` is normalized to `0`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_predictor_metadata.json`\n\n```json\n{\n    \"description\": \"After compiling an ensemble into a runnable predictor, expose the predictor's feature count, output-group count, post-processing transform name, global bias and sigmoid alpha.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"predictor_metadata\", \"dataset\": \"binary_mushroom\"},\n            \"expected_output\": \"num_feature=127\\nnum_output_group=1\\npred_transform=sigmoid\\nglobal_bias=0.000000\\nsigmoid_alpha=1.000000\\n\"\n        },\n        {\n            \"input\": {\"action\": \"predictor_metadata\", \"dataset\": \"multiclass_dermatology\"},\n            \"expected_output\": \"num_feature=33\\nnum_output_group=6\\npred_transform=softmax\\nglobal_bias=0.500000\\nsigmoid_alpha=1.000000\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Batch Prediction\n\n**As a developer**, I want to score a whole sparse data matrix at once and get a compact, verifiable summary of the output, so I can validate predictions in bulk without dumping thousands of rows.\n\n**Expected Behavior / Usage:**\n\nA batch request compiles the predictor and scores the model's companion test matrix. Two output modes are available: the default **probability** mode applies the model's post-processing transform; **margin** mode (`pred_margin: true`) returns the raw additive scores before any transform. Each run reports four lines: `num_row` (rows scored), `num_col` (values per row — 1 for binary/regression, one per class for multiclass), `row0` (the comma-separated 6-decimal values of the first row), and `mean` (the mean of all output values). For multiclass, `num_col` equals the class count and `row0` is the full per-class vector for the first row.\n\n*4.1 Binary classifier batch — single value per row, sigmoid-transformed probabilities vs. raw margins.*\n\nA binary classifier yields one value per row. In probability mode the values are sigmoid-squashed into (0,1); in margin mode they are the raw log-odds-style scores.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_binary_batch.json`\n\n```json\n{\n    \"description\": \"Run batch prediction over a sparse test matrix for a binary classifier, returning either the post-processed probability output or the raw margin output; report the row count, the per-row width, the first row's values and the mean over all outputs.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"predict_batch\", \"dataset\": \"binary_mushroom\"},\n            \"expected_output\": \"num_row=1583\\nnum_col=1\\nrow0=0.110274\\nmean=0.488999\\n\"\n        },\n        {\n            \"input\": {\"action\": \"predict_batch\", \"dataset\": \"binary_mushroom\", \"pred_margin\": true},\n            \"expected_output\": \"num_row=1583\\nnum_col=1\\nrow0=-2.087944\\nmean=-0.106025\\n\"\n        }\n    ]\n}\n```\n\n*4.2 Multiclass classifier batch — one value per class per row, softmax probabilities vs. raw margins.*\n\nA multiclass classifier yields one value per class for each row. `num_col` equals the number of classes and `row0` is the first row's full class vector.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_multiclass_batch.json`\n\n```json\n{\n    \"description\": \"Run batch prediction for a multiclass classifier, producing one value per class for each row; report the per-row width and the first row's vector for both the probability and the raw margin output.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"predict_batch\", \"dataset\": \"multiclass_dermatology\"},\n            \"expected_output\": \"num_row=110\\nnum_col=6\\nrow0=0.083662,0.088542,0.083608,0.577178,0.083545,0.083466\\nmean=0.166667\\n\"\n        },\n        {\n            \"input\": {\"action\": \"predict_batch\", \"dataset\": \"multiclass_dermatology\", \"pred_margin\": true},\n            \"expected_output\": \"num_row=110\\nnum_col=6\\nrow0=-0.059313,-0.002621,-0.059962,1.872051,-0.060716,-0.061665\\nmean=0.317861\\n\"\n        }\n    ]\n}\n```\n\n*4.3 Categorical-split regressor batch — single regression value per row.*\n\nAn ensemble whose trees branch on categorical (set-membership) conditions scores a single regression value per row in margin mode.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_categorical_margin.json`\n\n```json\n{\n    \"description\": \"Run batch margin prediction for an ensemble trained with categorical splits, returning a single regression value per row.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"predict_batch\", \"dataset\": \"categorical_toy\", \"pred_margin\": true},\n            \"expected_output\": \"num_row=180\\nnum_col=1\\nrow0=-20.738508\\nmean=-10.065133\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Single-Instance Prediction & Missing-Value Encodings\n\n**As a developer**, I want to score one row at a time and supply it in whichever encoding my data pipeline produces, so I can serve low-latency single predictions and trust that equivalent inputs give identical results.\n\n**Expected Behavior / Usage:**\n\nA single-instance request scores one selected row of the model's test matrix and reports `num_output_group` followed by `values` (the comma-separated 6-decimal output vector — one value for binary/regression, one per class for multiclass). The same row may be supplied in three equivalent encodings, all of which MUST produce identical output: `sparse` (only the present entries), `dense_zero_missing` (a full dense vector where 0 marks an absent feature), and `dense_nan_missing` (a full dense vector where NaN marks an absent feature). Both probability (default) and `pred_margin: true` outputs are supported. This guarantees that the choice of input representation is purely a convenience and never changes the prediction.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_single_instance.json`\n\n```json\n{\n    \"description\": \"Predict for a single row supplied in several equivalent encodings: a sparse row, a dense row treating 0 as the missing-value marker, and a dense row treating NaN as the missing-value marker. All encodings of the same row must yield identical output, and both probability and margin outputs are supported.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"predict_instance\", \"dataset\": \"binary_mushroom\", \"row_index\": 0, \"encoding\": \"sparse\"},\n            \"expected_output\": \"num_output_group=1\\nvalues=0.110274\\n\"\n        },\n        {\n            \"input\": {\"action\": \"predict_instance\", \"dataset\": \"binary_mushroom\", \"row_index\": 0, \"encoding\": \"dense_zero_missing\"},\n            \"expected_output\": \"num_output_group=1\\nvalues=0.110274\\n\"\n        },\n        {\n            \"input\": {\"action\": \"predict_instance\", \"dataset\": \"binary_mushroom\", \"row_index\": 0, \"encoding\": \"dense_nan_missing\"},\n            \"expected_output\": \"num_output_group=1\\nvalues=0.110274\\n\"\n        },\n        {\n            \"input\": {\"action\": \"predict_instance\", \"dataset\": \"binary_mushroom\", \"row_index\": 4, \"encoding\": \"sparse\", \"pred_margin\": true},\n            \"expected_output\": \"num_output_group=1\\nvalues=1.792405\\n\"\n        },\n        {\n            \"input\": {\"action\": \"predict_instance\", \"dataset\": \"multiclass_dermatology\", \"row_index\": 0, \"encoding\": \"sparse\"},\n            \"expected_output\": \"num_output_group=6\\nvalues=0.083662,0.088542,0.083608,0.577178,0.083545,0.083466\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Input Column-Count Adaptation\n\n**As a developer**, I want the predictor to behave predictably when the input matrix's column count doesn't exactly match the model's feature count, so narrower inputs still score and over-wide inputs fail loudly instead of silently corrupting results.\n\n**Expected Behavior / Usage:**\n\n*6.1 Narrower input is zero-padded.*\n\nWhen an input matrix declares fewer columns than the model expects, the missing trailing columns are treated as absent (zero) features and prediction proceeds normally. The output reports `num_row` and the comma-separated 6-decimal `values` (one per row). A fully empty narrow matrix therefore scores every row to the model's all-features-missing prediction.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_padded_matrix.json`\n\n```json\n{\n    \"description\": \"Predict over a sparse matrix that declares fewer columns than the model expects; the missing trailing columns are padded with zeros and prediction proceeds normally.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"predict_padded\", \"dataset\": \"binary_mushroom\", \"nrow\": 3, \"ncol\": 3},\n            \"expected_output\": \"num_row=3\\nvalues=0.954569,0.954569,0.954569\\n\"\n        }\n    ]\n}\n```\n\n*6.2 Wider input is rejected.*\n\nWhen an input matrix declares more columns than the model expects, the request is rejected with the neutral category `error=too_many_features`, followed by the offending input width and the model's feature count. No prediction is produced and no host-language exception identity appears.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_too_wide_matrix.json`\n\n```json\n{\n    \"description\": \"Predict over a sparse matrix that declares more columns than the model expects; this is rejected as a feature-count mismatch.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"predict_padded\", \"dataset\": \"binary_mushroom\", \"nrow\": 3, \"ncol\": 1000},\n            \"expected_output\": \"error=too_many_features\\ninput_features=1000\\nmodel_features=127\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Serialization Round-Trip\n\n**As a developer**, I want to serialize a loaded ensemble to a portable interchange buffer and reload it, so I can store, transmit, or convert models between formats while preserving their behavior exactly.\n\n**Expected Behavior / Usage:**\n\nThe system serializes a loaded ensemble to a portable binary interchange buffer, reloads it from that buffer into a fresh model, compiles the reloaded model and scores its test matrix. The reported batch summary (`num_row`, `num_col`, `row0`, `mean`) MUST match what the original (un-serialized) model produces, confirming the round-trip is lossless. Both probability and margin modes are supported.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_serialization_roundtrip.json`\n\n```json\n{\n    \"description\": \"Serialize an ensemble to the interchange buffer format, reload it from that buffer, compile the reloaded model, and confirm predictions are preserved across the round-trip.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"protobuf_roundtrip\", \"dataset\": \"binary_mushroom\"},\n            \"expected_output\": \"num_row=1583\\nnum_col=1\\nrow0=0.110274\\nmean=0.488999\\n\"\n        },\n        {\n            \"input\": {\"action\": \"protobuf_roundtrip\", \"dataset\": \"multiclass_dermatology\", \"pred_margin\": true},\n            \"expected_output\": \"num_row=110\\nnum_col=6\\nrow0=-0.059313,-0.002621,-0.059962,1.872051,-0.060716,-0.061665\\nmean=0.317861\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Compilation-Option Invariance\n\n**As a developer**, I want optional build-time tuning knobs (threshold quantization, code folding, splitting the generated code into parallel compilation units) to change only how the predictor is built — never what it predicts — so I can optimize build size and compile time with zero risk to correctness.\n\n**Expected Behavior / Usage:**\n\nThe compiler accepts tuning options: `quantize` (bucket continuous thresholds into integer codes), `code_folding` (collapse repeated subtrees up to a given depth ratio), and `parallel_comp` (split generated code across N translation units). Each option is purely a build-time optimization. A batch run with any single option enabled MUST produce the same prediction summary (`num_row`, `num_col`, `row0`, `mean`) as the plain compilation of the same model. The cases below all reproduce the binary classifier's margin output from Feature 4.1.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_compile_option_invariance.json`\n\n```json\n{\n    \"description\": \"Compilation tuning options (threshold quantization, code folding, and splitting generated code into parallel compilation units) change only how the predictor is built, never its numeric output. Predictions under each option match the plain compilation of the same model.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"predict_batch\", \"dataset\": \"binary_mushroom\", \"pred_margin\": true, \"quantize\": true},\n            \"expected_output\": \"num_row=1583\\nnum_col=1\\nrow0=-2.087944\\nmean=-0.106025\\n\"\n        },\n        {\n            \"input\": {\"action\": \"predict_batch\", \"dataset\": \"binary_mushroom\", \"pred_margin\": true, \"code_folding\": 2.0},\n            \"expected_output\": \"num_row=1583\\nnum_col=1\\nrow0=-2.087944\\nmean=-0.106025\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-module codebase implementing model loading, an internal ensemble representation, a compiler that emits a native predictor, a runtime that scores batches and single instances, and a (de)serializer for the portable interchange buffer. The modules MUST be decoupled from stdin/stdout and JSON.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON command from stdin, invokes the appropriate core logic, and prints the `key=value` contract lines to stdout, exactly matching the per-feature contracts above. It normalizes every error into a neutral `error=<category>` line with supporting fields and never emits host-language exception identities. This adapter is logically and physically separate from the core domain.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_ensemble_metadata.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_ensemble_metadata@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- format values the same way as the single_instance_predictions module uses for multiclass results\n",
+  "oracle_data": {
+    "task_id": "dmlc__treelite-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "how to handle",
+          "what happens if",
+          "validation rule for",
+          "input validation",
+          "error category"
+        ],
+        "oracle_response": "error='invalid_tree_limit'"
+      },
+      {
+        "constraint_id": "TC_feature4_1_binary_batch",
+        "trigger_keywords": [
+          "test cases for feature4 1 binary batch",
+          "show me feature4 1 binary batch test cases",
+          "what are the feature4 1 binary batch inputs and outputs",
+          "give me the feature4_1_binary_batch test file",
+          "feature4 1 binary batch expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_1_binary_batch:\n{\n  \"description\": \"Run batch prediction over a sparse test matrix for a binary classifier, returning either the post-processed probability output or the raw margin output; report the row count, the per-row width, the first row's values and the mean over all outputs.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"predict_batch\",\n        \"dataset\": \"binary_mushroom\"\n      },\n      \"expected_output\": \"num_row=1583\\nnum_col=1\\nrow0=0.110274\\nmean=0.488999\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"predict_batch\",\n        \"dataset\": \"binary_mushroom\",\n        \"pred_margin\": true\n      },\n      \"expected_output\": \"num_row=1583\\nnum_col=1\\nrow0=-2.087944\\nmean=-0.106025\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_2_multiclass_batch",
+        "trigger_keywords": [
+          "test cases for feature4 2 multiclass batch",
+          "show me feature4 2 multiclass batch test cases",
+          "what are the feature4 2 multiclass batch inputs and outputs",
+          "give me the feature4_2_multiclass_batch test file",
+          "feature4 2 multiclass batch expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_2_multiclass_batch:\n{\n  \"description\": \"Run batch prediction for a multiclass classifier, producing one value per class for each row; report the per-row width and the first row's vector for both the probability and the raw margin output.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"predict_batch\",\n        \"dataset\": \"multiclass_dermatology\"\n      },\n      \"expected_output\": \"num_row=110\\nnum_col=6\\nrow0=0.083662,0.088542,0.083608,0.577178,0.083545,0.083466\\nmean=0.166667\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"predict_batch\",\n        \"dataset\": \"multiclass_dermatology\",\n        \"pred_margin\": true\n      },\n      \"expected_output\": \"num_row=110\\nnum_col=6\\nrow0=-0.059313,-0.002621,-0.059962,1.872051,-0.060716,-0.061665\\nmean=0.317861\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "format values the same way as the single_instance_predictions module uses for multiclass results",
+        "actual_meaning": "comma-separated, 6 decimal precision per value, no spaces around commas"
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_ensemble_metadata.json": {
+      "description": "Load a serialized gradient-boosted tree ensemble and report its tree count, the number of input features it expects, and the number of output groups it produces.",
+      "cases": [
+        {
+          "input": {
+            "action": "model_metadata",
+            "dataset": "binary_mushroom"
+          },
+          "expected_output": "num_tree=2\nnum_feature=127\nnum_output_group=1\n"
+        },
+        {
+          "input": {
+            "action": "model_metadata",
+            "dataset": "multiclass_dermatology"
+          },
+          "expected_output": "num_tree=60\nnum_feature=33\nnum_output_group=6\n"
+        }
+      ]
+    },
+    "feature2_tree_limit.json": {
+      "description": "Truncate an ensemble to keep only its first N trees. Valid limits in the range 1..tree_count update the active tree count; a limit of zero or a limit exceeding the available trees is rejected as invalid.",
+      "cases": [
+        {
+          "input": {
+            "action": "set_tree_limit",
+            "dataset": "multiclass_dermatology",
+            "limit": 30
+          },
+          "expected_output": "num_tree=30\n"
+        },
+        {
+          "input": {
+            "action": "set_tree_limit",
+            "dataset": "binary_mushroom",
+            "limit": 1
+          },
+          "expected_output": "num_tree=1\n"
+        },
+        {
+          "input": {
+            "action": "set_tree_limit",
+            "dataset": "binary_mushroom",
+            "limit": 0
+          },
+          "expected_output": "error=invalid_tree_limit\nrequested=0\nmodel_tree_count=2\n"
+        },
+        {
+          "input": {
+            "action": "set_tree_limit",
+            "dataset": "binary_mushroom",
+            "limit": 3
+          },
+          "expected_output": "error=invalid_tree_limit\nrequested=3\nmodel_tree_count=2\n"
+        }
+      ]
+    },
+    "feature3_predictor_metadata.json": {
+      "description": "After compiling an ensemble into a runnable predictor, expose the predictor's feature count, output-group count, post-processing transform name, global bias and sigmoid alpha.",
+      "cases": [
+        {
+          "input": {
+            "action": "predictor_metadata",
+            "dataset": "binary_mushroom"
+          },
+          "expected_output": "num_feature=127\nnum_output_group=1\npred_transform=sigmoid\nglobal_bias=0.000000\nsigmoid_alpha=1.000000\n"
+        },
+        {
+          "input": {
+            "action": "predictor_metadata",
+            "dataset": "multiclass_dermatology"
+          },
+          "expected_output": "num_feature=33\nnum_output_group=6\npred_transform=softmax\nglobal_bias=0.500000\nsigmoid_alpha=1.000000\n"
+        }
+      ]
+    },
+    "feature4_1_binary_batch.json": {
+      "description": "Run batch prediction over a sparse test matrix for a binary classifier, returning either the post-processed probability output or the raw margin output; report the row count, the per-row width, the first row's values and the mean over all outputs.",
+      "cases": [
+        {
+          "input": {
+            "action": "predict_batch",
+            "dataset": "binary_mushroom"
+          },
+          "expected_output": "num_row=1583\nnum_col=1\nrow0=0.110274\nmean=0.488999\n"
+        },
+        {
+          "input": {
+            "action": "predict_batch",
+            "dataset": "binary_mushroom",
+            "pred_margin": true
+          },
+          "expected_output": "num_row=1583\nnum_col=1\nrow0=-2.087944\nmean=-0.106025\n"
+        }
+      ]
+    },
+    "feature4_2_multiclass_batch.json": {
+      "description": "Run batch prediction for a multiclass classifier, producing one value per class for each row; report the per-row width and the first row's vector for both the probability and the raw margin output.",
+      "cases": [
+        {
+          "input": {
+            "action": "predict_batch",
+            "dataset": "multiclass_dermatology"
+          },
+          "expected_output": "num_row=110\nnum_col=6\nrow0=0.083662,0.088542,0.083608,0.577178,0.083545,0.083466\nmean=0.166667\n"
+        },
+        {
+          "input": {
+            "action": "predict_batch",
+            "dataset": "multiclass_dermatology",
+            "pred_margin": true
+          },
+          "expected_output": "num_row=110\nnum_col=6\nrow0=-0.059313,-0.002621,-0.059962,1.872051,-0.060716,-0.061665\nmean=0.317861\n"
+        }
+      ]
+    },
+    "feature4_3_categorical_margin.json": {
+      "description": "Run batch margin prediction for an ensemble trained with categorical splits, returning a single regression value per row.",
+      "cases": [
+        {
+          "input": {
+            "action": "predict_batch",
+            "dataset": "categorical_toy",
+            "pred_margin": true
+          },
+          "expected_output": "num_row=180\nnum_col=1\nrow0=-20.738508\nmean=-10.065133\n"
+        }
+      ]
+    },
+    "feature5_single_instance.json": {
+      "description": "Predict for a single row supplied in several equivalent encodings: a sparse row, a dense row treating 0 as the missing-value marker, and a dense row treating NaN as the missing-value marker. All encodings of the same row must yield identical output, and both probability and margin outputs are supported.",
+      "cases": [
+        {
+          "input": {
+            "action": "predict_instance",
+            "dataset": "binary_mushroom",
+            "row_index": 0,
+            "encoding": "sparse"
+          },
+          "expected_output": "num_output_group=1\nvalues=0.110274\n"
+        },
+        {
+          "input": {
+            "action": "predict_instance",
+            "dataset": "binary_mushroom",
+            "row_index": 0,
+            "encoding": "dense_zero_missing"
+          },
+          "expected_output": "num_output_group=1\nvalues=0.110274\n"
+        },
+        {
+          "input": {
+            "action": "predict_instance",
+            "dataset": "binary_mushroom",
+            "row_index": 0,
+            "encoding": "dense_nan_missing"
+          },
+          "expected_output": "num_output_group=1\nvalues=0.110274\n"
+        },
+        {
+          "input": {
+            "action": "predict_instance",
+            "dataset": "binary_mushroom",
+            "row_index": 4,
+            "encoding": "sparse",
+            "pred_margin": true
+          },
+          "expected_output": "num_output_group=1\nvalues=1.792405\n"
+        },
+        {
+          "input": {
+            "action": "predict_instance",
+            "dataset": "multiclass_dermatology",
+            "row_index": 0,
+            "encoding": "sparse"
+          },
+          "expected_output": "num_output_group=6\nvalues=0.083662,0.088542,0.083608,0.577178,0.083545,0.083466\n"
+        }
+      ]
+    },
+    "feature6_1_padded_matrix.json": {
+      "description": "Predict over a sparse matrix that declares fewer columns than the model expects; the missing trailing columns are padded with zeros and prediction proceeds normally.",
+      "cases": [
+        {
+          "input": {
+            "action": "predict_padded",
+            "dataset": "binary_mushroom",
+            "nrow": 3,
+            "ncol": 3
+          },
+          "expected_output": "num_row=3\nvalues=0.954569,0.954569,0.954569\n"
+        }
+      ]
+    },
+    "feature6_2_too_wide_matrix.json": {
+      "description": "Predict over a sparse matrix that declares more columns than the model expects; this is rejected as a feature-count mismatch.",
+      "cases": [
+        {
+          "input": {
+            "action": "predict_padded",
+            "dataset": "binary_mushroom",
+            "nrow": 3,
+            "ncol": 1000
+          },
+          "expected_output": "error=too_many_features\ninput_features=1000\nmodel_features=127\n"
+        }
+      ]
+    },
+    "feature7_serialization_roundtrip.json": {
+      "description": "Serialize an ensemble to the interchange buffer format, reload it from that buffer, compile the reloaded model, and confirm predictions are preserved across the round-trip.",
+      "cases": [
+        {
+          "input": {
+            "action": "protobuf_roundtrip",
+            "dataset": "binary_mushroom"
+          },
+          "expected_output": "num_row=1583\nnum_col=1\nrow0=0.110274\nmean=0.488999\n"
+        },
+        {
+          "input": {
+            "action": "protobuf_roundtrip",
+            "dataset": "multiclass_dermatology",
+            "pred_margin": true
+          },
+          "expected_output": "num_row=110\nnum_col=6\nrow0=-0.059313,-0.002621,-0.059962,1.872051,-0.060716,-0.061665\nmean=0.317861\n"
+        }
+      ]
+    },
+    "feature8_compile_option_invariance.json": {
+      "description": "Compilation tuning options (threshold quantization, code folding, and splitting generated code into parallel compilation units) change only how the predictor is built, never its numeric output. Predictions under each option match the plain compilation of the same model.",
+      "cases": [
+        {
+          "input": {
+            "action": "predict_batch",
+            "dataset": "binary_mushroom",
+            "pred_margin": true,
+            "quantize": true
+          },
+          "expected_output": "num_row=1583\nnum_col=1\nrow0=-2.087944\nmean=-0.106025\n"
+        },
+        {
+          "input": {
+            "action": "predict_batch",
+            "dataset": "binary_mushroom",
+            "pred_margin": true,
+            "code_folding": 2.0
+          },
+          "expected_output": "num_row=1583\nnum_col=1\nrow0=-2.087944\nmean=-0.106025\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "ensemble_metadata",
+      "input_condition": "action=metadata, dataset=..., no extra fields",
+      "output_rule": "return exactly 3 lines: num_tree, num_feature, num_output_group",
+      "exact_values": [
+        "num_tree",
+        "num_feature",
+        "num_output_group"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "tree_limit_pruning",
+      "input_condition": "action=set_tree_limit, dataset=..., limit=N",
+      "output_rule": "if limit >= 1 AND limit <= model_tree_count: update active trees, return num_tree=N",
+      "exact_values": [
+        "num_tree"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "tree_limit_pruning",
+      "input_condition": "action=set_tree_limit, dataset=..., limit=0 OR limit > model_tree_count",
+      "output_rule": "leave ensemble unchanged, return error='invalid_tree_limit'",
+      "exact_values": [
+        "error",
+        "invalid_tree_limit",
+        "requested",
+        "model_tree_count"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "predictor_metadata",
+      "input_condition": "action=metadata, dataset=..., compiled",
+      "output_rule": "return 5 lines: num_feature, num_output_group, pred_transform, global_bias, sigmoid_alpha",
+      "exact_values": [
+        "num_feature",
+        "num_output_group",
+        "pred_transform",
+        "global_bias",
+        "sigmoid_alpha"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "predictor_metadata",
+      "input_condition": "predictor compiled",
+      "output_rule": "format all numeric values with exactly 6 decimal places",
+      "exact_values": [
+        "%.6f"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "predictor_metadata",
+      "input_condition": "predictor compiled",
+      "output_rule": "normalize -0 to 0 in global_bias and sigmoid_alpha",
+      "exact_values": [
+        "0",
+        "-0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "batch_prediction",
+      "input_condition": "action=predict_batch, dataset=..., (pred_margin is optional)",
+      "output_rule": "return 4 lines: num_row, num_col, row0, mean",
+      "exact_values": [
+        "num_row",
+        "num_col",
+        "row0",
+        "mean"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "batch_prediction",
+      "input_condition": "binary model AND default encoding",
+      "output_rule": "num_col must be 1",
+      "exact_values": [
+        "num_col",
+        "1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "batch_prediction",
+      "input_condition": "multiclass model AND default encoding",
+      "output_rule": "num_col must equal number of classes",
+      "exact_values": [
+        "num_col"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "batch_prediction",
+      "input_condition": "row0 field in any batch prediction",
+      "output_rule": "comma-separated values, each with 6 decimal places, no spaces around comma unless input format specifies otherwise (implied compact for dense)",
+      "exact_values": [
+        "row0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "batch_prediction",
+      "input_condition": "row_index, encoding (optional)",
+      "output_rule": "if encoding=sparse: only present entries in vector; if encoding=dense_zero_missing: full vector with 0 for missing; if encoding=dense_nan_missing: full vector with NaN for missing",
+      "exact_values": [
+        "sparse",
+        "dense_zero_missing",
+        "dense_nan_missing"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "single_instance_prediction",
+      "input_condition": "action=predict_instance, dataset=..., row_index",
+      "output_rule": "return 2 lines: num_output_group, values",
+      "exact_values": [
+        "num_output_group",
+        "values"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "single_instance_prediction",
+      "input_condition": "prediction output",
+      "output_rule": "values must be comma-separated, 6 decimal precision per value",
+      "exact_values": [
+        "values"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "single_instance_prediction",
+      "input_condition": "binary model",
+      "output_rule": "num_output_group must be 1",
+      "exact_values": [
+        "num_output_group",
+        "1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "single_instance_prediction",
+      "input_condition": "multiclass model",
+      "output_rule": "num_output_group must equal number of classes",
+      "exact_values": [
+        "num_output_group"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "single_instance_prediction",
+      "input_condition": "input wide (ncol > model_features)",
+      "output_rule": "reject with error='too_many_features'",
+      "exact_values": [
+        "error",
+        "too_many_features",
+        "input_features",
+        "model_features"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "single_instance_prediction",
+      "input_condition": "input narrow (ncol < model_features)",
+      "output_rule": "predict normally, missing columns treated as zero",
+      "exact_values": [
+        "values"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "serialization",
+      "input_condition": "action=protobuf_roundtrip",
+      "output_rule": "serialize to buffer, reload, compile, predict",
+      "exact_values": [
+        "protobuf_roundtrip"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "quantization_preservation",
+      "input_condition": "quantize=true",
+      "output_rule": "predictions must match unquantized baseline",
+      "exact_values": [
+        "quantize",
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "code_folding_preservation",
+      "input_condition": "code_folding=N",
+      "output_rule": "predictions must match unoptimized baseline",
+      "exact_values": [
+        "code_folding",
+        "2.0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "line_output",
+      "input_condition": "any action | any model",
+      "output_rule": "each output value must be on its own line with a trailing newline",
+      "exact_values": [
+        "\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "error_line_format",
+      "input_condition": "any error condition",
+      "output_rule": "first token of output must be 'error=' followed by category name",
+      "exact_values": [
+        "error="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "matrix_padding",
+      "input_condition": "predict_padded, ncol < model_features",
+      "output_rule": "missing columns are treated as absent (zero) features",
+      "exact_values": [
+        "values"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific sentinel value — ask the PM for the exact string",
+        "exact_values_to_replace": [
+          "at least 5 phrasings an agent might use to ask about this"
+        ],
+        "trigger_keywords": [
+          "how to handle",
+          "what happens if",
+          "validation rule for",
+          "input validation",
+          "error category"
+        ],
+        "oracle_response": "error='invalid_tree_limit'"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C013",
+        "vague_phrase": "format values the same way as the single_instance_predictions module uses for multiclass results",
+        "actual_meaning": "comma-separated, 6 decimal precision per value, no spaces around commas"
+      }
+    ]
+  }
+}

@@ -1,0 +1,1344 @@
+{
+  "fuzzy_prd": "# Feature Flags for Web Applications — Conditional Behavior Toggling\n\n## Project Goal\n\nBuild a feature-flag system that allows web-application developers to switch behavior on or off at runtime — per request, per user, per URL, or globally — without redeploying code or scattering hand-written `if` checks throughout the codebase. A flag's state is decided by one or more named *conditions*, each evaluated against runtime context, and the system exposes that decision uniformly to view guards, URL routing, templates, and plain code.\n\n---\n\n## Background & Problem\n\nWithout this system, developers hard-code branches like \"if the current user is X\" or \"if today is after date Y\" directly into views, templates, and routing tables. Rolling a behavior out to a subset of traffic, scheduling it for a future date, or turning it off in an incident all require code edits and a deploy. The toggling logic is duplicated across layers (server code, templates, URL maps) and drifts out of sync; there is no single place to ask \"is this behavior on right now, given this request?\".\n\nWith this system, each behavior is named by a flag whose on/off decision is computed from declarative conditions. Flags are defined in static configuration and/or stored records, merged from multiple providers, and queried through one consistent interface. The same flag can gate a view (returning not-found or a fallback when off), select between URL targets, branch a template, or be checked inline — all reading the same evaluated state.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This is a multi-responsibility system (condition evaluation, flag-state resolution, multi-source aggregation, request/response guarding, URL routing, template integration, configuration validation). It MUST NOT be a single \"god file\"; use a clear multi-directory tree separating the core domain from the I/O adapter. Do not over-engineer, but do not collapse distinct responsibilities together.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below are a **black-box contract for the execution adapter**, NOT the internal data model. The core logic must be decoupled from stdin/stdout and JSON parsing. The adapter is solely responsible for translating JSON commands into idiomatic calls to the core and rendering results to stdout.\n\n3. **Adherence to SOLID Design Principles:**\n   - **SRP:** Separate condition evaluation, flag-state resolution, source aggregation, guarding, routing, and output formatting.\n   - **OCP:** New condition types and new flag-source providers must be addable without modifying the resolution engine.\n   - **LSP:** All flag-source providers must be interchangeable behind one provider interface.\n   - **ISP:** Keep the condition interface and the provider interface small and cohesive.\n   - **DIP:** The resolution engine depends on the provider/condition abstractions, not on concrete configuration or storage details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface (checking a flag, guarding a view, declaring a flagged route, registering a condition) must be elegant and idiomatic to the target language.\n   - **Resilience:** Edge cases must be handled gracefully — unknown flags, missing required context, failing providers, invalid route targets, and misconfiguration must be modeled as well-defined outcomes, not generic crashes.\n\n---\n\n## Core Features\n\n### Feature 1: Condition Evaluation\n\n**As a developer**, I want named conditions that each decide on/off from runtime context, so I can compose flag behavior from small reusable predicates.\n\n**Expected Behavior / Usage:**\n\nA condition takes a configured value plus optional runtime context (a request) and returns a definite boolean. Several built-in condition types exist. Conditions that need request context but are evaluated without one must fail with a *normalized* error contract — `error=missing_required_argument`, the missing `argument`, and the offending `condition` — never a raw host-language exception. Each condition type below is an independent leaf.\n\n*1.1 Boolean condition — constant on/off from a literal or its string spelling.*\n\nEvaluates a literal boolean, or the case-insensitive string `true`/`false`, to a definite result. The literal `true` and any casing of the string `\"true\"` evaluate on; every other value (including `\"False\"`, `\"false\"`, literal `false`) evaluates off.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_boolean_condition.json`\n\n```json\n{\n    \"description\": \"Boolean condition: evaluate a literal boolean or its case-insensitive string spelling to a definite on/off result. The string 'true' (any casing) and the literal true evaluate on; everything else evaluates off.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"boolean\", \"value\": \"true\"}, \"expected_output\": \"result=true\\n\"},\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"boolean\", \"value\": \"False\"}, \"expected_output\": \"result=false\\n\"}\n    ]\n}\n```\n\n*1.2 User condition — match the request's user against an expected username.*\n\nPasses when the current request's user has the expected username, off otherwise. Requires request context; without a request it returns the normalized missing-required-argument error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_2_user_condition.json`\n\n```json\n{\n    \"description\": \"User condition: passes when the current request's user has the expected username. Requires request context; when the request is absent the evaluation reports a normalized missing-required-argument error naming the missing argument and the condition.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"user\", \"value\": \"testuser\", \"request\": {\"username\": \"testuser\"}}, \"expected_output\": \"result=true\\n\"},\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"user\", \"value\": \"testuser\"}, \"expected_output\": \"error=missing_required_argument\\nargument=request\\ncondition=user\\n\"}\n    ]\n}\n```\n\n*1.3 Anonymous condition — match user anonymity against an expected boolean.*\n\nPasses when whether the request's user is anonymous equals the expected boolean. Requires request context; without a request it returns the normalized missing-required-argument error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_3_anonymous_condition.json`\n\n```json\n{\n    \"description\": \"Anonymous condition: compares whether the request's user is anonymous against an expected boolean. Passes when the anonymity of the user matches the expected boolean. Requires request context; without a request it reports a normalized missing-required-argument error.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"anonymous\", \"value\": true, \"request\": {\"anonymous\": true}}, \"expected_output\": \"result=true\\n\"},\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"anonymous\", \"value\": true, \"request\": {\"anonymous\": false}}, \"expected_output\": \"result=false\\n\"}\n    ]\n}\n```\n\n*1.4 Parameter condition — presence of a query-string parameter set to True.*\n\nPasses when a named query-string parameter on the request equals the exact string `True`; any other value or an absent parameter evaluates off. Requires request context; without a request it returns the normalized missing-required-argument error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_4_parameter_condition.json`\n\n```json\n{\n    \"description\": \"Parameter condition: passes when a named query-string parameter on the request equals the exact string 'True'. Any other value, or an absent parameter, evaluates off. Requires request context; without a request it reports a normalized missing-required-argument error.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"parameter\", \"value\": \"query_flag\", \"request\": {\"get\": {\"query_flag\": \"True\"}}}, \"expected_output\": \"result=true\\n\"},\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"parameter\", \"value\": \"query_flag\", \"request\": {\"get\": {\"not_query_flag\": \"True\"}}}, \"expected_output\": \"result=false\\n\"}\n    ]\n}\n```\n\n*1.5 Path-matches condition — request path matches a regular expression.*\n\nPasses when the request path contains a match for the given regular expression anywhere within it (regex search, not anchored to the start). Requires request context; without a request it returns the normalized missing-required-argument error.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_5_path_condition.json`\n\n```json\n{\n    \"description\": \"Path-matches condition: passes when the request path contains a match for the given regular expression anywhere within it (substring/regex search, not anchored). Requires request context; without a request it reports a normalized missing-required-argument error.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"path matches\", \"value\": \"/my/path\", \"request\": {\"path\": \"/my/path/to/somewhere\"}}, \"expected_output\": \"result=true\\n\"},\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"path matches\", \"value\": \"/my/path\", \"request\": {\"path\": \"/your/path\"}}, \"expected_output\": \"result=false\\n\"}\n    ]\n}\n```\n\n*1.6 After-date condition — current moment is at or after a target datetime.*\n\nPasses when the current moment is at or after the given ISO 8601 datetime. A datetime far in the past evaluates on; far in the future evaluates off. A string that is not a valid datetime must evaluate off rather than raising.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_6_date_condition.json`\n\n```json\n{\n    \"description\": \"After-date condition: passes when the current moment is at or after the given ISO 8601 datetime. A datetime far in the past evaluates on; a datetime far in the future evaluates off; a string that is not a valid datetime evaluates off rather than failing.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"after date\", \"value\": \"2000-01-01T00:00:00\"}, \"expected_output\": \"result=true\\n\"},\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"after date\", \"value\": \"2999-01-01T00:00:00\"}, \"expected_output\": \"result=false\\n\"},\n        {\"input\": {\"op\": \"check_condition\", \"condition\": \"after date\", \"value\": \"I am not a valid date\"}, \"expected_output\": \"result=false\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Condition Registry\n\n**As a developer**, I want to register custom conditions by name and look them up, so the set of available conditions is extensible without changing the engine.\n\n**Expected Behavior / Usage:**\n\n*2.1 Registration — add a new named condition, reject duplicates.*\n\nA new condition can be registered under a name and then becomes discoverable. Registering a name that is already taken is rejected with a normalized `error=duplicate_condition` naming the condition.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_register_condition.json`\n\n```json\n{\n    \"description\": \"Condition registry registration: a new condition can be registered under a name and is then discoverable in the registry. Registering a name that is already taken is rejected with a normalized duplicate-condition error naming the condition.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"register_condition\", \"name\": \"decorated\"}, \"expected_output\": \"registered=decorated\\nfound=true\\n\"},\n        {\"input\": {\"op\": \"register_condition\", \"name\": \"boolean\"}, \"expected_output\": \"error=duplicate_condition\\ncondition=boolean\\n\"}\n    ]\n}\n```\n\n*2.2 Lookup — report whether a condition name is registered.*\n\nLooking up a registered condition name reports it found; an unregistered name reports not found.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_lookup_condition.json`\n\n```json\n{\n    \"description\": \"Condition registry lookup: looking up a built-in condition name reports it as found, while looking up a name that was never registered reports it as not found.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"lookup_condition\", \"name\": \"boolean\"}, \"expected_output\": \"condition=boolean\\nfound=true\\n\"},\n        {\"input\": {\"op\": \"lookup_condition\", \"name\": \"notgettable\"}, \"expected_output\": \"condition=notgettable\\nfound=false\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Flag State Resolution\n\n**As a developer**, I want to ask whether a flag is on, off, or undefined for given context, so all layers read one consistent decision.\n\n**Expected Behavior / Usage:**\n\nA flag's state is the disjunction of its conditions: it is on when **any** condition passes, off when all conditions are present but none pass, and a distinct undefined/`none` value when the flag is not configured at all (so callers can tell \"explicitly off\" from \"unknown\"). Context such as a request may be supplied and is forwarded to the conditions.\n\n*3.1 State query — on / off / undefined.*\n\nReturns on for a satisfied flag, off for an unsatisfied one, and `none` for an unconfigured flag (even when a request is supplied).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_flag_state.json`\n\n```json\n{\n    \"description\": \"Flag state resolution: resolving a flag returns its combined condition result. A flag whose conditions are all satisfied resolves on; a flag whose conditions are unsatisfied resolves off; a flag that is not configured resolves to a distinct none/undefined value (not the same as off).\",\n    \"cases\": [\n        {\"input\": {\"op\": \"resolve_flag\", \"flag\": \"FLAG_ENABLED\", \"mode\": \"state\"}, \"expected_output\": \"flag=FLAG_ENABLED\\nstate=true\\n\"},\n        {\"input\": {\"op\": \"resolve_flag\", \"flag\": \"FLAG_DISABLED\", \"mode\": \"state\"}, \"expected_output\": \"flag=FLAG_DISABLED\\nstate=false\\n\"},\n        {\"input\": {\"op\": \"resolve_flag\", \"flag\": \"FLAG_DOES_NOT_EXIST\", \"mode\": \"state\"}, \"expected_output\": \"flag=FLAG_DOES_NOT_EXIST\\n[state=none]\\n\"}\n    ]\n}\n```\n\n*3.2 Enabled helper — boolean \"is this on\".*\n\nA convenience query reporting on/off (an undefined flag reads off here).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_flag_enabled.json`\n\n```json\n{\n    \"description\": \"Enabled helper: a convenience query that reports whether a flag is currently on. An enabled flag reports on; a disabled flag reports off.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"resolve_flag\", \"flag\": \"FLAG_ENABLED\", \"mode\": \"enabled\"}, \"expected_output\": \"flag=FLAG_ENABLED\\nenabled=true\\n\"},\n        {\"input\": {\"op\": \"resolve_flag\", \"flag\": \"FLAG_DISABLED\", \"mode\": \"enabled\"}, \"expected_output\": \"flag=FLAG_DISABLED\\nenabled=false\\n\"}\n    ]\n}\n```\n\n*3.3 Disabled helper — boolean negation.*\n\nA convenience query reporting the negation of the state (an off or undefined flag reads on here).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_flag_disabled.json`\n\n```json\n{\n    \"description\": \"Disabled helper: a convenience query that reports the negation of a flag's state. A disabled flag reports on; an enabled flag reports off.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"resolve_flag\", \"flag\": \"FLAG_DISABLED\", \"mode\": \"disabled\"}, \"expected_output\": \"flag=FLAG_DISABLED\\ndisabled=true\\n\"},\n        {\"input\": {\"op\": \"resolve_flag\", \"flag\": \"FLAG_ENABLED\", \"mode\": \"disabled\"}, \"expected_output\": \"flag=FLAG_ENABLED\\ndisabled=false\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Multi-Source Flag Aggregation\n\n**As a developer**, I want flags drawn from several providers and merged, so static configuration and stored records (and custom providers) contribute to one flag collection.\n\n**Expected Behavior / Usage:**\n\nEach provider exposes a flag collection. The aggregator merges providers in order into a single set of flags, each flag carrying its conditions (name + value). The listing output reports the total flag count and, per flag, its condition count and each condition's name and value. Flags are listed in a stable order.\n\n*4.1 Static-configuration provider — flags from a configuration mapping.*\n\nReads flag definitions from the static configuration mapping; each flag exposes its conditions.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_settings_source.json`\n\n```json\n{\n    \"description\": \"Settings-backed flag provider: reads flag definitions from the static configuration mapping and exposes each flag with its conditions. The output lists the total flag count and, per flag, each condition's name and value.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"list_flags\", \"flags\": {\"MY_FLAG\": {\"boolean\": true}}, \"sources\": [\"flags.sources.SettingsFlagsSource\"]}, \"expected_output\": \"flags=1\\nflag=MY_FLAG conditions=1\\ncondition flag=MY_FLAG name=boolean value=True\\n\"}\n    ]\n}\n```\n\n*4.2 Stored-record provider — flags from persisted records.*\n\nReads persisted flag records, exposing each as a flag with one condition carrying the stored condition name and value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_database_source.json`\n\n```json\n{\n    \"description\": \"Database-backed flag provider: reads persisted flag records and exposes each as a flag with one condition carrying the stored condition name and value. The output lists the total flag count and the per-flag condition detail.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"list_flags\", \"sources\": [\"flags.sources.DatabaseFlagsSource\"], \"db\": [{\"name\": \"MY_FLAG\", \"condition\": \"boolean\", \"value\": \"False\"}]}, \"expected_output\": \"flags=1\\nflag=MY_FLAG conditions=1\\ncondition flag=MY_FLAG name=boolean value=False\\n\"}\n    ]\n}\n```\n\n*4.3 Provider merge — combine multiple providers.*\n\nFlags from several providers combine into one collection: a configured flag with no conditions coexists with provider-supplied flags, and a flag only an extra provider defines is included.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_merge_sources.json`\n\n```json\n{\n    \"description\": \"Multi-provider merge: flags from several providers are combined into one collection. A flag defined in the static configuration with no conditions appears alongside flags supplied by an additional provider, and a flag only the extra provider defines is included. The output lists the merged flag count with each flag's condition count and detail.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"list_flags\", \"flags\": {\"SOURCED_FLAG\": {}, \"OTHER_FLAG\": {}}, \"sources\": [\"flags.sources.SettingsFlagsSource\", \"dispatcher.source_fixture.CustomFlagsSource\"]}, \"expected_output\": \"flags=3\\nflag=NOT_IN_SETTINGS_FLAG conditions=1\\ncondition flag=NOT_IN_SETTINGS_FLAG name=boolean value=False\\nflag=OTHER_FLAG conditions=0\\nflag=SOURCED_FLAG conditions=1\\ncondition flag=SOURCED_FLAG name=boolean value=True\\n\"}\n    ]\n}\n```\n\n*4.4 Provider error handling — fail, ignore, or not found.*\n\nA provider that fails surfaces a normalized `error=source_failed` by default; when errors are explicitly ignored the failing provider is skipped and the remaining collection (possibly empty) is returned; a provider path that cannot be located surfaces a normalized `[normalized source-not-found error]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_4_source_errors.json`\n\n```json\n{\n    \"description\": \"Provider error handling: when a provider fails while producing flags, the default behavior surfaces a normalized source-failure error. When errors are explicitly ignored, the failing provider is skipped and an empty collection is returned. A provider path that cannot be located surfaces a normalized source-not-found error.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"list_flags\", \"sources\": [\"dispatcher.source_fixture.ExceptionalFlagsSource\"]}, \"expected_output\": \"error=source_failed\\n\"},\n        {\"input\": {\"op\": \"list_flags\", \"sources\": [\"dispatcher.source_fixture.ExceptionalFlagsSource\"], \"ignore_errors\": true}, \"expected_output\": \"flags=0\\n\"},\n        {\"input\": {\"op\": \"list_flags\", \"sources\": [\"non.existent.module\"]}, \"expected_output\": \"[normalized source-not-found error]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: View Access Guard\n\n**As a developer**, I want to gate a request handler on a flag, so a behavior is served only when the flag matches a required state and otherwise yields not-found or a fallback.\n\n**Expected Behavior / Usage:**\n\nA handler is wrapped with a flag and a required state. When the flag matches the required state, the primary handler runs (status 200). When it does not match, the request yields not-found (status 404) unless a fallback handler is configured, in which case the fallback runs (status 200). The required state may be off, which inverts the polarity. Outputs carry the framework-observable HTTP status and the response body so a stub that bypasses the guard cannot pass.\n\n*5.1 Function handler guard.*\n\nA plain handler function is guarded. The `body` line shows which handler ran (`ok` = primary, `fallback` = fallback).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_function_view_guard.json`\n\n```json\n{\n    \"description\": \"Function view access guard: a view is wrapped so it is served only when a flag matches a required state. With required-state on: an enabled flag serves the view (status 200, body 'ok'); a disabled or missing flag is blocked (status 404) unless a fallback view is supplied, in which case the fallback is served (status 200, body 'fallback'). With required-state off, the polarity inverts: a disabled or missing flag serves the view while an enabled flag is blocked or routed to the fallback.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"guarded_view\", \"flag\": \"FLAG_ENABLED\", \"state\": true}, \"expected_output\": \"status=200\\nbody=ok\\n\"},\n        {\"input\": {\"op\": \"guarded_view\", \"flag\": \"FLAG_DISABLED\", \"state\": true}, \"expected_output\": \"status=404\\n\"},\n        {\"input\": {\"op\": \"guarded_view\", \"flag\": \"FLAG_DISABLED\", \"state\": true, \"fallback\": true}, \"expected_output\": \"status=200\\nbody=fallback\\n\"},\n        {\"input\": {\"op\": \"guarded_view\", \"flag\": \"FLAG_DISABLED\", \"state\": false}, \"expected_output\": \"status=200\\nbody=ok\\n\"}\n    ]\n}\n```\n\n*5.2 Class handler guard.*\n\nA class-based handler is gated identically. Configuring the guard without naming a flag at all yields a normalized `error=misconfigured` with `reason=flag_name_required`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_class_view_guard.json`\n\n```json\n{\n    \"description\": \"Class-based view access guard: a class view is gated on a flag the same way. When the gating flag is enabled the view responds (status 200, body 'ok'); when disabled or missing it is blocked (status 404) unless a fallback view is configured, in which case the fallback responds. If the view is configured without naming a flag at all, it reports a normalized misconfiguration error.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"guarded_view\", \"flag\": \"FLAGGED_VIEW_MIXIN\", \"kind\": \"class\", \"state\": true, \"flags\": {\"FLAGGED_VIEW_MIXIN\": {\"boolean\": true}}}, \"expected_output\": \"status=200\\nbody=ok\\n\"},\n        {\"input\": {\"op\": \"guarded_view\", \"flag\": \"FLAGGED_VIEW_MIXIN\", \"kind\": \"class\", \"state\": true}, \"expected_output\": \"status=404\\n\"},\n        {\"input\": {\"op\": \"guarded_view\", \"flag\": \"FLAGGED_VIEW_MIXIN\", \"kind\": \"class\", \"omit_flag_name\": true}, \"expected_output\": \"error=misconfigured\\nreason=flag_name_required\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: URL Routing Guard\n\n**As a developer**, I want a flag to choose which target serves a URL, so I can route traffic to a new behavior, a fallback, or not-found based on flag state — including for whole groups of routes.\n\n**Expected Behavior / Usage:**\n\nA route is declared with a flag and a required state, optionally with a fallback target. Resolving the path and invoking it serves the primary target (status 200, body `view`) when the flag matches the required state; otherwise it serves the fallback target (status 200, body `fallback`) when one exists, or yields not-found (status 404). Output carries the resolved path, the HTTP status, and the served body — framework-observable signals that distinguish real routing from a stub.\n\n*6.1 Single guarded route.*\n\nOne route bound to a flag and required state, with optional fallback; required state may be off.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_single_route.json`\n\n```json\n{\n    \"description\": \"Single flag-guarded route: a route is bound to a flag and a required state. Resolving and invoking the route returns the primary view (status 200, body 'view') when the flag matches the required state; otherwise it returns not-found (status 404) when no fallback is registered, or the fallback view (status 200, body 'fallback') when one is. Required-state may be off, inverting the polarity.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"route\", \"path\": \"/url-true-no-fallback\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": true}}}, \"expected_output\": \"path=/url-true-no-fallback\\nstatus=200\\nbody=view\\n\"},\n        {\"input\": {\"op\": \"route\", \"path\": \"/url-true-no-fallback\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": false}}}, \"expected_output\": \"path=/url-true-no-fallback\\nstatus=404\\n\"},\n        {\"input\": {\"op\": \"route\", \"path\": \"/url-true-fallback\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": false}}}, \"expected_output\": \"path=/url-true-fallback\\nstatus=200\\nbody=fallback\\n\"},\n        {\"input\": {\"op\": \"route\", \"path\": \"/url-false-no-fallback\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": false}}}, \"expected_output\": \"path=/url-false-no-fallback\\nstatus=200\\nbody=view\\n\"}\n    ]\n}\n```\n\n*6.2 Guarded route groups.*\n\nA whole group of routes mounted under a prefix is guarded by one flag. When the flag does not match and a mirroring fallback group is supplied, member paths and fallback-only members serve the fallback, while paths in neither yield not-found.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_included_routes.json`\n\n```json\n{\n    \"description\": \"Flag-guarded included route groups: an entire group of routes can be mounted under a prefix and guarded by a single flag. When the flag matches, requests to a member route serve the primary view; when it does not match, they return not-found. A group mounted with required-state off serves its members when the flag is off. When the guard has a fallback group whose members mirror the primary routes, a non-matching flag serves the corresponding fallback for matching member paths and for members that exist only in the fallback group, while paths absent from both yield not-found.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"route\", \"path\": \"/include/included-url\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": true}}}, \"expected_output\": \"path=/include/included-url\\nstatus=200\\nbody=view\\n\"},\n        {\"input\": {\"op\": \"route\", \"path\": \"/include/included-url\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": false}}}, \"expected_output\": \"path=/include/included-url\\nstatus=404\\n\"},\n        {\"input\": {\"op\": \"route\", \"path\": \"/include-fallback-include/other-included-url\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": false}}}, \"expected_output\": \"path=/include-fallback-include/other-included-url\\nstatus=200\\nbody=fallback\\n\"}\n    ]\n}\n```\n\n*6.3 Bulk route declaration via shared context.*\n\nMultiple routes declared together inherit one flag, required state, and optional fallback, each behaving like a single guarded route.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_bulk_routes.json`\n\n```json\n{\n    \"description\": \"Bulk route guarding via a shared context: multiple routes declared together inherit one flag, required-state, and optional fallback. Members behave like single guarded routes: a route declared with required-state on serves the primary view when the flag is on and is not-found when off; a route declared with required-state off serves the primary view when the flag is off; a route declared with a shared fallback serves the fallback when the flag does not match the required state.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"route\", \"path\": \"/patterns-true-no-fallback\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": true}}}, \"expected_output\": \"path=/patterns-true-no-fallback\\nstatus=200\\nbody=view\\n\"},\n        {\"input\": {\"op\": \"route\", \"path\": \"/patterns-false-no-fallback\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": false}}}, \"expected_output\": \"path=/patterns-false-no-fallback\\nstatus=200\\nbody=view\\n\"},\n        {\"input\": {\"op\": \"route\", \"path\": \"/patterns-true-fallback\", \"flags\": {\"FLAGGED_URL\": {\"boolean\": false}}}, \"expected_output\": \"path=/patterns-true-fallback\\nstatus=200\\nbody=fallback\\n\"}\n    ]\n}\n```\n\n*6.4 Invalid route target rejection.*\n\nBuilding a guarded route whose target is neither a callable nor a route group is rejected with a normalized `error=invalid_view`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_4_invalid_view.json`\n\n```json\n{\n    \"description\": \"Invalid route target rejection: attempting to build a flag-guarded route whose target view is neither a callable nor a route group is rejected with a normalized invalid-view error.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"route\", \"invalid_view\": true}, \"expected_output\": \"error=invalid_view\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Request-Scoped Flag Caching\n\n**As a developer**, I want flags resolved once per request and reused, so repeated checks within a request are consistent and cheap even if configuration changes mid-request.\n\n**Expected Behavior / Usage:**\n\nA request-processing step resolves the flag collection once and attaches it to the request. A request that has not passed through this step carries no cached attribute; after it runs, the attribute is present and lists the configured flag names (in stable order). A flag check against a request with the cached snapshot keeps using that snapshot even if the live configuration is emptied afterward; a request without the snapshot reflects the now-empty configuration instead.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_1_request_cache.json`\n\n```json\n{\n    \"description\": \"Request-scoped flag caching: middleware attaches the resolved flag collection to the request so later checks reuse it. A request that has not passed through the middleware carries no cached attribute; after the middleware runs, the attribute is present and lists the configured flag names. Once cached, a flag check against that request keeps using the cached snapshot even if the live configuration is emptied afterward; a request without the cached snapshot reflects the now-empty configuration instead.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"request_cache\", \"scenario\": \"no_middleware_attr\", \"flag_sources\": [\"flags.sources.SettingsFlagsSource\"]}, \"expected_output\": \"cached=false\\n\"},\n        {\"input\": {\"op\": \"request_cache\", \"scenario\": \"with_middleware\", \"flag_sources\": [\"flags.sources.SettingsFlagsSource\"]}, \"expected_output\": \"cached=true\\nflags=DB_FLAG,FLAG_DISABLED,FLAG_ENABLED,FLAG_ENABLED_WITH_KWARG\\n\"},\n        {\"input\": {\"op\": \"request_cache\", \"scenario\": \"cached_after_change\"}, \"expected_output\": \"state=true\\n\"},\n        {\"input\": {\"op\": \"request_cache\", \"scenario\": \"no_cache_after_change\"}, \"expected_output\": \"state=false\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 8: Template Integration\n\n**As a developer**, I want to branch templates on flag state, so presentation can toggle without server-side branching.\n\n**Expected Behavior / Usage:**\n\nTemplates expose an enabled check and a disabled check for a flag; the disabled check is the inverse of the enabled one, and a missing flag reads as disabled. An extra keyword argument passed at the call site is forwarded to the flag's condition so value-matching conditions can pass.\n\n*8.1 Primary template engine — branch on flag state.*\n\nAn enabled tag and a disabled tag assign a boolean into a template variable; rendering shows the branch taken (`on`/`off`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_1_template_tags.json`\n\n```json\n{\n    \"description\": \"Server-side template flag tags: a template can branch on flag state using an enabled tag and a disabled tag, each assigning a boolean into a template variable. The enabled tag yields a truthy value for an on flag and falsy for an off or missing flag; the disabled tag is its inverse. An extra keyword argument supplied at the tag call is forwarded to the flag's condition so value-matching conditions can pass. Rendering 'on' or 'off' shows the branch taken.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"render_django\", \"tag\": \"flag_enabled\", \"flag\": \"FLAG_ENABLED\"}, \"expected_output\": \"rendered=on\\n\"},\n        {\"input\": {\"op\": \"render_django\", \"tag\": \"flag_enabled\", \"flag\": \"FLAG_DISABLED\"}, \"expected_output\": \"rendered=off\\n\"},\n        {\"input\": {\"op\": \"render_django\", \"tag\": \"flag_enabled\", \"flag\": \"FLAG_ENABLED_WITH_KWARG\", \"passed_value\": 4}, \"expected_output\": \"rendered=on\\n\"},\n        {\"input\": {\"op\": \"render_django\", \"tag\": \"flag_disabled\", \"flag\": \"FLAG_ENABLED\"}, \"expected_output\": \"rendered=off\\n\"}\n    ]\n}\n```\n\n*8.2 Alternative template engine — flag check globals.*\n\nA second template engine exposes enabled and disabled flag functions returning a rendered boolean (`True`/`False`), with the same keyword-forwarding behavior.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_2_jinja_tags.json`\n\n```json\n{\n    \"description\": \"Alternative template-engine flag globals: a second template engine exposes enabled and disabled flag functions that return a rendered boolean. The enabled function renders 'True' for an on flag and 'False' for an off flag; the disabled function is its inverse. A keyword argument passed in the call is forwarded to the flag's condition so value-matching conditions can pass.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"render_jinja\", \"tag\": \"flag_enabled\", \"flag\": \"FLAG_ENABLED\"}, \"expected_output\": \"[renders 'True' if flag is on, 'False' if flag is off/undefined]\\n\"},\n        {\"input\": {\"op\": \"render_jinja\", \"tag\": \"flag_disabled\", \"flag\": \"FLAG_ENABLED\"}, \"expected_output\": \"[renders 'True' if flag is on, 'False' if flag is off/undefined]\\n\"},\n        {\"input\": {\"op\": \"render_jinja\", \"tag\": \"flag_enabled\", \"flag\": \"FLAG_ENABLED_WITH_KWARG\", \"passed_value\": 4}, \"expected_output\": \"[renders 'True' if flag is on, 'False' if flag is off/undefined]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 9: Flag Administration Form\n\n**As a developer / administrator**, I want a form to create stored flag records and to choose from the currently available conditions, so flags can be managed at runtime.\n\n**Expected Behavior / Usage:**\n\n*9.1 Form validation and persistence.*\n\nThe form accepts a flag name, a condition name, and a value. Valid submissions persist a record and echo the saved fields; blank submissions are rejected, reporting which required fields are invalid (in stable order).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_1_form_validation.json`\n\n```json\n{\n    \"description\": \"Flag-state form validation and persistence: a form accepts a flag name, a condition name, and a value. Valid submissions persist a flag record and echo the saved name, condition, and value. Blank submissions are rejected, reporting which required fields are invalid.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"submit_form\", \"data\": {\"name\": \"FLAG_ENABLED\", \"condition\": \"boolean\", \"value\": \"True\"}}, \"expected_output\": \"valid=true\\nname=FLAG_ENABLED\\ncondition=boolean\\nvalue=True\\n\"},\n        {\"input\": {\"op\": \"submit_form\", \"data\": {}}, \"expected_output\": \"valid=false\\ninvalid_fields=condition,name,value\\n\"}\n    ]\n}\n```\n\n*9.2 Late-bound condition choices.*\n\nThe form's condition choices are computed when the form is built, not when it is defined, so a condition registered after definition is still offered.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_2_form_choices.json`\n\n```json\n{\n    \"description\": \"Late-bound condition choices: the form's condition choices are computed when the form is built, not when it is defined, so a condition registered after import is still offered. Querying a freshly registered condition reports it as present among the choices.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"form_choices\", \"condition\": \"fake_condition\", \"register\": true}, \"expected_output\": \"condition=fake_condition\\npresent=true\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 10: Configuration Validation\n\n**As a developer**, I want configured flags checked for conditions that name a non-existent condition type, so misconfiguration is caught early with a stable diagnostic.\n\n**Expected Behavior / Usage:**\n\nFlags are scanned: a configuration referencing only known conditions produces no warnings; a flag referencing an unregistered condition produces exactly one warning carrying a stable diagnostic id (`flags.E001`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_1_config_check.json`\n\n```json\n{\n    \"description\": \"Configuration validation check: flags are scanned for conditions that name a non-existent condition type. A configuration whose flags reference only known conditions produces no warnings; a flag that references an unregistered condition produces exactly one warning carrying a stable diagnostic id.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"validate_config\", \"flags\": {\"FLAG_TO_CHECK\": {\"boolean\": true}}}, \"expected_output\": \"warnings=0\\n\"},\n        {\"input\": {\"op\": \"validate_config\", \"flags\": {\"FLAG_TO_CHECK\": {\"nonexistent\": \"value\"}}}, \"expected_output\": \"warnings=1\\nwarning id=flags.E001\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 11: Flag Record Description\n\n**As a developer**, I want a stored flag record to render to a readable sentence, so records are legible in listings and admin screens.\n\n**Expected Behavior / Usage:**\n\nA persisted record renders to a sentence naming the flag, the condition that enables it, and the value it is enabled at.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_1_record_description.json`\n\n```json\n{\n    \"description\": \"Flag record human-readable description: a persisted flag record renders to a sentence describing the flag, the condition that enables it, and the value it is enabled at.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"describe_record\", \"name\": \"MY_FLAG\", \"condition\": \"boolean\", \"value\": \"True\"}, \"expected_output\": \"description=MY_FLAG is enabled when boolean is True\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-directory codebase implementing the features above — condition evaluation and registry, flag-state resolution, multi-source aggregation, view/route guarding, request-scoped caching, template integration, the administration form, configuration validation, and record description — with the core domain decoupled from I/O.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads a single JSON command from stdin, invokes the appropriate core logic, and prints the language-neutral stdout contract above. The adapter is the sole owner of JSON parsing and stdout formatting, and it translates any host-language or framework exception into the normalized `error=<category>` contract; the core never prints. Inputs carry an `op` selecting the behavior plus its parameters (e.g. `flags`, `flag_sources`, `request`); outputs are the exact byte strings shown in the cases.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_1_boolean_condition.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_1_boolean_condition@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` file contains **only** the raw stdout of the program under test (no PASS/FAIL or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follows the undefined-handling logic used in the state resolver helper\n- check the fallback group logic in the bulk routing container\n",
+  "oracle_data": {
+    "task_id": "cfpb__django-flags-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C015",
+        "trigger_keywords": [
+          "what is the state when flag is undefined",
+          "resolve_flag state none",
+          "undefined flag state value",
+          "flag state resolved to none",
+          "what happens for state=none"
+        ],
+        "oracle_response": "The output is exactly the string 'state=none'."
+      },
+      {
+        "constraint_id": "C020",
+        "trigger_keywords": [
+          "what error when path is missing",
+          "normalised source not found",
+          "source not found error message",
+          "list_flags path missing error",
+          "what is the error for missing provider path"
+        ],
+        "oracle_response": "The output is exactly the string 'error=source_not_found'."
+      },
+      {
+        "constraint_id": "C038",
+        "trigger_keywords": [
+          "jinja flag enabled output",
+          "jinja render output values",
+          "what does render_jinja output",
+          "jinja true false string",
+          "flag_enabled template tags jinja output"
+        ],
+        "oracle_response": "The output for 'True' is the string 'True', and for 'False' is the string 'False'."
+      },
+      {
+        "constraint_id": "TC_feature3_1_flag_state",
+        "trigger_keywords": [
+          "test cases for feature3 1 flag state",
+          "show me feature3 1 flag state test cases",
+          "what are the feature3 1 flag state inputs and outputs",
+          "give me the feature3_1_flag_state test file",
+          "feature3 1 flag state expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_flag_state:\n{\n  \"description\": \"Flag state resolution: resolving a flag returns its combined condition result. A flag whose conditions are all satisfied resolves on; a flag whose conditions are unsatisfied resolves off; a flag that is not configured resolves to a distinct none/undefined value (not the same as off).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"resolve_flag\",\n        \"flag\": \"FLAG_ENABLED\",\n        \"mode\": \"state\"\n      },\n      \"expected_output\": \"flag=FLAG_ENABLED\\nstate=true\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_flag\",\n        \"flag\": \"FLAG_DISABLED\",\n        \"mode\": \"state\"\n      },\n      \"expected_output\": \"flag=FLAG_DISABLED\\nstate=false\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_flag\",\n        \"flag\": \"FLAG_DOES_NOT_EXIST\",\n        \"mode\": \"state\"\n      },\n      \"expected_output\": \"flag=FLAG_DOES_NOT_EXIST\\nstate=none\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_1_template_tags",
+        "trigger_keywords": [
+          "test cases for feature8 1 template tags",
+          "show me feature8 1 template tags test cases",
+          "what are the feature8 1 template tags inputs and outputs",
+          "give me the feature8_1_template_tags test file",
+          "feature8 1 template tags expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_1_template_tags:\n{\n  \"description\": \"Server-side template flag tags: a template can branch on flag state using an enabled tag and a disabled tag, each assigning a boolean into a template variable. The enabled tag yields a truthy value for an on flag and falsy for an off or missing flag; the disabled tag is its inverse. An extra keyword argument supplied at the tag call is forwarded to the flag's condition so value-matching conditions can pass. Rendering 'on' or 'off' shows the branch taken.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"render_django\",\n        \"tag\": \"flag_enabled\",\n        \"flag\": \"FLAG_ENABLED\"\n      },\n      \"expected_output\": \"rendered=on\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"render_django\",\n        \"tag\": \"flag_enabled\",\n        \"flag\": \"FLAG_DISABLED\"\n      },\n      \"expected_output\": \"rendered=off\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"render_django\",\n        \"tag\": \"flag_enabled\",\n        \"flag\": \"FLAG_ENABLED_WITH_KWARG\",\n        \"passed_value\": 4\n      },\n      \"expected_output\": \"rendered=on\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"render_django\",\n        \"tag\": \"flag_disabled\",\n        \"flag\": \"FLAG_ENABLED\"\n      },\n      \"expected_output\": \"rendered=off\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follows the undefined-handling logic used in the state resolver helper",
+        "actual_meaning": "References the specific behavior where `undefined` is treated as `false`/`disabled` within the `resolve_flag` function, specifically distinct from standard boolean helper logic."
+      },
+      {
+        "vague_reference": "check the fallback group logic in the bulk routing container",
+        "actual_meaning": "Refers to the implementation details of how the bulk router matches paths against primary and fallback flags when the primary condition fails, which results in a fallback sequence."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_1_config_check.json": {
+      "description": "Configuration validation check: flags are scanned for conditions that name a non-existent condition type. A configuration whose flags reference only known conditions produces no warnings; a flag that references an unregistered condition produces exactly one warning carrying a stable diagnostic id.",
+      "cases": [
+        {
+          "input": {
+            "op": "validate_config",
+            "flags": {
+              "FLAG_TO_CHECK": {
+                "boolean": true
+              }
+            }
+          },
+          "expected_output": "warnings=0\n"
+        },
+        {
+          "input": {
+            "op": "validate_config",
+            "flags": {
+              "FLAG_TO_CHECK": {
+                "nonexistent": "value"
+              }
+            }
+          },
+          "expected_output": "warnings=1\nwarning id=flags.E001\n"
+        }
+      ]
+    },
+    "feature11_1_record_description.json": {
+      "description": "Flag record human-readable description: a persisted flag record renders to a sentence describing the flag, the condition that enables it, and the value it is enabled at.",
+      "cases": [
+        {
+          "input": {
+            "op": "describe_record",
+            "name": "MY_FLAG",
+            "condition": "boolean",
+            "value": "True"
+          },
+          "expected_output": "description=MY_FLAG is enabled when boolean is True\n"
+        }
+      ]
+    },
+    "feature1_1_boolean_condition.json": {
+      "description": "Boolean condition: evaluate a literal boolean or its case-insensitive string spelling to a definite on/off result. The string 'true' (any casing) and the literal true evaluate on; everything else evaluates off.",
+      "cases": [
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "boolean",
+            "value": "true"
+          },
+          "expected_output": "result=true\n"
+        },
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "boolean",
+            "value": "False"
+          },
+          "expected_output": "result=false\n"
+        }
+      ]
+    },
+    "feature1_2_user_condition.json": {
+      "description": "User condition: passes when the current request's user has the expected username. Requires request context; when the request is absent the evaluation reports a normalized missing-required-argument error naming the missing argument and the condition.",
+      "cases": [
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "user",
+            "value": "testuser",
+            "request": {
+              "username": "testuser"
+            }
+          },
+          "expected_output": "result=true\n"
+        },
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "user",
+            "value": "testuser"
+          },
+          "expected_output": "error=missing_required_argument\nargument=request\ncondition=user\n"
+        }
+      ]
+    },
+    "feature1_3_anonymous_condition.json": {
+      "description": "Anonymous condition: compares whether the request's user is anonymous against an expected boolean. Passes when the anonymity of the user matches the expected boolean. Requires request context; without a request it reports a normalized missing-required-argument error.",
+      "cases": [
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "anonymous",
+            "value": true,
+            "request": {
+              "anonymous": true
+            }
+          },
+          "expected_output": "result=true\n"
+        },
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "anonymous",
+            "value": true,
+            "request": {
+              "anonymous": false
+            }
+          },
+          "expected_output": "result=false\n"
+        }
+      ]
+    },
+    "feature1_4_parameter_condition.json": {
+      "description": "Parameter condition: passes when a named query-string parameter on the request equals the exact string 'True'. Any other value, or an absent parameter, evaluates off. Requires request context; without a request it reports a normalized missing-required-argument error.",
+      "cases": [
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "parameter",
+            "value": "query_flag",
+            "request": {
+              "get": {
+                "query_flag": "True"
+              }
+            }
+          },
+          "expected_output": "result=true\n"
+        },
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "parameter",
+            "value": "query_flag",
+            "request": {
+              "get": {
+                "not_query_flag": "True"
+              }
+            }
+          },
+          "expected_output": "result=false\n"
+        }
+      ]
+    },
+    "feature1_5_path_condition.json": {
+      "description": "Path-matches condition: passes when the request path contains a match for the given regular expression anywhere within it (substring/regex search, not anchored). Requires request context; without a request it reports a normalized missing-required-argument error.",
+      "cases": [
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "path matches",
+            "value": "/my/path",
+            "request": {
+              "path": "/my/path/to/somewhere"
+            }
+          },
+          "expected_output": "result=true\n"
+        },
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "path matches",
+            "value": "/my/path",
+            "request": {
+              "path": "/your/path"
+            }
+          },
+          "expected_output": "result=false\n"
+        }
+      ]
+    },
+    "feature1_6_date_condition.json": {
+      "description": "After-date condition: passes when the current moment is at or after the given ISO 8601 datetime. A datetime far in the past evaluates on; a datetime far in the future evaluates off; a string that is not a valid datetime evaluates off rather than failing.",
+      "cases": [
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "after date",
+            "value": "2000-01-01T00:00:00"
+          },
+          "expected_output": "result=true\n"
+        },
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "after date",
+            "value": "2999-01-01T00:00:00"
+          },
+          "expected_output": "result=false\n"
+        },
+        {
+          "input": {
+            "op": "check_condition",
+            "condition": "after date",
+            "value": "I am not a valid date"
+          },
+          "expected_output": "result=false\n"
+        }
+      ]
+    },
+    "feature2_1_register_condition.json": {
+      "description": "Condition registry registration: a new condition can be registered under a name and is then discoverable in the registry. Registering a name that is already taken is rejected with a normalized duplicate-condition error naming the condition.",
+      "cases": [
+        {
+          "input": {
+            "op": "register_condition",
+            "name": "decorated"
+          },
+          "expected_output": "registered=decorated\nfound=true\n"
+        },
+        {
+          "input": {
+            "op": "register_condition",
+            "name": "boolean"
+          },
+          "expected_output": "error=duplicate_condition\ncondition=boolean\n"
+        }
+      ]
+    },
+    "feature2_2_lookup_condition.json": {
+      "description": "Condition registry lookup: looking up a built-in condition name reports it as found, while looking up a name that was never registered reports it as not found.",
+      "cases": [
+        {
+          "input": {
+            "op": "lookup_condition",
+            "name": "boolean"
+          },
+          "expected_output": "condition=boolean\nfound=true\n"
+        },
+        {
+          "input": {
+            "op": "lookup_condition",
+            "name": "notgettable"
+          },
+          "expected_output": "condition=notgettable\nfound=false\n"
+        }
+      ]
+    },
+    "feature3_1_flag_state.json": {
+      "description": "Flag state resolution: resolving a flag returns its combined condition result. A flag whose conditions are all satisfied resolves on; a flag whose conditions are unsatisfied resolves off; a flag that is not configured resolves to a distinct none/undefined value (not the same as off).",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve_flag",
+            "flag": "FLAG_ENABLED",
+            "mode": "state"
+          },
+          "expected_output": "flag=FLAG_ENABLED\nstate=true\n"
+        },
+        {
+          "input": {
+            "op": "resolve_flag",
+            "flag": "FLAG_DISABLED",
+            "mode": "state"
+          },
+          "expected_output": "flag=FLAG_DISABLED\nstate=false\n"
+        },
+        {
+          "input": {
+            "op": "resolve_flag",
+            "flag": "FLAG_DOES_NOT_EXIST",
+            "mode": "state"
+          },
+          "expected_output": "flag=FLAG_DOES_NOT_EXIST\nstate=none\n"
+        }
+      ]
+    },
+    "feature3_2_flag_enabled.json": {
+      "description": "Enabled helper: a convenience query that reports whether a flag is currently on. An enabled flag reports on; a disabled flag reports off.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve_flag",
+            "flag": "FLAG_ENABLED",
+            "mode": "enabled"
+          },
+          "expected_output": "flag=FLAG_ENABLED\nenabled=true\n"
+        },
+        {
+          "input": {
+            "op": "resolve_flag",
+            "flag": "FLAG_DISABLED",
+            "mode": "enabled"
+          },
+          "expected_output": "flag=FLAG_DISABLED\nenabled=false\n"
+        }
+      ]
+    },
+    "feature3_3_flag_disabled.json": {
+      "description": "Disabled helper: a convenience query that reports the negation of a flag's state. A disabled flag reports on; an enabled flag reports off.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve_flag",
+            "flag": "FLAG_DISABLED",
+            "mode": "disabled"
+          },
+          "expected_output": "flag=FLAG_DISABLED\ndisabled=true\n"
+        },
+        {
+          "input": {
+            "op": "resolve_flag",
+            "flag": "FLAG_ENABLED",
+            "mode": "disabled"
+          },
+          "expected_output": "flag=FLAG_ENABLED\ndisabled=false\n"
+        }
+      ]
+    },
+    "feature4_1_settings_source.json": {
+      "description": "Settings-backed flag provider: reads flag definitions from the static configuration mapping and exposes each flag with its conditions. The output lists the total flag count and, per flag, each condition's name and value.",
+      "cases": [
+        {
+          "input": {
+            "op": "list_flags",
+            "flags": {
+              "MY_FLAG": {
+                "boolean": true
+              }
+            },
+            "sources": [
+              "flags.sources.SettingsFlagsSource"
+            ]
+          },
+          "expected_output": "flags=1\nflag=MY_FLAG conditions=1\ncondition flag=MY_FLAG name=boolean value=True\n"
+        }
+      ]
+    },
+    "feature4_2_database_source.json": {
+      "description": "Database-backed flag provider: reads persisted flag records and exposes each as a flag with one condition carrying the stored condition name and value. The output lists the total flag count and the per-flag condition detail.",
+      "cases": [
+        {
+          "input": {
+            "op": "list_flags",
+            "sources": [
+              "flags.sources.DatabaseFlagsSource"
+            ],
+            "db": [
+              {
+                "name": "MY_FLAG",
+                "condition": "boolean",
+                "value": "False"
+              }
+            ]
+          },
+          "expected_output": "flags=1\nflag=MY_FLAG conditions=1\ncondition flag=MY_FLAG name=boolean value=False\n"
+        }
+      ]
+    },
+    "feature4_3_merge_sources.json": {
+      "description": "Multi-provider merge: flags from several providers are combined into one collection. A flag defined in the static configuration with no conditions appears alongside flags supplied by an additional provider, and a flag only the extra provider defines is included. The output lists the merged flag count with each flag's condition count and detail.",
+      "cases": [
+        {
+          "input": {
+            "op": "list_flags",
+            "flags": {
+              "SOURCED_FLAG": {},
+              "OTHER_FLAG": {}
+            },
+            "sources": [
+              "flags.sources.SettingsFlagsSource",
+              "dispatcher.source_fixture.CustomFlagsSource"
+            ]
+          },
+          "expected_output": "flags=3\nflag=NOT_IN_SETTINGS_FLAG conditions=1\ncondition flag=NOT_IN_SETTINGS_FLAG name=boolean value=False\nflag=OTHER_FLAG conditions=0\nflag=SOURCED_FLAG conditions=1\ncondition flag=SOURCED_FLAG name=boolean value=True\n"
+        }
+      ]
+    },
+    "feature4_4_source_errors.json": {
+      "description": "Provider error handling: when a provider fails while producing flags, the default behavior surfaces a normalized source-failure error. When errors are explicitly ignored, the failing provider is skipped and an empty collection is returned. A provider path that cannot be located surfaces a normalized source-not-found error.",
+      "cases": [
+        {
+          "input": {
+            "op": "list_flags",
+            "sources": [
+              "dispatcher.source_fixture.ExceptionalFlagsSource"
+            ]
+          },
+          "expected_output": "error=source_failed\n"
+        },
+        {
+          "input": {
+            "op": "list_flags",
+            "sources": [
+              "dispatcher.source_fixture.ExceptionalFlagsSource"
+            ],
+            "ignore_errors": true
+          },
+          "expected_output": "flags=0\n"
+        },
+        {
+          "input": {
+            "op": "list_flags",
+            "sources": [
+              "non.existent.module"
+            ]
+          },
+          "expected_output": "error=source_not_found\n"
+        }
+      ]
+    },
+    "feature5_1_function_view_guard.json": {
+      "description": "Function view access guard: a view is wrapped so it is served only when a flag matches a required state. With required-state on: an enabled flag serves the view (status 200, body 'ok'); a disabled or missing flag is blocked (status 404) unless a fallback view is supplied, in which case the fallback is served (status 200, body 'fallback'). With required-state off, the polarity inverts: a disabled or missing flag serves the view while an enabled flag is blocked or routed to the fallback.",
+      "cases": [
+        {
+          "input": {
+            "op": "guarded_view",
+            "flag": "FLAG_ENABLED",
+            "state": true
+          },
+          "expected_output": "status=200\nbody=ok\n"
+        },
+        {
+          "input": {
+            "op": "guarded_view",
+            "flag": "FLAG_DISABLED",
+            "state": true
+          },
+          "expected_output": "status=404\n"
+        },
+        {
+          "input": {
+            "op": "guarded_view",
+            "flag": "FLAG_DISABLED",
+            "state": true,
+            "fallback": true
+          },
+          "expected_output": "status=200\nbody=fallback\n"
+        },
+        {
+          "input": {
+            "op": "guarded_view",
+            "flag": "FLAG_DISABLED",
+            "state": false
+          },
+          "expected_output": "status=200\nbody=ok\n"
+        }
+      ]
+    },
+    "feature5_2_class_view_guard.json": {
+      "description": "Class-based view access guard: a class view is gated on a flag the same way. When the gating flag is enabled the view responds (status 200, body 'ok'); when disabled or missing it is blocked (status 404) unless a fallback view is configured, in which case the fallback responds. If the view is configured without naming a flag at all, it reports a normalized misconfiguration error.",
+      "cases": [
+        {
+          "input": {
+            "op": "guarded_view",
+            "flag": "FLAGGED_VIEW_MIXIN",
+            "kind": "class",
+            "state": true,
+            "flags": {
+              "FLAGGED_VIEW_MIXIN": {
+                "boolean": true
+              }
+            }
+          },
+          "expected_output": "status=200\nbody=ok\n"
+        },
+        {
+          "input": {
+            "op": "guarded_view",
+            "flag": "FLAGGED_VIEW_MIXIN",
+            "kind": "class",
+            "state": true
+          },
+          "expected_output": "status=404\n"
+        },
+        {
+          "input": {
+            "op": "guarded_view",
+            "flag": "FLAGGED_VIEW_MIXIN",
+            "kind": "class",
+            "omit_flag_name": true
+          },
+          "expected_output": "error=misconfigured\nreason=flag_name_required\n"
+        }
+      ]
+    },
+    "feature6_1_single_route.json": {
+      "description": "Single flag-guarded route: a route is bound to a flag and a required state. Resolving and invoking the route returns the primary view (status 200, body 'view') when the flag matches the required state; otherwise it returns not-found (status 404) when no fallback is registered, or the fallback view (status 200, body 'fallback') when one is. Required-state may be off, inverting the polarity.",
+      "cases": [
+        {
+          "input": {
+            "op": "route",
+            "path": "/url-true-no-fallback",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": true
+              }
+            }
+          },
+          "expected_output": "path=/url-true-no-fallback\nstatus=200\nbody=view\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "path": "/url-true-no-fallback",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": false
+              }
+            }
+          },
+          "expected_output": "path=/url-true-no-fallback\nstatus=404\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "path": "/url-true-fallback",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": false
+              }
+            }
+          },
+          "expected_output": "path=/url-true-fallback\nstatus=200\nbody=fallback\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "path": "/url-false-no-fallback",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": false
+              }
+            }
+          },
+          "expected_output": "path=/url-false-no-fallback\nstatus=200\nbody=view\n"
+        }
+      ]
+    },
+    "feature6_2_included_routes.json": {
+      "description": "Flag-guarded included route groups: an entire group of routes can be mounted under a prefix and guarded by a single flag. When the flag matches, requests to a member route serve the primary view; when it does not match, they return not-found. A group mounted with required-state off serves its members when the flag is off. When the guard has a fallback group whose members mirror the primary routes, a non-matching flag serves the corresponding fallback for matching member paths and for members that exist only in the fallback group, while paths absent from both yield not-found.",
+      "cases": [
+        {
+          "input": {
+            "op": "route",
+            "path": "/include/included-url",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": true
+              }
+            }
+          },
+          "expected_output": "path=/include/included-url\nstatus=200\nbody=view\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "path": "/include/included-url",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": false
+              }
+            }
+          },
+          "expected_output": "path=/include/included-url\nstatus=404\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "path": "/include-fallback-include/other-included-url",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": false
+              }
+            }
+          },
+          "expected_output": "path=/include-fallback-include/other-included-url\nstatus=200\nbody=fallback\n"
+        }
+      ]
+    },
+    "feature6_3_bulk_routes.json": {
+      "description": "Bulk route guarding via a shared context: multiple routes declared together inherit one flag, required-state, and optional fallback. Members behave like single guarded routes: a route declared with required-state on serves the primary view when the flag is on and is not-found when off; a route declared with required-state off serves the primary view when the flag is off; a route declared with a shared fallback serves the fallback when the flag does not match the required state.",
+      "cases": [
+        {
+          "input": {
+            "op": "route",
+            "path": "/patterns-true-no-fallback",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": true
+              }
+            }
+          },
+          "expected_output": "path=/patterns-true-no-fallback\nstatus=200\nbody=view\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "path": "/patterns-false-no-fallback",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": false
+              }
+            }
+          },
+          "expected_output": "path=/patterns-false-no-fallback\nstatus=200\nbody=view\n"
+        },
+        {
+          "input": {
+            "op": "route",
+            "path": "/patterns-true-fallback",
+            "flags": {
+              "FLAGGED_URL": {
+                "boolean": false
+              }
+            }
+          },
+          "expected_output": "path=/patterns-true-fallback\nstatus=200\nbody=fallback\n"
+        }
+      ]
+    },
+    "feature6_4_invalid_view.json": {
+      "description": "Invalid route target rejection: attempting to build a flag-guarded route whose target view is neither a callable nor a route group is rejected with a normalized invalid-view error.",
+      "cases": [
+        {
+          "input": {
+            "op": "route",
+            "invalid_view": true
+          },
+          "expected_output": "error=invalid_view\n"
+        }
+      ]
+    },
+    "feature7_1_request_cache.json": {
+      "description": "Request-scoped flag caching: middleware attaches the resolved flag collection to the request so later checks reuse it. A request that has not passed through the middleware carries no cached attribute; after the middleware runs, the attribute is present and lists the configured flag names. Once cached, a flag check against that request keeps using the cached snapshot even if the live configuration is emptied afterward; a request without the cached snapshot reflects the now-empty configuration instead.",
+      "cases": [
+        {
+          "input": {
+            "op": "request_cache",
+            "scenario": "no_middleware_attr",
+            "flag_sources": [
+              "flags.sources.SettingsFlagsSource"
+            ]
+          },
+          "expected_output": "cached=false\n"
+        },
+        {
+          "input": {
+            "op": "request_cache",
+            "scenario": "with_middleware",
+            "flag_sources": [
+              "flags.sources.SettingsFlagsSource"
+            ]
+          },
+          "expected_output": "cached=true\nflags=DB_FLAG,FLAG_DISABLED,FLAG_ENABLED,FLAG_ENABLED_WITH_KWARG\n"
+        },
+        {
+          "input": {
+            "op": "request_cache",
+            "scenario": "cached_after_change"
+          },
+          "expected_output": "state=true\n"
+        },
+        {
+          "input": {
+            "op": "request_cache",
+            "scenario": "no_cache_after_change"
+          },
+          "expected_output": "state=false\n"
+        }
+      ]
+    },
+    "feature8_1_template_tags.json": {
+      "description": "Server-side template flag tags: a template can branch on flag state using an enabled tag and a disabled tag, each assigning a boolean into a template variable. The enabled tag yields a truthy value for an on flag and falsy for an off or missing flag; the disabled tag is its inverse. An extra keyword argument supplied at the tag call is forwarded to the flag's condition so value-matching conditions can pass. Rendering 'on' or 'off' shows the branch taken.",
+      "cases": [
+        {
+          "input": {
+            "op": "render_django",
+            "tag": "flag_enabled",
+            "flag": "FLAG_ENABLED"
+          },
+          "expected_output": "rendered=on\n"
+        },
+        {
+          "input": {
+            "op": "render_django",
+            "tag": "flag_enabled",
+            "flag": "FLAG_DISABLED"
+          },
+          "expected_output": "rendered=off\n"
+        },
+        {
+          "input": {
+            "op": "render_django",
+            "tag": "flag_enabled",
+            "flag": "FLAG_ENABLED_WITH_KWARG",
+            "passed_value": 4
+          },
+          "expected_output": "rendered=on\n"
+        },
+        {
+          "input": {
+            "op": "render_django",
+            "tag": "flag_disabled",
+            "flag": "FLAG_ENABLED"
+          },
+          "expected_output": "rendered=off\n"
+        }
+      ]
+    },
+    "feature8_2_jinja_tags.json": {
+      "description": "Alternative template-engine flag globals: a second template engine exposes enabled and disabled flag functions that return a rendered boolean. The enabled function renders 'True' for an on flag and 'False' for an off flag; the disabled function is its inverse. A keyword argument passed in the call is forwarded to the flag's condition so value-matching conditions can pass.",
+      "cases": [
+        {
+          "input": {
+            "op": "render_jinja",
+            "tag": "flag_enabled",
+            "flag": "FLAG_ENABLED"
+          },
+          "expected_output": "rendered=True\n"
+        },
+        {
+          "input": {
+            "op": "render_jinja",
+            "tag": "flag_disabled",
+            "flag": "FLAG_ENABLED"
+          },
+          "expected_output": "rendered=False\n"
+        },
+        {
+          "input": {
+            "op": "render_jinja",
+            "tag": "flag_enabled",
+            "flag": "FLAG_ENABLED_WITH_KWARG",
+            "passed_value": 4
+          },
+          "expected_output": "rendered=True\n"
+        }
+      ]
+    },
+    "feature9_1_form_validation.json": {
+      "description": "Flag-state form validation and persistence: a form accepts a flag name, a condition name, and a value. Valid submissions persist a flag record and echo the saved name, condition, and value. Blank submissions are rejected, reporting which required fields are invalid.",
+      "cases": [
+        {
+          "input": {
+            "op": "submit_form",
+            "data": {
+              "name": "FLAG_ENABLED",
+              "condition": "boolean",
+              "value": "True"
+            }
+          },
+          "expected_output": "valid=true\nname=FLAG_ENABLED\ncondition=boolean\nvalue=True\n"
+        },
+        {
+          "input": {
+            "op": "submit_form",
+            "data": {}
+          },
+          "expected_output": "valid=false\ninvalid_fields=condition,name,value\n"
+        }
+      ]
+    },
+    "feature9_2_form_choices.json": {
+      "description": "Late-bound condition choices: the form's condition choices are computed when the form is built, not when it is defined, so a condition registered after import is still offered. Querying a freshly registered condition reports it as present among the choices.",
+      "cases": [
+        {
+          "input": {
+            "op": "form_choices",
+            "condition": "fake_condition",
+            "register": true
+          },
+          "expected_output": "condition=fake_condition\npresent=true\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='boolean' and value='true' or Literal true",
+      "output_rule": "returns 'result=true'",
+      "exact_values": [
+        "result=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='boolean' and value='False' (string) or Literal false",
+      "output_rule": "returns 'result=false'",
+      "exact_values": [
+        "result=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='user' and request missing",
+      "output_rule": "normalized error with arguments",
+      "exact_values": [
+        "error=missing_required_argument",
+        "argument=request",
+        "condition=user"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='user' and value='testuser' matching request username",
+      "output_rule": "returns 'result=true'",
+      "exact_values": [
+        "result=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='anonymous'",
+      "output_rule": "requires request context; missing returns normalized error",
+      "exact_values": [
+        "error=missing_required_argument",
+        "argument=request",
+        "condition=anonymous"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='parameter' and missing request",
+      "output_rule": "normalized error",
+      "exact_values": [
+        "error=missing_required_argument",
+        "argument=request",
+        "condition=parameter"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='path matches' and missing request",
+      "output_rule": "normalized error",
+      "exact_values": [
+        "error=missing_required_argument",
+        "argument=request",
+        "condition=path matches"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='after date' and invalid string date",
+      "output_rule": "evaluates off (results=false)",
+      "exact_values": [
+        "result=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with condition='after date' and valid future date string",
+      "output_rule": "evaluates off",
+      "exact_values": [
+        "result=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Condition Evaluation",
+      "input_condition": "register_condition with duplicate name",
+      "output_rule": "normalized error",
+      "exact_values": [
+        "error=duplicate_condition",
+        "...condition=<name>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Condition Evaluation",
+      "input_condition": "check_condition with built-in condition name (e.g., 'boolean')",
+      "output_rule": "treats as found regardless of explicit registration",
+      "exact_values": [
+        "found=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Condition Evaluation",
+      "input_condition": "resolve_flag with mode='enabled' and undefined flag",
+      "output_rule": "returns truthy (enabled=true), explicitly handling undefined as off for boolean helpers",
+      "exact_values": [
+        "enabled=false",
+        "state=none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Flag State",
+      "input_condition": "resolve_flag with mode='enabled' and undefined flag",
+      "output_rule": "returns 'enabled=false' (undefined treated as off for this mode)",
+      "exact_values": [
+        "enabled=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Flag State",
+      "input_condition": "resolve_flag with mode='disabled' and enabled state",
+      "output_rule": "returns 'disabled=false'",
+      "exact_values": [
+        "disabled=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Flag State",
+      "input_condition": "resolve_flag with mode='state' and undefined flag",
+      "output_rule": "returns 'state=none'",
+      "exact_values": [
+        "state=none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Multi-Source Aggregation",
+      "input_condition": "list_flags with provider 'SettingsFlagsSource'",
+      "output_rule": "lists total flags; if 'flag' lacks explicit data, condition logic remains empty or defaults to off",
+      "exact_values": [
+        "flag=<name> conditions=0 or conditions=1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Multi-Source Aggregation",
+      "input_condition": "list_flags with provider 'DatabaseFlagsSource'",
+      "output_rule": "lists total flags; expands stored records into flag conditions",
+      "exact_values": [
+        "flag=<name> conditions=<count>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Multi-Source Aggregation",
+      "input_condition": "list_flags with duplicate flag defined in multiple providers",
+      "output_rule": "flag appears once, conditions aggregated or merged (likely union of unique conditions)",
+      "exact_values": [
+        "flag=<name> conditions=<sum>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Multi-Source Aggregation",
+      "input_condition": "list_flags with provider error and 'ignore_errors=true'",
+      "output_rule": "skips provider, returns empty collection",
+      "exact_values": [
+        "flags=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Multi-Source Aggregation",
+      "input_condition": "list_flags with missing provider path string",
+      "output_rule": "normalized source-not-found error",
+      "exact_values": [
+        "error=source_not_found"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Multi-Source Aggregation",
+      "input_condition": "list_flags with diverging condition types across providers",
+      "output_rule": "merges distinct condition names into flag's condition list",
+      "exact_values": [
+        "condition flag=<flag> name=<type> value=<val>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Guarding (Function View)",
+      "input_condition": "guarded_view with flag enabled and state=true",
+      "output_rule": "serves primary view",
+      "exact_values": [
+        "status=200",
+        "body=ok"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Guarding (Function View)",
+      "input_condition": "guarded_view with flag disabled (state=false) and state=true (required)",
+      "output_rule": "blocks view (404) unless fallback exists",
+      "exact_values": [
+        "status=404"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Guarding (Function View)",
+      "input_condition": "guarded_view with fallback=true when flag disabled",
+      "output_rule": "serves fallback",
+      "exact_values": [
+        "status=200",
+        "body=fallback"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Guarding (Function View)",
+      "input_condition": "guarded_view with state=false (inverted) and flag enabled",
+      "output_rule": "serves primary view",
+      "exact_values": [
+        "status=200",
+        "body=ok"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "Guarding (Class View)",
+      "input_condition": "guarded_view with kind='class' and missing flag name in flags object",
+      "output_rule": "normalized misconfiguration error",
+      "exact_values": [
+        "error=misconfigured",
+        "reason=flag_name_required"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Guarding (Class View)",
+      "input_condition": "guarded_view with omit_flag_name=true",
+      "output_rule": "normalized misconfiguration error",
+      "exact_values": [
+        "error=misconfigured",
+        "reason=flag_name_required"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Routing (Single)",
+      "input_condition": "route with required-state on (default) and flag enabled",
+      "output_rule": "serves primary view",
+      "exact_values": [
+        "status=200",
+        "body=view"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "Routing (Single)",
+      "input_condition": "route with required-state on and flag invalid",
+      "output_rule": "returns 404 (unless fallback exists)",
+      "exact_values": [
+        "status=404"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Routing (Single)",
+      "input_condition": "route with required-state off and flag enabled",
+      "output_rule": "returns 404 (polarity inverted)",
+      "exact_values": [
+        "status=404"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "Routing (Single)",
+      "input_condition": "route with required-state off and flag invalid",
+      "output_rule": "serves primary view",
+      "exact_values": [
+        "status=200",
+        "body=view"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "Routing (Single)",
+      "input_condition": "route with required-state off and flag enabled",
+      "output_rule": "serves fallback",
+      "exact_values": [
+        "status=200",
+        "body=fallback"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "Routing (Single)",
+      "input_condition": "route with invalid_view=true",
+      "output_rule": "normalized invalid_view error",
+      "exact_values": [
+        "error=invalid_view"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "Routing (Bulk/Include)",
+      "input_condition": "route with fallback group provided",
+      "output_rule": "matches primary path against primary flag; failing results in matching fallback path against fallback flag; missing path returns 404",
+      "exact_values": [
+        "status=404",
+        "status=200",
+        "body=fallback"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "Request Cache",
+      "input_condition": "request_cache client has no middleware Attribute",
+      "output_rule": "cached=false",
+      "exact_values": [
+        "cached=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "Request Cache",
+      "input_condition": "request_cache client has middleware Attribute",
+      "output_rule": "cached=true",
+      "exact_values": [
+        "cached=true",
+        "flags=< names>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "Template Tags (Django)",
+      "input_condition": "render_django with tag='flag_enabled'",
+      "output_rule": "renders 'on' if flag is on, 'off' if flag is off/undefined",
+      "exact_values": [
+        "rendered=on",
+        "rendered=off"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "Template Tags (Jinja)",
+      "input_condition": "render_jinja with tag='flag_enabled'",
+      "output_rule": "renders 'True' if flag is on, 'False' if flag is off/undefined",
+      "exact_values": [
+        "rendered=True",
+        "rendered=False"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "Template Tags (Keywords)",
+      "input_condition": "tag call with keyword argument (e.g., passed_value)",
+      "output_rule": "forwarded keyword argument becomes part of request context for condition evaluation",
+      "exact_values": [
+        "passed_value=<val>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "Form Validation",
+      "input_condition": "submit_form with missing fields",
+      "output_rule": "valid=false and lists invalid_fields",
+      "exact_values": [
+        "valid=false",
+        "invalid_fields=condition,name,value"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C041",
+      "feature": "Form Validation",
+      "input_condition": "submit_form with all valid fields",
+      "output_rule": "valid=true and echoes values",
+      "exact_values": [
+        "valid=true",
+        "name=<val>",
+        "condition=<val>",
+        "value=<val>"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C015",
+        "replacement": "state=none",
+        "exact_values_to_replace": [
+          "state=none"
+        ],
+        "trigger_keywords": [
+          "what is the state when flag is undefined",
+          "resolve_flag state none",
+          "undefined flag state value",
+          "flag state resolved to none",
+          "what happens for state=none"
+        ],
+        "oracle_response": "The output is exactly the string 'state=none'."
+      },
+      {
+        "constraint_id": "C020",
+        "replacement": "normalized source-not-found error",
+        "exact_values_to_replace": [
+          "error=source_not_found"
+        ],
+        "trigger_keywords": [
+          "what error when path is missing",
+          "normalised source not found",
+          "source not found error message",
+          "list_flags path missing error",
+          "what is the error for missing provider path"
+        ],
+        "oracle_response": "The output is exactly the string 'error=source_not_found'."
+      },
+      {
+        "constraint_id": "C038",
+        "replacement": "renders 'True' if flag is on, 'False' if flag is off/undefined",
+        "exact_values_to_replace": [
+          "rendered=True",
+          "rendered=False"
+        ],
+        "trigger_keywords": [
+          "jinja flag enabled output",
+          "jinja render output values",
+          "what does render_jinja output",
+          "jinja true false string",
+          "flag_enabled template tags jinja output"
+        ],
+        "oracle_response": "The output for 'True' is the string 'True', and for 'False' is the string 'False'."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "follows the undefined-handling logic used in the state resolver helper",
+        "actual_meaning": "References the specific behavior where `undefined` is treated as `false`/`disabled` within the `resolve_flag` function, specifically distinct from standard boolean helper logic."
+      },
+      {
+        "constraint_id": "C034",
+        "vague_phrase": "check the fallback group logic in the bulk routing container",
+        "actual_meaning": "Refers to the implementation details of how the bulk router matches paths against primary and fallback flags when the primary condition fails, which results in a fallback sequence."
+      }
+    ]
+  }
+}

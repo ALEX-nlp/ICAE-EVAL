@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up that cross-platform desktop notification routing library we've been planning. The basic idea is that app developers should only have to write one options object and the library handles all the messy platform differences under the hood — no more hand-rolling shell commands or worrying about which binary to call on what machine.
+
+A few things I want to make sure we nail: the library should know about all the notification senders we support and be able to tell you which ones exist plus confirm a default one is ready to go. Each sender has its own quirky naming conventions for things like icons and urgency, so we need that normalization layer that maps our friendly option names into whatever that specific tool actually expects. One of the senders (the network-push one) is a bit special because it needs to handle icon data differently from the others — remember how we handled binary assets in that earlier media pipeline work, same kind of idea.
+
+Also really important: the command arguments each tool gets need to be constructed safely — users can put weird characters in their notification text and we can't let that cause problems. Windows has that extra wrinkle where you need to pick the right binary depending on the machine architecture. And the quiet/sound behavior on Windows needs to be toggleable. Finally, any request missing a message should be rejected cleanly before anything gets dispatched. Keep the code organized — no giant single files please.

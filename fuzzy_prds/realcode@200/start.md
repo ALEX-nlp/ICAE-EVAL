@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that password strength checker library we've been talking about. Basically devs should be able to throw a password at it and get back useful info — how strong it is, roughly how long it'd take to crack, a human-readable label for that time, and some kind of score. We also want it to spit out what patterns it found inside the password (like if someone used a keyboard row, or repeated chars, or a dictionary word). Oh and we need feedback messages too — like warnings and suggestions — similar to what we did in that scoring module a while back, you know the one.
+
+One thing that's been causing support tickets: users are picking passwords that look complex but are actually things like their name or pet — so we need to support passing in personal terms so those get flagged as weak too. There should also be a way to register your own word lists once and reuse them across multiple checks without re-registering every time.
+
+Output should be plain text key=value lines, not JSON. Multiple results should be separated somehow. Numbers need to be rounded consistently — I think to 3 decimal places? Check how we handled that before. Also make sure weird or invalid inputs don't blow things up. Architecture should be clean and modular, not one giant file. Let's get this scoped out properly.

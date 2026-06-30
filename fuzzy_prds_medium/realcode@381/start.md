@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to get this binary serialization thing shipped. The basic idea is we have structured data (records with various field types) and we want to convert them to bytes and back again reliably. Think of it like our own compact wire format — similar to what we did with that encoding layer in the transport module, but more self-contained.
+
+The tricky parts are: we need to handle ALL the primitive types including the weird ones like dates (stored as ticks, similar to how the calendar service does it), GUIDs in that mixed-endian layout we've used before, and those 64-bit integers that JS can't represent natively so they come in as strings. We also need nested stuff — maps, arrays, unions with discriminators, enumerations with different backing sizes.
+
+There's also this decode-only operation where someone hands us a pre-baked hex blob and we need to parse it into a known shape (songs catalog format, I think it was spec'd somewhere in the test fixtures). Oh and constants/flags resolution needs to work too — the bit-flag enum has some combined members and even a negative one, make sure those compute correctly.
+
+The output format for decoded records needs to be deterministic — fields in alphabetical order, maps in wire order. Floats have special string representations for infinity/NaN. Please just refer to how the existing round-trip tests expect the output to look, that's the contract.
+
+One more pass on the details the team asked about so we stay aligned with what the tests already expect. For dates, we’re storing them as 8-byte little-endian unsigned integers representing 100-nanosecond ticks since 0001-01-01. The formula is: ticks = (milliseconds_since_unix_epoch * 10000 + 621355968000000000) bitwise-AND with 0x3fffffffffffffff (top two bits cleared). Decoding reverses this: milliseconds = (ticks - 621355968000000000) / 10000. Same thing stated the other way from the wire rules: ticks = milliseconds * 10000 + 621355968000000000, then masked with 0x3fffffffffffffff. This is the .NET DateTime ticks epoch offset.
+
+For GUIDs, we do want the canonical mixed-endian 16-byte layout, exactly the same pattern we’ve used before: the first hyphen-group (8 hex digits) is written as a little-endian 32-bit integer, the second and third groups (4 hex digits each) are each written as a little-endian 16-bit integer, and the last two groups are written as raw bytes in big-endian order. Example stays exact: 01234567-0123-0123-0123-0123456789ab encodes to the 16 bytes 674523012301230101230123456789ab.
+
+A couple rendering details too. Constants are resolved by name handle. float_scientific (e.g., 1.2345678e11) prints its numeric value in full decimal: 123456780000. Quoted string constants with embedded quotes and newlines must be rendered with proper JSON escape sequences: e.g., value="hello \"world\"\nwith newlines". The output is simply value=<rendered_value> on one line.
+
+Also, byte arrays are the one array special case. An array of raw bytes (byte array) is encoded as the 4-byte little-endian element count followed by the contiguous raw bytes (one byte per element, no per-element framing). All other typed arrays (int16, int32, etc.) are encoded as the 4-byte count followed by each element individually encoded per its type's width. When we render decoded byte arrays, it should be [comma-separated decimal byte values].
+
+On the 64-bit side, both int64 and uint64 are supplied in JSON as decimal strings so we don’t lose precision beyond JavaScript’s safe integer range, like "6" and "9223372036854775807". They still encode as 8 little-endian bytes. Decoded output renders them as plain decimal numbers in the text rendering, but for the 64-bit-backed enum size case the runtime kind needs to come through as 'bigint'.
+
+And for the tagged message format, the shape is: a 4-byte little-endian prefix giving the byte length of the message body, then for each present field a 1-byte field number followed by that field's encoded value, then a terminating 0x00 byte. Absent fields are simply omitted. Decoding stops at the 0x00 terminator or at the declared body length. The body length counts all field-tag bytes, value bytes, and the terminator byte.

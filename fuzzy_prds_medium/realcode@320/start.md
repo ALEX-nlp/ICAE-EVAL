@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need a client adapter thingy for that remote AI service we've been integrating with. Basically devs are complaining they keep writing the same boilerplate over and over just to talk to the service — checking if it's up, grabbing providers, running completions, messing with datasets, submitting jobs, getting model recommendations, etc. It's a mess and everyone's doing it slightly differently which causes bugs.
+
+The idea is to build something that wraps all that up cleanly. There should be a way to run it from the command line where you pipe in some JSON describing what you want and it spits out the result — similar to how we did that stdin/stdout pattern on the billing connector last quarter, you know the one. The output format needs to be consistent key=value lines, one per line.
+
+A few things that keep biting us: when a provider isn't in the supported list we need a clear normalized error (not a stack trace), same for blank prompts. Datasets and jobs have their own create/delete/list flows. Oh and the health check output should always include the deployment field even if the service doesn't send it back. For job types we support evaluate and inference routes. Model suggestions can fail with a bad task name and that needs to be handled gracefully too.
+
+Structure should be clean, not one giant file. Tests should run with a single bash command. Let me know if questions.
+
+Quick follow-up from the questions that came in: on the health check, if the service response doesn’t include `deployment_type`, we still need to print `deployment_type=` as an empty value every single time. That field should never disappear from output. That’s the behavior in `available_without_deployment_type`, and it matches the earlier note that the health check output always includes the deployment field even when the service leaves it out.
+
+On vendor validation, if the requested vendor isn’t in the supported vendors list, the output needs to be exactly `error=unsupported_vendor\n`. Nothing else gets printed with it — no HTTP method, no path, no status code lines. This is just our normalized domain error flow for `invalid_vendor`. Also, prompts that are empty or only whitespace need to fail before any HTTP call happens, with exactly `error=empty_prompt\n`, even if the vendor itself is valid.
+
+For job creation, if somebody sends unknown or disallowed fields, that should fail locally too, before any HTTP call is made. The output in that case starts with `error=schema_validation\n` and also includes the failing field name and the validation category. On the model suggestions side, for a valid task like `summarization`, the response should report `total=9` and `item_count=9`, and the first result should be `first_name=facebook/bart-large-cnn` plus `first_uri=hf://facebook/bart-large-cnn`. If the task name is bad, that one comes back as `error=http_status\nstatus_code=400\n`.
+
+A couple implementation-shape details too since folks asked: this should not be one giant file. We want a multi-file layout, like `src/` for the core domain logic and a separate adapter / entry-point script. The stdin/stdout execution adapter is the same pattern described in start.md: read a single JSON object from stdin, route to the core logic, and write key=value lines to stdout. That adapter needs to be physically separate from the business logic. And the HTTP API shape we’re targeting from start.md uses base path `/api/v1/` with these endpoints: `/health`, `/completions`, `/completions/{provider}/`, `/datasets`, `/datasets/{id}`, `/jobs/{type}/`, `/jobs`, `/health/jobs/{submission_id}`, and `/models/{task}`.
+
+Last thing, the IDs in these scenarios are fixed fixture values, not generated on the fly. Dataset and job records use `daab39ac-be9f-4de9-87c0-c4c94b297a97` as the returned or deleted id, and submission / dataset fields use `6f6487ac-7170-4a11-af7a-0f6db1ec9a74`.

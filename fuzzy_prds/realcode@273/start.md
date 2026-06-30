@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from a few enterprise CAD integrators who are trying to use our DXF toolkit in their pipelines. The main pain points are around compatibility — some of their older drawings just don't parse right, especially when they're coming from machines set to non-English regional settings (the numbers come out wrong). Also, a couple of partners are asking about support for that compact binary format some legacy tools spit out, plus the regular binary encoding. The BOM issue keeps coming up too — some pre-processing tools add that invisible prefix and everything breaks downstream.
+
+On the authoring side, people want to target specific product versions when they export, and apparently some features (like certain table types and entity kinds) shouldn't appear in older-format outputs. The guy from that one integration project mentioned it's similar to the version-gating logic we did for the classes section — just extend that pattern.
+
+We also need clean error handling — no raw stack traces leaking out, just stable category codes so downstream tools can parse failures programmatically. Can someone make sure the whole thing is properly split across files too? Last time we shipped a god-file and it was a nightmare to maintain. Thumbnail embedding came up as well — stripping the bitmap file header before storing should be handled automatically.

@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from devs using our CLI toolkit that they keep having to write the same boilerplate argument scanning code over and over again. Every project reinvents the wheel — someone parses --long flags, someone else handles -s short forms, and nobody handles the edge cases the same way (like what happens when you pass a number that's too big, or forget to give a value after a flag). We need a proper library that lets you just declare what options your program accepts and get back a clean result object you can query.
+
+Remember how we handled the 'compatibility logic' for grouped short flags in that config-loader module last quarter? Something like that approach would work here. Users should be able to bundle short flags together, mix positional arguments with named ones, and get sensible errors back when something goes wrong — not a crash or a silent wrong value.
+
+We also want support for things like 'if the flag is missing, use this fallback' and 'if the flag is present but has no value attached, use this other fallback.' Numeric stuff needs to handle hex, negatives, overflow — the usual. Oh and there should be some kind of help/synopsis output. The JSON adapter contract we discussed internally should stay completely separate from the core engine. Please refer to how we scoped the iteration and optional-value patterns in the last sprint.

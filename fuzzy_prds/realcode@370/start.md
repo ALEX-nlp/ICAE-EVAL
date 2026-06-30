@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out a math utility library for working with rotations and rigid body transforms — think the kind of stuff robotics and computer vision folks need constantly. The core idea is that developers should be able to plug in a transformation (like a rotation angle or a set of angles for 3D), do stuff with it (combine two transforms, undo one, find the 'difference' between two poses), and also nudge a transform by a small local correction from either side. There should also be a way to move a point using a transform, get the linear map that converts between left/right tangent representations, and do smooth interpolation between two poses.
+
+We also need all the derivative/Jacobian stuff baked in — basically every operation should optionally return its analytic gradients, since downstream optimization code depends on this heavily.
+
+The tricky part is the input/output format — I remember we discussed something similar to how the login module handled its coordinate conventions, but I don't recall the exact agreed-upon format for quaternions or how SE3 parameters are ordered. Also the number formatting had some special rule about near-zero values that I think got documented somewhere. The system should cover four groups: planar rotation, 3D rotation, planar rigid motion, and spatial rigid motion. JSON in, human-readable text out. Please make sure the architecture is clean and not just one giant file.

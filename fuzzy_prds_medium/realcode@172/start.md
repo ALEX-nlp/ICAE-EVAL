@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need to build out our error reporting client library. The core idea is that devs drop this into their app and it handles all the messy stuff — capturing errors, cleaning up sensitive data before it goes out, keeping a running log of what happened leading up to a crash, and shipping the report off to the right place depending on whether we're talking browser or server context.
+
+One thing that burned us before (remember that login module incident?) is we kept leaking things like passwords and tokens in query strings and form data. So redaction needs to be really solid — both in URLs and in nested object data. Same substring-match approach we've used elsewhere.
+
+We also had issues with deeply recursive objects crashing the serializer, so there needs to be some kind of depth-limiting safety net.
+
+For the browser side, we need to hook into the global error surfaces and make sure cross-origin noise doesn't spam us. The server side needs clean HTTP delivery with proper callbacks.
+
+Also — and this is the one people keep forgetting — we shouldn't be firing off reports in local dev environments unless someone has explicitly said they want that. We've had too many dev machines polluting production dashboards.
+
+Middleware integration should clear per-request state cleanly and forward errors down the chain. The breadcrumb trail should cap out at a reasonable size so memory doesn't balloon. Can someone own this end to end?
+
+A couple extra specifics from the questions that came in: the filtering should be case-insensitive and substring-based everywhere we use it, both for filterUrl and filterData. So if a configured term shows up anywhere inside a key name, that value gets replaced with the literal string '[FILTERED]'. That means a filter of 'secret' should catch 'secret_key', 'my_secret', and 'SECRET', and this is the same behavior we want because of the earlier leak where things like 'password', 'secret', and auth tokens were getting sent in plain text in URL query params and structured POST body data. The shared matching behavior lives in src/core/filter.ts (or equivalent), but the important product behavior is just that any key whose name contains a filter term gets redacted to '[FILTERED]'.
+
+On the sanitizer side, if nobody passes maxDepth, the default cap is 8. Anything deeper than that becomes '[DEPTH]'. Recursive references and non-serializable values should turn into stable neutral marker strings, and absent or undefined object fields should just be left out of the output entirely. For stack traces, we’re parsing line by line and only accepting the usual V8/Node.js shapes: 'at <method> (<file>:<line>:<column>)' or 'at <file>:<line>:<column>'. Each parsed frame needs to come out as exactly four fields: 'file', 'method', 'number', and 'column'. If a line doesn’t fit, skip it, and if nothing matches at all, return an empty array.
+
+For browser handling, one specific drop rule we do want is to silently ignore events where message === 'Script error' and line === 0, since that’s the cross-origin browser noise we talked about. For DOM descriptions, use a name fragment made from the tag plus an optional nth-child qualifier when there are siblings of the same type, include id/class in that fragment when present, and build a CSS selector path rooted at body by walking down through ancestors. Text content can be included, but if it runs long, truncate to 300 characters and append '...'. Other than id and class, attributes should stay limited to the permitted set.
+
+Also confirming delivery rules because there was some confusion there: we only send when an API key is configured, reporting is not explicitly disabled, and the environment is not 'development' or 'test'. The one override is if 'reportData' is explicitly set to true in config, in which case we still send even in development or test. Missing API key always blocks delivery no matter what. And for breadcrumbs, keep only the newest 40 records, dropping the oldest when a new one comes in after the trail is full. If breadcrumbs are enabled, sending a notice should automatically add one with message 'Honeybadger Notice', and that one counts toward the same 40-record cap. If no category is provided, default it to 'custom'.

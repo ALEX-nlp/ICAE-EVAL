@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Our package management platform needs a robust version intelligence engine that enables developers to work with software release strings and the rules that govern compatibility between them. The engine must handle the full spectrum of version formats found in the wild — numeric releases, pre-release markers, date-stamped builds, development branch names, and aliased identifiers — and convert any recognized input into a single canonical comparable form that makes ordering and equality checks reliable and consistent.
+
+Beyond normalization, the engine must support filtering a list of candidate releases against a range expression to find what is acceptable, sorting releases from oldest to newest or newest to oldest, and evaluating whether two arbitrary range rules can ever be satisfied by the same release at the same time. Range expressions themselves can be constructed from exact pins, directional comparators, wildcard slots, tilde shorthand, caret shorthand, and inclusive hyphen spans, and multiple clauses can be combined with AND or OR semantics.
+
+Error cases must be surfaced as neutral, language-agnostic category codes — never as raw exception messages — so that the surrounding tooling remains decoupled from implementation details. The system should follow the separation logic described in the internal "stability rules" module and the "branch normalization" pathway. All behavior must be exercised through a thin adapter layer that routes JSON commands to the core engine and prints plain-text results.

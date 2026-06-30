@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need to ship that foundational toolkit we've been talking about — the one that handles all those low-level building blocks so our messaging and scheduler teams stop reimplementing the same stuff over and over. you know the pain points: someone needs to grab a chunk of items from a list, or loop through things round-robin style, and everyone just rolls their own with slightly different edge case behavior and then we get bugs in prod.
+
+basically we need: ways to slice/filter sequences (think 'give me everything starting from X' or 'stop before Y'), a looping iterator that wraps around, a one-pass cursor thing, a map that can hold multiple values per key with clean removal behavior, some kind of ordering queue that doesn't scramble things when priorities match, a simple on/off gate that handles failed transitions safely (similar to how we did the auth toggle in that login flow last quarter), a rate limiter with a pluggable clock so tests aren't flaky, raw byte buffer utilities with encoding support, and a path parser that handles quoted segments.
+
+the whole thing needs to be split into separate modules — no monolithic files please, we got burned by that before. the JSON adapter approach from the previous spike should work fine for wiring it all up. edge cases matter a lot here, especially around empty inputs, wrap-around, and bad arguments. let's make sure errors come back in a clean normalized format rather than raw exceptions.

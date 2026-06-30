@@ -1,0 +1,2022 @@
+{
+  "fuzzy_prd": "# In-Memory File System Engine - Product Requirements\n\n## Project Goal\n\nBuild an in-memory file system engine that gives developers a complete, POSIX-style file system — directories, files, symbolic links, file handles, and a current working directory — living entirely in process memory. It allows developers to create, read, write, move, link, and inspect file system entities with the exact semantics of a real disk-backed file system, but without touching real storage, so tests and tooling become fast, isolated, and fully deterministic.\n\n---\n\n## Background & Problem\n\nWithout this engine, developers who want to test or simulate file system behavior are forced to write to real disk: they must pick scratch directories, clean them up, worry about cross-test pollution, tolerate slow I/O, and accept platform-specific path quirks. This leads to flaky tests, leftover temp files, and logic that is hard to exercise (symlink loops, permission-style errors, exotic path traversals) because reproducing those states on a real disk is awkward and destructive.\n\nWith this engine, the entire file tree is a programmable in-memory structure. Tests run in microseconds, every run starts from a clean root, error conditions (missing paths, link loops, non-empty directory deletes) are trivially reproducible, and behavior is identical regardless of host platform. Developers get a faithful POSIX-style contract — including byte-accurate reads/writes, link resolution, and seekable file handles — that behaves like the real thing.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a non-trivial domain (path resolution, multiple entity kinds, link following, seekable handles, error mapping). The codebase MUST be organized into clear, separated units — at minimum: a core model of the file tree and entities, a path-resolution component, the public file-system operations, and a separate execution adapter for I/O. It MUST NOT be a single \"god file\". Do not over-engineer, but reflect the real complexity in a production-grade directory layout.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases in \"Core Features\" are a **black-box contract for the execution adapter**, NOT the internal data model of the engine. The core file-system logic must be completely decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for translating JSON command programs into idiomatic calls on the core engine and rendering results.\n\n3. **Adherence to SOLID Design Principles:**\n   - **SRP:** Separate parsing, command routing, path resolution, core entity operations, and output formatting.\n   - **OCP:** Adding a new entity operation should not require rewriting existing ones.\n   - **LSP:** File, directory, and link entity types must be substitutable wherever a generic entity is expected.\n   - **ISP:** Keep entity interfaces small and cohesive (a directory listing concern is distinct from a byte-seek concern).\n   - **DIP:** High-level operations depend on an abstract file-system interface, not on the adapter or any concrete I/O.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the engine must be elegant and idiomatic to the implementation language, hiding path-resolution and link-following complexity.\n   - **Resilience:** Every failure path must be modeled as a typed error mapped to a stable, language-neutral category (see Feature 7). The engine must never crash on malformed-but-valid operations; it surfaces the proper error category instead.\n\n---\n\n## Execution Adapter Contract (shared by all features)\n\nThe execution adapter reads **one JSON object** from stdin describing a *program*, runs it against **one fresh, empty in-memory file system** rooted at `/`, and writes a **line-oriented, language-neutral result** to stdout.\n\nThe program shape is:\n\n```json\n{ \"ops\": [ { \"op\": \"<name>\", ... }, ... ] }\n```\n\nOperations execute in order against shared state. Each operation appends zero or more `key=value` lines to stdout in execution order. Paths are POSIX-style (`/`-separated, root `/`). The features below define each operation's inputs and its exact stdout lines. All of an op's observable result is expressed through these lines; there is no trailing status line.\n\nCommon output conventions:\n- Text content is emitted JSON-quoted (e.g. `[a specific error message format for non-UTF-8 bytes]hello\"`), so embedded quotes/newlines are escaped and an empty file reads as `[a specific error message format for non-UTF-8 bytes]\"`.\n- Byte sequences are emitted as comma-joined decimal byte values (e.g. `bytes=1,2,3,255`); an empty file reads as `bytes=`.\n- Entity kinds are the literal words `file`, `directory`, `link`, or `not_found`.\n- Booleans are the literal words `true` / `false`.\n- Any failure replaces the op's normal lines with a single `error=<category>` line (see Feature 7).\n\n---\n\n## Core Features\n\n### Feature 1: Directory Management\n\n**As a developer**, I want to create, list, delete, rename, navigate, and allocate temporary directories, so I can model a full directory tree in memory.\n\n**Expected Behavior / Usage:**\n\n*1.1 Create Directory — materialize a directory, optionally creating missing ancestors*\n\n`create_directory` takes a `path` and an optional `recursive` flag. When the parent already exists it creates the directory and emits `created_directory=<path>`. With `recursive: true` it also creates every missing ancestor. Creating a directory that already exists as a directory is a successful no-op. Creating a directory whose parent does not exist while `recursive` is false fails with a not-found category. `exists` with `as: \"directory\"` reports `[a specific boolean literal and response prefix]true|false`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_directory_create.json`\n\n```json\n{\n  \"description\": \"Create directories. A directory can be created at a path whose parent already exists; creating it recursively also materializes any missing ancestor directories. Creating a directory that already exists as a directory is a no-op success. The created directory's path is echoed back.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo\"}, {\"op\": \"exists\", \"path\": \"/foo\", \"as\": \"directory\"}]}, \"expected_output\": \"created_directory=/foo\\n[a specific boolean literal and response prefix]true\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/a/b/c\", \"recursive\": true}, {\"op\": \"exists\", \"path\": \"/a/b/c\", \"as\": \"directory\"}]}, \"expected_output\": \"created_directory=/a/b/c\\n[a specific boolean literal and response prefix]true\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/a/b/c\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"}\n  ]\n}\n```\n\n*1.2 List Directory — enumerate immediate or recursive children, sorted*\n\n`list` takes a `path` and optional `recursive` flag. It emits `entry_count=<n>` followed by one `entry=<kind>:<path>` line per child, where `<kind>` is `file`/`directory`/`link`. Entries are emitted in stable lexicographically sorted order. With `recursive: true`, all descendants are included. Listing a path that does not exist fails with a not-found category. An empty directory yields `entry_count=0`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_2_directory_list.json`\n\n```json\n{\n  \"description\": \"List the immediate children of a directory, or recursively list all descendants. Each entry is reported as its kind (file/directory/link) and its path. Entries are emitted in a stable, lexicographically sorted order and the total count is reported first.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/d\"}, {\"op\": \"create_file\", \"path\": \"/d/b\"}, {\"op\": \"create_file\", \"path\": \"/d/a\"}, {\"op\": \"create_directory\", \"path\": \"/d/sub\"}, {\"op\": \"list\", \"path\": \"/d\"}]}, \"expected_output\": \"created_directory=/d\\ncreated_file=/d/b\\ncreated_file=/d/a\\ncreated_directory=/d/sub\\nentry_count=3\\nentry=directory:/d/sub\\nentry=file:/d/a\\nentry=file:/d/b\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/a/b/c\", \"recursive\": true}, {\"op\": \"create_file\", \"path\": \"/a/b/c/f.txt\"}, {\"op\": \"list\", \"path\": \"/a\", \"recursive\": true}]}, \"expected_output\": \"created_directory=/a/b/c\\ncreated_file=/a/b/c/f.txt\\nentry_count=3\\nentry=directory:/a/b\\nentry=directory:/a/b/c\\nentry=file:/a/b/c/f.txt\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/empty\"}, {\"op\": \"list\", \"path\": \"/empty\"}]}, \"expected_output\": \"created_directory=/empty\\nentry_count=0\\n\"}\n  ]\n}\n```\n\n*1.3 Delete Directory — empty-only delete vs. recursive delete*\n\n`delete` with `as: \"directory\"` removes a directory and emits `deleted=<path>`. Without `recursive`, it succeeds only on an empty directory; deleting a non-empty directory fails with a directory-not-empty category. With `recursive: true` it removes the directory and all contents.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_3_directory_delete.json`\n\n```json\n{\n  \"description\": \"Delete a directory. A non-recursive delete succeeds only when the directory is empty; deleting a non-empty directory non-recursively fails with a directory-not-empty category. A recursive delete removes the directory and all of its contents. The deleted path is echoed back.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/d\"}, {\"op\": \"delete\", \"path\": \"/d\", \"as\": \"directory\"}, {\"op\": \"exists\", \"path\": \"/d\", \"as\": \"directory\"}]}, \"expected_output\": \"created_directory=/d\\ndeleted=/d\\n[a specific boolean literal and response prefix]false\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo\"}, {\"op\": \"create_file\", \"path\": \"/foo/x\"}, {\"op\": \"delete\", \"path\": \"/foo\", \"as\": \"directory\"}]}, \"expected_output\": \"created_directory=/foo\\ncreated_file=/foo/x\\nerror=directory_not_empty\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo\"}, {\"op\": \"create_file\", \"path\": \"/foo/x\"}, {\"op\": \"delete\", \"path\": \"/foo\", \"as\": \"directory\", \"recursive\": true}, {\"op\": \"exists\", \"path\": \"/foo\", \"as\": \"directory\"}]}, \"expected_output\": \"created_directory=/foo\\ncreated_file=/foo/x\\ndeleted=/foo\\n[a specific boolean literal and response prefix]false\\n\"}\n  ]\n}\n```\n\n*1.4 Rename Directory — move a directory subtree*\n\n`rename` with `as: \"directory\"` moves a directory from `from` to `to`, emitting `renamed=<to>`. Renaming a source that does not exist fails with a not-found category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_4_directory_rename.json`\n\n```json\n{\n  \"description\": \"Rename (move) a directory to a new path. Renaming onto a path whose parent does not exist fails, and renaming a source that does not exist fails, both with a not-found category. A successful rename reports the new path.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/a\"}, {\"op\": \"rename\", \"from\": \"/a\", \"to\": \"/b\", \"as\": \"directory\"}, {\"op\": \"exists\", \"path\": \"/b\", \"as\": \"directory\"}]}, \"expected_output\": \"created_directory=/a\\nrenamed=/b\\n[a specific boolean literal and response prefix]true\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"rename\", \"from\": \"/nope\", \"to\": \"/b\", \"as\": \"directory\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"}\n  ]\n}\n```\n\n*1.5 Path Navigation — parent and absolute resolution*\n\n`parent` emits `parent=<path>` for the parent directory of `path`; the parent of root `/` is `/` itself. `absolute` emits `absolute=<path>`, resolving a relative `path` against the current working directory (root by default). These are pure path computations and do not require the entity to exist.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_5_directory_navigation.json`\n\n```json\n{\n  \"description\": \"Compute structural path properties of a directory without touching storage: the parent directory of a path, and the absolute form of a relative path resolved against the current working directory. The parent of the root directory is the root itself.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"parent\", \"path\": \"/foo/bar\"}]}, \"expected_output\": \"parent=/foo\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"parent\", \"path\": \"/\"}]}, \"expected_output\": \"parent=/\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"absolute\", \"path\": \"foo\"}]}, \"expected_output\": \"absolute=/foo\\n\"}\n  ]\n}\n```\n\n*1.6 Temporary Directory — collision-free unique names*\n\n`create_temp` allocates a uniquely-named directory under a system temp area and emits `temp=<path>`. An optional `prefix` is incorporated into the generated name. Successive allocations with the same prefix receive distinct names via an incrementing suffix, so no two collide.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_6_temp_directory.json`\n\n```json\n{\n  \"description\": \"Create a uniquely-named temporary directory under a system temp area. Successive temp directories created with the same prefix receive distinct names by appending an incrementing suffix.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_temp\", \"prefix\": \"x\"}]}, \"expected_output\": \"temp=/.tmp_rand0/xrand0\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_temp\", \"prefix\": \"foo\"}, {\"op\": \"create_temp\", \"prefix\": \"foo\"}]}, \"expected_output\": \"temp=/.tmp_rand0/foorand0\\ntemp=/.tmp_rand0/foorand1\\n\"}\n  ]\n}\n```\n\n---\n\n### Feature 2: File Content I/O\n\n**As a developer**, I want to write and read file content as text, bytes, or lines, and copy/rename/measure files, so I can manipulate file data with byte-accurate fidelity.\n\n**Expected Behavior / Usage:**\n\n*2.1 Text Read/Write — write a string and read it back*\n\n`write` with a `text` field writes the UTF-8 bytes of the string (default overwrite mode) and emits `wrote_bytes=<n>` where `n` is the UTF-8 byte count. `read` (default `as: \"text\"`) emits `text=<json-quoted-content>`. `create_file` (optionally `recursive`) creates an empty file and emits `created_file=<path>`. A zero-byte file reads as `[a specific error message format for non-UTF-8 bytes]\"`. Multi-byte characters count as multiple bytes.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_file_text.json`\n\n```json\n{\n  \"description\": \"Write a string to a file and read it back as text. Writing reports the number of bytes (UTF-8 encoded) written; reading returns the JSON-quoted text content. Reading a zero-byte file yields an empty string.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo/bar.txt\", \"recursive\": true}, {\"op\": \"write\", \"path\": \"/foo/bar.txt\", \"text\": \"hello\"}, {\"op\": \"read\", \"path\": \"/foo/bar.txt\"}, {\"op\": \"length\", \"path\": \"/foo/bar.txt\"}]}, \"expected_output\": \"created_file=/foo/bar.txt\\nwrote_bytes=5\\ntext=\\\"hello\\\"\\nlength=5\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/e\"}, {\"op\": \"read\", \"path\": \"/e\"}]}, \"expected_output\": \"created_file=/e\\ntext=\\\"\\\"\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/u.txt\", \"text\": \"héllo\"}, {\"op\": \"read\", \"path\": \"/u.txt\"}, {\"op\": \"length\", \"path\": \"/u.txt\"}]}, \"expected_output\": \"wrote_bytes=6\\ntext=\\\"héllo\\\"\\nlength=6\\n\"}\n  ]\n}\n```\n\n*2.2 Byte Read/Write — write and read raw byte values*\n\n`write` with a `bytes` field (list of integer byte values) writes them verbatim and emits `wrote_bytes=<n>`. `read` with `as: \"bytes\"` emits `bytes=<comma-joined values>`. A zero-byte file reads as `bytes=` (empty).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_file_bytes.json`\n\n```json\n{\n  \"description\": \"Write a list of raw byte values to a file and read them back as bytes. The byte count is reported on write; reading returns the comma-joined byte values. A zero-byte file reads back as an empty byte sequence.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/b.bin\", \"bytes\": [1, 2, 3, 255]}, {\"op\": \"read\", \"path\": \"/b.bin\", \"as\": \"bytes\"}]}, \"expected_output\": \"wrote_bytes=4\\nbytes=1,2,3,255\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/e\"}, {\"op\": \"read\", \"path\": \"/e\", \"as\": \"bytes\"}]}, \"expected_output\": \"created_file=/e\\nbytes=\\n\"}\n  ]\n}\n```\n\n*2.3 Line Read — split content into trailing-newline-agnostic lines*\n\n`read` with `as: \"lines\"` emits `[the exact count prefix and line format]<n>` followed by one `line=<text>` per line. Line splitting is trailing-newline agnostic: a final newline does not add an empty trailing line. A zero-byte file yields `[the exact count prefix and line format]0`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_3_file_lines.json`\n\n```json\n{\n  \"description\": \"Read a file as a list of text lines. The line count is reported first, followed by each line. Line splitting is trailing-newline agnostic: a final newline does not produce an extra empty line. A zero-byte file yields zero lines.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/t.txt\", \"text\": \"a\\nb\\nc\"}, {\"op\": \"read\", \"path\": \"/t.txt\", \"as\": \"lines\"}]}, \"expected_output\": \"wrote_bytes=5\\n[the exact count prefix and line format]3\\nline=a\\nline=b\\nline=c\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/t.txt\", \"text\": \"a\\nb\\nc\\n\"}, {\"op\": \"read\", \"path\": \"/t.txt\", \"as\": \"lines\"}]}, \"expected_output\": \"wrote_bytes=6\\n[the exact count prefix and line format]3\\nline=a\\nline=b\\nline=c\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/e\"}, {\"op\": \"read\", \"path\": \"/e\", \"as\": \"lines\"}]}, \"expected_output\": \"created_file=/e\\n[the exact count prefix and line format]0\\n\"}\n  ]\n}\n```\n\n*2.4 Append vs. Overwrite — write modes*\n\n`write` defaults to overwrite mode (replaces content). With `mode: \"append\"` it preserves existing content and appends. Appending to a non-existent file creates it.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_4_file_append.json`\n\n```json\n{\n  \"description\": \"Append mode preserves existing file content and adds new content at the end, in contrast to the default write mode which overwrites. Appending to a non-existent file creates it.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/f\", \"text\": \"ab\"}, {\"op\": \"write\", \"path\": \"/f\", \"text\": \"cd\", \"mode\": \"append\"}, {\"op\": \"read\", \"path\": \"/f\"}]}, \"expected_output\": \"wrote_bytes=2\\nwrote_bytes=2\\ntext=\\\"abcd\\\"\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/f\", \"text\": \"x\", \"mode\": \"append\"}, {\"op\": \"read\", \"path\": \"/f\"}]}, \"expected_output\": \"wrote_bytes=1\\ntext=\\\"x\\\"\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/f\", \"text\": \"old\"}, {\"op\": \"write\", \"path\": \"/f\", \"text\": \"new\"}, {\"op\": \"read\", \"path\": \"/f\"}]}, \"expected_output\": \"wrote_bytes=3\\nwrote_bytes=3\\ntext=\\\"new\\\"\\n\"}\n  ]\n}\n```\n\n*2.5 File Length — measure byte size*\n\n`length` emits `length=<n>`, the byte size of the file. A newly created file has length 0; after writing N bytes it is N. Querying the length of a non-existent path fails with a not-found category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_5_file_length.json`\n\n```json\n{\n  \"description\": \"Report the byte length of a file. A newly created file has length zero; after writing N bytes the length is N. Querying the length of a path that does not exist fails with a not-found category.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/f\"}, {\"op\": \"length\", \"path\": \"/f\"}]}, \"expected_output\": \"created_file=/f\\nlength=0\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/f\", \"text\": \"hello\"}, {\"op\": \"length\", \"path\": \"/f\"}]}, \"expected_output\": \"wrote_bytes=5\\nlength=5\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"length\", \"path\": \"/nope\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"}\n  ]\n}\n```\n\n*2.6 Copy File — duplicate content to a destination*\n\n`copy` copies file content from `from` to `to`, emitting `copied=<to>`. If the destination exists as a file, its content is overwritten. Copying a non-existent source fails with a not-found category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_6_file_copy.json`\n\n```json\n{\n  \"description\": \"Copy a file's content to a destination path, returning the destination path. If the destination already exists as a file, its content is overwritten by the source's content. Copying a non-existent source fails with a not-found category.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/a\", \"text\": \"hi\"}, {\"op\": \"copy\", \"from\": \"/a\", \"to\": \"/b\"}, {\"op\": \"read\", \"path\": \"/b\"}]}, \"expected_output\": \"wrote_bytes=2\\ncopied=/b\\ntext=\\\"hi\\\"\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/a\", \"text\": \"new\"}, {\"op\": \"write\", \"path\": \"/b\", \"text\": \"old\"}, {\"op\": \"copy\", \"from\": \"/a\", \"to\": \"/b\"}, {\"op\": \"read\", \"path\": \"/b\"}]}, \"expected_output\": \"wrote_bytes=3\\nwrote_bytes=3\\ncopied=/b\\ntext=\\\"new\\\"\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"copy\", \"from\": \"/nope\", \"to\": \"/b\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"}\n  ]\n}\n```\n\n*2.7 Rename File — move a file and its content*\n\n`rename` (default `as: \"file\"`) moves a file from `from` to `to`, emitting `renamed=<to>`. The content moves and the old path no longer exists. Renaming a non-existent source fails with a not-found category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_7_file_rename.json`\n\n```json\n{\n  \"description\": \"Rename (move) a file to a new path, returning the new path. The content moves with the file and the old path no longer exists. Renaming a source that does not exist fails with a not-found category.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/a\", \"text\": \"data\"}, {\"op\": \"rename\", \"from\": \"/a\", \"to\": \"/b\"}, {\"op\": \"exists\", \"path\": \"/a\"}, {\"op\": \"read\", \"path\": \"/b\"}]}, \"expected_output\": \"wrote_bytes=4\\nrenamed=/b\\n[a specific boolean literal and response prefix]false\\ntext=\\\"data\\\"\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"rename\", \"from\": \"/nope\", \"to\": \"/b\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"}\n  ]\n}\n```\n\n---\n\n### Feature 3: Symbolic Links\n\n**As a developer**, I want to create symbolic links, read their targets, follow or not-follow them, resolve them to real paths, and unlink them, so I can model indirection and aliasing in the file tree.\n\n**Expected Behavior / Usage:**\n\n*3.1 Create Link and Read Target — record an indirection*\n\n`create_link` creates a link at `path` pointing at `target`, emitting `created_link=<path>` then `link_target=<target>`. The link stores the literal target string whether or not the target exists. `target` reads back the stored target as `target=<value>`. Creating a link where a file already exists fails with a file-exists category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_link_create_target.json`\n\n```json\n{\n  \"description\": \"Create a symbolic link pointing at a target path, and read back the stored target. The link records the literal target string regardless of whether the target exists. Creating a link at a path already occupied by a file fails with an already-exists category.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo\"}, {\"op\": \"create_link\", \"path\": \"/bar\", \"target\": \"/foo\"}, {\"op\": \"target\", \"path\": \"/bar\"}]}, \"expected_output\": \"created_file=/foo\\ncreated_link=/bar\\nlink_target=/foo\\ntarget=/foo\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_link\", \"path\": \"/l\", \"target\": \"/nope\"}, {\"op\": \"target\", \"path\": \"/l\"}]}, \"expected_output\": \"created_link=/l\\nlink_target=/nope\\ntarget=/nope\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo\"}, {\"op\": \"create_link\", \"path\": \"/foo\", \"target\": \"/bar\"}]}, \"expected_output\": \"created_file=/foo\\nerror=file_exists\\n\"}\n  ]\n}\n```\n\n*3.2 Link Following — type query with controllable follow*\n\n`type` reports the entity kind at `path` as `type=<kind>`. With `follow_links: true` a link to a file reports `type=file`; with `follow_links: false` it reports `type=link`. A link whose target chain forms a loop reports `type=not_found` when followed.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_link_type.json`\n\n```json\n{\n  \"description\": \"Determine the kind of entity at a path with link following controlled by a flag. With link-following enabled, a link to a file reports as a file; with following disabled, it reports as a link. A link whose target chain forms a loop reports as not-found when followed.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo\"}, {\"op\": \"create_link\", \"path\": \"/bar\", \"target\": \"/foo\"}, {\"op\": \"type\", \"path\": \"/bar\", \"follow_links\": true}]}, \"expected_output\": \"created_file=/foo\\ncreated_link=/bar\\nlink_target=/foo\\ntype=file\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo\"}, {\"op\": \"create_link\", \"path\": \"/bar\", \"target\": \"/foo\"}, {\"op\": \"type\", \"path\": \"/bar\", \"follow_links\": false}]}, \"expected_output\": \"created_file=/foo\\ncreated_link=/bar\\nlink_target=/foo\\ntype=link\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_link\", \"path\": \"/foo\", \"target\": \"/bar\"}, {\"op\": \"create_link\", \"path\": \"/bar\", \"target\": \"/foo\"}, {\"op\": \"type\", \"path\": \"/foo\", \"follow_links\": true}]}, \"expected_output\": \"created_link=/foo\\nlink_target=/bar\\ncreated_link=/bar\\nlink_target=/foo\\ntype=not_found\\n\"}\n  ]\n}\n```\n\n*3.3 Resolve Symbolic Links — canonicalize to a real path*\n\n`resolve` follows every link in `path` and emits `resolved=<canonical path>`. A link to a directory resolves to the directory, including when nested within a traversal. Resolving an empty path fails with a not-found category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_link_resolve.json`\n\n```json\n{\n  \"description\": \"Resolve all symbolic links in a path to its canonical real path. A link to a directory resolves to the directory's path, including when the link is nested within a traversal. Resolving an empty path fails with a not-found category.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo\"}, {\"op\": \"create_link\", \"path\": \"/bar\", \"target\": \"/foo\"}, {\"op\": \"resolve\", \"path\": \"/bar\"}]}, \"expected_output\": \"created_directory=/foo\\ncreated_link=/bar\\nlink_target=/foo\\nresolved=/foo\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo/bar\", \"recursive\": true}, {\"op\": \"create_link\", \"path\": \"/foo/baz\", \"target\": \"/foo/bar\"}, {\"op\": \"resolve\", \"path\": \"/foo/baz\"}]}, \"expected_output\": \"created_directory=/foo/bar\\ncreated_link=/foo/baz\\nlink_target=/foo/bar\\nresolved=/foo/bar\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"resolve\", \"path\": \"\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"}\n  ]\n}\n```\n\n*3.4 Unlink — delete the link without touching its target*\n\n`delete` with `as: \"link\"` removes the link only, emitting `deleted=<path>`. The former target remains intact afterward.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_4_link_delete.json`\n\n```json\n{\n  \"description\": \"Delete a symbolic link itself without affecting the entity it points to. After unlinking, the link no longer exists but its former target remains.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo\"}, {\"op\": \"create_link\", \"path\": \"/bar\", \"target\": \"/foo\"}, {\"op\": \"delete\", \"path\": \"/bar\", \"as\": \"link\"}, {\"op\": \"exists\", \"path\": \"/foo\"}, {\"op\": \"exists\", \"path\": \"/bar\", \"as\": \"link\"}]}, \"expected_output\": \"created_file=/foo\\ncreated_link=/bar\\nlink_target=/foo\\ndeleted=/bar\\n[a specific boolean literal and response prefix]true\\n[a specific boolean literal and response prefix]false\\n\"}\n  ]\n}\n```\n\n---\n\n### Feature 4: Current Working Directory\n\n**As a developer**, I want a mutable current working directory that relative paths resolve against, so I can model process-relative file access.\n\n**Expected Behavior / Usage:**\n\n`set_cwd` sets the working directory to `path` and emits `current_directory=<path>`; `cwd` reports it. After setting it, relative paths (e.g. via `absolute`) resolve against it. Setting the working directory to a non-existent path fails with a not-found category; setting it to a file fails with a not-a-directory category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_cwd.json`\n\n```json\n{\n  \"description\": \"Get and set the current working directory. Setting the working directory to an existing directory updates it and echoes the new path; relative paths passed afterward resolve against it. Setting it to a path that does not exist fails with a not-found category, and setting it to a file fails with a not-a-directory category.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo\"}, {\"op\": \"set_cwd\", \"path\": \"/foo\"}, {\"op\": \"cwd\"}]}, \"expected_output\": \"created_directory=/foo\\ncurrent_directory=/foo\\ncurrent_directory=/foo\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo\"}, {\"op\": \"set_cwd\", \"path\": \"/foo\"}, {\"op\": \"absolute\", \"path\": \"bar\"}]}, \"expected_output\": \"created_directory=/foo\\ncurrent_directory=/foo\\nabsolute=/foo/bar\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"set_cwd\", \"path\": \"/nope\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/f\"}, {\"op\": \"set_cwd\", \"path\": \"/f\"}]}, \"expected_output\": \"created_file=/f\\nerror=not_a_directory\\n\"}\n  ]\n}\n```\n\n---\n\n### Feature 5: Random Access File Handles\n\n**As a developer**, I want seekable file handles for byte-level sequential and positioned I/O, so I can read and write portions of a file without loading it whole.\n\n**Expected Behavior / Usage:**\n\nA handle is opened with `open` (`path`, `handle` name, `mode` one of `read`/`write`/`append`/`writeOnly`/`writeOnlyAppend`), emitting `opened=<path>`. Subsequent ops reference the handle by name. `raf_close` emits `closed=<handle>`.\n\n*5.1 Sequential Read/Write — append-style byte/text writes*\n\n`raf_write` writes a `text` string (or `bytes` list) at the cursor and emits `wrote_bytes=<n>`. `raf_write_byte` writes one byte `value` and emits `wrote_bytes=1`. `raf_length` emits `length=<n>` reflecting accumulated writes. After closing, the file content reflects the writes.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_1_raf_sequential.json`\n\n```json\n{\n  \"description\": \"Open a file handle and write bytes/text sequentially, then read them back. Writing reports the number of bytes written; the handle's length reflects accumulated writes. A single byte value can also be written and read back as raw bytes.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/f\"}, {\"op\": \"open\", \"path\": \"/f\", \"handle\": \"h\", \"mode\": \"write\"}, {\"op\": \"raf_write\", \"handle\": \"h\", \"text\": \"hello\"}, {\"op\": \"raf_length\", \"handle\": \"h\"}, {\"op\": \"raf_close\", \"handle\": \"h\"}, {\"op\": \"read\", \"path\": \"/f\"}]}, \"expected_output\": \"created_file=/f\\nopened=/f\\nwrote_bytes=5\\nlength=5\\nclosed=h\\ntext=\\\"hello\\\"\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/f\"}, {\"op\": \"open\", \"path\": \"/f\", \"handle\": \"h\", \"mode\": \"write\"}, {\"op\": \"raf_write_byte\", \"handle\": \"h\", \"value\": 65}, {\"op\": \"raf_close\", \"handle\": \"h\"}, {\"op\": \"read\", \"path\": \"/f\", \"as\": \"bytes\"}]}, \"expected_output\": \"created_file=/f\\nopened=/f\\nwrote_bytes=1\\nclosed=h\\nbytes=65\\n\"}\n  ]\n}\n```\n\n*5.2 Cursor Positioning — seek and positioned reads*\n\n`raf_read_byte` reads one byte and emits `read_byte=<value>`, advancing the cursor. `raf_position` emits `position=<offset>`. `raf_set_position` moves the cursor to an absolute `position` and emits the new `position=<offset>`. `raf_read` reads up to `count` bytes and emits `read_length=<n>` then `read_text=<json-quoted text>`; reading past end returns only the remaining bytes.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_2_raf_position.json`\n\n```json\n{\n  \"description\": \"A file handle tracks a read/write cursor position. Reading advances the position; the cursor can be repositioned to an absolute offset and subsequent reads start from there. Reading more bytes than remain returns only the available bytes.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/f\", \"text\": \"hello\"}, {\"op\": \"open\", \"path\": \"/f\", \"handle\": \"h\", \"mode\": \"read\"}, {\"op\": \"raf_read_byte\", \"handle\": \"h\"}, {\"op\": \"raf_position\", \"handle\": \"h\"}, {\"op\": \"raf_set_position\", \"handle\": \"h\", \"position\": 0}, {\"op\": \"raf_read\", \"handle\": \"h\", \"count\": 5}]}, \"expected_output\": \"wrote_bytes=5\\nopened=/f\\nread_byte=104\\nposition=1\\nposition=0\\nread_length=5\\nread_text=\\\"hello\\\"\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/f\", \"text\": \"hi\"}, {\"op\": \"open\", \"path\": \"/f\", \"handle\": \"h\", \"mode\": \"read\"}, {\"op\": \"raf_read\", \"handle\": \"h\", \"count\": 10}]}, \"expected_output\": \"wrote_bytes=2\\nopened=/f\\nread_length=2\\nread_text=\\\"hi\\\"\\n\"}\n  ]\n}\n```\n\n*5.3 Truncate — shrink an open handle*\n\n`raf_truncate` truncates the handle to `length` bytes (discarding content beyond it) and emits `truncated=<length>`. The truncation is visible in the file content after the handle is closed.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_3_raf_truncate.json`\n\n```json\n{\n  \"description\": \"Truncate an open file handle to a given length, discarding any content beyond that length. The file content reflects the truncation after the handle is closed.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"write\", \"path\": \"/f\", \"text\": \"hello\"}, {\"op\": \"open\", \"path\": \"/f\", \"handle\": \"h\", \"mode\": \"append\"}, {\"op\": \"raf_truncate\", \"handle\": \"h\", \"length\": 2}, {\"op\": \"raf_close\", \"handle\": \"h\"}, {\"op\": \"read\", \"path\": \"/f\"}]}, \"expected_output\": \"wrote_bytes=5\\nopened=/f\\ntruncated=2\\nclosed=h\\ntext=\\\"he\\\"\\n\"}\n  ]\n}\n```\n\n---\n\n### Feature 6: Entity Inspection\n\n**As a developer**, I want to test existence, query entity kind, and compare identity, so I can introspect the file tree without modifying it.\n\n**Expected Behavior / Usage:**\n\n*6.1 Existence — kind-aware existence test*\n\n`exists` (with optional `as` of `file`/`directory`/`link`) emits `[a specific boolean literal and response prefix]<bool>`. A link is considered to exist as a link even when its target is missing, but does not exist as a file in that case.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_exists.json`\n\n```json\n{\n  \"description\": \"Test whether an entity exists at a path, interpreted as a specific kind (file/directory/link). A link is considered to exist as a link even when its target is missing, but does not exist as a file in that case.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/f\"}, {\"op\": \"exists\", \"path\": \"/f\", \"as\": \"file\"}, {\"op\": \"exists\", \"path\": \"/nope\", \"as\": \"file\"}]}, \"expected_output\": \"created_file=/f\\n[a specific boolean literal and response prefix]true\\n[a specific boolean literal and response prefix]false\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_link\", \"path\": \"/l\", \"target\": \"/nope\"}, {\"op\": \"exists\", \"path\": \"/l\", \"as\": \"link\"}, {\"op\": \"exists\", \"path\": \"/l\", \"as\": \"file\"}]}, \"expected_output\": \"created_link=/l\\nlink_target=/nope\\n[a specific boolean literal and response prefix]true\\n[a specific boolean literal and response prefix]false\\n\"}\n  ]\n}\n```\n\n*6.2 Entity Kind — following vs. non-following kind queries*\n\n`type` (non-following at tail, or following per `follow_links`) emits `type=<kind>`. `stat_type` always follows links and emits `stat_type=<kind>` of the final target — e.g. a link to a file reports `stat_type=file`, and a missing path reports `not_found`. The root directory and ancestors of root report as directories.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_entity_type.json`\n\n```json\n{\n  \"description\": \"Report the entity kind at a path. The non-following type query reports file/directory/link/not-found at the tail of the path. The stat-based type follows links and reports the kind of the final target (e.g. a link to a file reports as a file), or not-found when nothing is there. The root directory and ancestors of root report as directories.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"stat_type\", \"path\": \"/nope\"}]}, \"expected_output\": \"stat_type=not_found\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo\"}, {\"op\": \"create_link\", \"path\": \"/bar\", \"target\": \"/foo\"}, {\"op\": \"stat_type\", \"path\": \"/bar\"}]}, \"expected_output\": \"created_file=/foo\\ncreated_link=/bar\\nlink_target=/foo\\nstat_type=file\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"type\", \"path\": \"/\"}]}, \"expected_output\": \"type=directory\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"type\", \"path\": \"/nope\"}]}, \"expected_output\": \"type=not_found\\n\"}\n  ]\n}\n```\n\n*6.3 Identity — same-object comparison*\n\n`identical` emits `identical=<bool>`, true only when `path1` and `path2` refer to the same underlying object. Comparing where an entity does not exist fails with a not-found category.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_identical.json`\n\n```json\n{\n  \"description\": \"Test whether two paths refer to the same underlying file system object. The same path compared with itself is identical; distinct files are not. Comparing paths where an entity does not exist fails with a not-found category.\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/a\"}, {\"op\": \"create_file\", \"path\": \"/b\"}, {\"op\": \"identical\", \"path1\": \"/a\", \"path2\": \"/a\"}, {\"op\": \"identical\", \"path1\": \"/a\", \"path2\": \"/b\"}]}, \"expected_output\": \"created_file=/a\\ncreated_file=/b\\nidentical=true\\nidentical=false\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"identical\", \"path1\": \"/a\", \"path2\": \"/b\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"}\n  ]\n}\n```\n\n---\n\n### Feature 7: Error Normalization\n\n**As a developer**, I want every failure surfaced as a stable, language-neutral category, so my error handling is portable and never depends on host-runtime exception details.\n\n**Expected Behavior / Usage:**\n\nWhen any operation fails, its normal output lines are replaced by a single `error=<category>` line. Categories are POSIX-style and language-neutral; they never expose host-language exception types, message suffixes, or object renderings. The defined categories include: `no_such_file_or_directory` (missing path), `is_a_directory` (a file-content operation aimed at a directory), `not_a_directory` (a directory operation aimed at a file, or traversing through a file), `file_exists` (creating over an existing entity), `directory_not_empty` (non-recursive delete of a populated directory), and `unknown_operation` (an unrecognized op name). Other POSIX categories (e.g. `too_many_symbolic_links`, `bad_file_descriptor`, `invalid_argument`) follow the same `error=<category>` convention.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_error_normalization.json`\n\n```json\n{\n  \"description\": \"All failures are surfaced as language-neutral POSIX-style error categories on an `error=` line, never as host-language exception artifacts. Categories include not-found (missing path), is-a-directory (file operation targeting a directory), not-a-directory (directory operation targeting a file), file-exists (creating over an existing entity), and directory-not-empty (non-recursive delete of a populated directory).\",\n  \"cases\": [\n    {\"input\": {\"ops\": [{\"op\": \"read\", \"path\": \"/nope.txt\"}]}, \"expected_output\": \"error=no_such_file_or_directory\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo\"}, {\"op\": \"read\", \"path\": \"/foo\"}]}, \"expected_output\": \"created_directory=/foo\\nerror=is_a_directory\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo\"}, {\"op\": \"create_directory\", \"path\": \"/foo\"}]}, \"expected_output\": \"created_file=/foo\\nerror=not_a_directory\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_file\", \"path\": \"/foo\"}, {\"op\": \"create_link\", \"path\": \"/foo\", \"target\": \"/bar\"}]}, \"expected_output\": \"created_file=/foo\\nerror=file_exists\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"create_directory\", \"path\": \"/foo\"}, {\"op\": \"create_file\", \"path\": \"/foo/x\"}, {\"op\": \"delete\", \"path\": \"/foo\", \"as\": \"directory\"}]}, \"expected_output\": \"created_directory=/foo\\ncreated_file=/foo/x\\nerror=directory_not_empty\\n\"},\n    {\"input\": {\"ops\": [{\"op\": \"frobnicate\"}]}, \"expected_output\": \"error=unknown_operation\\n\"}\n  ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured in-memory file system engine implementing the features above — directory/file/link entities, path resolution with link following, seekable file handles, a mutable working directory, and typed errors. Its physical structure MUST follow the \"Scale-Driven Code Organization\" constraint: a multi-file layout separating the core model, path resolution, operations, and the execution adapter.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON program object from stdin, runs its `ops` in order against one fresh in-memory file system, and prints the line-oriented contract to stdout exactly as specified per leaf feature. The adapter owns all stdout formatting and error normalization (translating native errors into `error=<category>` lines); it must be logically and physically separated from the core engine.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to choose the directory (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_1_directory_create.json` under `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_1_directory_create@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` contains **only** the raw stdout of the program under test (no PASS/FAIL or metadata), so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the exact quoting convention used by the 'read' operation for text output\n- inspect the codebase for the default 'mode' flag behavior when explicitly omitted during the 'write' operation\n",
+  "oracle_data": {
+    "task_id": "dart-archive__file.dart-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C032",
+        "trigger_keywords": [
+          "how does it handle non-UTF-8 characters?",
+          "what error message for invalid encoding?",
+          "escape sequence format for special chars?"
+        ],
+        "oracle_response": "The exact JSON string representation with unescaped backslash sequences (e.g., 'text=\"\\\\u00e9\"')"
+      },
+      {
+        "constraint_id": "C029",
+        "trigger_keywords": [
+          "what is the exact response format?",
+          "true or false response?",
+          "prefix for boolean response?"
+        ],
+        "oracle_response": "Emits 'exists=true' or 'exists=false' where 'exists=' is the prefix and the value is strictly lowercase true or false."
+      },
+      {
+        "constraint_id": "C017",
+        "trigger_keywords": [
+          "how many lines reported?",
+          "line prefix format?",
+          "count variable name?"
+        ],
+        "oracle_response": "Emits 'line_count=N' followed by 'line=content' where N is an integer count and line content is the stripped line string."
+      },
+      {
+        "constraint_id": "TC_feature1_1_directory_create",
+        "trigger_keywords": [
+          "test cases for feature1 1 directory create",
+          "show me feature1 1 directory create test cases",
+          "what are the feature1 1 directory create inputs and outputs",
+          "give me the feature1_1_directory_create test file",
+          "feature1 1 directory create expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_directory_create:\n{\n  \"description\": \"Create directories. A directory can be created at a path whose parent already exists; creating it recursively also materializes any missing ancestor directories. Creating a directory that already exists as a directory is a no-op success. The created directory's path is echoed back.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/foo\",\n            \"as\": \"directory\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_directory=/foo\\nexists=true\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/a/b/c\",\n            \"recursive\": true\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/a/b/c\",\n            \"as\": \"directory\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_directory=/a/b/c\\nexists=true\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/a/b/c\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=no_such_file_or_directory\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_directory_delete",
+        "trigger_keywords": [
+          "test cases for feature1 3 directory delete",
+          "show me feature1 3 directory delete test cases",
+          "what are the feature1 3 directory delete inputs and outputs",
+          "give me the feature1_3_directory_delete test file",
+          "feature1 3 directory delete expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_directory_delete:\n{\n  \"description\": \"Delete a directory. A non-recursive delete succeeds only when the directory is empty; deleting a non-empty directory non-recursively fails with a directory-not-empty category. A recursive delete removes the directory and all of its contents. The deleted path is echoed back.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/d\"\n          },\n          {\n            \"op\": \"delete\",\n            \"path\": \"/d\",\n            \"as\": \"directory\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/d\",\n            \"as\": \"directory\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_directory=/d\\ndeleted=/d\\nexists=false\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo/x\"\n          },\n          {\n            \"op\": \"delete\",\n            \"path\": \"/foo\",\n            \"as\": \"directory\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_directory=/foo\\ncreated_file=/foo/x\\nerror=directory_not_empty\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo/x\"\n          },\n          {\n            \"op\": \"delete\",\n            \"path\": \"/foo\",\n            \"as\": \"directory\",\n            \"recursive\": true\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/foo\",\n            \"as\": \"directory\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_directory=/foo\\ncreated_file=/foo/x\\ndeleted=/foo\\nexists=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_4_directory_rename",
+        "trigger_keywords": [
+          "test cases for feature1 4 directory rename",
+          "show me feature1 4 directory rename test cases",
+          "what are the feature1 4 directory rename inputs and outputs",
+          "give me the feature1_4_directory_rename test file",
+          "feature1 4 directory rename expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_4_directory_rename:\n{\n  \"description\": \"Rename (move) a directory to a new path. Renaming onto a path whose parent does not exist fails, and renaming a source that does not exist fails, both with a not-found category. A successful rename reports the new path.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/a\"\n          },\n          {\n            \"op\": \"rename\",\n            \"from\": \"/a\",\n            \"to\": \"/b\",\n            \"as\": \"directory\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/b\",\n            \"as\": \"directory\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_directory=/a\\nrenamed=/b\\nexists=true\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"rename\",\n            \"from\": \"/nope\",\n            \"to\": \"/b\",\n            \"as\": \"directory\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=no_such_file_or_directory\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_file_text",
+        "trigger_keywords": [
+          "test cases for feature2 1 file text",
+          "show me feature2 1 file text test cases",
+          "what are the feature2 1 file text inputs and outputs",
+          "give me the feature2_1_file_text test file",
+          "feature2 1 file text expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_file_text:\n{\n  \"description\": \"Write a string to a file and read it back as text. Writing reports the number of bytes (UTF-8 encoded) written; reading returns the JSON-quoted text content. Reading a zero-byte file yields an empty string.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo/bar.txt\",\n            \"recursive\": true\n          },\n          {\n            \"op\": \"write\",\n            \"path\": \"/foo/bar.txt\",\n            \"text\": \"hello\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/foo/bar.txt\"\n          },\n          {\n            \"op\": \"length\",\n            \"path\": \"/foo/bar.txt\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/foo/bar.txt\\nwrote_bytes=5\\ntext=\\\"hello\\\"\\nlength=5\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/e\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/e\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/e\\ntext=\\\"\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/u.txt\",\n            \"text\": \"héllo\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/u.txt\"\n          },\n          {\n            \"op\": \"length\",\n            \"path\": \"/u.txt\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=6\\ntext=\\\"héllo\\\"\\nlength=6\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_file_bytes",
+        "trigger_keywords": [
+          "test cases for feature2 2 file bytes",
+          "show me feature2 2 file bytes test cases",
+          "what are the feature2 2 file bytes inputs and outputs",
+          "give me the feature2_2_file_bytes test file",
+          "feature2 2 file bytes expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_file_bytes:\n{\n  \"description\": \"Write a list of raw byte values to a file and read them back as bytes. The byte count is reported on write; reading returns the comma-joined byte values. A zero-byte file reads back as an empty byte sequence.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/b.bin\",\n            \"bytes\": [\n              1,\n              2,\n              3,\n              255\n            ]\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/b.bin\",\n            \"as\": \"bytes\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=4\\nbytes=1,2,3,255\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/e\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/e\",\n            \"as\": \"bytes\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/e\\nbytes=\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_file_lines",
+        "trigger_keywords": [
+          "test cases for feature2 3 file lines",
+          "show me feature2 3 file lines test cases",
+          "what are the feature2 3 file lines inputs and outputs",
+          "give me the feature2_3_file_lines test file",
+          "feature2 3 file lines expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_file_lines:\n{\n  \"description\": \"Read a file as a list of text lines. The line count is reported first, followed by each line. Line splitting is trailing-newline agnostic: a final newline does not produce an extra empty line. A zero-byte file yields zero lines.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/t.txt\",\n            \"text\": \"a\\nb\\nc\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/t.txt\",\n            \"as\": \"lines\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=5\\nline_count=3\\nline=a\\nline=b\\nline=c\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/t.txt\",\n            \"text\": \"a\\nb\\nc\\n\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/t.txt\",\n            \"as\": \"lines\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=6\\nline_count=3\\nline=a\\nline=b\\nline=c\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/e\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/e\",\n            \"as\": \"lines\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/e\\nline_count=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_4_file_append",
+        "trigger_keywords": [
+          "test cases for feature2 4 file append",
+          "show me feature2 4 file append test cases",
+          "what are the feature2 4 file append inputs and outputs",
+          "give me the feature2_4_file_append test file",
+          "feature2 4 file append expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_4_file_append:\n{\n  \"description\": \"Append mode preserves existing file content and adds new content at the end, in contrast to the default write mode which overwrites. Appending to a non-existent file creates it.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/f\",\n            \"text\": \"ab\"\n          },\n          {\n            \"op\": \"write\",\n            \"path\": \"/f\",\n            \"text\": \"cd\",\n            \"mode\": \"append\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/f\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=2\\nwrote_bytes=2\\ntext=\\\"abcd\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/f\",\n            \"text\": \"x\",\n            \"mode\": \"append\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/f\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=1\\ntext=\\\"x\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/f\",\n            \"text\": \"old\"\n          },\n          {\n            \"op\": \"write\",\n            \"path\": \"/f\",\n            \"text\": \"new\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/f\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=3\\nwrote_bytes=3\\ntext=\\\"new\\\"\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_6_file_copy",
+        "trigger_keywords": [
+          "test cases for feature2 6 file copy",
+          "show me feature2 6 file copy test cases",
+          "what are the feature2 6 file copy inputs and outputs",
+          "give me the feature2_6_file_copy test file",
+          "feature2 6 file copy expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_6_file_copy:\n{\n  \"description\": \"Copy a file's content to a destination path, returning the destination path. If the destination already exists as a file, its content is overwritten by the source's content. Copying a non-existent source fails with a not-found category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/a\",\n            \"text\": \"hi\"\n          },\n          {\n            \"op\": \"copy\",\n            \"from\": \"/a\",\n            \"to\": \"/b\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/b\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=2\\ncopied=/b\\ntext=\\\"hi\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/a\",\n            \"text\": \"new\"\n          },\n          {\n            \"op\": \"write\",\n            \"path\": \"/b\",\n            \"text\": \"old\"\n          },\n          {\n            \"op\": \"copy\",\n            \"from\": \"/a\",\n            \"to\": \"/b\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/b\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=3\\nwrote_bytes=3\\ncopied=/b\\ntext=\\\"new\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"copy\",\n            \"from\": \"/nope\",\n            \"to\": \"/b\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=no_such_file_or_directory\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_7_file_rename",
+        "trigger_keywords": [
+          "test cases for feature2 7 file rename",
+          "show me feature2 7 file rename test cases",
+          "what are the feature2 7 file rename inputs and outputs",
+          "give me the feature2_7_file_rename test file",
+          "feature2 7 file rename expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_7_file_rename:\n{\n  \"description\": \"Rename (move) a file to a new path, returning the new path. The content moves with the file and the old path no longer exists. Renaming a source that does not exist fails with a not-found category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/a\",\n            \"text\": \"data\"\n          },\n          {\n            \"op\": \"rename\",\n            \"from\": \"/a\",\n            \"to\": \"/b\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/a\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/b\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=4\\nrenamed=/b\\nexists=false\\ntext=\\\"data\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"rename\",\n            \"from\": \"/nope\",\n            \"to\": \"/b\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=no_such_file_or_directory\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_link_create_target",
+        "trigger_keywords": [
+          "test cases for feature3 1 link create target",
+          "show me feature3 1 link create target test cases",
+          "what are the feature3 1 link create target inputs and outputs",
+          "give me the feature3_1_link_create_target test file",
+          "feature3 1 link create target expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_link_create_target:\n{\n  \"description\": \"Create a symbolic link pointing at a target path, and read back the stored target. The link records the literal target string regardless of whether the target exists. Creating a link at a path already occupied by a file fails with an already-exists category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"create_link\",\n            \"path\": \"/bar\",\n            \"target\": \"/foo\"\n          },\n          {\n            \"op\": \"target\",\n            \"path\": \"/bar\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/foo\\ncreated_link=/bar\\nlink_target=/foo\\ntarget=/foo\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_link\",\n            \"path\": \"/l\",\n            \"target\": \"/nope\"\n          },\n          {\n            \"op\": \"target\",\n            \"path\": \"/l\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_link=/l\\nlink_target=/nope\\ntarget=/nope\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"create_link\",\n            \"path\": \"/foo\",\n            \"target\": \"/bar\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/foo\\nerror=file_exists\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_4_link_delete",
+        "trigger_keywords": [
+          "test cases for feature3 4 link delete",
+          "show me feature3 4 link delete test cases",
+          "what are the feature3 4 link delete inputs and outputs",
+          "give me the feature3_4_link_delete test file",
+          "feature3 4 link delete expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_4_link_delete:\n{\n  \"description\": \"Delete a symbolic link itself without affecting the entity it points to. After unlinking, the link no longer exists but its former target remains.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"create_link\",\n            \"path\": \"/bar\",\n            \"target\": \"/foo\"\n          },\n          {\n            \"op\": \"delete\",\n            \"path\": \"/bar\",\n            \"as\": \"link\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/bar\",\n            \"as\": \"link\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/foo\\ncreated_link=/bar\\nlink_target=/foo\\ndeleted=/bar\\nexists=true\\nexists=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_raf_sequential",
+        "trigger_keywords": [
+          "test cases for feature5 1 raf sequential",
+          "show me feature5 1 raf sequential test cases",
+          "what are the feature5 1 raf sequential inputs and outputs",
+          "give me the feature5_1_raf_sequential test file",
+          "feature5 1 raf sequential expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_raf_sequential:\n{\n  \"description\": \"Open a file handle and write bytes/text sequentially, then read them back. Writing reports the number of bytes written; the handle's length reflects accumulated writes. A single byte value can also be written and read back as raw bytes.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/f\"\n          },\n          {\n            \"op\": \"open\",\n            \"path\": \"/f\",\n            \"handle\": \"h\",\n            \"mode\": \"write\"\n          },\n          {\n            \"op\": \"raf_write\",\n            \"handle\": \"h\",\n            \"text\": \"hello\"\n          },\n          {\n            \"op\": \"raf_length\",\n            \"handle\": \"h\"\n          },\n          {\n            \"op\": \"raf_close\",\n            \"handle\": \"h\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/f\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/f\\nopened=/f\\nwrote_bytes=5\\nlength=5\\nclosed=h\\ntext=\\\"hello\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/f\"\n          },\n          {\n            \"op\": \"open\",\n            \"path\": \"/f\",\n            \"handle\": \"h\",\n            \"mode\": \"write\"\n          },\n          {\n            \"op\": \"raf_write_byte\",\n            \"handle\": \"h\",\n            \"value\": 65\n          },\n          {\n            \"op\": \"raf_close\",\n            \"handle\": \"h\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/f\",\n            \"as\": \"bytes\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/f\\nopened=/f\\nwrote_bytes=1\\nclosed=h\\nbytes=65\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_raf_position",
+        "trigger_keywords": [
+          "test cases for feature5 2 raf position",
+          "show me feature5 2 raf position test cases",
+          "what are the feature5 2 raf position inputs and outputs",
+          "give me the feature5_2_raf_position test file",
+          "feature5 2 raf position expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_raf_position:\n{\n  \"description\": \"A file handle tracks a read/write cursor position. Reading advances the position; the cursor can be repositioned to an absolute offset and subsequent reads start from there. Reading more bytes than remain returns only the available bytes.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/f\",\n            \"text\": \"hello\"\n          },\n          {\n            \"op\": \"open\",\n            \"path\": \"/f\",\n            \"handle\": \"h\",\n            \"mode\": \"read\"\n          },\n          {\n            \"op\": \"raf_read_byte\",\n            \"handle\": \"h\"\n          },\n          {\n            \"op\": \"raf_position\",\n            \"handle\": \"h\"\n          },\n          {\n            \"op\": \"raf_set_position\",\n            \"handle\": \"h\",\n            \"position\": 0\n          },\n          {\n            \"op\": \"raf_read\",\n            \"handle\": \"h\",\n            \"count\": 5\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=5\\nopened=/f\\nread_byte=104\\nposition=1\\nposition=0\\nread_length=5\\nread_text=\\\"hello\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/f\",\n            \"text\": \"hi\"\n          },\n          {\n            \"op\": \"open\",\n            \"path\": \"/f\",\n            \"handle\": \"h\",\n            \"mode\": \"read\"\n          },\n          {\n            \"op\": \"raf_read\",\n            \"handle\": \"h\",\n            \"count\": 10\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=2\\nopened=/f\\nread_length=2\\nread_text=\\\"hi\\\"\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_3_raf_truncate",
+        "trigger_keywords": [
+          "test cases for feature5 3 raf truncate",
+          "show me feature5 3 raf truncate test cases",
+          "what are the feature5 3 raf truncate inputs and outputs",
+          "give me the feature5_3_raf_truncate test file",
+          "feature5 3 raf truncate expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_3_raf_truncate:\n{\n  \"description\": \"Truncate an open file handle to a given length, discarding any content beyond that length. The file content reflects the truncation after the handle is closed.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"write\",\n            \"path\": \"/f\",\n            \"text\": \"hello\"\n          },\n          {\n            \"op\": \"open\",\n            \"path\": \"/f\",\n            \"handle\": \"h\",\n            \"mode\": \"append\"\n          },\n          {\n            \"op\": \"raf_truncate\",\n            \"handle\": \"h\",\n            \"length\": 2\n          },\n          {\n            \"op\": \"raf_close\",\n            \"handle\": \"h\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/f\"\n          }\n        ]\n      },\n      \"expected_output\": \"wrote_bytes=5\\nopened=/f\\ntruncated=2\\nclosed=h\\ntext=\\\"he\\\"\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_exists",
+        "trigger_keywords": [
+          "test cases for feature6 1 exists",
+          "show me feature6 1 exists test cases",
+          "what are the feature6 1 exists inputs and outputs",
+          "give me the feature6_1_exists test file",
+          "feature6 1 exists expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_exists:\n{\n  \"description\": \"Test whether an entity exists at a path, interpreted as a specific kind (file/directory/link). A link is considered to exist as a link even when its target is missing, but does not exist as a file in that case.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/f\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/f\",\n            \"as\": \"file\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/nope\",\n            \"as\": \"file\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/f\\nexists=true\\nexists=false\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_link\",\n            \"path\": \"/l\",\n            \"target\": \"/nope\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/l\",\n            \"as\": \"link\"\n          },\n          {\n            \"op\": \"exists\",\n            \"path\": \"/l\",\n            \"as\": \"file\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_link=/l\\nlink_target=/nope\\nexists=true\\nexists=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_error_normalization",
+        "trigger_keywords": [
+          "test cases for feature7 error normalization",
+          "show me feature7 error normalization test cases",
+          "what are the feature7 error normalization inputs and outputs",
+          "give me the feature7_error_normalization test file",
+          "feature7 error normalization expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_error_normalization:\n{\n  \"description\": \"All failures are surfaced as language-neutral POSIX-style error categories on an `error=` line, never as host-language exception artifacts. Categories include not-found (missing path), is-a-directory (file operation targeting a directory), not-a-directory (directory operation targeting a file), file-exists (creating over an existing entity), and directory-not-empty (non-recursive delete of a populated directory).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"read\",\n            \"path\": \"/nope.txt\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=no_such_file_or_directory\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"read\",\n            \"path\": \"/foo\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_directory=/foo\\nerror=is_a_directory\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/foo\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/foo\\nerror=not_a_directory\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"create_link\",\n            \"path\": \"/foo\",\n            \"target\": \"/bar\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_file=/foo\\nerror=file_exists\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"create_directory\",\n            \"path\": \"/foo\"\n          },\n          {\n            \"op\": \"create_file\",\n            \"path\": \"/foo/x\"\n          },\n          {\n            \"op\": \"delete\",\n            \"path\": \"/foo\",\n            \"as\": \"directory\"\n          }\n        ]\n      },\n      \"expected_output\": \"created_directory=/foo\\ncreated_file=/foo/x\\nerror=directory_not_empty\\n\"\n    },\n    {\n      \"input\": {\n        \"ops\": [\n          {\n            \"op\": \"frobnicate\"\n          }\n        ]\n      },\n      \"expected_output\": \"error=unknown_operation\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the exact quoting convention used by the 'read' operation for text output",
+        "actual_meaning": "JSON double-quoted string (e.g., \"hello\")"
+      },
+      {
+        "vague_reference": "inspect the codebase for the default 'mode' flag behavior when explicitly omitted during the 'write' operation",
+        "actual_meaning": "Defaulting to 'overwrite' mode when 'mode' is absent"
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_directory_create.json": {
+      "description": "Create directories. A directory can be created at a path whose parent already exists; creating it recursively also materializes any missing ancestor directories. Creating a directory that already exists as a directory is a no-op success. The created directory's path is echoed back.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              },
+              {
+                "op": "exists",
+                "path": "/foo",
+                "as": "directory"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo\nexists=true\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/a/b/c",
+                "recursive": true
+              },
+              {
+                "op": "exists",
+                "path": "/a/b/c",
+                "as": "directory"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/a/b/c\nexists=true\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/a/b/c"
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        }
+      ]
+    },
+    "feature1_2_directory_list.json": {
+      "description": "List the immediate children of a directory, or recursively list all descendants. Each entry is reported as its kind (file/directory/link) and its path. Entries are emitted in a stable, lexicographically sorted order and the total count is reported first.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/d"
+              },
+              {
+                "op": "create_file",
+                "path": "/d/b"
+              },
+              {
+                "op": "create_file",
+                "path": "/d/a"
+              },
+              {
+                "op": "create_directory",
+                "path": "/d/sub"
+              },
+              {
+                "op": "list",
+                "path": "/d"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/d\ncreated_file=/d/b\ncreated_file=/d/a\ncreated_directory=/d/sub\nentry_count=3\nentry=directory:/d/sub\nentry=file:/d/a\nentry=file:/d/b\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/a/b/c",
+                "recursive": true
+              },
+              {
+                "op": "create_file",
+                "path": "/a/b/c/f.txt"
+              },
+              {
+                "op": "list",
+                "path": "/a",
+                "recursive": true
+              }
+            ]
+          },
+          "expected_output": "created_directory=/a/b/c\ncreated_file=/a/b/c/f.txt\nentry_count=3\nentry=directory:/a/b\nentry=directory:/a/b/c\nentry=file:/a/b/c/f.txt\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/empty"
+              },
+              {
+                "op": "list",
+                "path": "/empty"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/empty\nentry_count=0\n"
+        }
+      ]
+    },
+    "feature1_3_directory_delete.json": {
+      "description": "Delete a directory. A non-recursive delete succeeds only when the directory is empty; deleting a non-empty directory non-recursively fails with a directory-not-empty category. A recursive delete removes the directory and all of its contents. The deleted path is echoed back.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/d"
+              },
+              {
+                "op": "delete",
+                "path": "/d",
+                "as": "directory"
+              },
+              {
+                "op": "exists",
+                "path": "/d",
+                "as": "directory"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/d\ndeleted=/d\nexists=false\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              },
+              {
+                "op": "create_file",
+                "path": "/foo/x"
+              },
+              {
+                "op": "delete",
+                "path": "/foo",
+                "as": "directory"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo\ncreated_file=/foo/x\nerror=directory_not_empty\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              },
+              {
+                "op": "create_file",
+                "path": "/foo/x"
+              },
+              {
+                "op": "delete",
+                "path": "/foo",
+                "as": "directory",
+                "recursive": true
+              },
+              {
+                "op": "exists",
+                "path": "/foo",
+                "as": "directory"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo\ncreated_file=/foo/x\ndeleted=/foo\nexists=false\n"
+        }
+      ]
+    },
+    "feature1_4_directory_rename.json": {
+      "description": "Rename (move) a directory to a new path. Renaming onto a path whose parent does not exist fails, and renaming a source that does not exist fails, both with a not-found category. A successful rename reports the new path.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/a"
+              },
+              {
+                "op": "rename",
+                "from": "/a",
+                "to": "/b",
+                "as": "directory"
+              },
+              {
+                "op": "exists",
+                "path": "/b",
+                "as": "directory"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/a\nrenamed=/b\nexists=true\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "rename",
+                "from": "/nope",
+                "to": "/b",
+                "as": "directory"
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        }
+      ]
+    },
+    "feature1_5_directory_navigation.json": {
+      "description": "Compute structural path properties of a directory without touching storage: the parent directory of a path, and the absolute form of a relative path resolved against the current working directory. The parent of the root directory is the root itself.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "parent",
+                "path": "/foo/bar"
+              }
+            ]
+          },
+          "expected_output": "parent=/foo\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "parent",
+                "path": "/"
+              }
+            ]
+          },
+          "expected_output": "parent=/\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "absolute",
+                "path": "foo"
+              }
+            ]
+          },
+          "expected_output": "absolute=/foo\n"
+        }
+      ]
+    },
+    "feature1_6_temp_directory.json": {
+      "description": "Create a uniquely-named temporary directory under a system temp area. Successive temp directories created with the same prefix receive distinct names by appending an incrementing suffix.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_temp",
+                "prefix": "x"
+              }
+            ]
+          },
+          "expected_output": "temp=/.tmp_rand0/xrand0\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_temp",
+                "prefix": "foo"
+              },
+              {
+                "op": "create_temp",
+                "prefix": "foo"
+              }
+            ]
+          },
+          "expected_output": "temp=/.tmp_rand0/foorand0\ntemp=/.tmp_rand0/foorand1\n"
+        }
+      ]
+    },
+    "feature2_1_file_text.json": {
+      "description": "Write a string to a file and read it back as text. Writing reports the number of bytes (UTF-8 encoded) written; reading returns the JSON-quoted text content. Reading a zero-byte file yields an empty string.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo/bar.txt",
+                "recursive": true
+              },
+              {
+                "op": "write",
+                "path": "/foo/bar.txt",
+                "text": "hello"
+              },
+              {
+                "op": "read",
+                "path": "/foo/bar.txt"
+              },
+              {
+                "op": "length",
+                "path": "/foo/bar.txt"
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo/bar.txt\nwrote_bytes=5\ntext=\"hello\"\nlength=5\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/e"
+              },
+              {
+                "op": "read",
+                "path": "/e"
+              }
+            ]
+          },
+          "expected_output": "created_file=/e\ntext=\"\"\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/u.txt",
+                "text": "héllo"
+              },
+              {
+                "op": "read",
+                "path": "/u.txt"
+              },
+              {
+                "op": "length",
+                "path": "/u.txt"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=6\ntext=\"héllo\"\nlength=6\n"
+        }
+      ]
+    },
+    "feature2_2_file_bytes.json": {
+      "description": "Write a list of raw byte values to a file and read them back as bytes. The byte count is reported on write; reading returns the comma-joined byte values. A zero-byte file reads back as an empty byte sequence.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/b.bin",
+                "bytes": [
+                  1,
+                  2,
+                  3,
+                  255
+                ]
+              },
+              {
+                "op": "read",
+                "path": "/b.bin",
+                "as": "bytes"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=4\nbytes=1,2,3,255\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/e"
+              },
+              {
+                "op": "read",
+                "path": "/e",
+                "as": "bytes"
+              }
+            ]
+          },
+          "expected_output": "created_file=/e\nbytes=\n"
+        }
+      ]
+    },
+    "feature2_3_file_lines.json": {
+      "description": "Read a file as a list of text lines. The line count is reported first, followed by each line. Line splitting is trailing-newline agnostic: a final newline does not produce an extra empty line. A zero-byte file yields zero lines.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/t.txt",
+                "text": "a\nb\nc"
+              },
+              {
+                "op": "read",
+                "path": "/t.txt",
+                "as": "lines"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=5\nline_count=3\nline=a\nline=b\nline=c\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/t.txt",
+                "text": "a\nb\nc\n"
+              },
+              {
+                "op": "read",
+                "path": "/t.txt",
+                "as": "lines"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=6\nline_count=3\nline=a\nline=b\nline=c\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/e"
+              },
+              {
+                "op": "read",
+                "path": "/e",
+                "as": "lines"
+              }
+            ]
+          },
+          "expected_output": "created_file=/e\nline_count=0\n"
+        }
+      ]
+    },
+    "feature2_4_file_append.json": {
+      "description": "Append mode preserves existing file content and adds new content at the end, in contrast to the default write mode which overwrites. Appending to a non-existent file creates it.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "ab"
+              },
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "cd",
+                "mode": "append"
+              },
+              {
+                "op": "read",
+                "path": "/f"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=2\nwrote_bytes=2\ntext=\"abcd\"\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "x",
+                "mode": "append"
+              },
+              {
+                "op": "read",
+                "path": "/f"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=1\ntext=\"x\"\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "old"
+              },
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "new"
+              },
+              {
+                "op": "read",
+                "path": "/f"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=3\nwrote_bytes=3\ntext=\"new\"\n"
+        }
+      ]
+    },
+    "feature2_5_file_length.json": {
+      "description": "Report the byte length of a file. A newly created file has length zero; after writing N bytes the length is N. Querying the length of a path that does not exist fails with a not-found category.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/f"
+              },
+              {
+                "op": "length",
+                "path": "/f"
+              }
+            ]
+          },
+          "expected_output": "created_file=/f\nlength=0\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "hello"
+              },
+              {
+                "op": "length",
+                "path": "/f"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=5\nlength=5\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "length",
+                "path": "/nope"
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        }
+      ]
+    },
+    "feature2_6_file_copy.json": {
+      "description": "Copy a file's content to a destination path, returning the destination path. If the destination already exists as a file, its content is overwritten by the source's content. Copying a non-existent source fails with a not-found category.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/a",
+                "text": "hi"
+              },
+              {
+                "op": "copy",
+                "from": "/a",
+                "to": "/b"
+              },
+              {
+                "op": "read",
+                "path": "/b"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=2\ncopied=/b\ntext=\"hi\"\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/a",
+                "text": "new"
+              },
+              {
+                "op": "write",
+                "path": "/b",
+                "text": "old"
+              },
+              {
+                "op": "copy",
+                "from": "/a",
+                "to": "/b"
+              },
+              {
+                "op": "read",
+                "path": "/b"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=3\nwrote_bytes=3\ncopied=/b\ntext=\"new\"\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "copy",
+                "from": "/nope",
+                "to": "/b"
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        }
+      ]
+    },
+    "feature2_7_file_rename.json": {
+      "description": "Rename (move) a file to a new path, returning the new path. The content moves with the file and the old path no longer exists. Renaming a source that does not exist fails with a not-found category.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/a",
+                "text": "data"
+              },
+              {
+                "op": "rename",
+                "from": "/a",
+                "to": "/b"
+              },
+              {
+                "op": "exists",
+                "path": "/a"
+              },
+              {
+                "op": "read",
+                "path": "/b"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=4\nrenamed=/b\nexists=false\ntext=\"data\"\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "rename",
+                "from": "/nope",
+                "to": "/b"
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        }
+      ]
+    },
+    "feature3_1_link_create_target.json": {
+      "description": "Create a symbolic link pointing at a target path, and read back the stored target. The link records the literal target string regardless of whether the target exists. Creating a link at a path already occupied by a file fails with an already-exists category.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo"
+              },
+              {
+                "op": "create_link",
+                "path": "/bar",
+                "target": "/foo"
+              },
+              {
+                "op": "target",
+                "path": "/bar"
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo\ncreated_link=/bar\nlink_target=/foo\ntarget=/foo\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_link",
+                "path": "/l",
+                "target": "/nope"
+              },
+              {
+                "op": "target",
+                "path": "/l"
+              }
+            ]
+          },
+          "expected_output": "created_link=/l\nlink_target=/nope\ntarget=/nope\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo"
+              },
+              {
+                "op": "create_link",
+                "path": "/foo",
+                "target": "/bar"
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo\nerror=file_exists\n"
+        }
+      ]
+    },
+    "feature3_2_link_type.json": {
+      "description": "Determine the kind of entity at a path with link following controlled by a flag. With link-following enabled, a link to a file reports as a file; with following disabled, it reports as a link. A link whose target chain forms a loop reports as not-found when followed.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo"
+              },
+              {
+                "op": "create_link",
+                "path": "/bar",
+                "target": "/foo"
+              },
+              {
+                "op": "type",
+                "path": "/bar",
+                "follow_links": true
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo\ncreated_link=/bar\nlink_target=/foo\ntype=file\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo"
+              },
+              {
+                "op": "create_link",
+                "path": "/bar",
+                "target": "/foo"
+              },
+              {
+                "op": "type",
+                "path": "/bar",
+                "follow_links": false
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo\ncreated_link=/bar\nlink_target=/foo\ntype=link\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_link",
+                "path": "/foo",
+                "target": "/bar"
+              },
+              {
+                "op": "create_link",
+                "path": "/bar",
+                "target": "/foo"
+              },
+              {
+                "op": "type",
+                "path": "/foo",
+                "follow_links": true
+              }
+            ]
+          },
+          "expected_output": "created_link=/foo\nlink_target=/bar\ncreated_link=/bar\nlink_target=/foo\ntype=not_found\n"
+        }
+      ]
+    },
+    "feature3_3_link_resolve.json": {
+      "description": "Resolve all symbolic links in a path to its canonical real path. A link to a directory resolves to the directory's path, including when the link is nested within a traversal. Resolving an empty path fails with a not-found category.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              },
+              {
+                "op": "create_link",
+                "path": "/bar",
+                "target": "/foo"
+              },
+              {
+                "op": "resolve",
+                "path": "/bar"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo\ncreated_link=/bar\nlink_target=/foo\nresolved=/foo\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo/bar",
+                "recursive": true
+              },
+              {
+                "op": "create_link",
+                "path": "/foo/baz",
+                "target": "/foo/bar"
+              },
+              {
+                "op": "resolve",
+                "path": "/foo/baz"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo/bar\ncreated_link=/foo/baz\nlink_target=/foo/bar\nresolved=/foo/bar\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "resolve",
+                "path": ""
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        }
+      ]
+    },
+    "feature3_4_link_delete.json": {
+      "description": "Delete a symbolic link itself without affecting the entity it points to. After unlinking, the link no longer exists but its former target remains.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo"
+              },
+              {
+                "op": "create_link",
+                "path": "/bar",
+                "target": "/foo"
+              },
+              {
+                "op": "delete",
+                "path": "/bar",
+                "as": "link"
+              },
+              {
+                "op": "exists",
+                "path": "/foo"
+              },
+              {
+                "op": "exists",
+                "path": "/bar",
+                "as": "link"
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo\ncreated_link=/bar\nlink_target=/foo\ndeleted=/bar\nexists=true\nexists=false\n"
+        }
+      ]
+    },
+    "feature4_1_cwd.json": {
+      "description": "Get and set the current working directory. Setting the working directory to an existing directory updates it and echoes the new path; relative paths passed afterward resolve against it. Setting it to a path that does not exist fails with a not-found category, and setting it to a file fails with a not-a-directory category.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              },
+              {
+                "op": "set_cwd",
+                "path": "/foo"
+              },
+              {
+                "op": "cwd"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo\ncurrent_directory=/foo\ncurrent_directory=/foo\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              },
+              {
+                "op": "set_cwd",
+                "path": "/foo"
+              },
+              {
+                "op": "absolute",
+                "path": "bar"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo\ncurrent_directory=/foo\nabsolute=/foo/bar\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "set_cwd",
+                "path": "/nope"
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/f"
+              },
+              {
+                "op": "set_cwd",
+                "path": "/f"
+              }
+            ]
+          },
+          "expected_output": "created_file=/f\nerror=not_a_directory\n"
+        }
+      ]
+    },
+    "feature5_1_raf_sequential.json": {
+      "description": "Open a file handle and write bytes/text sequentially, then read them back. Writing reports the number of bytes written; the handle's length reflects accumulated writes. A single byte value can also be written and read back as raw bytes.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/f"
+              },
+              {
+                "op": "open",
+                "path": "/f",
+                "handle": "h",
+                "mode": "write"
+              },
+              {
+                "op": "raf_write",
+                "handle": "h",
+                "text": "hello"
+              },
+              {
+                "op": "raf_length",
+                "handle": "h"
+              },
+              {
+                "op": "raf_close",
+                "handle": "h"
+              },
+              {
+                "op": "read",
+                "path": "/f"
+              }
+            ]
+          },
+          "expected_output": "created_file=/f\nopened=/f\nwrote_bytes=5\nlength=5\nclosed=h\ntext=\"hello\"\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/f"
+              },
+              {
+                "op": "open",
+                "path": "/f",
+                "handle": "h",
+                "mode": "write"
+              },
+              {
+                "op": "raf_write_byte",
+                "handle": "h",
+                "value": 65
+              },
+              {
+                "op": "raf_close",
+                "handle": "h"
+              },
+              {
+                "op": "read",
+                "path": "/f",
+                "as": "bytes"
+              }
+            ]
+          },
+          "expected_output": "created_file=/f\nopened=/f\nwrote_bytes=1\nclosed=h\nbytes=65\n"
+        }
+      ]
+    },
+    "feature5_2_raf_position.json": {
+      "description": "A file handle tracks a read/write cursor position. Reading advances the position; the cursor can be repositioned to an absolute offset and subsequent reads start from there. Reading more bytes than remain returns only the available bytes.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "hello"
+              },
+              {
+                "op": "open",
+                "path": "/f",
+                "handle": "h",
+                "mode": "read"
+              },
+              {
+                "op": "raf_read_byte",
+                "handle": "h"
+              },
+              {
+                "op": "raf_position",
+                "handle": "h"
+              },
+              {
+                "op": "raf_set_position",
+                "handle": "h",
+                "position": 0
+              },
+              {
+                "op": "raf_read",
+                "handle": "h",
+                "count": 5
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=5\nopened=/f\nread_byte=104\nposition=1\nposition=0\nread_length=5\nread_text=\"hello\"\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "hi"
+              },
+              {
+                "op": "open",
+                "path": "/f",
+                "handle": "h",
+                "mode": "read"
+              },
+              {
+                "op": "raf_read",
+                "handle": "h",
+                "count": 10
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=2\nopened=/f\nread_length=2\nread_text=\"hi\"\n"
+        }
+      ]
+    },
+    "feature5_3_raf_truncate.json": {
+      "description": "Truncate an open file handle to a given length, discarding any content beyond that length. The file content reflects the truncation after the handle is closed.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "write",
+                "path": "/f",
+                "text": "hello"
+              },
+              {
+                "op": "open",
+                "path": "/f",
+                "handle": "h",
+                "mode": "append"
+              },
+              {
+                "op": "raf_truncate",
+                "handle": "h",
+                "length": 2
+              },
+              {
+                "op": "raf_close",
+                "handle": "h"
+              },
+              {
+                "op": "read",
+                "path": "/f"
+              }
+            ]
+          },
+          "expected_output": "wrote_bytes=5\nopened=/f\ntruncated=2\nclosed=h\ntext=\"he\"\n"
+        }
+      ]
+    },
+    "feature6_1_exists.json": {
+      "description": "Test whether an entity exists at a path, interpreted as a specific kind (file/directory/link). A link is considered to exist as a link even when its target is missing, but does not exist as a file in that case.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/f"
+              },
+              {
+                "op": "exists",
+                "path": "/f",
+                "as": "file"
+              },
+              {
+                "op": "exists",
+                "path": "/nope",
+                "as": "file"
+              }
+            ]
+          },
+          "expected_output": "created_file=/f\nexists=true\nexists=false\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_link",
+                "path": "/l",
+                "target": "/nope"
+              },
+              {
+                "op": "exists",
+                "path": "/l",
+                "as": "link"
+              },
+              {
+                "op": "exists",
+                "path": "/l",
+                "as": "file"
+              }
+            ]
+          },
+          "expected_output": "created_link=/l\nlink_target=/nope\nexists=true\nexists=false\n"
+        }
+      ]
+    },
+    "feature6_2_entity_type.json": {
+      "description": "Report the entity kind at a path. The non-following type query reports file/directory/link/not-found at the tail of the path. The stat-based type follows links and reports the kind of the final target (e.g. a link to a file reports as a file), or not-found when nothing is there. The root directory and ancestors of root report as directories.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "stat_type",
+                "path": "/nope"
+              }
+            ]
+          },
+          "expected_output": "stat_type=not_found\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo"
+              },
+              {
+                "op": "create_link",
+                "path": "/bar",
+                "target": "/foo"
+              },
+              {
+                "op": "stat_type",
+                "path": "/bar"
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo\ncreated_link=/bar\nlink_target=/foo\nstat_type=file\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "type",
+                "path": "/"
+              }
+            ]
+          },
+          "expected_output": "type=directory\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "type",
+                "path": "/nope"
+              }
+            ]
+          },
+          "expected_output": "type=not_found\n"
+        }
+      ]
+    },
+    "feature6_3_identical.json": {
+      "description": "Test whether two paths refer to the same underlying file system object. The same path compared with itself is identical; distinct files are not. Comparing paths where an entity does not exist fails with a not-found category.",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/a"
+              },
+              {
+                "op": "create_file",
+                "path": "/b"
+              },
+              {
+                "op": "identical",
+                "path1": "/a",
+                "path2": "/a"
+              },
+              {
+                "op": "identical",
+                "path1": "/a",
+                "path2": "/b"
+              }
+            ]
+          },
+          "expected_output": "created_file=/a\ncreated_file=/b\nidentical=true\nidentical=false\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "identical",
+                "path1": "/a",
+                "path2": "/b"
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        }
+      ]
+    },
+    "feature7_error_normalization.json": {
+      "description": "All failures are surfaced as language-neutral POSIX-style error categories on an `error=` line, never as host-language exception artifacts. Categories include not-found (missing path), is-a-directory (file operation targeting a directory), not-a-directory (directory operation targeting a file), file-exists (creating over an existing entity), and directory-not-empty (non-recursive delete of a populated directory).",
+      "cases": [
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "read",
+                "path": "/nope.txt"
+              }
+            ]
+          },
+          "expected_output": "error=no_such_file_or_directory\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              },
+              {
+                "op": "read",
+                "path": "/foo"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo\nerror=is_a_directory\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo"
+              },
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo\nerror=not_a_directory\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_file",
+                "path": "/foo"
+              },
+              {
+                "op": "create_link",
+                "path": "/foo",
+                "target": "/bar"
+              }
+            ]
+          },
+          "expected_output": "created_file=/foo\nerror=file_exists\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "create_directory",
+                "path": "/foo"
+              },
+              {
+                "op": "create_file",
+                "path": "/foo/x"
+              },
+              {
+                "op": "delete",
+                "path": "/foo",
+                "as": "directory"
+              }
+            ]
+          },
+          "expected_output": "created_directory=/foo\ncreated_file=/foo/x\nerror=directory_not_empty\n"
+        },
+        {
+          "input": {
+            "ops": [
+              {
+                "op": "frobnicate"
+              }
+            ]
+          },
+          "expected_output": "error=unknown_operation\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "create_directory",
+      "input_condition": "Operation 'create_directory' is invoked with 'path'.",
+      "output_rule": "If parent exists or 'recursive' is true, creates directory. Emits 'created_directory=<path>'. If parent missing and 'recursive' false, fails.",
+      "exact_values": [
+        "created_directory="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "create_directory",
+      "input_condition": "Operation 'create_directory' is invoked with existing directory path.",
+      "output_rule": "Successful no-op. No error emitted.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "create_directory",
+      "input_condition": "Operation 'create_directory' is invoked with missing parent and 'recursive': false.",
+      "output_rule": "Fails immediately. Emits 'error=no_such_file_or_directory'.",
+      "exact_values": [
+        "error=no_such_file_or_directory"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "list",
+      "input_condition": "Operation 'list' is invoked with 'recursive': false.",
+      "output_rule": "Emits 'entry_count=<n>', then lists immediate children sorted lexicographically. Children reported as 'entry=<kind>:<path>'.",
+      "exact_values": [
+        "entry=directory:",
+        "entry=file:",
+        "entry=link:"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "list",
+      "input_condition": "Operation 'list' is invoked with 'recursive': true.",
+      "output_rule": "Emits 'entry_count=<n>', then lists all descendants sorted lexicographically.",
+      "exact_values": [
+        "entry=directory:",
+        "entry=file:",
+        "entry=link:"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "delete",
+      "input_condition": "Operation 'delete' is invoked with 'as': 'directory' and 'recursive': false on non-empty dir.",
+      "output_rule": "Fails. Emits 'error=directory_not_empty'.",
+      "exact_values": [
+        "error=directory_not_empty"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "delete",
+      "input_condition": "Operation 'delete' is invoked with 'as': 'directory' and 'recursive': true.",
+      "output_rule": "Removes directory and all contents. Emits 'deleted=<path>'.",
+      "exact_values": [
+        "deleted="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "list",
+      "input_condition": "Operation 'list' targets a non-existent path.",
+      "output_rule": "Fails. Emits 'error=no_such_file_or_directory'.",
+      "exact_values": [
+        "error=no_such_file_or_directory"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "parent",
+      "input_condition": "Operation 'parent' is invoked with path '/'.",
+      "output_rule": "Emits 'parent=/'.",
+      "exact_values": [
+        "parent=/"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "parent",
+      "input_condition": "Operation 'parent' IS NOT invoked with path '/'.",
+      "output_rule": "Emits 'parent=<parent_path>'.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "create_temp",
+      "input_condition": "Operation 'create_temp' called for the first time with a given prefix.",
+      "output_rule": "Emits 'temp=/.tmp_rand0/<prefix><suffix>', where suffix is 'rand0' (first call) or 'rand1' etc. based on path existence within the random area.",
+      "exact_values": [
+        "temp="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "write",
+      "input_condition": "Operation 'write' with 'text' and 'mode': 'append' on non-existent file.",
+      "output_rule": "Creates file and appends. Emits 'wrote_bytes=<n>'.",
+      "exact_values": [
+        "wrote_bytes="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "write",
+      "input_condition": "Operation 'write' with 'text' but no 'mode' (default overwrite).",
+      "output_rule": "Overwrites existing content. Emits 'wrote_bytes=<n>'.",
+      "exact_values": [
+        "wrote_bytes="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "read",
+      "input_condition": "Operation 'read' with default 'as': 'text' on file containing 'hello'.",
+      "output_rule": "Emits 'text=\\\"hello\\\"'.",
+      "exact_values": [
+        "text=\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "read",
+      "input_condition": "Operation 'read' on zero-byte file.",
+      "output_rule": "Emits 'text=\"\"' for text mode and 'bytes=' for bytes mode.",
+      "exact_values": [
+        "text=\"\"",
+        "bytes="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "read",
+      "input_condition": "Operation 'read' with 'as': 'bytes'.",
+      "output_rule": "Emits 'bytes=<byte1>,<byte2>,...'. Empty file yields 'bytes='. UTF8 multi-byte chars are flattened to decimal values.",
+      "exact_values": [
+        "bytes="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "read",
+      "input_condition": "Operation 'read' with 'as': 'lines' on file 'a\\nb\\nc\\n'.",
+      "output_rule": "Emits 'line_count=3' followed by 'line=a', 'line=b', 'line=c'. Trailing newline does not create empty line.",
+      "exact_values": [
+        "line_count="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "read",
+      "input_condition": "Operation 'read' with 'as': 'lines' on file 'a\\nb\\nc' (no final newline).",
+      "output_rule": "Emits 'line_count=3' followed by 'line=a', 'line=b', 'line=c'.",
+      "exact_values": [
+        "line_count="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "read",
+      "input_condition": "Operation 'read' with 'as': 'lines' on empty file.",
+      "output_rule": "Emits 'line_count=0'. No 'line=' lines.",
+      "exact_values": [
+        "line_count=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "length",
+      "input_condition": "Operation 'length' on non-existent file.",
+      "output_rule": "Fails. Emits 'error=no_such_file_or_directory'.",
+      "exact_values": [
+        "error=no_such_file_or_directory"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "copy",
+      "input_condition": "Operation 'copy' with non-existent source.",
+      "output_rule": "Fails. Emits 'error=no_such_file_or_directory'.",
+      "exact_values": [
+        "error=no_such_file_or_directory"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "copy",
+      "input_condition": "Operation 'copy' succeeds where dest is already a file.",
+      "output_rule": "Dest content is overwritten by src. Dest path is emitted.",
+      "exact_values": [
+        "copied="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "type",
+      "input_condition": "Operation 'type' with 'follow_links': false on a symlink to a file.",
+      "output_rule": "Emits 'type=link'.",
+      "exact_values": [
+        "type=link"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "type",
+      "input_condition": "Operation 'type' with 'follow_links': true on a symlink to a file.",
+      "output_rule": "Emits 'type=file'.",
+      "exact_values": [
+        "type=file"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "type",
+      "input_condition": "Operation 'type' traverses a loop (link A->B, link B->A) with 'follow_links': true.",
+      "output_rule": "Fails traversal. Emits 'type=not_found'.",
+      "exact_values": [
+        "type=not_found"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "resolve",
+      "input_condition": "Operation 'resolve' on empty string or non-existent path.",
+      "output_rule": "Fails. Emits 'error=no_such_file_or_directory'.",
+      "exact_values": [
+        "error=no_such_file_or_directory"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "import",
+      "input_condition": "Execution script contains an 'import' operation.",
+      "output_rule": "Behavior not fully defined in tests, assumed to bridge runtime root prefix to `/` for import/export if present, otherwise ignored or invalid based on 'ops' shape description requiring no importing status line.",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C028",
+      "feature": "export",
+      "input_condition": "Execution script contains an 'export' operation.",
+      "output_rule": "Behavior not fully defined in tests, assumed to bridge runtime root prefix to `/` for import/export if present, otherwise ignored based on op definition range.",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C029",
+      "feature": "exists",
+      "input_condition": "Operation 'exists' with 'as': 'directory'.",
+      "output_rule": "Emits 'exists=true' or 'exists=false'. Does not check content, only if parent is a directory or path itself is a directory.",
+      "exact_values": [
+        "exists=",
+        "exists=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "create_directory",
+      "input_condition": "Operation 'create_directory' with 'recursive': false on a path with missing intermediate ancestors.",
+      "output_rule": "Fails. Emits 'error=no_such_file_or_directory'.",
+      "exact_values": [
+        "error=no_such_file_or_directory"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "rename (directory)",
+      "input_condition": "Operation 'rename' moves a directory to a path where parent is missing.",
+      "output_rule": "Fails. Emits 'error=no_such_file_or_directory'.",
+      "exact_values": [
+        "error=no_such_file_or_directory"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "read",
+      "input_condition": "Operation 'read' with 'as': 'text' on file containing non-ASCII UTF-8 characters.",
+      "output_rule": "Emits JSON-quoted text with escaped sequences (e.g. \\u00e9).",
+      "exact_values": [
+        "text=\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "write",
+      "input_condition": "Operation 'write' emits 'wrote_bytes'.",
+      "output_rule": "Count is based on number of bytes written (UTF-8 encoding).",
+      "exact_values": [
+        "wrote_bytes="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "length",
+      "input_condition": "Operation 'length' on new file (created via create_file).",
+      "output_rule": "Emits 'length=0'.",
+      "exact_values": [
+        "length=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "create_link",
+      "input_condition": "Operation 'create_link' attempts to create link on existing file path.",
+      "output_rule": "Fails. Emits 'error=file_exists'.",
+      "exact_values": [
+        "error=file_exists"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "import",
+      "input_condition": "If an import command is present (inferred from feature list but not tested), behavior is to bridge the runtime's file system root prefix to the `/` root of the in-memory engine.",
+      "output_rule": "Assumption: Full file system content must be mirrored to the root of the engine.",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C037",
+      "feature": "export",
+      "input_condition": "If an export command is present (inferred from feature list but not tested), behavior is to bridge the runtime's file system root prefix to export to the defaults.",
+      "output_rule": "Assumption: Full file system content is generated as JSON.",
+      "exact_values": [],
+      "ambiguous": true
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C032",
+        "replacement": "a specific error message format for non-UTF-8 bytes",
+        "exact_values_to_replace": [
+          "text=\""
+        ],
+        "trigger_keywords": [
+          "how does it handle non-UTF-8 characters?",
+          "what error message for invalid encoding?",
+          "escape sequence format for special chars?"
+        ],
+        "oracle_response": "The exact JSON string representation with unescaped backslash sequences (e.g., 'text=\"\\\\u00e9\"')"
+      },
+      {
+        "constraint_id": "C029",
+        "replacement": "a specific boolean literal and response prefix",
+        "exact_values_to_replace": [
+          "exists=",
+          "exists=false"
+        ],
+        "trigger_keywords": [
+          "what is the exact response format?",
+          "true or false response?",
+          "prefix for boolean response?"
+        ],
+        "oracle_response": "Emits 'exists=true' or 'exists=false' where 'exists=' is the prefix and the value is strictly lowercase true or false."
+      },
+      {
+        "constraint_id": "C017",
+        "replacement": "the exact count prefix and line format",
+        "exact_values_to_replace": [
+          "line_count="
+        ],
+        "trigger_keywords": [
+          "how many lines reported?",
+          "line prefix format?",
+          "count variable name?"
+        ],
+        "oracle_response": "Emits 'line_count=N' followed by 'line=content' where N is an integer count and line content is the stripped line string."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C014",
+        "vague_phrase": "follow the exact quoting convention used by the 'read' operation for text output",
+        "actual_meaning": "JSON double-quoted string (e.g., \"hello\")"
+      },
+      {
+        "constraint_id": "C015",
+        "vague_phrase": "inspect the codebase for the default 'mode' flag behavior when explicitly omitted during the 'write' operation",
+        "actual_meaning": "Defaulting to 'overwrite' mode when 'mode' is absent"
+      }
+    ]
+  }
+}

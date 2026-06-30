@@ -1,0 +1,462 @@
+{
+  "fuzzy_prd": "Hey team, we've been getting complaints from a few enterprise customers who say their backend services are running out of connections under load and things just hang or crash in weird ways. We need to build some kind of connection/resource pooling layer that handles this gracefully. The basic idea is: you have a limited number of expensive things (think DB connections, HTTP clients, whatever), and you need to lend them out, get them back, and reuse them without leaking or deadlocking.\n\nWe talked about this in the last architecture sync — basically the same pattern we used in that retry/backpressure module but applied to object lifecycle. Key things I remember being discussed: there should be a way to cap how many things exist at once, some warmup behavior so we're not cold-starting on the first real request, a queue for when everything is busy (but also a way to say 'don't queue at all'), and clean shutdown. Oh and someone mentioned we need to handle the case where a caller tries to return a resource twice or both return and destroy it — that was causing double-free bugs in the old code.\n\nAlso the reuse order matters apparently — FIFO vs LIFO style — and there's some eviction logic for stale resources. I don't remember all the exact thresholds but it was something like 'if it's been sitting idle too long, toss it'. Context passing per-request was also brought up but I'm fuzzy on how that interacts with reuse. Can someone just build this out properly?\n\nOne extra pass on this since a few folks asked for edge-case specifics: when the pool is already at maximum allocation and there are no idle resources left, what happens next depends on max_pending. If max_pending is 0, the borrow request should fail right away with error=pending_acquire_limit and reason=no_pending_allowed. If max_pending is 1 and there’s already one waiter in the queue, then the next request should fail with reason=queue_limit_reached. Also worth calling out that the pending count is observable before the failure occurs.\n\nAlso, despite the earlier warmup talk, the pool does NOT allocate any resources at construction time even if a minimum is configured. The constructor.allocated count must be 0. The first borrow is what triggers warmup, and that allocates up to the configured minimum. After warmup, one resource is borrowed and the remaining (minimum - 1) newly allocated resources become idle. After that, subsequent borrows should consume idle resources without triggering new allocations.\n\nOn reuse order, this is a real config and not just an implementation detail. The reuse_order field should accept 'lru' or 'mru'. 'lru' means least-recently-used, so the oldest idle resource comes back first. 'mru' means most-recently-used, so the newest idle resource comes back first. Concrete example: with mru and 3 idle resources numbered 1, 2, 3 released in that order, the first reacquire returns 3 and the second returns 1 (skipping 2 because it was released second, making it middle-aged). This is the same idle-pool selection behavior we talked about around Feature 3.3 idle_reuse_order scenario.\n\nAnother important safety thing: a borrowed resource can only be completed once, and the first action wins. If release happens first, the resource becomes idle, release_count increments by 1, destroy_count stays 0, and any later invalidate is silently ignored with no metric changes. If invalidate happens first, allocated count drops to 0, destroy_count increments by 1, release_count stays 0, and any later release is silently ignored. That should close off the double-complete/double-free weirdness from the old code.\n\nWe also need the disposed state to be explicit. Before dispose() is called it is false, after it becomes true. Any borrow attempt on a disposed pool must fail immediately with error=pool_shutdown and must not allocate a new resource or return any resource value.\n\nLast thing, the permit side of this should follow the CapacityPermit abstraction in the pool, specifically BoundedPermitStrategy and UnboundedPermitStrategy, which handle permit accounting analogous to backpressure semaphores; see Feature 1 in start.md and the size_strategy_sequence / unbounded_strategy_sequence scenarios. That part should line up with the general capacity behavior rather than being a separate one-off path.",
+  "oracle_data": {
+    "task_id": "POOL-reactive-resource-pool-001",
+    "golden_api_signature": "ResourcePool<T>.acquire(context?) -> Mono<PooledRef<T>>; PooledRef<T>.release() -> void; PooledRef<T>.invalidate() -> void",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "eviction threshold",
+          "when is an idle resource considered stale",
+          "idle time TTL eviction rule"
+        ],
+        "oracle_response": "The idle-time eviction predicate marks a resource for eviction when its idle duration is greater than OR EQUAL TO the configured TTL threshold. A resource with idle_ms exactly equal to ttl_ms is evicted (evict=true). Only resources with idle_ms strictly less than ttl_ms are considered reusable (evict=false)."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "bounded vs unbounded capacity",
+          "what does the permit system return for unlimited pools",
+          "max integer for unbounded permits"
+        ],
+        "oracle_response": "An unbounded permit policy reports a remaining capacity of exactly 2147483647 (Integer.MAX_VALUE) at all times. It grants any positive request exactly as requested and returns 0 for non-positive requests. Returning capacity never reduces the reported availability. A bounded permit policy tracks real capacity: it starts at max, grants up to remaining capacity, and rejects returns that would push granted capacity above the configured maximum with error=too_many_permits_returned."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "context per borrow request",
+          "does context affect reused resources",
+          "per-request allocation context and idle reuse interaction"
+        ],
+        "oracle_response": "Per-request context is only visible to the allocation factory when a NEW resource is being created. When a borrow request is satisfied by an existing idle resource, the idle resource's original value is returned as-is and the new request's context is NOT applied to it. For example: first borrow with context=1 creates resource value 1, second borrow with context=2 creates resource value 2; after both are released, third borrow returns value 1 (original, not overwritten by any new context), fourth borrow returns value 2."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "source stream allocation invocation count",
+          "multi-value publisher cancellation",
+          "how many times is the allocation factory called"
+        ],
+        "oracle_response": "A source stream (publisher) used for allocation yields exactly one resource value per allocation request. If the underlying source can emit multiple values, it must be cancelled after the first emitted value so later values are never consumed. The source_invocations count for a single allocation must be exactly 1 regardless of source type."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "bounded permit minimum warmup grant",
+          "what happens when current granted is below minimum",
+          "permit get below configured minimum"
+        ],
+        "oracle_response": "For a bounded permit policy, while the currently granted capacity is below the configured minimum, a get() request can be increased to satisfy the minimum warmup target. However if the requested amount already exceeds remaining capacity the grant is still capped at remaining capacity. Negative or zero requests always grant zero regardless of warmup state."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_1_bounded_capacity_permits",
+        "trigger_keywords": [
+          "test cases for feature1 1 bounded capacity permits",
+          "show me feature1 1 bounded capacity permits test cases",
+          "what are the feature1 1 bounded capacity permits test inputs",
+          "give me the feature1_1_bounded_capacity_permits test file",
+          "test cases for feature 1",
+          "feature1 1 bounded capacity permits expected output",
+          "what does feature1 1 bounded capacity permits expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_bounded_capacity_permits:\n{\n  \"description\": \"A bounded capacity controller grants requested capacity up to its configured maximum, performs minimum-size warmup grants when below the minimum, reports remaining capacity after each operation, and rejects returns that would exceed the maximum.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"size_strategy_sequence\",\n        \"min\": 0,\n        \"max\": 1,\n        \"operations\": [\n          {\n            \"op\": \"get\",\n            \"value\": 100\n          },\n          {\n            \"op\": \"get\",\n            \"value\": 1\n          }\n        ]\n      },\n      \"expected_output\": \"initial_permits=1\\nget(100)=1\\npermits=0\\nget(1)=0\\npermits=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_unbounded_capacity_permits",
+        "trigger_keywords": [
+          "test cases for feature1 2 unbounded capacity permits",
+          "show me feature1 2 unbounded capacity permits test cases",
+          "what are the feature1 2 unbounded capacity permits test inputs",
+          "give me the feature1_2_unbounded_capacity_permits test file",
+          "test cases for feature 1",
+          "feature1 2 unbounded capacity permits expected output",
+          "what does feature1 2 unbounded capacity permits expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_unbounded_capacity_permits:\n{\n  \"description\": \"An unbounded capacity controller always reports effectively unlimited remaining capacity, grants any positive requested amount, grants nothing for non-positive requests, and accepts returned capacity without reducing the reported availability.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"unbounded_strategy_sequence\",\n        \"operations\": [\n          {\n            \"op\": \"get\",\n            \"value\": 100\n          },\n          {\n            \"op\": \"get\",\n            \"value\": 1000\n          }\n        ]\n      },\n      \"expected_output\": \"initial_permits=2147483647\\nget(100)=100\\npermits=2147483647\\nget(1000)=1000\\npermits=2147483647\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_idle_time_eviction",
+        "trigger_keywords": [
+          "test cases for feature2 1 idle time eviction",
+          "show me feature2 1 idle time eviction test cases",
+          "what are the feature2 1 idle time eviction test inputs",
+          "give me the feature2_1_idle_time_eviction test file",
+          "test cases for feature 2",
+          "feature2 1 idle time eviction expected output",
+          "what does feature2 1 idle time eviction expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_idle_time_eviction:\n{\n  \"description\": \"An idle-time eviction rule marks a resource for eviction when its idle duration is equal to or greater than the configured time-to-live, while shorter idle durations remain reusable.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"idle_ttl_predicate\",\n        \"ttl_ms\": 3000,\n        \"idle_ms\": [\n          4000,\n          2000,\n          3000\n        ]\n      },\n      \"expected_output\": \"resource[0].idle_ms=4000\\nresource[0].evict=true\\nresource[1].idle_ms=2000\\nresource[1].evict=false\\nresource[2].idle_ms=3000\\nresource[2].evict=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_publisher_source_allocation",
+        "trigger_keywords": [
+          "test cases for feature2 2 publisher source allocation",
+          "show me feature2 2 publisher source allocation test cases",
+          "what are the feature2 2 publisher source allocation test inputs",
+          "give me the feature2_2_publisher_source_allocation test file",
+          "test cases for feature 2",
+          "feature2 2 publisher source allocation expected output",
+          "what does feature2 2 publisher source allocation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_publisher_source_allocation:\n{\n  \"description\": \"A source stream used for allocation yields exactly one resource value to an allocation request; a multi-value source is cancelled after the first emitted value so later values are not consumed.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"publisher_source_single\",\n        \"source\": \"single\"\n      },\n      \"expected_output\": \"allocated_value=1\\nsource_invocations=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_pool_acquire_release_metrics",
+        "trigger_keywords": [
+          "test cases for feature3 1 pool acquire release metrics",
+          "show me feature3 1 pool acquire release metrics test cases",
+          "what are the feature3 1 pool acquire release metrics test inputs",
+          "give me the feature3_1_pool_acquire_release_metrics test file",
+          "test cases for feature 3",
+          "feature3 1 pool acquire release metrics expected output",
+          "what does feature3 1 pool acquire release metrics expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_pool_acquire_release_metrics:\n{\n  \"description\": \"A resource pool exposes externally visible counts for allocated, idle, and borrowed resources; acquiring a resource moves it into the borrowed count, and releasing it moves it into the idle count without changing total allocation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"pool_acquire_release_metrics\",\n        \"reuse_order\": \"lru\"\n      },\n      \"expected_output\": \"before.allocated=0\\nbefore.idle=0\\nbefore.acquired=0\\nacquired.value=1\\nafter_acquire.allocated=1\\nafter_acquire.idle=0\\nafter_acquire.acquired=1\\nafter_release.allocated=1\\nafter_release.idle=1\\nafter_release.acquired=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_minimum_warmup_on_first_acquire",
+        "trigger_keywords": [
+          "test cases for feature3 2 minimum warmup on first acquire",
+          "show me feature3 2 minimum warmup on first acquire test cases",
+          "what are the feature3 2 minimum warmup on first acquire test inputs",
+          "give me the feature3_2_minimum_warmup_on_first_acquire test file",
+          "test cases for feature 3",
+          "feature3 2 minimum warmup on first acquire expected output",
+          "what does feature3 2 minimum warmup on first acquire expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_minimum_warmup_on_first_acquire:\n{\n  \"description\": \"A pool configured with a positive minimum does not allocate at construction time; the first borrow warms up to the minimum, leaving all non-borrowed warmed resources idle, and later borrows consume those idle resources without extra allocation.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"pool_warmup_minimum\",\n        \"reuse_order\": \"lru\",\n        \"min\": 4,\n        \"max\": 8\n      },\n      \"expected_output\": \"constructor.allocated=0\\nafter_first.allocated=4\\nafter_first.idle=3\\nafter_second.allocated=4\\nafter_second.idle=2\\nallocation_count=4\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_idle_resource_reuse_order",
+        "trigger_keywords": [
+          "test cases for feature3 3 idle resource reuse order",
+          "show me feature3 3 idle resource reuse order test cases",
+          "what are the feature3 3 idle resource reuse order test inputs",
+          "give me the feature3_3_idle_resource_reuse_order test file",
+          "test cases for feature 3",
+          "feature3 3 idle resource reuse order expected output",
+          "what does feature3 3 idle resource reuse order expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_idle_resource_reuse_order:\n{\n  \"description\": \"When multiple resources are idle, the configured reuse order determines which idle resource is borrowed first: oldest idle first for least-recent reuse, newest idle first for most-recent reuse.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"idle_reuse_order\",\n        \"reuse_order\": \"mru\"\n      },\n      \"expected_output\": \"idle_after_release=3\\nfirst_reacquire=3\\nsecond_reacquire=1\\nidle_after_reacquire=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_4_pending_acquire_limits",
+        "trigger_keywords": [
+          "test cases for feature3 4 pending acquire limits",
+          "show me feature3 4 pending acquire limits test cases",
+          "what are the feature3 4 pending acquire limits test inputs",
+          "give me the feature3_4_pending_acquire_limits test file",
+          "test cases for feature 3",
+          "feature3 4 pending acquire limits expected output",
+          "what does feature3 4 pending acquire limits expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_4_pending_acquire_limits:\n{\n  \"description\": \"When a pool has no idle resources and has reached its allocation maximum, a pending-acquire limit controls whether additional borrow requests may wait; if the limit is zero or already reached, the request fails with a neutral pending-limit error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"pending_acquire_limit\",\n        \"reuse_order\": \"lru\",\n        \"max_pending\": 0\n      },\n      \"expected_output\": \"warmup=1\\nfirst=1\\nsecond=2\\nerror=pending_acquire_limit\\nreason=no_pending_allowed\\n\"\n    },\n    {\n      \"input\": {\n        \"scenario\": \"pending_acquire_limit\",\n        \"reuse_order\": \"mru\",\n        \"max_pending\": 1\n      },\n      \"expected_output\": \"warmup=1\\nfirst=1\\nsecond=2\\nthird=pending\\npending=1\\nerror=pending_acquire_limit\\nreason=queue_limit_reached\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_5_disposed_pool_rejects_acquire",
+        "trigger_keywords": [
+          "test cases for feature3 5 disposed pool rejects acquire",
+          "show me feature3 5 disposed pool rejects acquire test cases",
+          "what are the feature3 5 disposed pool rejects acquire test inputs",
+          "give me the feature3_5_disposed_pool_rejects_acquire test file",
+          "test cases for feature 3",
+          "feature3 5 disposed pool rejects acquire expected output",
+          "what does feature3 5 disposed pool rejects acquire expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_5_disposed_pool_rejects_acquire:\n{\n  \"description\": \"Once a pool has been disposed, its disposed state becomes observable and a later borrow request fails with a neutral shutdown error instead of allocating or returning a resource.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"disposed_pool_acquire\",\n        \"reuse_order\": \"lru\"\n      },\n      \"expected_output\": \"before_dispose.disposed=false\\nafter_dispose.disposed=true\\nerror=pool_shutdown\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_6_release_invalidate_idempotency",
+        "trigger_keywords": [
+          "test cases for feature3 6 release invalidate idempotency",
+          "show me feature3 6 release invalidate idempotency test cases",
+          "what are the feature3 6 release invalidate idempotency test inputs",
+          "give me the feature3_6_release_invalidate_idempotency test file",
+          "test cases for feature 3",
+          "feature3 6 release invalidate idempotency expected output",
+          "what does feature3 6 release invalidate idempotency expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_6_release_invalidate_idempotency:\n{\n  \"description\": \"A borrowed resource can be completed only once: after release, later invalidation is ignored; after invalidation, later release is ignored. Metrics and lifecycle handler counts reflect only the first completion action.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"release_invalidate_idempotency\",\n        \"reuse_order\": \"lru\",\n        \"first_action\": \"release\"\n      },\n      \"expected_output\": \"before.allocated=1\\nbefore.idle=0\\nbefore.acquired=1\\nafter.allocated=1\\nafter.idle=1\\nafter.acquired=0\\nrelease_count=1\\ndestroy_count=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_7_contextual_allocation",
+        "trigger_keywords": [
+          "test cases for feature3 7 contextual allocation",
+          "show me feature3 7 contextual allocation test cases",
+          "what are the feature3 7 contextual allocation test inputs",
+          "give me the feature3_7_contextual_allocation test file",
+          "test cases for feature 3",
+          "feature3 7 contextual allocation expected output",
+          "what does feature3 7 contextual allocation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_7_contextual_allocation:\n{\n  \"description\": \"Per-request contextual data is visible to allocation when a new resource is created, while reusing an idle resource preserves the original resource value rather than replacing it with the later request context.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"scenario\": \"contextual_allocation\",\n        \"reuse_order\": \"lru\"\n      },\n      \"expected_output\": \"first=1\\nsecond=2\\nthird=1\\nfourth=2\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the compatibility logic from that login module we did last time",
+        "actual_meaning": "The idempotency guard on PooledRef completion — the first-action-wins logic that prevents double release or double invalidate; see Feature 3.6 release_invalidate_idempotency scenario and the release_count / destroy_count tracking"
+      },
+      {
+        "vague_reference": "context passing per-request was also brought up but I'm fuzzy on how that interacts with reuse",
+        "actual_meaning": "The contextual_allocation scenario in Feature 3.7: context is passed to the allocation factory only when creating a new resource; idle resource reuse ignores the incoming context and preserves the original resource value"
+      }
+    ],
+    "fallback_response": "That detail wasn't explicitly called out in our planning discussions — you'll need to look at the existing patterns in the codebase or check with the tech lead. Try searching for related scenario names or configuration field names in the test cases and source to get the canonical behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_bounded_capacity_permits.json": {
+      "description": "A bounded capacity controller grants requested capacity up to its configured maximum, performs minimum-size warmup grants when below the minimum, reports remaining capacity after each operation, and rejects returns that would exceed the maximum.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "size_strategy_sequence",
+            "min": 0,
+            "max": 1,
+            "operations": [
+              {
+                "op": "get",
+                "value": 100
+              },
+              {
+                "op": "get",
+                "value": 1
+              }
+            ]
+          },
+          "expected_output": "initial_permits=1\nget(100)=1\npermits=0\nget(1)=0\npermits=0\n"
+        }
+      ]
+    },
+    "feature1_2_unbounded_capacity_permits.json": {
+      "description": "An unbounded capacity controller always reports effectively unlimited remaining capacity, grants any positive requested amount, grants nothing for non-positive requests, and accepts returned capacity without reducing the reported availability.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "unbounded_strategy_sequence",
+            "operations": [
+              {
+                "op": "get",
+                "value": 100
+              },
+              {
+                "op": "get",
+                "value": 1000
+              }
+            ]
+          },
+          "expected_output": "initial_permits=2147483647\nget(100)=100\npermits=2147483647\nget(1000)=1000\npermits=2147483647\n"
+        }
+      ]
+    },
+    "feature2_1_idle_time_eviction.json": {
+      "description": "An idle-time eviction rule marks a resource for eviction when its idle duration is equal to or greater than the configured time-to-live, while shorter idle durations remain reusable.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "idle_ttl_predicate",
+            "ttl_ms": 3000,
+            "idle_ms": [
+              4000,
+              2000,
+              3000
+            ]
+          },
+          "expected_output": "resource[0].idle_ms=4000\nresource[0].evict=true\nresource[1].idle_ms=2000\nresource[1].evict=false\nresource[2].idle_ms=3000\nresource[2].evict=true\n"
+        }
+      ]
+    },
+    "feature2_2_publisher_source_allocation.json": {
+      "description": "A source stream used for allocation yields exactly one resource value to an allocation request; a multi-value source is cancelled after the first emitted value so later values are not consumed.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "publisher_source_single",
+            "source": "single"
+          },
+          "expected_output": "allocated_value=1\nsource_invocations=1\n"
+        }
+      ]
+    },
+    "feature3_1_pool_acquire_release_metrics.json": {
+      "description": "A resource pool exposes externally visible counts for allocated, idle, and borrowed resources; acquiring a resource moves it into the borrowed count, and releasing it moves it into the idle count without changing total allocation.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "pool_acquire_release_metrics",
+            "reuse_order": "lru"
+          },
+          "expected_output": "before.allocated=0\nbefore.idle=0\nbefore.acquired=0\nacquired.value=1\nafter_acquire.allocated=1\nafter_acquire.idle=0\nafter_acquire.acquired=1\nafter_release.allocated=1\nafter_release.idle=1\nafter_release.acquired=0\n"
+        }
+      ]
+    },
+    "feature3_2_minimum_warmup_on_first_acquire.json": {
+      "description": "A pool configured with a positive minimum does not allocate at construction time; the first borrow warms up to the minimum, leaving all non-borrowed warmed resources idle, and later borrows consume those idle resources without extra allocation.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "pool_warmup_minimum",
+            "reuse_order": "lru",
+            "min": 4,
+            "max": 8
+          },
+          "expected_output": "constructor.allocated=0\nafter_first.allocated=4\nafter_first.idle=3\nafter_second.allocated=4\nafter_second.idle=2\nallocation_count=4\n"
+        }
+      ]
+    },
+    "feature3_3_idle_resource_reuse_order.json": {
+      "description": "When multiple resources are idle, the configured reuse order determines which idle resource is borrowed first: oldest idle first for least-recent reuse, newest idle first for most-recent reuse.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "idle_reuse_order",
+            "reuse_order": "mru"
+          },
+          "expected_output": "idle_after_release=3\nfirst_reacquire=3\nsecond_reacquire=1\nidle_after_reacquire=1\n"
+        }
+      ]
+    },
+    "feature3_4_pending_acquire_limits.json": {
+      "description": "When a pool has no idle resources and has reached its allocation maximum, a pending-acquire limit controls whether additional borrow requests may wait; if the limit is zero or already reached, the request fails with a neutral pending-limit error.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "pending_acquire_limit",
+            "reuse_order": "lru",
+            "max_pending": 0
+          },
+          "expected_output": "warmup=1\nfirst=1\nsecond=2\nerror=pending_acquire_limit\nreason=no_pending_allowed\n"
+        },
+        {
+          "input": {
+            "scenario": "pending_acquire_limit",
+            "reuse_order": "mru",
+            "max_pending": 1
+          },
+          "expected_output": "warmup=1\nfirst=1\nsecond=2\nthird=pending\npending=1\nerror=pending_acquire_limit\nreason=queue_limit_reached\n"
+        }
+      ]
+    },
+    "feature3_5_disposed_pool_rejects_acquire.json": {
+      "description": "Once a pool has been disposed, its disposed state becomes observable and a later borrow request fails with a neutral shutdown error instead of allocating or returning a resource.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "disposed_pool_acquire",
+            "reuse_order": "lru"
+          },
+          "expected_output": "before_dispose.disposed=false\nafter_dispose.disposed=true\nerror=pool_shutdown\n"
+        }
+      ]
+    },
+    "feature3_6_release_invalidate_idempotency.json": {
+      "description": "A borrowed resource can be completed only once: after release, later invalidation is ignored; after invalidation, later release is ignored. Metrics and lifecycle handler counts reflect only the first completion action.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "release_invalidate_idempotency",
+            "reuse_order": "lru",
+            "first_action": "release"
+          },
+          "expected_output": "before.allocated=1\nbefore.idle=0\nbefore.acquired=1\nafter.allocated=1\nafter.idle=1\nafter.acquired=0\nrelease_count=1\ndestroy_count=0\n"
+        }
+      ]
+    },
+    "feature3_7_contextual_allocation.json": {
+      "description": "Per-request contextual data is visible to allocation when a new resource is created, while reusing an idle resource preserves the original resource value rather than replacing it with the later request context.",
+      "cases": [
+        {
+          "input": {
+            "scenario": "contextual_allocation",
+            "reuse_order": "lru"
+          },
+          "expected_output": "first=1\nsecond=2\nthird=1\nfourth=2\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C003",
+      "C004",
+      "C005"
+    ],
+    "kept_c": [
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

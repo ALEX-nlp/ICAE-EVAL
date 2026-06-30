@@ -1,0 +1,9 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up that credential helper utility library we've been talking about. The core idea is that right now every time someone builds a new credential helper they're re-writing the same fiddly bits from scratch — parsing Git's wire format, figuring out config values, building auth headers, etc. We keep getting bug reports that boil down to someone getting the casing rules wrong or messing up the encoding.
+
+Basically we need a clean multi-file library (not one giant file please, we had that problem last time with the login module) that handles all these building blocks in one place. Things like interpreting config strings the way Git does, chopping strings around delimiters, encoding credentials for headers, reading and writing those key=value blocks Git sends over stdin/stdout, and reconstructing URLs from the query fields Git passes in.
+
+The tricky part is the library itself shouldn't know anything about JSON or how we're testing it — there should be a separate thin adapter layer that handles that translation. Each feature should have proper error signals, not just generic crashes, and the errors should be clean category names, nothing with stack traces or internal type info leaking out.
+
+I know Priya had some notes on the case-sensitivity rules for config keys that we should follow — can someone track those down? Also need to make sure the URL scope-walking logic matches what Git actually does when it walks remotes. Timeline is pretty tight so let's make sure we nail the edge cases on the boolean parsing and the base64 encoding stuff first.

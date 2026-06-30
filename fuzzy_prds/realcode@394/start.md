@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a text layout engine library built in Rust. We've been getting complaints from users that rendering mixed-direction text, handling cursor positions, and doing paragraph wrapping all require tons of custom glue code that keeps breaking. The idea is to wrap the parley/fontique ecosystem into something clean that apps can just call into.
+
+Basically it needs to handle the usual stuff — laying out lines, measuring how wide content is before committing to a layout, embedding little boxes inside text (like icons or images inline), controlling how lines wrap when text overflows, aligning text left/right/center, and inspecting individual character clusters for hit testing and cursor logic. Also line height control — we had a bug last quarter where the absolute spacing mode wasn't being respected, similar to how we fixed the metric scaling in that other rendering module.
+
+The adapter layer that reads commands and spits out results should be totally separate from the core logic — we don't want the business rules tangled up with the JSON parsing like what happened last time. There should be a test harness that runs all the case files and saves raw output per case so we can diff them. Cases live under rcb_tests/public_test_cases/ and output should go under rcb_tests/stdout/ namespaced by the cases directory name. Needs to match the expected output exactly.

@@ -1,0 +1,961 @@
+{
+  "fuzzy_prd": "# Array Field Binding Toolkit for Reactive Forms - Behavioral Specification\n\n## Project Goal\n\nBuild a reactive-form array-field binding that lets developers render and edit a variable-length list of values (or structured objects) inside a form, exposing the list as an addressable, iterable collection of named child fields. Each item is bound to its own input by a stable, index-derived name, and the surrounding form's value tree stays in sync as items are added, edited, or reordered — without the developer hand-writing index bookkeeping or wiring re-subscription logic.\n\n---\n\n## Background & Problem\n\nWithout this binding, developers wiring an editable list into a form must manually fabricate a unique field name for every element (`people[0].firstName`, `people[1].firstName`, …), keep that naming in lockstep with the underlying array as items are inserted or removed, and re-register the list with the form engine whenever the bound name changes. This leads to repetitive, error-prone boilerplate: off-by-one bugs in generated names, stale subscriptions after a rename, lists whose length silently drifts from the form state, and validators that never see the array as a whole.\n\nWith this binding, the developer declares a single array field by name, picks a render strategy, and receives a ready-made field bundle: the current item count, the live array value, helpers to iterate or project over the items (each yielding a correctly indexed child-field name), and mutation helpers to grow or shrink the list. The binding handles name generation, length tracking, re-subscription on rename, and array-level validation, so the developer focuses only on what each row looks like.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain has several distinct responsibilities (subscription-difference logic, the array-field view/binding, a render-strategy resolver, and the execution adapter). It MUST NOT be a single \"god file\": separate the pure predicate logic, the field-binding component, the render dispatch, and the adapter into distinct units. Do not over-engineer, but avoid a monolith.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases in \"Core Features\" are a **black-box contract** for the execution adapter, NOT the internal data model. The core binding logic must remain completely decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls against the core binding and rendering observed results to stdout.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Keep subscription diffing, render-strategy resolution, field-bundle construction, validation handling, and output formatting in distinct logical units.\n   - **Open/Closed Principle (OCP):** New render strategies or mutation helpers should be addable without rewriting the core binding.\n   - **Liskov Substitution Principle (LSP):** Any supported render strategy must be substitutable for another wherever a renderable is accepted.\n   - **Interface Segregation Principle (ISP):** The field bundle's iteration, mutation, and metadata surfaces should be cohesive and not force consumers to depend on parts they do not use.\n   - **Dependency Inversion Principle (DIP):** The binding depends on an abstract form context, not on a concrete I/O implementation.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface must be elegant and idiomatic to the target language, hiding internal subscription and indexing complexity.\n   - **Resilience:** Misuse (no form context, no render strategy, missing mutation helpers) must be reported through clear, normalized developer-facing signals rather than crashing or silently doing nothing.\n\n---\n\n## Core Features\n\n### Feature 1: Subscription Difference Predicate\n\n**As a developer**, I want a predicate that decides whether two optional subscription descriptors differ over a chosen set of keys, so I can avoid re-registering a field with the form engine unless something it actually cares about changed.\n\n**Expected Behavior / Usage:**\n\nThe predicate takes two optional subscription maps (`a` and `b`, each either absent/null or an object of key→flag) and a list of keys to compare. It answers a single boolean \"do these differ?\" question under these rules: if exactly one of the two maps is present and the other is absent, they differ; if both are absent, they do not differ; if both are present, they differ only when at least one of the listed keys holds a non-identical value between the two maps (keys not in the list are ignored). The contract also surfaces, for transparency, whether each side was present. Output lines: `a_present`, `b_present`, then `differs`, each `true`/`false`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_subscription_diff.json`\n\n```json\n{\n    \"description\": \"Compares two optional field-subscription maps over a fixed key set to decide whether a re-subscription is needed. Reports whether each side is present and whether the selected keys differ. A present map versus an absent one always differs; two absent maps do not differ; two present maps differ only when at least one listed key holds a different value.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"subscription_diff\", \"a\": null, \"b\": {}, \"keys\": [\"foo\"]},\n            \"expected_output\": \"a_present=false\\nb_present=true\\ndiffers=true\\n\"\n        },\n        {\n            \"input\": {\"op\": \"subscription_diff\", \"a\": {}, \"b\": null, \"keys\": [\"foo\"]},\n            \"expected_output\": \"a_present=true\\nb_present=false\\ndiffers=true\\n\"\n        },\n        {\n            \"input\": {\"op\": \"subscription_diff\", \"a\": {\"foo\": 2, \"bar\": 5}, \"b\": {\"foo\": 2, \"bar\": 5}, \"keys\": [\"foo\", \"bar\"]},\n            \"expected_output\": \"a_present=true\\nb_present=true\\ndiffers=false\\n\"\n        },\n        {\n            \"input\": {\"op\": \"subscription_diff\", \"a\": {\"foo\": 2, \"bar\": 5}, \"b\": {\"foo\": 2, \"bar\": 4}, \"keys\": [\"foo\", \"bar\"]},\n            \"expected_output\": \"a_present=true\\nb_present=true\\ndiffers=true\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Render Strategy Resolution\n\n**As a developer**, I want to supply the row/list view through any one of three interchangeable strategies — a component, a render function passed as a dedicated prop, or a render function passed as children — so I can use whichever style fits my codebase, all receiving the same field bundle.\n\n**Expected Behavior / Usage:**\n\nThe array field accepts exactly one render strategy and invokes it with the field bundle (which carries the current item count among other things). For a static initial list the strategy is invoked, and the bundle's reported item count equals the number of items in the initial list (including zero for an empty list). All three strategies are mutually substitutable and produce the same observable result for the same input. Output lines: `rendered` (`true`/`false`) and `length` (the item count).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_render_strategy.json`\n\n```json\n{\n    \"description\": \"Renders the array field through any one of the supported render strategies (a component prop, a render-function prop, or a function passed as children). Each strategy receives the same field bundle and is invoked exactly once for a static initial array; the reported length reflects the number of items in the initial array.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"render_strategy\", \"name\": \"foo\", \"strategy\": \"component\", \"initialValues\": {\"foo\": [\"x\", \"y\"]}},\n            \"expected_output\": \"rendered=true\\nlength=2\\n\"\n        },\n        {\n            \"input\": {\"op\": \"render_strategy\", \"name\": \"foo\", \"strategy\": \"render\", \"initialValues\": {\"foo\": [\"x\"]}},\n            \"expected_output\": \"rendered=true\\nlength=1\\n\"\n        },\n        {\n            \"input\": {\"op\": \"render_strategy\", \"name\": \"foo\", \"strategy\": \"children\", \"initialValues\": {\"foo\": []}},\n            \"expected_output\": \"rendered=true\\nlength=0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Misuse Diagnostics\n\n**As a developer**, I want clear, normalized diagnostics when I wire the array field incorrectly, so I can immediately tell which precondition I violated instead of debugging a silent failure.\n\n**Expected Behavior / Usage:**\n\nThe binding detects three distinct misuse conditions and, for each, emits exactly one diagnostic whose category is a stable, language-neutral identifier. The contract reports the number of diagnostics emitted (`warnings=<n>`) followed by one `warning=<category>` line per diagnostic.\n\n*3.1 Missing Form Context — the field is used with no surrounding form*\n\nWhen the array field is mounted with no enclosing form context to register against, it emits one diagnostic categorized as `[a specific missing context key string — verify against implementation constants]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_warn_no_form.json`\n\n```json\n{\n    \"description\": \"When the array field is mounted outside of any surrounding form context, it emits exactly one developer warning whose normalized category signals that a form context is required. The warning count and category are reported.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"warnings\", \"scenario\": \"no_form\"},\n            \"expected_output\": \"warnings=1\\nwarning=[a specific missing context key string — verify against implementation constants]\\n\"\n        }\n    ]\n}\n```\n\n*3.2 Missing Render Strategy — no component, render prop, or children function supplied*\n\nWhen the array field is inside a form but no render strategy is provided, it emits one diagnostic categorized as `[the specific category code for missing render strategy — check constants file]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_warn_no_render.json`\n\n```json\n{\n    \"description\": \"When the array field is mounted inside a form but no render strategy (component, render prop, or children function) is supplied, it emits exactly one developer warning whose normalized category signals that a render strategy is missing.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"warnings\", \"scenario\": \"no_render\"},\n            \"expected_output\": \"warnings=1\\nwarning=[the specific category code for missing render strategy — check constants file]\\n\"\n        }\n    ]\n}\n```\n\n*3.3 Missing Array Mutators — the form was configured without the array-mutation helpers*\n\nWhen the array field is inside a form whose configuration lacks the array-mutation helpers, it emits one diagnostic categorized as `missing_array_mutators`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_warn_no_mutators.json`\n\n```json\n{\n    \"description\": \"When the array field is mounted inside a form whose configuration lacks the array-mutation helpers, it emits exactly one developer warning whose normalized category signals that the array mutators were not provided.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"warnings\", \"scenario\": \"no_mutators\"},\n            \"expected_output\": \"warnings=1\\nwarning=missing_array_mutators\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Always-Available Item Count\n\n**As a developer**, I want the current item count to be available on the field bundle even when I subscribe only to unrelated metadata, so I can render the right number of rows without having to subscribe to the whole value.\n\n**Expected Behavior / Usage:**\n\nThe item count is always present on the field bundle regardless of how narrow the field's subscription is. With a subscription limited to a single unrelated metadata flag, the bundle still reports `length` equal to the number of items in the initial array, and the subscribed flag is also reported. For a freshly initialized, untouched array the `dirty` flag is `false`. Output lines: `length` then the requested metadata flag.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_length_always_present.json`\n\n```json\n{\n    \"description\": \"The current item count of the array is always available on the field bundle even when the field subscribes only to an unrelated metadata flag (here a 'dirty' subscription). The reported length equals the number of items in the initial array, and the subscribed metadata flag is reported alongside it (a pristine, untouched array is not dirty).\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"array_state\", \"name\": \"foo\", \"subscription\": {\"dirty\": true}, \"initialValues\": {\"foo\": [\"a\", \"b\"]}, \"report\": [\"length\", \"dirty\"]},\n            \"expected_output\": \"length=2\\ndirty=false\\n\"\n        },\n        {\n            \"input\": {\"op\": \"array_state\", \"name\": \"foo\", \"subscription\": {\"dirty\": true}, \"initialValues\": {\"foo\": [\"a\", \"b\", \"c\", \"d\"]}, \"report\": [\"length\", \"dirty\"]},\n            \"expected_output\": \"length=4\\ndirty=false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Item Iteration Helper\n\n**As a developer**, I want a helper that visits every item in order and hands me each item's generated field name and position, so I can render or process rows without computing index-based names myself.\n\n**Expected Behavior / Usage:**\n\nThe field bundle exposes an iteration helper that invokes a callback once per item, in order, passing two arguments: the item's field name (the array's name followed by a bracketed zero-based index) and the numeric index. The helper returns no value. The contract emits one `name=index` line per visited item followed by a `return` line reporting the (absent) return value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_for_each.json`\n\n```json\n{\n    \"description\": \"The field bundle exposes an iteration helper that invokes a callback once per array item, in order, passing the indexed field name (parent name with a bracketed index suffix) and the zero-based position. The helper returns no value. Each emitted line records one visited name and its index; the final line reports the (absent) return value.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"for_each\", \"name\": \"foo\", \"initialValues\": {\"foo\": [\"a\", \"b\", \"c\"]}},\n            \"expected_output\": \"foo[0]=0\\nfoo[1]=1\\nfoo[2]=2\\nreturn=undefined\\n\"\n        },\n        {\n            \"input\": {\"op\": \"for_each\", \"name\": \"foo\", \"initialValues\": {\"foo\": [\"x\"]}},\n            \"expected_output\": \"foo[0]=0\\nreturn=undefined\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Item Projection Helper\n\n**As a developer**, I want a helper that maps every item to a value and collects the results in order, so I can build a list of rendered rows keyed by each item's generated field name.\n\n**Expected Behavior / Usage:**\n\nThe field bundle exposes a mapping helper that invokes a callback once per item, in order, passing the item's field name (array name with bracketed zero-based index) and the numeric index, and collects each callback's return value into a new ordered array. The contract emits one `name=index` line per visited item, then a `result` line carrying the JSON-encoded array of collected results (here the upper-cased field names).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_map.json`\n\n```json\n{\n    \"description\": \"The field bundle exposes a mapping helper that invokes a callback once per array item, in order, passing the indexed field name (parent name with a bracketed index suffix) and the zero-based position, and collects the callback's return values into a new array preserving order. Each emitted line records one visited name and its index; the final line reports the JSON-encoded array of results (here the upper-cased indexed names).\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"map\", \"name\": \"foo\", \"initialValues\": {\"foo\": [\"a\", \"b\", \"c\"]}},\n            \"expected_output\": \"foo[0]=0\\nfoo[1]=1\\nfoo[2]=2\\nresult=[\\\"FOO[0]\\\",\\\"FOO[1]\\\",\\\"FOO[2]\\\"]\\n\"\n        },\n        {\n            \"input\": {\"op\": \"map\", \"name\": \"foo\", \"initialValues\": {\"foo\": [\"a\", \"b\"]}},\n            \"expected_output\": \"foo[0]=0\\nfoo[1]=1\\nresult=[\\\"FOO[0]\\\",\\\"FOO[1]\\\"]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Array-Level Validation\n\n**As a developer**, I want to attach a validator that sees the whole array value and can flag the list as invalid with a message, so I can enforce constraints (like a maximum number of items) on the collection as a unit.\n\n**Expected Behavior / Usage:**\n\nA validator may be attached that receives the entire array value and returns an error message when the array violates a constraint, or nothing when it is valid. The result surfaces on the array's metadata: a valid array reports a valid flag of `true` and no error; once a mutation pushes the array past the constraint, it reports valid `false` and the validator's message. If the array already satisfies the constraint and no mutation occurs, it stays valid with no error. Output lines: `valid_initial`, `error_initial`, then `valid_final`, `error_final`. Error values are reported as the validator's own message string (JSON-encoded), or `undefined` when there is none.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_array_validation.json`\n\n```json\n{\n    \"description\": \"An array-level validator may be attached that receives the whole array value and returns an error message when the array violates a constraint (here a maximum length), or no message when it is valid. The validator result surfaces on the array's metadata: a valid array reports a valid flag of true and no error; after an item is appended that exceeds the limit, the array reports valid false and the validator's error message. When the array already satisfies the constraint and no mutation occurs, it stays valid with no error.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"validate\", \"name\": \"foo\", \"initialValues\": {\"foo\": [\"a\", \"b\"]}, \"validateMaxLength\": 2, \"validateError\": \"Too long\", \"actions\": [{\"type\": \"push\", \"value\": \"c\"}]},\n            \"expected_output\": \"valid_initial=true\\nerror_initial=undefined\\nvalid_final=false\\nerror_final=\\\"Too long\\\"\\n\"\n        },\n        {\n            \"input\": {\"op\": \"validate\", \"name\": \"foo\", \"initialValues\": {\"foo\": []}, \"validateMaxLength\": 2, \"validateError\": \"Too long\", \"actions\": []},\n            \"expected_output\": \"valid_initial=true\\nerror_initial=undefined\\nvalid_final=true\\nerror_final=undefined\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Item Mutation & Per-Item Input Binding\n\n**As a developer**, I want to append items to the list and have each item bind to its own input(s) by a generated name, so editing one row updates only that row and the form value stays consistent.\n\n**Expected Behavior / Usage:**\n\nAppending an item grows the list length by one and produces a new addressable child field bound to a fresh input. Editing an existing item's input changes only that item; later-appended items remain empty. Item field names follow the parent-name-with-bracketed-index convention, and structured (object) items expose one input per sub-property, each named with the item path followed by a dotted sub-property name.\n\n*8.1 Scalar Items — append scalar values and edit them independently*\n\nStarting from an empty list, appending an item, editing its input, then appending another yields a length of 2 with the first input holding the edited value and the second input empty. Output lines: `length`, `inputs=<count>`, then one `name=value` line per input (sorted by name).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_1_push_scalar.json`\n\n```json\n{\n    \"description\": \"Appending an item to the array grows its length by one and renders a corresponding input bound to the new indexed field. Editing the value of an existing item's input updates only that item and leaves later appended items empty. After appending one item, editing it, then appending a second, the array length is 2 and the two inputs hold the edited value and an empty string respectively. The input names follow the parent-name-with-bracketed-index convention.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"array_state\", \"name\": \"foo\", \"subscription\": {}, \"initialValues\": {\"foo\": []}, \"itemFields\": [\"\"], \"actions\": [{\"type\": \"push\", \"value\": null}, {\"type\": \"change\", \"name\": \"foo[0]\", \"value\": \"dog\"}, {\"type\": \"push\", \"value\": null}], \"report\": [\"length\", \"inputs\"]},\n            \"expected_output\": \"length=2\\ninputs=2\\nfoo[0]=dog\\nfoo[1]=\\n\"\n        }\n    ]\n}\n```\n\n*8.2 Object Items — append structured items with independent sub-field inputs*\n\nAppending an empty object item renders one input per declared sub-property, each named with the item path plus a dotted sub-property name; editing one sub-field updates only that sub-field. After appending one object item and editing its first sub-field, the length is 1 and the two nested inputs hold the edited value and an empty string. Output lines: `length`, `inputs=<count>`, then one `name=value` line per input (sorted by name).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_2_push_object.json`\n\n```json\n{\n    \"description\": \"Items may be objects whose sub-properties are bound to independent nested inputs. Appending an empty object renders one input per declared sub-field, each named with the parent item path followed by a dotted sub-property name. Editing one sub-field updates only that sub-field and leaves the sibling sub-field empty. After appending one object item and editing its first sub-field, the array length is 1 and the two nested inputs hold the edited value and an empty string.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"array_state\", \"name\": \"foo\", \"subscription\": {}, \"initialValues\": {\"foo\": []}, \"itemFields\": [\"firstName\", \"lastName\"], \"actions\": [{\"type\": \"push\", \"value\": {}}, {\"type\": \"change\", \"name\": \"foo[0].firstName\", \"value\": \"Erik\"}], \"report\": [\"length\", \"inputs\"]},\n            \"expected_output\": \"length=1\\ninputs=2\\nfoo[0].firstName=Erik\\nfoo[0].lastName=\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 9: Re-subscription on Name Change\n\n**As a developer**, I want the array field to follow a new target array when I change its bound name, so I can repoint the same field at a different list and immediately see that list's value.\n\n**Expected Behavior / Usage:**\n\nWhen the array field's target name changes, it re-registers against the newly named array and its reported value switches to that array's value. Given a form holding two named arrays, the field bound to the first name reports the first array's value; after the bound name is switched to the second array, the field reports the second array's value. Output line: `value` carrying the JSON-encoded array value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_resubscribe_on_name_change.json`\n\n```json\n{\n    \"description\": \"The array field re-subscribes to a different array when its target name changes, so its reported value follows the named array. With one form holding two named arrays, the field bound to the first name reports that array's value; after the field's name is switched to the second array, it reports the second array's value.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"array_state\", \"name\": \"dogs\", \"formSubscription\": {}, \"initialValues\": {\"dogs\": [\"Odie\"], \"cats\": [\"Garfield\"]}, \"report\": [\"value\"]},\n            \"expected_output\": \"value=[\\\"Odie\\\"]\\n\"\n        },\n        {\n            \"input\": {\"op\": \"array_state\", \"name\": \"dogs\", \"formSubscription\": {}, \"initialValues\": {\"dogs\": [\"Odie\"], \"cats\": [\"Garfield\"]}, \"actions\": [{\"type\": \"set_name\", \"name\": \"cats\"}], \"report\": [\"value\"]},\n            \"expected_output\": \"value=[\\\"Garfield\\\"]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features above — the subscription-difference predicate, the array-field binding (item count, value, iteration, projection, mutation, validation, re-subscription), the render-strategy resolver, and the misuse diagnostics. Its physical structure MUST align with the \"Scale-Driven Code Organization\" constraint: multiple cohesive units, no god file, no over-engineering.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client of the core binding. It reads a single JSON command from stdin, drives the appropriate core logic (mounting the field, performing the listed actions, reading back the requested state), and prints the result to stdout, strictly matching the per-leaf-feature contracts above. The adapter must be logically (and ideally physically) separated from the core domain, and it owns all error normalization — translating any native runtime failure into the neutral category lines defined here (e.g. `error=unknown_op`), never leaking host-language exception identities into stdout.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_subscription_diff.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_subscription_diff@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- matches the 'report' array structure as defined in the array state module\n- uses the same naming convention as the for_each loop iteration\n",
+  "oracle_data": {
+    "task_id": "final-form__react-final-form-arrays-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C011",
+        "trigger_keywords": [
+          "What is the string for missing form?",
+          "missing form context error code",
+          "what string represents missing form",
+          "error category for empty form",
+          "form context missing sentinel"
+        ],
+        "oracle_response": "The exact string literal is 'missing_form_context'."
+      },
+      {
+        "constraint_id": "C013",
+        "trigger_keywords": [
+          "missing render strategy category",
+          "render strategy missing error code",
+          "what string is missing_render_strategy",
+          "error type for no render",
+          "render strategy missing literal"
+        ],
+        "oracle_response": "The exact string literal is 'missing_render_strategy'."
+      },
+      {
+        "constraint_id": "C030",
+        "trigger_keywords": [
+          "error message for initial violation",
+          "what is the string error_initial says",
+          "invalid initial state error text",
+          "error value when valid_initial is false",
+          "initial validation failure message"
+        ],
+        "oracle_response": "The exact string is 'Constraint X violated' where X is the specific constraint ID number."
+      },
+      {
+        "constraint_id": "TC_feature7_array_validation",
+        "trigger_keywords": [
+          "test cases for feature7 array validation",
+          "show me feature7 array validation test cases",
+          "what are the feature7 array validation inputs and outputs",
+          "give me the feature7_array_validation test file",
+          "feature7 array validation expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_array_validation:\n{\n  \"description\": \"An array-level validator may be attached that receives the whole array value and returns an error message when the array violates a constraint (here a maximum length), or no message when it is valid. The validator result surfaces on the array's metadata: a valid array reports a valid flag of true and no error; after an item is appended that exceeds the limit, the array reports valid false and the validator's error message. When the array already satisfies the constraint and no mutation occurs, it stays valid with no error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"validate\",\n        \"name\": \"foo\",\n        \"initialValues\": {\n          \"foo\": [\n            \"a\",\n            \"b\"\n          ]\n        },\n        \"validateMaxLength\": 2,\n        \"validateError\": \"Too long\",\n        \"actions\": [\n          {\n            \"type\": \"push\",\n            \"value\": \"c\"\n          }\n        ]\n      },\n      \"expected_output\": \"valid_initial=true\\nerror_initial=undefined\\nvalid_final=false\\nerror_final=\\\"Too long\\\"\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"validate\",\n        \"name\": \"foo\",\n        \"initialValues\": {\n          \"foo\": []\n        },\n        \"validateMaxLength\": 2,\n        \"validateError\": \"Too long\",\n        \"actions\": []\n      },\n      \"expected_output\": \"valid_initial=true\\nerror_initial=undefined\\nvalid_final=true\\nerror_final=undefined\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "matches the 'report' array structure as defined in the array state module",
+        "actual_meaning": "The output lines are strictly those generated by the function responsible for the main array state report, excluding any metadata lines unless specified by other constraints."
+      },
+      {
+        "vague_reference": "uses the same naming convention as the for_each loop iteration",
+        "actual_meaning": "The output format 'exact_field_name=<index>' follows the internal naming logic of the for_each utility function, where 'exact_field_name' corresponds to the property key or fqdn of the current item index."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_subscription_diff.json": {
+      "description": "Compares two optional field-subscription maps over a fixed key set to decide whether a re-subscription is needed. Reports whether each side is present and whether the selected keys differ. A present map versus an absent one always differs; two absent maps do not differ; two present maps differ only when at least one listed key holds a different value.",
+      "cases": [
+        {
+          "input": {
+            "op": "subscription_diff",
+            "a": null,
+            "b": {},
+            "keys": [
+              "foo"
+            ]
+          },
+          "expected_output": "a_present=false\nb_present=true\ndiffers=true\n"
+        },
+        {
+          "input": {
+            "op": "subscription_diff",
+            "a": {},
+            "b": null,
+            "keys": [
+              "foo"
+            ]
+          },
+          "expected_output": "a_present=true\nb_present=false\ndiffers=true\n"
+        },
+        {
+          "input": {
+            "op": "subscription_diff",
+            "a": {
+              "foo": 2,
+              "bar": 5
+            },
+            "b": {
+              "foo": 2,
+              "bar": 5
+            },
+            "keys": [
+              "foo",
+              "bar"
+            ]
+          },
+          "expected_output": "a_present=true\nb_present=true\ndiffers=false\n"
+        },
+        {
+          "input": {
+            "op": "subscription_diff",
+            "a": {
+              "foo": 2,
+              "bar": 5
+            },
+            "b": {
+              "foo": 2,
+              "bar": 4
+            },
+            "keys": [
+              "foo",
+              "bar"
+            ]
+          },
+          "expected_output": "a_present=true\nb_present=true\ndiffers=true\n"
+        }
+      ]
+    },
+    "feature2_render_strategy.json": {
+      "description": "Renders the array field through any one of the supported render strategies (a component prop, a render-function prop, or a function passed as children). Each strategy receives the same field bundle and is invoked exactly once for a static initial array; the reported length reflects the number of items in the initial array.",
+      "cases": [
+        {
+          "input": {
+            "op": "render_strategy",
+            "name": "foo",
+            "strategy": "component",
+            "initialValues": {
+              "foo": [
+                "x",
+                "y"
+              ]
+            }
+          },
+          "expected_output": "rendered=true\nlength=2\n"
+        },
+        {
+          "input": {
+            "op": "render_strategy",
+            "name": "foo",
+            "strategy": "render",
+            "initialValues": {
+              "foo": [
+                "x"
+              ]
+            }
+          },
+          "expected_output": "rendered=true\nlength=1\n"
+        },
+        {
+          "input": {
+            "op": "render_strategy",
+            "name": "foo",
+            "strategy": "children",
+            "initialValues": {
+              "foo": []
+            }
+          },
+          "expected_output": "rendered=true\nlength=0\n"
+        }
+      ]
+    },
+    "feature3_1_warn_no_form.json": {
+      "description": "When the array field is mounted outside of any surrounding form context, it emits exactly one developer warning whose normalized category signals that a form context is required. The warning count and category are reported.",
+      "cases": [
+        {
+          "input": {
+            "op": "warnings",
+            "scenario": "no_form"
+          },
+          "expected_output": "warnings=1\nwarning=missing_form_context\n"
+        }
+      ]
+    },
+    "feature3_2_warn_no_render.json": {
+      "description": "When the array field is mounted inside a form but no render strategy (component, render prop, or children function) is supplied, it emits exactly one developer warning whose normalized category signals that a render strategy is missing.",
+      "cases": [
+        {
+          "input": {
+            "op": "warnings",
+            "scenario": "no_render"
+          },
+          "expected_output": "warnings=1\nwarning=missing_render_strategy\n"
+        }
+      ]
+    },
+    "feature3_3_warn_no_mutators.json": {
+      "description": "When the array field is mounted inside a form whose configuration lacks the array-mutation helpers, it emits exactly one developer warning whose normalized category signals that the array mutators were not provided.",
+      "cases": [
+        {
+          "input": {
+            "op": "warnings",
+            "scenario": "no_mutators"
+          },
+          "expected_output": "warnings=1\nwarning=missing_array_mutators\n"
+        }
+      ]
+    },
+    "feature4_length_always_present.json": {
+      "description": "The current item count of the array is always available on the field bundle even when the field subscribes only to an unrelated metadata flag (here a 'dirty' subscription). The reported length equals the number of items in the initial array, and the subscribed metadata flag is reported alongside it (a pristine, untouched array is not dirty).",
+      "cases": [
+        {
+          "input": {
+            "op": "array_state",
+            "name": "foo",
+            "subscription": {
+              "dirty": true
+            },
+            "initialValues": {
+              "foo": [
+                "a",
+                "b"
+              ]
+            },
+            "report": [
+              "length",
+              "dirty"
+            ]
+          },
+          "expected_output": "length=2\ndirty=false\n"
+        },
+        {
+          "input": {
+            "op": "array_state",
+            "name": "foo",
+            "subscription": {
+              "dirty": true
+            },
+            "initialValues": {
+              "foo": [
+                "a",
+                "b",
+                "c",
+                "d"
+              ]
+            },
+            "report": [
+              "length",
+              "dirty"
+            ]
+          },
+          "expected_output": "length=4\ndirty=false\n"
+        }
+      ]
+    },
+    "feature5_for_each.json": {
+      "description": "The field bundle exposes an iteration helper that invokes a callback once per array item, in order, passing the indexed field name (parent name with a bracketed index suffix) and the zero-based position. The helper returns no value. Each emitted line records one visited name and its index; the final line reports the (absent) return value.",
+      "cases": [
+        {
+          "input": {
+            "op": "for_each",
+            "name": "foo",
+            "initialValues": {
+              "foo": [
+                "a",
+                "b",
+                "c"
+              ]
+            }
+          },
+          "expected_output": "foo[0]=0\nfoo[1]=1\nfoo[2]=2\nreturn=undefined\n"
+        },
+        {
+          "input": {
+            "op": "for_each",
+            "name": "foo",
+            "initialValues": {
+              "foo": [
+                "x"
+              ]
+            }
+          },
+          "expected_output": "foo[0]=0\nreturn=undefined\n"
+        }
+      ]
+    },
+    "feature6_map.json": {
+      "description": "The field bundle exposes a mapping helper that invokes a callback once per array item, in order, passing the indexed field name (parent name with a bracketed index suffix) and the zero-based position, and collects the callback's return values into a new array preserving order. Each emitted line records one visited name and its index; the final line reports the JSON-encoded array of results (here the upper-cased indexed names).",
+      "cases": [
+        {
+          "input": {
+            "op": "map",
+            "name": "foo",
+            "initialValues": {
+              "foo": [
+                "a",
+                "b",
+                "c"
+              ]
+            }
+          },
+          "expected_output": "foo[0]=0\nfoo[1]=1\nfoo[2]=2\nresult=[\"FOO[0]\",\"FOO[1]\",\"FOO[2]\"]\n"
+        },
+        {
+          "input": {
+            "op": "map",
+            "name": "foo",
+            "initialValues": {
+              "foo": [
+                "a",
+                "b"
+              ]
+            }
+          },
+          "expected_output": "foo[0]=0\nfoo[1]=1\nresult=[\"FOO[0]\",\"FOO[1]\"]\n"
+        }
+      ]
+    },
+    "feature7_array_validation.json": {
+      "description": "An array-level validator may be attached that receives the whole array value and returns an error message when the array violates a constraint (here a maximum length), or no message when it is valid. The validator result surfaces on the array's metadata: a valid array reports a valid flag of true and no error; after an item is appended that exceeds the limit, the array reports valid false and the validator's error message. When the array already satisfies the constraint and no mutation occurs, it stays valid with no error.",
+      "cases": [
+        {
+          "input": {
+            "op": "validate",
+            "name": "foo",
+            "initialValues": {
+              "foo": [
+                "a",
+                "b"
+              ]
+            },
+            "validateMaxLength": 2,
+            "validateError": "Too long",
+            "actions": [
+              {
+                "type": "push",
+                "value": "c"
+              }
+            ]
+          },
+          "expected_output": "valid_initial=true\nerror_initial=undefined\nvalid_final=false\nerror_final=\"Too long\"\n"
+        },
+        {
+          "input": {
+            "op": "validate",
+            "name": "foo",
+            "initialValues": {
+              "foo": []
+            },
+            "validateMaxLength": 2,
+            "validateError": "Too long",
+            "actions": []
+          },
+          "expected_output": "valid_initial=true\nerror_initial=undefined\nvalid_final=true\nerror_final=undefined\n"
+        }
+      ]
+    },
+    "feature8_1_push_scalar.json": {
+      "description": "Appending an item to the array grows its length by one and renders a corresponding input bound to the new indexed field. Editing the value of an existing item's input updates only that item and leaves later appended items empty. After appending one item, editing it, then appending a second, the array length is 2 and the two inputs hold the edited value and an empty string respectively. The input names follow the parent-name-with-bracketed-index convention.",
+      "cases": [
+        {
+          "input": {
+            "op": "array_state",
+            "name": "foo",
+            "subscription": {},
+            "initialValues": {
+              "foo": []
+            },
+            "itemFields": [
+              ""
+            ],
+            "actions": [
+              {
+                "type": "push",
+                "value": null
+              },
+              {
+                "type": "change",
+                "name": "foo[0]",
+                "value": "dog"
+              },
+              {
+                "type": "push",
+                "value": null
+              }
+            ],
+            "report": [
+              "length",
+              "inputs"
+            ]
+          },
+          "expected_output": "length=2\ninputs=2\nfoo[0]=dog\nfoo[1]=\n"
+        }
+      ]
+    },
+    "feature8_2_push_object.json": {
+      "description": "Items may be objects whose sub-properties are bound to independent nested inputs. Appending an empty object renders one input per declared sub-field, each named with the parent item path followed by a dotted sub-property name. Editing one sub-field updates only that sub-field and leaves the sibling sub-field empty. After appending one object item and editing its first sub-field, the array length is 1 and the two nested inputs hold the edited value and an empty string.",
+      "cases": [
+        {
+          "input": {
+            "op": "array_state",
+            "name": "foo",
+            "subscription": {},
+            "initialValues": {
+              "foo": []
+            },
+            "itemFields": [
+              "firstName",
+              "lastName"
+            ],
+            "actions": [
+              {
+                "type": "push",
+                "value": {}
+              },
+              {
+                "type": "change",
+                "name": "foo[0].firstName",
+                "value": "Erik"
+              }
+            ],
+            "report": [
+              "length",
+              "inputs"
+            ]
+          },
+          "expected_output": "length=1\ninputs=2\nfoo[0].firstName=Erik\nfoo[0].lastName=\n"
+        }
+      ]
+    },
+    "feature9_resubscribe_on_name_change.json": {
+      "description": "The array field re-subscribes to a different array when its target name changes, so its reported value follows the named array. With one form holding two named arrays, the field bound to the first name reports that array's value; after the field's name is switched to the second array, it reports the second array's value.",
+      "cases": [
+        {
+          "input": {
+            "op": "array_state",
+            "name": "dogs",
+            "formSubscription": {},
+            "initialValues": {
+              "dogs": [
+                "Odie"
+              ],
+              "cats": [
+                "Garfield"
+              ]
+            },
+            "report": [
+              "value"
+            ]
+          },
+          "expected_output": "value=[\"Odie\"]\n"
+        },
+        {
+          "input": {
+            "op": "array_state",
+            "name": "dogs",
+            "formSubscription": {},
+            "initialValues": {
+              "dogs": [
+                "Odie"
+              ],
+              "cats": [
+                "Garfield"
+              ]
+            },
+            "actions": [
+              {
+                "type": "set_name",
+                "name": "cats"
+              }
+            ],
+            "report": [
+              "value"
+            ]
+          },
+          "expected_output": "value=[\"Garfield\"]\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "subscription_diff",
+      "input_condition": "op equals 'subscription_diff'",
+      "output_rule": "Output three lines: a_present, b_present, differs",
+      "exact_values": [
+        "a_present",
+        "b_present",
+        "differs"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "subscription_diff",
+      "input_condition": "a is null and b is empty object",
+      "output_rule": "a_present must be false, b_present must be true, differs must be true",
+      "exact_values": [
+        "false",
+        "true",
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "subscription_diff",
+      "input_condition": "a is empty object and b is null",
+      "output_rule": "a_present must be true, b_present must be false, differs must be true",
+      "exact_values": [
+        "true",
+        "false",
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "subscription_diff",
+      "input_condition": "a and b are present with identical values for listed keys",
+      "output_rule": "a_present true, b_present true, differs false",
+      "exact_values": [
+        "true",
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "subscription_diff",
+      "input_condition": "a and b are present with different values for at least one listed key",
+      "output_rule": "a_present true, b_present true, differs true",
+      "exact_values": [
+        "true",
+        "true",
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "subscription_diff",
+      "input_condition": "a and b present, keys ignore values not in input list",
+      "output_rule": "Comparison is strictly scoped to supplied keys array",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "render_strategy",
+      "input_condition": "op equals 'render_strategy'",
+      "output_rule": "Output two lines: rendered, length",
+      "exact_values": [
+        "rendered",
+        "length"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "render_strategy",
+      "input_condition": "strategy is 'component', 'render', or 'children'",
+      "output_rule": "rendered must be true, length matches initial array count",
+      "exact_values": [
+        "true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "render_strategy",
+      "input_condition": "strategy is invalid",
+      "output_rule": "Not specified, but contract implies only specific strategies accepted",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C010",
+      "feature": "warnings_no_form",
+      "input_condition": "op equals 'warnings' and scenario equals 'no_form'",
+      "output_rule": "Output two lines: warnings, warning",
+      "exact_values": [
+        "warnings",
+        "warning"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "warnings_no_form",
+      "input_condition": "scenario equals 'no_form'",
+      "output_rule": "warnings=1 and warning=missing_form_context",
+      "exact_values": [
+        "1",
+        "missing_form_context"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "warnings_no_render",
+      "input_condition": "op equals 'warnings' and scenario equals 'no_render'",
+      "output_rule": "Total count must be 1",
+      "exact_values": [
+        "1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "warnings_no_render",
+      "input_condition": "scenario equals 'no_render'",
+      "output_rule": "warning category must be missing_render_strategy",
+      "exact_values": [
+        "missing_render_strategy"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "warnings_no_mutators",
+      "input_condition": "op equals 'warnings' and scenario equals 'no_mutators'",
+      "output_rule": "Total count must be 1",
+      "exact_values": [
+        "1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "warnings_no_mutators",
+      "input_condition": "scenario equals 'no_mutators'",
+      "output_rule": "warning category must be missing_array_mutators",
+      "exact_values": [
+        "missing_array_mutators"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "array_state",
+      "input_condition": "op equals 'array_state'",
+      "output_rule": "Output lines matching 'report' array, plus line for subscribed flag values",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "array_state",
+      "input_condition": "initialValues array has N items",
+      "output_rule": "length must be N regardless of subscription target keys",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "array_state",
+      "input_condition": "initialValues is empty array",
+      "output_rule": "length must be 0",
+      "exact_values": [
+        "0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "array_state",
+      "input_condition": "report contains 'length'",
+      "output_rule": "Output line 'length=<count>'",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "array_state",
+      "input_condition": "report contains metadata key (e.g., 'dirty')",
+      "output_rule": "Output line key=value where value is current metadata state",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "array_state",
+      "input_condition": "initialValues pristine (no mutations)",
+      "output_rule": "Any clean metadata flag (e.g., dirty) must report false",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "for_each",
+      "input_condition": "op equals 'for_each'",
+      "output_rule": "Output line for each item: index_name=index, final line 'return=undefined'",
+      "exact_values": [
+        "undefined"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "for_each",
+      "input_condition": "item existence",
+      "output_rule": "Format: exact_field_name=<index>",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "for_each",
+      "input_condition": "initialValues empty",
+      "output_rule": "No intermediate name lines, only 'return=undefined'",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "map",
+      "input_condition": "op equals 'map'",
+      "output_rule": "Output name/index lines per item, final line 'result=[...json_array...]'",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "map",
+      "input_condition": "callback return value used",
+      "output_rule": "result array must contain values in order passed to callback",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "map",
+      "input_condition": "initialValues empty",
+      "output_rule": "result array must be empty JSON",
+      "exact_values": [
+        "[]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "validate",
+      "input_condition": "op equals 'validate'",
+      "output_rule": "Output four lines: valid_initial, error_initial, valid_final, error_final",
+      "exact_values": [
+        "valid_initial",
+        "error_initial",
+        "valid_final",
+        "error_final"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "validate",
+      "input_condition": "initial state satisfies constraint",
+      "output_rule": "valid_initial=true, error_initial=undefined",
+      "exact_values": [
+        "true",
+        "undefined"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "validate",
+      "input_condition": "initial state violates constraint",
+      "output_rule": "valid_initial=false, error_initial=<message>",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "validate",
+      "input_condition": "validation fails after mutation",
+      "output_rule": "valid_final=false, error_final=<message>",
+      "exact_values": [
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "validate",
+      "input_condition": "validation passes after mutation",
+      "output_rule": "valid_final=true, error_final=undefined",
+      "exact_values": [
+        "true",
+        "undefined"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "array_state_push_scalar",
+      "input_condition": "op equals 'array_state' and actions includes push",
+      "output_rule": "length increments by 1, input count increments by 1",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "array_state_push_scalar",
+      "input_condition": "action type 'push'",
+      "output_rule": "Adds new item to array",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "array_state_push_scalar",
+      "input_condition": "action type 'change'",
+      "output_rule": "Updates specific field name, updates metadata",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "array_state_push_scalar",
+      "input_condition": "action type 'set_name'",
+      "output_rule": "Re-subscribes to named array",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "array_state_object",
+      "input_condition": "itemFields defined",
+      "output_rule": "Generated inputs use dotted notation for object sub-properties",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "array_state_object",
+      "input_condition": "pushed object",
+      "output_rule": "Validates object structure against itemFields",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "array_state_object",
+      "input_condition": "change action on dot notation key (e.g. foo[0].firstName)",
+      "output_rule": "Updates nested value",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "array_state_object",
+      "input_condition": "change action on invalid dot notation key",
+      "output_rule": "Behavior implies validation or ignore (implied by 'binds to independent nested inputs')",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C041",
+      "feature": "array_state_resubscription",
+      "input_condition": "action includes 'set_name'",
+      "output_rule": "Field bundle reports value from the newly named array key",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C042",
+      "feature": "array_state_resubscription",
+      "input_condition": "name switch",
+      "output_rule": "Previous value from old name is ignored",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C043",
+      "feature": "linear_indexing",
+      "input_condition": "any item operación",
+      "output_rule": "Fields must use 0-based sequential indexing (foo[0], foo[1], ..."
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C011",
+        "replacement": "a specific missing context key string — verify against implementation constants",
+        "exact_values_to_replace": [
+          "missing_form_context"
+        ],
+        "trigger_keywords": [
+          "What is the string for missing form?",
+          "missing form context error code",
+          "what string represents missing form",
+          "error category for empty form",
+          "form context missing sentinel"
+        ],
+        "oracle_response": "The exact string literal is 'missing_form_context'."
+      },
+      {
+        "constraint_id": "C013",
+        "replacement": "the specific category code for missing render strategy — check constants file",
+        "exact_values_to_replace": [
+          "missing_render_strategy"
+        ],
+        "trigger_keywords": [
+          "missing render strategy category",
+          "render strategy missing error code",
+          "what string is missing_render_strategy",
+          "error type for no render",
+          "render strategy missing literal"
+        ],
+        "oracle_response": "The exact string literal is 'missing_render_strategy'."
+      },
+      {
+        "constraint_id": "C030",
+        "replacement": "the specific error message text for invalid initial state — rely on error messages config",
+        "exact_values_to_replace": [
+          "<message>"
+        ],
+        "trigger_keywords": [
+          "error message for initial violation",
+          "what is the string error_initial says",
+          "invalid initial state error text",
+          "error value when valid_initial is false",
+          "initial validation failure message"
+        ],
+        "oracle_response": "The exact string is 'Constraint X violated' where X is the specific constraint ID number."
+      },
+      {
+        "constraint_id": "C041",
+        "replacement": "the exact key name representing the new array — cross-reference with pending action logs",
+        "exact_values_to_replace": [
+          "<key>"
+        ],
+        "trigger_keywords": [
+          "key name after set_name action",
+          "what variable holds the new array key",
+          "resubscription key for set_name",
+          "name switch target identifier",
+          "new bundle key string"
+        ],
+        "oracle_response": "The exact string is the parameter named 'key' or 'newName' passed into the set_name function."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C016",
+        "vague_phrase": "matches the 'report' array structure as defined in the array state module",
+        "actual_meaning": "The output lines are strictly those generated by the function responsible for the main array state report, excluding any metadata lines unless specified by other constraints."
+      },
+      {
+        "constraint_id": "C023",
+        "vague_phrase": "uses the same naming convention as the for_each loop iteration",
+        "actual_meaning": "The output format 'exact_field_name=<index>' follows the internal naming logic of the for_each utility function, where 'exact_field_name' corresponds to the property key or fqdn of the current item index."
+      }
+    ]
+  }
+}

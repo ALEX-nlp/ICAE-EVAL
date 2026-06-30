@@ -1,0 +1,114 @@
+## Product Requirement Document
+
+# Static Directory Listing Server — Recursive-Download Command & Flat Listing Links
+
+## Project Goal
+
+Build an HTTP server that exposes a directory tree on disk as browsable web pages, so a developer can drop a folder behind a single command and let anyone navigate, preview, and bulk-download its contents without standing up a full web stack or writing any markup by hand.
+
+---
+
+## Background & Problem
+
+Sharing a folder over HTTP usually means either configuring a heavyweight web server or hand-writing index pages, and neither approach gives visitors a clean way to grab an entire sub-tree at once or to script against a stable, decoration-free view of the listing.
+
+This server renders each directory as an HTML page with links to its entries, and it layers on two behaviors that make the listing genuinely useful: it advertises a ready-to-paste shell command that mirrors the current folder recursively, and it offers a flat "raw" rendering mode whose links are wired so that scripted clients stay in raw mode as they descend the tree. The two features below are the externally observable contract for those behaviors.
+
+---
+
+## Architecture & Engineering Constraints
+
+To ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:
+
+1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.
+   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.
+   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single "god file". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.
+   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.
+
+2. **Strict Separation of Concerns (Anti-Overfitting):**
+   The JSON input/output test cases provided in the "Core Features" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls to the core domain.
+
+3. **Adherence to SOLID Design Principles:**
+   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):
+   - **Single Responsibility Principle (SRP):** Separate [a string defining the current view state — ask PM for literal value] routing, filesystem enumeration, link construction, and HTML rendering into distinct logical units.
+   - **Open/Closed Principle (OCP):** The rendering engine must be open for extension but closed for modification.
+   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.
+   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.
+   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.
+
+4. **Robustness & Interface Design:**
+   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.
+   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.
+
+---
+
+## Core Features
+
+### Feature 1: Recursive Folder-Download Command
+
+**As a developer**, I want the listing page to advertise a single ready-to-run command that mirrors the folder I am viewing, so I can copy it and download the whole sub-tree in one step instead of clicking each file.
+
+**Expected Behavior / Usage:**
+
+The server serves a directory tree rooted at some base directory and, with the recursive-download footer enabled, every folder page exposes one shell command that downloads that folder. The command targets the folder in the server's flat/raw form (its URL ends with the raw-mode query marker `?raw=true`), and it instructs a `wget`-style downloader to recurse, continue partial transfers, keep timestamps, avoid creating a host-named directory, and reject auto-generated index pages — expressed as the fixed flag block `-rcnHp -R 'index.html*'`. The variable part of the command depends solely on the depth of the [a string defining the current view state — ask PM for literal value]ed folder beneath the served root (depth counts the path segments below root; the root itself is depth 0): at depth 0 the command adds ` -P '<authority>'` so the mirror lands in a folder named after the host authority the client addressed; at depth 1 no path-adjustment flag is added; at depth 2 or deeper the command adds ` --cut-dirs=<n>` where `<n>` is the depth minus one, so the downloader strips that many leading remote path segments and does not nest the files under redundant directories. The absolute URL embedded in the command is built from the scheme, the authority the client supplied (host and port), and the [a string defining the current view state — ask PM for literal value]ed path with a trailing slash, followed by `?raw=true`. The whole command is emitted as a single line.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature1_recursive_download_command.json`
+
+```json
+{
+    "description": "A directory-listing HTTP server renders a page footer offering a single shell command that recursively downloads the currently-viewed folder. The input materializes a directory tree on disk and [a string defining the current view state — ask PM for literal value]s one folder of that tree; the output is the exact download command string the server advertises for that folder. The command always fetches the folder in the server's flat/raw form and instructs the downloader to mirror the directory recursively while skipping auto-generated index pages. The wording of the command adapts to how deep the [a string defining the current view state — ask PM for literal value]ed folder sits below the served root: the top-level folder is captured into a destination named after the [a string defining the current view state — ask PM for literal value] authority, a folder one level deep needs no path adjustment, and folders two or more levels deep ask the downloader to drop the appropriate number of leading remote path segments so files are not nested under redundant directories. The absolute URL embedded in the command reflects the host the client addressed.",
+    "cases": [
+        {
+            "input": {"dirs": ["dira", "very/deeply/nested"], "files": ["test.txt", "very/deeply/nested/test.rs"], "[a string defining the current view state — ask PM for literal value]": "/", "raw": false},
+            "expected_output": "wget -rcnHp -R 'index.html*' -P 'localhost:8080' 'http://localhost:8080/?raw=true'\n"
+        },
+        {
+            "input": {"dirs": ["dira", "very/deeply/nested"], "files": ["test.txt", "very/deeply/nested/test.rs"], "[a string defining the current view state — ask PM for literal value]": "/very/deeply/", "raw": false},
+            "expected_output": "wget -rcnHp -R 'index.html*' --cut-dirs=1 'http://localhost:8080/very/deeply/?raw=true'\n"
+        }
+    ]
+}
+```
+
+---
+
+### Feature 2: Flat (Raw) Listing Link Wiring
+
+**As a developer**, I want the flat listing's links to keep me in flat mode while navigating directories but point straight at files, so a script can crawl an entire tree in raw mode yet still link directly to downloadable files.
+
+**Expected Behavior / Usage:**
+
+When a folder is [a string defining the current view state — ask PM for literal value]ed in flat/raw mode (the [a string defining the current view state — ask PM for literal value] carries the raw-mode query marker `raw=true`), the server returns a minimal listing whose navigational links fall into three roles distinguished by a link role/class: a single parent-directory link (role `root`, present only when the [a string defining the current view state — ask PM for literal value]ed folder is not the served root), one link per sub-directory (role `directory`), and one link per regular file (role `file`). Both directory-type roles — the parent link and sub-directory links — preserve flat mode by ending their target with the raw-mode query marker `?raw=true`, and their path always ends with a trailing slash; file links carry no raw-mode marker and target the file path directly. The output enumerates these anchors in the order they appear in the document, each rendered as the link role, a single space, then the target URL.
+
+**Test Cases:** `rcb_tests/public_test_cases/feature2_raw_listing_links.json`
+
+```json
+{
+    "description": "When a directory is [a string defining the current view state — ask PM for literal value]ed in the server's flat/raw listing mode, every navigational link in the response must keep the visitor inside raw mode if and only if it points at another directory, while links that point directly at a regular file stay plain. The input materializes a directory tree and [a string defining the current view state — ask PM for literal value]s one folder in raw mode; the output lists, in document order, each navigational anchor as its link role followed by the URL it targets. Anchors come in three roles: the parent-directory link shown when the folder is not the served root, links to sub-directories, and links to files. Directory-type links (both the parent link and sub-directory links) carry the raw-mode marker as a trailing query so navigation continues in raw mode, and they always end with a trailing slash on the path; file links carry no such marker and point straight at the file.",
+    "cases": [
+        {
+            "input": {"dirs": ["dira", "very/deeply/nested"], "files": ["test.txt", "very/deeply/nested/test.rs"], "[a string defining the current view state — ask PM for literal value]": "/", "raw": true},
+            "expected_output": "directory /dira/?raw=true\nfile /test.txt\ndirectory /very/?raw=true\n"
+        },
+        {
+            "input": {"dirs": ["dira", "very/deeply/nested"], "files": ["test.txt", "very/deeply/nested/test.rs"], "[a string defining the current view state — ask PM for literal value]": "/very/", "raw": true},
+            "expected_output": "root ../?raw=true\ndirectory /very/deeply/?raw=true\n"
+        }
+    ]
+}
+```
+
+---
+
+## Deliverables
+
+1. **The Core System:** A cleanly structured codebase implementing an HTTP directory-listing server with the two behaviors above. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the "Scale-Driven Code Organization" constraint. The core logic that builds the download command and the listing links must be decoupled from standard I/O (stdin/stdout) and JSON parsing.
+
+2. **The Execution/Test Adapter:** A runnable program that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON [a string defining the current view state — ask PM for literal value] from stdin describing a directory tree to serve (`dirs`, `files`), the path to [a string defining the current view state — ask PM for literal value] (`[a string defining the current view state — ask PM for literal value]`), and whether to [a string defining the current view state — ask PM for literal value] the flat/raw listing (`raw`), then prints to stdout exactly the contract output for the selected behavior: when `raw` is false, the single recursive-download command line for the [a string defining the current view state — ask PM for literal value]ed folder; when `raw` is true, one line per navigational anchor (`<role> <url>`) in document order. The recursive-download footer is always enabled. To keep the embedded absolute URL deterministic, the adapter addresses the server with a fixed host authority of `localhost:8080`.
+
+3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.
+
+
+---
+**Implementation notes:**
+- adhere to the `single_line_mode` pattern defined in util/formatters.ts for list rendering

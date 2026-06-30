@@ -1,0 +1,761 @@
+{
+  "fuzzy_prd": "# Browser-Side OAuth 2.0 / OpenID Connect Helper Library (Authorization Code Flow with PKCE)\n\n## Project Goal\n\nBuild the deterministic, pure building blocks that a single-page web application needs in order to participate in the OAuth 2.0 / OpenID Connect **Authorization Code flow with PKCE** entirely from the browser, without a backend. These helpers cover the parts of the flow that do not require any live network call: assembling the parameters of an authorization request, generating and protecting the PKCE secret, encoding the opaque values that tie a request to its response, parsing and validating the identity token that comes back, and keying an in-memory token store. Each component is side-effect free (apart from value-derivation) and fully reproducible: given the same inputs it always produces the same output, so it can be exercised in isolation from any identity provider.\n\n---\n\n## Background & Problem\n\nA browser-only application that authenticates users with an external identity provider must implement a security-sensitive handshake by hand: it has to build a correctly-encoded authorization URL, create a high-entropy secret (the *code verifier*) and its hashed public form (the *code challenge*), carry opaque anti-forgery values (*state*) and anti-replay values (*nonce*) across a redirect, then, on return, decode the response, validate the issued identity token against a strict set of rules, and cache the resulting tokens so they are not re-requested unnecessarily.\n\nGetting any of these steps wrong is a security hazard: a malformed query string breaks the flow, a weak or leaked verifier defeats PKCE, an unvalidated token allows impersonation, and a cache that ignores the requested audience or scope can return a token that grants the wrong access. This library isolates those concerns into small, independently testable, deterministic units.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is acceptable, provided it keeps clean logical separation.\n   - **For complex systems:** If the project spans multiple distinct responsibilities (e.g. request building, cryptographic helpers, token decoding/validation, caching), it MUST NOT collapse into one \"god file\". Use a clear multi-file layout that reflects a production-grade repository. This domain has several distinct responsibilities (scope normalization, query serialization, PKCE secret handling, base64url codecs, token decode/verify, cache keying) and should be organized into separate modules.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below represent a **black-box testing contract** for an execution adapter, NOT the internal data model of the core system. The core logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter alone is responsible for translating JSON commands into idiomatic calls to the core code, and for translating thrown errors into the neutral `error=<category>` lines described below.\n\n3. **Adherence to SOLID Design Principles:** scaled appropriately to the project's size — single responsibility per unit, small cohesive interfaces, and high-level logic that does not depend on low-level I/O details.\n\n4. **Robustness & Interface Design:** The public interface must be idiomatic to the target language and hide internal complexity. Edge cases (empty/blank/missing inputs, invalid tokens) must be handled gracefully and modeled with proper error types rather than generic faults.\n\n---\n\n## Execution Adapter Contract\n\nEvery feature is driven through a thin adapter that reads **one JSON object from stdin** and writes plain text to **stdout**. The object always carries an `op` field selecting the behavior; the remaining fields are the operation's inputs. Output is a sequence of `key=value` lines, each terminated by a newline (`\\n`). When an operation rejects its input, the adapter prints exactly one neutral line of the form `error=<category>` and nothing else. Output must contain only the program's own results — no test-runner metadata.\n\nThe authoritative, complete set of cases for each feature lives in `rcb_tests/test_cases/*.json`; the snippets below are illustrative.\n\n---\n\n## Core Features\n\n### Feature 1: Effective Scope Set (`op: scope_set`)\n\n**As a developer**, I want to combine several space-separated scope strings into one normalized scope string, so that the authorization request asks for exactly the right set of permissions with no duplicates.\n\n**Expected Behavior:** The input field `scopes` is an ordered list of scope strings. Empty, blank, and null entries are ignored. Whitespace runs act as separators; duplicate scope tokens are removed keeping first-seen order; the result is a single space-joined string with no leading/trailing whitespace, emitted as `scope=<result>`.\n\n```json\n{\n  \"input\": { \"op\": \"scope_set\", \"scopes\": [\"openid profile\", \"openid email\", \"email\"] },\n  \"expected_output\": \"scope=openid profile email\\n\"\n}\n```\n\n---\n\n### Feature 2: Authorization Request Query (`op: authorize_query`)\n\n**As a developer**, I want to serialize the parameters of an authorization request into a URL query string, so I can build the URL the browser is sent to.\n\n**Expected Behavior:** The input field `params` is an object of request parameters (e.g. requested scope, response type and mode, redirect target, API audience, opaque state, nonce, and the PKCE challenge fields). Keys are serialized in the order given, each value is URL-component-encoded, and pairs are joined with `&`. The result is emitted as `query=<query-string>`.\n\n```json\n{\n  \"input\": { \"op\": \"authorize_query\", \"params\": { \"scope\": \"openid profile email\", \"response_type\": \"code\", \"response_mode\": \"query\", \"redirect_uri\": \"https://app.example.com/callback\", \"audience\": \"https://api.example.com/v2/\", \"state\": \"c3RhdGU\", \"nonce\": \"n0nce-AbC\", \"code_challenge\": \"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\", \"code_challenge_method\": \"S256\" } },\n  \"expected_output\": \"query=scope=openid%20profile%20email&response_type=code&response_mode=query&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcallback&audience=https%3A%2F%2Fapi.example.com%2Fv2%2F&state=c3RhdGU&nonce=n0nce-AbC&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256\\n\"\n}\n```\n\n---\n\n### Feature 3: Callback Query Parsing (`op: parse_query`)\n\n**As a developer**, I want to parse the query string returned to my redirect/callback target into a structured result, so I can read the authorization code (or error) and accompanying values.\n\n**Expected Behavior:** The input field `query` is the query string with no leading separator. Each key/value pair is URL-decoded. A token-lifetime field, when present, is converted to an integer; when absent it is reported as a null lifetime. Both successful results and provider error responses are parsed identically. The result object is emitted as `result=<json>`.\n\n```json\n{\n  \"input\": { \"op\": \"parse_query\", \"query\": \"code=AUTH_CODE_123&state=c3RhdGU&expires_in=86400\" },\n  \"expected_output\": \"result={\\\"code\\\":\\\"AUTH_CODE_123\\\",\\\"state\\\":\\\"c3RhdGU\\\",\\\"expires_in\\\":86400}\\n\"\n}\n```\n\n---\n\n### Feature 4: State Value Codec (`op: state_codec`)\n\n**As a developer**, I want to encode an opaque transaction value into a transport-safe text form and decode it back exactly, so anti-forgery state survives the redirect round-trip.\n\n**Expected Behavior:** The input field `state` is the value to encode. The adapter emits the encoded form as `encoded=<...>` and the value recovered by decoding it as `decoded=<...>`; decoding an encoded value reproduces the original input unchanged.\n\n```json\n{\n  \"input\": { \"op\": \"state_codec\", \"state\": \"opaque-STATE_value~123\" },\n  \"expected_output\": \"encoded=b3BhcXVlLVNUQVRFX3ZhbHVlfjEyMw==\\ndecoded=opaque-STATE_value~123\\n\"\n}\n```\n\n---\n\n### Feature 5: URL-Safe Base64 Codec (`op: base64url`)\n\n**As a developer**, I want to convert raw bytes into URL-safe base64 text and convert such text back, so binary material (like a hashed challenge) is safe to put in a URL.\n\n**Expected Behavior:** When the input supplies `bytes` (a list of byte values), the adapter emits `encoded=<url-safe base64, no [URL-safe alphabet requirements]>`. When the input supplies `encoded` (URL-safe base64 text), the adapter emits `decoded=<decoded string>`. The URL-safe alphabet is used and [URL-safe alphabet requirements] characters are omitted.\n\n```json\n{\n  \"input\": { \"op\": \"base64url\", \"bytes\": [72, 101, 108, 108, 111] },\n  \"expected_output\": \"encoded=SGVsbG8\\n\"\n}\n```\n\n---\n\n### Feature 6: PKCE Code Verifier Generation (`op: code_verifier`)\n\n**As a developer**, I want to turn a sequence of random bytes into a code verifier string, so the PKCE secret draws only from an unreserved character set.\n\n**Expected Behavior:** The input field `bytes` provides the random byte values the generator consumes. Each requested byte maps to exactly one character of a fixed unreserved character set, producing a string whose length equals the number of bytes the generator requests. The mapping is deterministic, so fixed bytes always yield the same string, emitted as `verifier=<string>`.\n\n```json\n{\n  \"input\": { \"op\": \"code_verifier\", \"bytes\": [1, 5, 10, 15, 100] },\n  \"expected_output\": \"verifier=15AFa15AFa15AFa15AFa15AFa15AFa15AFa15AFa15A\\n\"\n}\n```\n\n---\n\n### Feature 7: PKCE Code Challenge Derivation (`op: code_challenge`)\n\n**As a developer**, I want to derive the code challenge from a code verifier, so the authorization request can carry the hashed public form of the secret.\n\n**Expected Behavior:** The input field `verifier` is the code verifier. The adapter hashes it with SHA-256 and encodes the digest as URL-safe base64 without [URL-safe alphabet requirements], emitting `code_challenge=<...>` followed by `code_challenge_method=S256`. A fixed verifier always produces the same challenge.\n\n```json\n{\n  \"input\": { \"op\": \"code_challenge\", \"verifier\": \"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk\" },\n  \"expected_output\": \"code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\\ncode_challenge_method=S256\\n\"\n}\n```\n\n---\n\n### Feature 8: Identity Token Decoding (`op: decode_token`)\n\n**As a developer**, I want to decode an identity token without verifying its signature, so I can read its header, its full claim set, and the end-user profile it carries.\n\n**Expected Behavior:** The input field `id_token` is a token of three dot-separated base64url segments. The adapter emits three lines: `header=<json>` (the decoded header), `claims=<json>` (all decoded claims, plus a `__raw` copy of the original token string), and `user=<json>` (the subset of claims that are *not* well-known protocol/registered claim names — i.e. the end-user profile fields).\n\n```json\n{\n  \"input\": { \"op\": \"decode_token\", \"id_token\": \"<header>.<payload>.<signature>\" },\n  \"expected_output\": \"header={\\\"alg\\\":\\\"RS256\\\",\\\"typ\\\":\\\"JWT\\\"}\\nclaims={\\\"__raw\\\":\\\"<token>\\\",\\\"iss\\\":\\\"https://tenant.example.com/\\\",\\\"aud\\\":\\\"CLIENTID123\\\",\\\"nonce\\\":\\\"n0nce-AbC\\\",\\\"sub\\\":\\\"auth0|0123456789\\\",\\\"name\\\":\\\"Jane Doe\\\",\\\"email\\\":\\\"jane@example.com\\\",\\\"email_verified\\\":true,\\\"exp\\\":2000000000,\\\"iat\\\":1500000000}\\nuser={\\\"sub\\\":\\\"auth0|0123456789\\\",\\\"name\\\":\\\"Jane Doe\\\",\\\"email\\\":\\\"jane@example.com\\\",\\\"email_verified\\\":true}\\n\"\n}\n```\n\n(See `rcb_tests/test_cases/feature8_token_decode.json` for the concrete token and exact bytes.)\n\n---\n\n### Feature 9: Identity Token Verification (`op: verify_token`)\n\n**As a developer**, I want to validate a decoded identity token against expectations, so I reject impersonation, replay, and stale tokens.\n\n**Expected Behavior:** The input supplies the `id_token` plus the expected `iss`, `aud`, and `nonce` (and an optional clock-skew `leeway`). The token is checked for: matching issuer, matching audience, the required signing algorithm, matching nonce, and the time constraints expiry / issued-at / not-before (each with a small skew allowance). On success the adapter emits `valid=true` followed by `claims=<json>`. On the first failing check it emits exactly one neutral category line, one of: `error=invalid_issuer`, `error=invalid_audience`, `error=invalid_algorithm`, `error=invalid_nonce`, `error=expired`, `error=future_issued`, `error=not_yet_valid`.\n\n```json\n{\n  \"input\": { \"op\": \"verify_token\", \"id_token\": \"<valid token>\", \"iss\": \"https://tenant.example.com/\", \"aud\": \"CLIENTID123\", \"nonce\": \"n0nce-AbC\" },\n  \"expected_output\": \"valid=true\\nclaims={ ... }\\n\"\n}\n```\n\n```json\n{\n  \"input\": { \"op\": \"verify_token\", \"id_token\": \"<token with wrong issuer expectation>\", \"iss\": \"https://evil.example.com/\", \"aud\": \"CLIENTID123\", \"nonce\": \"n0nce-AbC\" },\n  \"expected_output\": \"error=invalid_issuer\\n\"\n}\n```\n\n(See `rcb_tests/test_cases/feature9_token_verify.json` for every category and the concrete tokens.)\n\n---\n\n### Feature 10: Token Cache Keying (`op: cache_key`)\n\n**As a developer**, I want a token cache that is keyed by both the API audience and the scope of a request, so a cached token is only reused for the exact audience+scope it was issued for.\n\n**Expected Behavior:** The input supplies an `entry` to store (carrying at least its `audience`, `scope`, and `access_token`) and a list of `lookups`, each with an `audience` and `scope`. The entry is stored, then each lookup is resolved: a lookup whose audience and scope both match the stored entry returns that entry's access token; any other combination misses. Results are emitted in order as `lookup0=<...>`, `lookup1=<...>`, …, where the value is the matched access token or `miss`.\n\n```json\n{\n  \"input\": { \"op\": \"cache_key\", \"entry\": { \"audience\": \"https://api.example.com/\", \"scope\": \"openid profile\", \"access_token\": \"AT-1\", \"id_token\": \"id1\", \"expires_in\": 3600, \"exp\": 2000000000 }, \"lookups\": [ { \"audience\": \"https://api.example.com/\", \"scope\": \"openid profile\" }, { \"audience\": \"https://api.example.com/\", \"scope\": \"openid profile email\" }, { \"audience\": \"default\", \"scope\": \"openid profile\" } ] },\n  \"expected_output\": \"lookup0=AT-1\\nlookup1=miss\\nlookup2=miss\\n\"\n}\n```\n\n---\n\n## Test Data Layout\n\n- `rcb_tests/test_cases/featureN_*.json` — the authoritative, complete case list for each feature, of the form `{ \"description\", \"cases\": [ { \"input\", \"expected_output\" } ] }`.\n- `rcb_tests/public_test_cases/featureN_*.json` — a strict subset mirror of the illustrative cases shown above.\n- `expected_output` is the exact raw stdout the adapter must produce for the given `input`.\n\n\n---\n**Implementation notes:**\n- follow the same derivation steps as the token challenge section\n- unhide flagged keys for verification\n",
+  "oracle_data": {
+    "task_id": "auth0__auth0-spa-js-001",
+    "golden_api_signature": "main(stdin: JSON object routed by op) -> stdout exactly matching public_test_cases expected_output",
+    "hidden_constraints": [
+      {
+        "constraint_id": "V007",
+        "trigger_keywords": [
+          "state工场 encoding",
+          "state delimiter char",
+          "state padding rules",
+          "base64 encoding standard used",
+          "how is state segmented"
+        ],
+        "oracle_response": "The field name is 'op.state工场' (likely a typo for 'op.state_field') and the encoding is standard base64 WITH padding ('=')."
+      },
+      {
+        "constraint_id": "V009",
+        "trigger_keywords": [
+          "SBASE64 alphabet invalid chars",
+          "base64 padding rule code logic",
+          "what chars excluded from alphabet",
+          "SBASE64 padding required",
+          "character set for UR base64"
+        ],
+        "oracle_response": "The alphabet consists of uppercase letters, lowercase letters, digits, hyphens ('-'), and underscores ('_'), and padding characters ('=') must be explicitly EXCLUDED from the output."
+      },
+      {
+        "constraint_id": "FULL_SCOPE",
+        "trigger_keywords": [
+          "full task scope",
+          "all public features",
+          "semantic equivalence"
+        ],
+        "oracle_response": "This generated package must cover the full detailed-PRD behavior represented by all authoritative public test case files, not just a subset mentioned in the fuzzy PRD. Public feature files: feature10_cache_key, feature1_scope_set, feature2_authorize_query, feature3_callback_parse, feature4_state_codec, feature5_base64url_codec, feature6_code_verifier, feature7_code_challenge, feature8_token_decode, feature9_token_verify. Feature descriptions include: Store a token cache entry keyed by the combination of its API audience and its scope, then look it up by audience and scope. A lookup whose audience and scope both match the stored entry returns that entry's access token; any other audience/scope combination misses. This verifies that the cache key is derived from both audience and scope together.; Compute the effective OAuth scope string for an authorization request by combining several space-separated scope inputs into a single normalized string. Inputs may be empty, blank, or null and must be ignored. Any internal runs of whitespace act as separators, duplicate scope tokens are removed while preserving first-seen order, and the result is a single space-joined string with no surrounding whitespace.; Serialize a set of authorization-request parameters (such as the requested scope, response type and mode, redirect target, API audience, opaque state and nonce, and PKCE challenge fields) into a URL query string. Keys appear in the order given, each value is URL-component encoded, and pairs are joined with ampersands. The result is the query portion that would be appended to an authorization endpoint.; Parse a redirect/callback query string (the part after the separator) into a structured result. Each key/value pair is URL-decoded. The token-lifetime field, when present, is converted to an integer; when absent it is reported as a null lifetime. Both successful authorization results and provider error responses are parsed the same way.; Encode an opaque transaction value (such as a login state token) into a compact transport-safe text form, and decode it back to recover the original value exactly. The encoding round-trips: decoding an encoded value yields the original input unchanged.; Convert raw bytes into a URL-safe base64 text representation (using the URL-safe alphabet and no padding), and convert such URL-safe text back into the original decoded string. This is the byte/text codec used for transport-safe handling of binary material like a hashed challenge.; Generate a PKCE code verifier string by mapping a sequence of random byte values onto a fixed unreserved character set, one character per byte. The number of characters produced matches the number of random bytes requested by the generator, and the mapping from byte value to character is deterministic, so a fixed sequence of bytes always yields the same string.; Derive a PKCE code challenge from a code verifier: hash the verifier with SHA-256 and encode the resulting digest as URL-safe base64 without padding. The transformation method is reported alongside the challenge. A fixed verifier always produces the same challenge.; Decode a signed identity token (three dot-separated base64url segments) without verifying its signature. Report the decoded header object, the full set of decoded claims (including a raw copy of the original token string), and the subset of claims that represent end-user profile information, i.e. those that are not part of the set of well-known protocol/registered claim names.; Validate a decoded identity token against the expected issuer, expected audience, expected nonce, required signing algorithm, and time-based constraints (expiry, issued-at, and not-before, each with a small clock-skew allowance). On success, report that the token is valid together with its decoded claims. On failure, report a single neutral error category identifying which check failed: wrong issuer, wrong audience, wrong signing algorith..."
+      },
+      {
+        "constraint_id": "EXECUTION_CONTRACT",
+        "trigger_keywords": [
+          "dispatcher contract",
+          "same tests",
+          "input fields",
+          "stdout expected_output"
+        ],
+        "oracle_response": "The execution adapter must accept exactly the input shapes used by public_test_cases and emit stdout exactly equal to each expected_output. Observed top-level input fields/values include: op=['authorize_query', 'base64url', 'cache_key', 'code_challenge', 'code_verifier', 'decode_token', 'parse_query', 'scope_set', 'state_codec', 'verify_token'], entry=['{dict}'], lookups=['[list]'], scopes=['[list]'], params=['{dict}'], query=['code=AUTH_CODE_123&state=c3RhdGU&expires_in=86400', 'error=access_denied&error_description=User%20did%20not%20authorize&state=c3RhdGU'], state=['opaque-STATE_value~123'], bytes=['[list]'], verifier=['dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk'], id_token=['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmN', 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmN'], iss=['https://evil.example.com/', 'https://tenant.example.com/'], aud=['CLIENTID123'], nonce=['n0nce-AbC']. Do not require a different discriminator field, different action names, JSON output where line output is expected, or extra PASS/FAIL metadata."
+      },
+      {
+        "constraint_id": "PUBLIC_TEST_CASES_AUTHORITY",
+        "trigger_keywords": [
+          "exact outputs",
+          "public tests authoritative",
+          "expected_output"
+        ],
+        "oracle_response": "The embedded public_test_cases are part of oracle_data and are authoritative for exact input shapes, action/operation names, stdout line order, whitespace, error categories, numeric formatting, and deterministic serialization. If prose, fuzzy_prd, context pointers, or older hidden constraints are vague or conflict with expected_output, the public_test_cases expected_output is the pass-critical contract."
+      },
+      {
+        "constraint_id": "NO_CROSS_TASK_INFERENCE",
+        "trigger_keywords": [
+          "ignore unrelated analogies",
+          "cross task contamination"
+        ],
+        "oracle_response": "Ignore any vague analogy or context pointer that names an unrelated module, pipeline, login flow, audit generator, or previous project. Such wording is non-normative; only this repo’s detailed PRD, FULL_SCOPE, EXECUTION_CONTRACT, and public_test_cases define the task."
+      },
+      {
+        "constraint_id": "TC_feature9_token_verify",
+        "trigger_keywords": [
+          "feature9_token_verify",
+          "feature9_token_verify.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature9_token_verify:\n{\n  \"description\": \"Validate a decoded identity token against the expected issuer, expected audience, expected nonce, required signing algorithm, and time-based constraints (expiry, issued-at, and not-before, each with a small clock-skew allowance). On success, report that the token is valid together with its decoded claims. On failure, report a single neutral error category identifying which check failed: wrong issuer, wrong audience, wrong signing algorithm, wrong nonce, expired token, token issued in the future, or token not yet valid.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"verify_token\",\n        \"id_token\": \"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl\",\n        \"iss\": \"https://tenant.example.com/\",\n        \"aud\": \"CLIENTID123\",\n        \"nonce\": \"n0nce-AbC\"\n      },\n      \"expected_output\": \"valid=true\\nclaims={\\\"__raw\\\":\\\"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl\\\",\\\"iss\\\":\\\"https://tenant.example.com/\\\",\\\"aud\\\":\\\"CLIENTID123\\\",\\\"nonce\\\":\\\"n0nce-AbC\\\",\\\"sub\\\":\\\"auth0|0123456789\\\",\\\"name\\\":\\\"Jane Doe\\\",\\\"email\\\":\\\"jane@example.com\\\",\\\"email_verified\\\":true,\\\"exp\\\":2000000000,\\\"iat\\\":1500000000}\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"verify_token\",\n        \"id_token\": \"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl\",\n        \"iss\": \"https://evil.example.com/\",\n        \"aud\": \"CLIENTID123\",\n        \"nonce\": \"n0nce-AbC\"\n      },\n      \"expected_output\": \"error=invalid_issuer\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"verify_token\",\n        \"id_token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl\",\n        \"iss\": \"https://tenant.example.com/\",\n        \"aud\": \"CLIENTID123\",\n        \"nonce\": \"n0nce-AbC\"\n      },\n      \"expected_output\": \"error=invalid_algorithm\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"verify_token\",\n        \"id_token\": \"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjEwMDAwMDAwMDAsImlhdCI6OTAwMDAwMDAwfQ.c2lnbmF0dXJl\",\n        \"iss\": \"https://tenant.example.com/\",\n        \"aud\": \"CLIENTID123\",\n        \"nonce\": \"n0nce-AbC\"\n      },\n      \"expected_output\": \"error=expired\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_token_decode",
+        "trigger_keywords": [
+          "feature8_token_decode",
+          "feature8_token_decode.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature8_token_decode:\n{\n  \"description\": \"Decode a signed identity token (three dot-separated base64url segments) without verifying its signature. Report the decoded header object, the full set of decoded claims (including a raw copy of the original token string), and the subset of claims that represent end-user profile information, i.e. those that are not part of the set of well-known protocol/registered claim names.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"decode_token\",\n        \"id_token\": \"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl\"\n      },\n      \"expected_output\": \"header={\\\"alg\\\":\\\"RS256\\\",\\\"typ\\\":\\\"JWT\\\"}\\nclaims={\\\"__raw\\\":\\\"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl\\\",\\\"iss\\\":\\\"https://tenant.example.com/\\\",\\\"aud\\\":\\\"CLIENTID123\\\",\\\"nonce\\\":\\\"n0nce-AbC\\\",\\\"sub\\\":\\\"auth0|0123456789\\\",\\\"name\\\":\\\"Jane Doe\\\",\\\"email\\\":\\\"jane@example.com\\\",\\\"email_verified\\\":true,\\\"exp\\\":2000000000,\\\"iat\\\":1500000000}\\nuser={\\\"sub\\\":\\\"auth0|0123456789\\\",\\\"name\\\":\\\"Jane Doe\\\",\\\"email\\\":\\\"jane@example.com\\\",\\\"email_verified\\\":true}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_code_challenge",
+        "trigger_keywords": [
+          "feature7_code_challenge",
+          "feature7_code_challenge.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature7_code_challenge:\n{\n  \"description\": \"Derive a PKCE code challenge from a code verifier: hash the verifier with SHA-256 and encode the resulting digest as URL-safe base64 without padding. The transformation method is reported alongside the challenge. A fixed verifier always produces the same challenge.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"code_challenge\",\n        \"verifier\": \"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk\"\n      },\n      \"expected_output\": \"code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\\ncode_challenge_method=S256\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_code_verifier",
+        "trigger_keywords": [
+          "feature6_code_verifier",
+          "feature6_code_verifier.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature6_code_verifier:\n{\n  \"description\": \"Generate a PKCE code verifier string by mapping a sequence of random byte values onto a fixed unreserved character set, one character per byte. The number of characters produced matches the number of random bytes requested by the generator, and the mapping from byte value to character is deterministic, so a fixed sequence of bytes always yields the same string.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"code_verifier\",\n        \"bytes\": [\n          1,\n          5,\n          10,\n          15,\n          100\n        ]\n      },\n      \"expected_output\": \"verifier=15AFa15AFa15AFa15AFa15AFa15AFa15AFa15AFa15A\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_base64url_codec",
+        "trigger_keywords": [
+          "feature5_base64url_codec",
+          "feature5_base64url_codec.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature5_base64url_codec:\n{\n  \"description\": \"Convert raw bytes into a URL-safe base64 text representation (using the URL-safe alphabet and no padding), and convert such URL-safe text back into the original decoded string. This is the byte/text codec used for transport-safe handling of binary material like a hashed challenge.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"base64url\",\n        \"bytes\": [\n          72,\n          101,\n          108,\n          108,\n          111\n        ]\n      },\n      \"expected_output\": \"encoded=SGVsbG8\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"base64url\",\n        \"bytes\": [\n          255,\n          255,\n          255\n        ]\n      },\n      \"expected_output\": \"encoded=____\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_state_codec",
+        "trigger_keywords": [
+          "feature4_state_codec",
+          "feature4_state_codec.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature4_state_codec:\n{\n  \"description\": \"Encode an opaque transaction value (such as a login state token) into a compact transport-safe text form, and decode it back to recover the original value exactly. The encoding round-trips: decoding an encoded value yields the original input unchanged.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"state_codec\",\n        \"state\": \"opaque-STATE_value~123\"\n      },\n      \"expected_output\": \"encoded=b3BhcXVlLVNUQVRFX3ZhbHVlfjEyMw==\\ndecoded=opaque-STATE_value~123\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_callback_parse",
+        "trigger_keywords": [
+          "feature3_callback_parse",
+          "feature3_callback_parse.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature3_callback_parse:\n{\n  \"description\": \"Parse a redirect/callback query string (the part after the separator) into a structured result. Each key/value pair is URL-decoded. The token-lifetime field, when present, is converted to an integer; when absent it is reported as a null lifetime. Both successful authorization results and provider error responses are parsed the same way.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"parse_query\",\n        \"query\": \"code=AUTH_CODE_123&state=c3RhdGU&expires_in=86400\"\n      },\n      \"expected_output\": \"result={\\\"code\\\":\\\"AUTH_CODE_123\\\",\\\"state\\\":\\\"c3RhdGU\\\",\\\"expires_in\\\":86400}\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"parse_query\",\n        \"query\": \"error=access_denied&error_description=User%20did%20not%20authorize&state=c3RhdGU\"\n      },\n      \"expected_output\": \"result={\\\"error\\\":\\\"access_denied\\\",\\\"error_description\\\":\\\"User did not authorize\\\",\\\"state\\\":\\\"c3RhdGU\\\",\\\"expires_in\\\":null}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_authorize_query",
+        "trigger_keywords": [
+          "feature2_authorize_query",
+          "feature2_authorize_query.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_authorize_query:\n{\n  \"description\": \"Serialize a set of authorization-request parameters (such as the requested scope, response type and mode, redirect target, API audience, opaque state and nonce, and PKCE challenge fields) into a URL query string. Keys appear in the order given, each value is URL-component encoded, and pairs are joined with ampersands. The result is the query portion that would be appended to an authorization endpoint.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"authorize_query\",\n        \"params\": {\n          \"scope\": \"openid profile email\",\n          \"response_type\": \"code\",\n          \"response_mode\": \"query\",\n          \"redirect_uri\": \"https://app.example.com/callback\",\n          \"audience\": \"https://api.example.com/v2/\",\n          \"state\": \"c3RhdGU\",\n          \"nonce\": \"n0nce-AbC\",\n          \"code_challenge\": \"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\",\n          \"code_challenge_method\": \"S256\"\n        }\n      },\n      \"expected_output\": \"query=scope=openid%20profile%20email&response_type=code&response_mode=query&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcallback&audience=https%3A%2F%2Fapi.example.com%2Fv2%2F&state=c3RhdGU&nonce=n0nce-AbC&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_scope_set",
+        "trigger_keywords": [
+          "feature1_scope_set",
+          "feature1_scope_set.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature1_scope_set:\n{\n  \"description\": \"Compute the effective OAuth scope string for an authorization request by combining several space-separated scope inputs into a single normalized string. Inputs may be empty, blank, or null and must be ignored. Any internal runs of whitespace act as separators, duplicate scope tokens are removed while preserving first-seen order, and the result is a single space-joined string with no surrounding whitespace.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"scope_set\",\n        \"scopes\": [\n          \"openid profile\",\n          \"openid email\",\n          \"email\"\n        ]\n      },\n      \"expected_output\": \"scope=openid profile email\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"scope_set\",\n        \"scopes\": [\n          \"  read:users   write:users \",\n          \"read:users\"\n        ]\n      },\n      \"expected_output\": \"scope=read:users write:users\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_cache_key",
+        "trigger_keywords": [
+          "feature10_cache_key",
+          "feature10_cache_key.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature10_cache_key:\n{\n  \"description\": \"Store a token cache entry keyed by the combination of its API audience and its scope, then look it up by audience and scope. A lookup whose audience and scope both match the stored entry returns that entry's access token; any other audience/scope combination misses. This verifies that the cache key is derived from both audience and scope together.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"cache_key\",\n        \"entry\": {\n          \"audience\": \"https://api.example.com/\",\n          \"scope\": \"openid profile\",\n          \"access_token\": \"AT-1\",\n          \"id_token\": \"id1\",\n          \"expires_in\": 3600,\n          \"exp\": 2000000000\n        },\n        \"lookups\": [\n          {\n            \"audience\": \"https://api.example.com/\",\n            \"scope\": \"openid profile\"\n          },\n          {\n            \"audience\": \"https://api.example.com/\",\n            \"scope\": \"openid profile email\"\n          },\n          {\n            \"audience\": \"default\",\n            \"scope\": \"openid profile\"\n          }\n        ]\n      },\n      \"expected_output\": \"lookup0=AT-1\\nlookup1=miss\\nlookup2=miss\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the same derivation steps as the token challenge section",
+        "actual_meaning": "This refers to the standard HMAC-SHA256 derivation where the verifier (S) is hashed combined with the code verifier, rejecting plain S256 without the verifier tag (S256(tag='code'))."
+      },
+      {
+        "vague_reference": "unhide flagged keys for verification",
+        "actual_meaning": "This refers to keys prefixed with '__'. Their exact definition and reconstruction logic are not fully specified in this constraint."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_cache_key.json": {
+      "description": "Store a token cache entry keyed by the combination of its API audience and its scope, then look it up by audience and scope. A lookup whose audience and scope both match the stored entry returns that entry's access token; any other audience/scope combination misses. This verifies that the cache key is derived from both audience and scope together.",
+      "cases": [
+        {
+          "input": {
+            "op": "cache_key",
+            "entry": {
+              "audience": "https://api.example.com/",
+              "scope": "openid profile",
+              "access_token": "AT-1",
+              "id_token": "id1",
+              "expires_in": 3600,
+              "exp": 2000000000
+            },
+            "lookups": [
+              {
+                "audience": "https://api.example.com/",
+                "scope": "openid profile"
+              },
+              {
+                "audience": "https://api.example.com/",
+                "scope": "openid profile email"
+              },
+              {
+                "audience": "default",
+                "scope": "openid profile"
+              }
+            ]
+          },
+          "expected_output": "lookup0=AT-1\nlookup1=miss\nlookup2=miss\n"
+        }
+      ]
+    },
+    "feature1_scope_set.json": {
+      "description": "Compute the effective OAuth scope string for an authorization request by combining several space-separated scope inputs into a single normalized string. Inputs may be empty, blank, or null and must be ignored. Any internal runs of whitespace act as separators, duplicate scope tokens are removed while preserving first-seen order, and the result is a single space-joined string with no surrounding whitespace.",
+      "cases": [
+        {
+          "input": {
+            "op": "scope_set",
+            "scopes": [
+              "openid profile",
+              "openid email",
+              "email"
+            ]
+          },
+          "expected_output": "scope=openid profile email\n"
+        },
+        {
+          "input": {
+            "op": "scope_set",
+            "scopes": [
+              "  read:users   write:users ",
+              "read:users"
+            ]
+          },
+          "expected_output": "scope=read:users write:users\n"
+        }
+      ]
+    },
+    "feature2_authorize_query.json": {
+      "description": "Serialize a set of authorization-request parameters (such as the requested scope, response type and mode, redirect target, API audience, opaque state and nonce, and PKCE challenge fields) into a URL query string. Keys appear in the order given, each value is URL-component encoded, and pairs are joined with ampersands. The result is the query portion that would be appended to an authorization endpoint.",
+      "cases": [
+        {
+          "input": {
+            "op": "authorize_query",
+            "params": {
+              "scope": "openid profile email",
+              "response_type": "code",
+              "response_mode": "query",
+              "redirect_uri": "https://app.example.com/callback",
+              "audience": "https://api.example.com/v2/",
+              "state": "c3RhdGU",
+              "nonce": "n0nce-AbC",
+              "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+              "code_challenge_method": "S256"
+            }
+          },
+          "expected_output": "query=scope=openid%20profile%20email&response_type=code&response_mode=query&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcallback&audience=https%3A%2F%2Fapi.example.com%2Fv2%2F&state=c3RhdGU&nonce=n0nce-AbC&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256\n"
+        }
+      ]
+    },
+    "feature3_callback_parse.json": {
+      "description": "Parse a redirect/callback query string (the part after the separator) into a structured result. Each key/value pair is URL-decoded. The token-lifetime field, when present, is converted to an integer; when absent it is reported as a null lifetime. Both successful authorization results and provider error responses are parsed the same way.",
+      "cases": [
+        {
+          "input": {
+            "op": "parse_query",
+            "query": "code=AUTH_CODE_123&state=c3RhdGU&expires_in=86400"
+          },
+          "expected_output": "result={\"code\":\"AUTH_CODE_123\",\"state\":\"c3RhdGU\",\"expires_in\":86400}\n"
+        },
+        {
+          "input": {
+            "op": "parse_query",
+            "query": "error=access_denied&error_description=User%20did%20not%20authorize&state=c3RhdGU"
+          },
+          "expected_output": "result={\"error\":\"access_denied\",\"error_description\":\"User did not authorize\",\"state\":\"c3RhdGU\",\"expires_in\":null}\n"
+        }
+      ]
+    },
+    "feature4_state_codec.json": {
+      "description": "Encode an opaque transaction value (such as a login state token) into a compact transport-safe text form, and decode it back to recover the original value exactly. The encoding round-trips: decoding an encoded value yields the original input unchanged.",
+      "cases": [
+        {
+          "input": {
+            "op": "state_codec",
+            "state": "opaque-STATE_value~123"
+          },
+          "expected_output": "encoded=b3BhcXVlLVNUQVRFX3ZhbHVlfjEyMw==\ndecoded=opaque-STATE_value~123\n"
+        }
+      ]
+    },
+    "feature5_base64url_codec.json": {
+      "description": "Convert raw bytes into a URL-safe base64 text representation (using the URL-safe alphabet and no padding), and convert such URL-safe text back into the original decoded string. This is the byte/text codec used for transport-safe handling of binary material like a hashed challenge.",
+      "cases": [
+        {
+          "input": {
+            "op": "base64url",
+            "bytes": [
+              72,
+              101,
+              108,
+              108,
+              111
+            ]
+          },
+          "expected_output": "encoded=SGVsbG8\n"
+        },
+        {
+          "input": {
+            "op": "base64url",
+            "bytes": [
+              255,
+              255,
+              255
+            ]
+          },
+          "expected_output": "encoded=____\n"
+        }
+      ]
+    },
+    "feature6_code_verifier.json": {
+      "description": "Generate a PKCE code verifier string by mapping a sequence of random byte values onto a fixed unreserved character set, one character per byte. The number of characters produced matches the number of random bytes requested by the generator, and the mapping from byte value to character is deterministic, so a fixed sequence of bytes always yields the same string.",
+      "cases": [
+        {
+          "input": {
+            "op": "code_verifier",
+            "bytes": [
+              1,
+              5,
+              10,
+              15,
+              100
+            ]
+          },
+          "expected_output": "verifier=15AFa15AFa15AFa15AFa15AFa15AFa15AFa15AFa15A\n"
+        }
+      ]
+    },
+    "feature7_code_challenge.json": {
+      "description": "Derive a PKCE code challenge from a code verifier: hash the verifier with SHA-256 and encode the resulting digest as URL-safe base64 without padding. The transformation method is reported alongside the challenge. A fixed verifier always produces the same challenge.",
+      "cases": [
+        {
+          "input": {
+            "op": "code_challenge",
+            "verifier": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+          },
+          "expected_output": "code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\ncode_challenge_method=S256\n"
+        }
+      ]
+    },
+    "feature8_token_decode.json": {
+      "description": "Decode a signed identity token (three dot-separated base64url segments) without verifying its signature. Report the decoded header object, the full set of decoded claims (including a raw copy of the original token string), and the subset of claims that represent end-user profile information, i.e. those that are not part of the set of well-known protocol/registered claim names.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_token",
+            "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl"
+          },
+          "expected_output": "header={\"alg\":\"RS256\",\"typ\":\"JWT\"}\nclaims={\"__raw\":\"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl\",\"iss\":\"https://tenant.example.com/\",\"aud\":\"CLIENTID123\",\"nonce\":\"n0nce-AbC\",\"sub\":\"auth0|0123456789\",\"name\":\"Jane Doe\",\"email\":\"jane@example.com\",\"email_verified\":true,\"exp\":2000000000,\"iat\":1500000000}\nuser={\"sub\":\"auth0|0123456789\",\"name\":\"Jane Doe\",\"email\":\"jane@example.com\",\"email_verified\":true}\n"
+        }
+      ]
+    },
+    "feature9_token_verify.json": {
+      "description": "Validate a decoded identity token against the expected issuer, expected audience, expected nonce, required signing algorithm, and time-based constraints (expiry, issued-at, and not-before, each with a small clock-skew allowance). On success, report that the token is valid together with its decoded claims. On failure, report a single neutral error category identifying which check failed: wrong issuer, wrong audience, wrong signing algorithm, wrong nonce, expired token, token issued in the future, or token not yet valid.",
+      "cases": [
+        {
+          "input": {
+            "op": "verify_token",
+            "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl",
+            "iss": "https://tenant.example.com/",
+            "aud": "CLIENTID123",
+            "nonce": "n0nce-AbC"
+          },
+          "expected_output": "valid=true\nclaims={\"__raw\":\"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl\",\"iss\":\"https://tenant.example.com/\",\"aud\":\"CLIENTID123\",\"nonce\":\"n0nce-AbC\",\"sub\":\"auth0|0123456789\",\"name\":\"Jane Doe\",\"email\":\"jane@example.com\",\"email_verified\":true,\"exp\":2000000000,\"iat\":1500000000}\n"
+        },
+        {
+          "input": {
+            "op": "verify_token",
+            "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl",
+            "iss": "https://evil.example.com/",
+            "aud": "CLIENTID123",
+            "nonce": "n0nce-AbC"
+          },
+          "expected_output": "error=invalid_issuer\n"
+        },
+        {
+          "input": {
+            "op": "verify_token",
+            "id_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTUwMDAwMDAwMH0.c2lnbmF0dXJl",
+            "iss": "https://tenant.example.com/",
+            "aud": "CLIENTID123",
+            "nonce": "n0nce-AbC"
+          },
+          "expected_output": "error=invalid_algorithm\n"
+        },
+        {
+          "input": {
+            "op": "verify_token",
+            "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3RlbmFudC5leGFtcGxlLmNvbS8iLCJhdWQiOiJDTElFTlRJRDEyMyIsIm5vbmNlIjoibjBuY2UtQWJDIiwic3ViIjoiYXV0aDB8MDEyMzQ1Njc4OSIsIm5hbWUiOiJKYW5lIERvZSIsImVtYWlsIjoiamFuZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjEwMDAwMDAwMDAsImlhdCI6OTAwMDAwMDAwfQ.c2lnbmF0dXJl",
+            "iss": "https://tenant.example.com/",
+            "aud": "CLIENTID123",
+            "nonce": "n0nce-AbC"
+          },
+          "expected_output": "error=expired\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "V001",
+      "feature": "Authorization Request Builder",
+      "input_condition": "input.params is a map/string",
+      "output_rule": "Generate a URL query string ready for appending to the authorization endpoint.",
+      "exact_values": [
+        {
+          "key": "scope",
+          "value": "string | null"
+        },
+        {
+          "key": "response_type",
+          "value": "code"
+        },
+        {
+          "key": "response_mode",
+          "value": "query"
+        },
+        {
+          "key": "redirect_uri",
+          "value": "string | null"
+        },
+        {
+          "key": "audience",
+          "value": "string | null"
+        },
+        {
+          "key": "state",
+          "value": "string | null"
+        },
+        {
+          "key": "nonce",
+          "value": "string | null"
+        },
+        {
+          "key": "code_challenge",
+          "value": "string | null"
+        },
+        {
+          "key": "code_challenge_method",
+          "value": "S256"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V002",
+      "feature": "Authorization Request Builder",
+      "input_condition": "output is generated",
+      "output_rule": "Keys must be serialized in the order they appear in the input map.",
+      "exact_values": [
+        {
+          "separator": "&"
+        },
+        {
+          "encoding": "URL component encoding"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V003",
+      "feature": "Authorization Request Builder",
+      "input_condition": "output is generated",
+      "output_rule": "URL component encoding must replace characters that require safe transmission",
+      "exact_values": [
+        {
+          "char": " ",
+          "replacement": "%20"
+        },
+        {
+          "char": ":",
+          "replacement": "%3A"
+        },
+        {
+          "char": "/",
+          "replacement": "%2F"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V004",
+      "feature": "Callback Query Parser",
+      "input_condition": "input.query is a string without leading separator",
+      "output_rule": "Parse the query string into a JSON structure named under the key 'result'.",
+      "exact_values": [
+        {
+          "key": "code",
+          "value": "string"
+        },
+        {
+          "key": "error",
+          "value": "string"
+        },
+        {
+          "key": "error_description",
+          "value": "string"
+        },
+        {
+          "key": "state",
+          "value": "string"
+        },
+        {
+          "key": "expires_in",
+          "value": "integer | null"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V005",
+      "feature": "Callback Query Parser",
+      "input_condition": "input.query contains 'expires_in'",
+      "output_rule": "Numeric value for 'expires_in' must be converted to an integer.",
+      "ambiguous": false
+    },
+    {
+      "id": "V006",
+      "feature": "Callback Query Parser",
+      "input_condition": "input.query lacks 'expires_in'",
+      "output_rule": "'expires_in' must be set to null",
+      "ambiguous": false
+    },
+    {
+      "id": "V007",
+      "feature": "State Codec",
+      "input_condition": "op.state工场 is a string",
+      "output_rule": "Two lines must be output: encoded and decoded",
+      "exact_values": [
+        {
+          "format": "key=value"
+        },
+        {
+          "encoding": "base64 standard with padding"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V008",
+      "feature": "State Codec",
+      "input_condition": "input value is decoded from base64",
+      "output_rule": "Round-trip decoding must reproduce the original input exactly",
+      "ambiguous": false
+    },
+    {
+      "id": "V009",
+      "feature": "UR SBASE64 Codec",
+      "input_condition": "input provides bytes as an array of integers",
+      "output_rule": "Output must be encoded using URL-safe base64",
+      "exact_values": [
+        {
+          "alphabet": "0-9 A-Z a-z - _"
+        },
+        {
+          "excludes": "padding"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V010",
+      "feature": "UR SBASE64 Codec",
+      "input_condition": "input provides encoded string",
+      "output_rule": "Output must be decoded to the original raw value",
+      "ambiguous": false
+    },
+    {
+      "id": "V011",
+      "feature": "PKCE Verifier Generator",
+      "input_condition": "input bytes is an array of integers",
+      "output_rule": "Each byte maps to exactly one character from a fixed set",
+      "exact_values": [
+        {
+          "set": "Unreserved characters"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V012",
+      "feature": "PKCE Challenge Derivation",
+      "input_condition": "input verifier is a string",
+      "output_rule": "Generate a code challenge string and a method string",
+      "exact_values": [
+        {
+          "algorithm": "SHA-256"
+        },
+        {
+          "encoding": "URL-safe base64 without padding"
+        },
+        {
+          "method_output": "S256"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V013",
+      "feature": "Token Decoder",
+      "input_condition": "input id_token is a 3-segment dot-separated string",
+      "output_rule": "Output 3 lines: payload, claims, user",
+      "exact_values": [
+        {
+          "line1_label": "header"
+        },
+        {
+          "line2_label": "claims"
+        },
+        {
+          "line3_label": "user"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V014",
+      "feature": "Token Decoding",
+      "input_condition": "decoded token is claimed",
+      "output_rule": "Claims must contain keys starting with '__' and standard claim keys",
+      "exact_values": [
+        {
+          "__raw": "exact original token string"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V015",
+      "feature": "Token Decoding",
+      "input_condition": "claims are extracted",
+      "output_rule": "User object must exclude standard protocol claims",
+      "exclude_keys": [
+        "iss",
+        "aud",
+        "nonce",
+        "sub",
+        "name",
+        "email",
+        "email_verified",
+        "exp",
+        "iat",
+        "typ",
+        "alg"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V016",
+      "feature": "Token Verifier",
+      "input_condition": "input id_token, iss, aud, nonce",
+      "output_rule": "Output success path: 'valid=true' followed by 'claims=', or 'error=...' if validation fails",
+      "exact_values": [
+        {
+          "fields_to_check": [
+            "issuer (iss)",
+            "audience (aud)",
+            "algorithm (alg)",
+            "nonce",
+            "expiration (exp)",
+            "issued at (iat)",
+            "not before (nbf)"
+          ]
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V017",
+      "feature": "Token Verification",
+      "input_condition": "first check fails",
+      "output_rule": "Output exact error category line",
+      "exact_values": [
+        "error=invalid_issuer",
+        "error=invalid_audience",
+        "error=invalid_algorithm",
+        "error=invalid_nonce",
+        "error=expired",
+        "error=future_issued",
+        "error=not_yet_valid"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V018",
+      "feature": "Token Cache Keying",
+      "input_condition": "entry with audience and scope stored",
+      "output_rule": "Generates output for each lookup in the lookup list",
+      "exact_values": [
+        {
+          "success_label": "lookupX=<access_token>"
+        },
+        {
+          "miss_label": "lookupX=miss"
+        }
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "V019",
+      "feature": "Token Cache Keying",
+      "input_condition": "lookup matches entry (audience AND scope)",
+      "output_rule": "Return the entry's access token",
+      "ambiguous": false
+    },
+    {
+      "id": "V020",
+      "feature": "Token Cache Keying",
+      "input_condition": "lookup does not match entry (audience OR scope differs)",
+      "output_rule": "Return 'miss'",
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "V007",
+        "replacement": "a custom state format",
+        "exact_values_to_replace": [
+          "op.state工场",
+          "base64 standard with padding"
+        ],
+        "trigger_keywords": [
+          "state工场 encoding",
+          "state delimiter char",
+          "state padding rules",
+          "base64 encoding standard used",
+          "how is state segmented"
+        ],
+        "oracle_response": "The field name is 'op.state工场' (likely a typo for 'op.state_field') and the encoding is standard base64 WITH padding ('=')."
+      },
+      {
+        "constraint_id": "V009",
+        "replacement": "URL-safe alphabet requirements",
+        "exact_values_to_replace": [
+          "0-9 A-Z a-z - _",
+          "padding"
+        ],
+        "trigger_keywords": [
+          "SBASE64 alphabet invalid chars",
+          "base64 padding rule code logic",
+          "what chars excluded from alphabet",
+          "SBASE64 padding required",
+          "character set for UR base64"
+        ],
+        "oracle_response": "The alphabet consists of uppercase letters, lowercase letters, digits, hyphens ('-'), and underscores ('_'), and padding characters ('=') must be explicitly EXCLUDED from the output."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "V012",
+        "vague_phrase": "follow the same derivation steps as the token challenge section",
+        "actual_meaning": "This refers to the standard HMAC-SHA256 derivation where the verifier (S) is hashed combined with the code verifier, rejecting plain S256 without the verifier tag (S256(tag='code'))."
+      },
+      {
+        "constraint_id": "V014",
+        "vague_phrase": "unhide flagged keys for verification",
+        "actual_meaning": "This refers to keys prefixed with '__'. Their exact definition and reconstruction logic are not fully specified in this constraint."
+      }
+    ]
+  }
+}

@@ -1,0 +1,769 @@
+{
+  "fuzzy_prd": "hey team, we need a new internal tool for the data platform squad — basically a mini query engine that can take columnar data (think arrays of values per column) and run expressions over them in batch. the idea is you describe what computation you want as a tree of nodes (like conditions, math ops, membership checks, pattern matching etc), and the system compiles that once and evaluates it over a whole batch at a time. we need two modes: one that produces a new computed column (projection), and one that gives back the row positions that pass some condition (filtering). these two should also be chainable — filter first, then project only the surviving rows.\n\nwe talked about this being similar to what the old ETL team did with their expression evaluator last quarter, so maybe reuse that pattern where you separate the tree-building logic from the actual evaluation runtime. also there was that thing we did in the login module around input validation — same vibe, reject bad inputs early with a clear error category rather than letting garbage through.\n\nnull/missing values in input columns need to be handled gracefully — they should flow through and appear as nulls in output. also make sure the output format is consistent and machine-readable since downstream tools will parse it. the whole thing should be structured across multiple files, not one big blob. let me know if you have questions, i'll try to get more details from the data team.\n\nquick follow-up from the questions that came back: the top-level operation values the adapter should recognize are `project`, `filter`, `filter_project`, and `literal_check`. `project` means evaluate an expression over all rows and produce an output column, `filter` means evaluate a boolean condition and produce a uint32 selection-index vector of surviving row positions in ascending order, and `filter_project` means filter first and then project only those surviving rows. `literal_check` is just for validating typed literal construction, and it reports per-literal `type`, `form`, and `status=ok` or `status=error error=type_mismatch`.\n\nOn the output shape, we do need this to be very strict. For a projection operation the output must be exactly four lines: `op=project`, `result_type=<type>`, `length=<n>`, `values=[<v1>, <v2>, ...]` and each line ends with `\n`. For a filter operation it’s also exactly four lines: `op=filter`, `selection_type=uint32`, `length=<n>`, `indices=[<i1>, <i2>, ...]` and again each line ends with `\n`. For the filter-then-project pipeline, the format matches the projection format. In the value lists, boolean values must be lowercase `true`/`false`, and missing values must be rendered as `null`.\n\nAlso spelling out the expression tree a bit more so there’s no guessing: it needs to support `field`, `literal`, `function`, `if`, `in`, `and`, and `or`. `field` is a column reference by name. `literal` is a typed constant value. `function` is a named function with typed args and a declared return type, covering `add`, `greater_than`, `less_than`, and `like`. `if` has `cond`, `then`, and `else` children plus a declared `type`. `in` has an `expr` child, a `values` list, and a declared `type`. `and` and `or` both take an `args` list of child nodes.\n\nSupported scalar types are `int32`, `int64`, `float64`, `string`, and `bool`, and the selection/index vector from a filter always has type `uint32`. One other small thing the team asked about: type names can come in either as a plain string, the `name` form, or as a structured type object, the `datatype` form, and both forms need to be accepted when constructing literals.\n\nFor null behavior, the rule is consistent all the way through: a null input value has to propagate through every expression node that touches it — arithmetic, comparison, conditional, membership, pattern-match — and produce a null in the output column for that row. In the filter-then-project path, if the projected value is null it should show up in the output values list as the literal token `null` in lowercase with no quotes. For filtering, if a boolean condition comes out null for a row, that row should be treated as non-matching and not appear in the selection vector.\n\nAnd on structure, same direction as before but a little more explicit: the core compiler/evaluation logic needs to stay decoupled from stdin/stdout and JSON parsing, and the execution adapter is the only piece that translates JSON requests into calls on the core engine. So the multi-file split should cleanly separate the expression node module, projection engine, filter engine, and adapter layer.",
+  "oracle_data": {
+    "task_id": "ARROW-VEC-EXPR-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "how should invalid or malformed trees be rejected",
+          "what error do we return when a required node is null",
+          "what error categories exist and when are they triggered"
+        ],
+        "oracle_response": "Two normalised error categories must be produced. First, `null_node`: emitted as `error=null_node\n` when any required node position in an expression tree (the root expression of a project, the condition of a filter, the `cond`/`then`/`else` of an if-node, the operands of and/or, the subject of an `in` node, or any function argument) is supplied as null — the construction must be refused rather than producing a malformed tree. Second, `type_mismatch`: emitted in the `literal_check` operation as `status=error error=type_mismatch` when a literal's value is incompatible with its declared type, or when the declared type is null/missing."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "how does the LIKE / pattern match work",
+          "what wildcard syntax does the pattern matching support",
+          "which characters are wildcards in the like function"
+        ],
+        "oracle_response": "The `like` function implements SQL-style pattern matching. The only wildcard character is `%`, which matches any sequence of zero or more characters at that position in the pattern. The match must cover the entire string (i.e. it is anchored). For example, `%spark%` matches any string that contains the substring `spark` anywhere. The function returns a `bool` column when used in a projection, and acts as a boolean predicate when used in a filter condition."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "how should the codebase be structured across files",
+          "what modules or files are expected",
+          "how do we separate concerns in the implementation"
+        ],
+        "oracle_response": "The implementation must be split across multiple files reflecting distinct responsibilities — do not put everything in a single file. Required separation: (1) type system / scalar type definitions, (2) expression node abstractions and tree construction/validation, (3) projection engine logic, (4) filter engine logic, (5) value rendering / output formatting utilities, and (6) a thin execution adapter that reads JSON from stdin, calls the core engine, and writes the text output to stdout. The core engine modules must not depend on JSON parsing or I/O; only the adapter layer touches those concerns."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "what is the literal_check operation and what does it output",
+          "how do we test literal construction and type validation",
+          "what does the literal check report for each literal"
+        ],
+        "oracle_response": "The `literal_check` operation takes a list of literal descriptors, each with a `type` (string type name or null), a `value`, and a `form` field (either `\"datatype\"` or `\"name\"` indicating which spelling of the type was used). The output begins with `op=literal_check\n`, then for each literal in order one line: `type=<type_label> form=<form> status=ok` for a valid literal, or `type=<type_label> form=<form> status=error error=type_mismatch` for an invalid one. When the type is null the type label must be rendered as `none`."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_conditional_projection",
+        "trigger_keywords": [
+          "test cases for feature1 conditional projection",
+          "show me feature1 conditional projection test cases",
+          "what are the feature1 conditional projection test inputs",
+          "give me the feature1_conditional_projection test file",
+          "test cases for feature 1",
+          "feature1 conditional projection expected output",
+          "what does feature1 conditional projection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_conditional_projection:\n{\n  \"description\": \"Project a record batch through a compiled conditional expression. The schema has two equally-typed signed-integer columns. The expression compares the two columns element-wise and, for each row, selects the value from the first column when it is strictly greater than the second, otherwise the value from the second column (an if/then/else over a greater-than comparison). The adapter reports the operation, the declared result type, the number of output rows, and the resulting projected column as an ordered value list.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"project\",\n        \"schema\": [\n          {\n            \"name\": \"a\",\n            \"type\": \"int32\"\n          },\n          {\n            \"name\": \"b\",\n            \"type\": \"int32\"\n          }\n        ],\n        \"columns\": {\n          \"a\": [\n            10,\n            12,\n            -20,\n            5\n          ],\n          \"b\": [\n            5,\n            15,\n            15,\n            17\n          ]\n        },\n        \"expression\": {\n          \"node\": \"if\",\n          \"cond\": {\n            \"node\": \"function\",\n            \"name\": \"greater_than\",\n            \"args\": [\n              {\n                \"node\": \"field\",\n                \"name\": \"a\"\n              },\n              {\n                \"node\": \"field\",\n                \"name\": \"b\"\n              }\n            ],\n            \"return\": \"bool\"\n          },\n          \"then\": {\n            \"node\": \"field\",\n            \"name\": \"a\"\n          },\n          \"else\": {\n            \"node\": \"field\",\n            \"name\": \"b\"\n          },\n          \"type\": \"int32\"\n        },\n        \"result_type\": \"int32\"\n      },\n      \"expected_output\": \"op=project\\nresult_type=int32\\nlength=4\\nvalues=[10, 15, 15, 17]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_arithmetic_projection",
+        "trigger_keywords": [
+          "test cases for feature2 arithmetic projection",
+          "show me feature2 arithmetic projection test cases",
+          "what are the feature2 arithmetic projection test inputs",
+          "give me the feature2_arithmetic_projection test file",
+          "test cases for feature 2",
+          "feature2 arithmetic projection expected output",
+          "what does feature2 arithmetic projection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_arithmetic_projection:\n{\n  \"description\": \"Project a record batch through a compiled arithmetic expression. The schema has two double-precision floating-point columns. The expression adds the two columns element-wise to produce a new double-precision column. The adapter reports the operation, the declared result type, the number of output rows, and the resulting projected column as an ordered value list.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"project\",\n        \"schema\": [\n          {\n            \"name\": \"a\",\n            \"type\": \"float64\"\n          },\n          {\n            \"name\": \"b\",\n            \"type\": \"float64\"\n          }\n        ],\n        \"columns\": {\n          \"a\": [\n            1.0,\n            2.0\n          ],\n          \"b\": [\n            3.0,\n            4.0\n          ]\n        },\n        \"expression\": {\n          \"node\": \"function\",\n          \"name\": \"add\",\n          \"args\": [\n            {\n              \"node\": \"field\",\n              \"name\": \"a\"\n            },\n            {\n              \"node\": \"field\",\n              \"name\": \"b\"\n            }\n          ],\n          \"return\": \"float64\"\n        },\n        \"result_type\": \"float64\"\n      },\n      \"expected_output\": \"op=project\\nresult_type=float64\\nlength=2\\nvalues=[4.0, 6.0]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_comparison_filter",
+        "trigger_keywords": [
+          "test cases for feature3 comparison filter",
+          "show me feature3 comparison filter test cases",
+          "what are the feature3 comparison filter test inputs",
+          "give me the feature3_comparison_filter test file",
+          "test cases for feature 3",
+          "feature3 comparison filter expected output",
+          "what does feature3 comparison filter expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_comparison_filter:\n{\n  \"description\": \"Filter a record batch with a compiled boolean condition that compares a column against a constant. The schema has one double-precision column. The condition keeps rows whose value is strictly less than a fixed numeric literal. Filtering yields a selection vector of zero-based row positions (an unsigned 32-bit index list) identifying the surviving rows in ascending order. The adapter reports the operation, the selection index element type, the number of surviving rows, and the selected positions as an ordered index list.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"filter\",\n        \"schema\": [\n          {\n            \"name\": \"a\",\n            \"type\": \"float64\"\n          }\n        ],\n        \"columns\": {\n          \"a\": [\n            0.0,\n            1.0,\n            2.0,\n            3.0,\n            4.0,\n            5.0,\n            6.0,\n            7.0,\n            8.0,\n            9.0\n          ]\n        },\n        \"condition\": {\n          \"node\": \"function\",\n          \"name\": \"less_than\",\n          \"args\": [\n            {\n              \"node\": \"field\",\n              \"name\": \"a\"\n            },\n            {\n              \"node\": \"literal\",\n              \"type\": \"float64\",\n              \"value\": 5.0\n            }\n          ],\n          \"return\": \"bool\"\n        }\n      },\n      \"expected_output\": \"op=filter\\nselection_type=uint32\\nlength=5\\nindices=[0, 1, 2, 3, 4]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_membership_filter",
+        "trigger_keywords": [
+          "test cases for feature4 membership filter",
+          "show me feature4 membership filter test cases",
+          "what are the feature4 membership filter test inputs",
+          "give me the feature4_membership_filter test file",
+          "test cases for feature 4",
+          "feature4 membership filter expected output",
+          "what does feature4 membership filter expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_membership_filter:\n{\n  \"description\": \"Filter a record batch with a compiled membership condition that keeps rows whose value belongs to a fixed set of candidate constants (an IN-set test). The single column may be textual or signed integer; the candidate set is supplied as part of the expression and is typed to match the column. Filtering yields a selection vector of zero-based positions (an unsigned 32-bit index list) of the matching rows in ascending order. The adapter reports the operation, the selection index element type, the number of matching rows, and the matching positions as an ordered index list.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"filter\",\n        \"schema\": [\n          {\n            \"name\": \"a\",\n            \"type\": \"string\"\n          }\n        ],\n        \"columns\": {\n          \"a\": [\n            \"ga\",\n            \"an\",\n            \"nd\",\n            \"di\",\n            \"iv\",\n            \"va\"\n          ]\n        },\n        \"condition\": {\n          \"node\": \"in\",\n          \"expr\": {\n            \"node\": \"field\",\n            \"name\": \"a\"\n          },\n          \"values\": [\n            \"an\",\n            \"nd\"\n          ],\n          \"type\": \"string\"\n        }\n      },\n      \"expected_output\": \"op=filter\\nselection_type=uint32\\nlength=2\\nindices=[1, 2]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_boolean_composition_filter",
+        "trigger_keywords": [
+          "test cases for feature5 boolean composition filter",
+          "show me feature5 boolean composition filter test cases",
+          "what are the feature5 boolean composition filter test inputs",
+          "give me the feature5_boolean_composition_filter test file",
+          "test cases for feature 5",
+          "feature5 boolean composition filter expected output",
+          "what does feature5 boolean composition filter expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_boolean_composition_filter:\n{\n  \"description\": \"Filter a record batch with a compiled boolean condition built from several elementary comparisons combined with boolean conjunction and disjunction. The schema has two double-precision columns. The condition keeps a row when EITHER (the first column is below a constant AND the first column exceeds the second column) OR (the second column is below another constant). Filtering yields a selection vector of zero-based positions (an unsigned 32-bit index list) of surviving rows in ascending order. The adapter reports the operation, the selection index element type, the number of surviving rows, and the positions as an ordered index list.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"filter\",\n        \"schema\": [\n          {\n            \"name\": \"a\",\n            \"type\": \"float64\"\n          },\n          {\n            \"name\": \"b\",\n            \"type\": \"float64\"\n          }\n        ],\n        \"columns\": {\n          \"a\": [\n            1.0,\n            31.0,\n            46.0,\n            3.0,\n            57.0,\n            44.0,\n            22.0\n          ],\n          \"b\": [\n            5.0,\n            45.0,\n            36.0,\n            73.0,\n            83.0,\n            23.0,\n            76.0\n          ]\n        },\n        \"condition\": {\n          \"node\": \"or\",\n          \"args\": [\n            {\n              \"node\": \"and\",\n              \"args\": [\n                {\n                  \"node\": \"function\",\n                  \"name\": \"less_than\",\n                  \"args\": [\n                    {\n                      \"node\": \"field\",\n                      \"name\": \"a\"\n                    },\n                    {\n                      \"node\": \"literal\",\n                      \"type\": \"float64\",\n                      \"value\": 50.0\n                    }\n                  ],\n                  \"return\": \"bool\"\n                },\n                {\n                  \"node\": \"function\",\n                  \"name\": \"greater_than\",\n                  \"args\": [\n                    {\n                      \"node\": \"field\",\n                      \"name\": \"a\"\n                    },\n                    {\n                      \"node\": \"field\",\n                      \"name\": \"b\"\n                    }\n                  ],\n                  \"return\": \"bool\"\n                }\n              ]\n            },\n            {\n              \"node\": \"function\",\n              \"name\": \"less_than\",\n              \"args\": [\n                {\n                  \"node\": \"field\",\n                  \"name\": \"b\"\n                },\n                {\n                  \"node\": \"literal\",\n                  \"type\": \"float64\",\n                  \"value\": 11.0\n                }\n              ],\n              \"return\": \"bool\"\n            }\n          ]\n        }\n      },\n      \"expected_output\": \"op=filter\\nselection_type=uint32\\nlength=3\\nindices=[0, 2, 5]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_pattern_match_projection",
+        "trigger_keywords": [
+          "test cases for feature6 pattern match projection",
+          "show me feature6 pattern match projection test cases",
+          "what are the feature6 pattern match projection test inputs",
+          "give me the feature6_pattern_match_projection test file",
+          "test cases for feature 6",
+          "feature6 pattern match projection expected output",
+          "what does feature6 pattern match projection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_pattern_match_projection:\n{\n  \"description\": \"Project a record batch through a compiled SQL-style pattern-matching expression. The schema has one textual column. The expression applies a LIKE match against a pattern literal, where the percent sign is a wildcard matching any (possibly empty) run of characters, producing a boolean column that is true exactly for the rows whose text matches the pattern. The adapter reports the operation, the declared result type, the number of output rows, and the resulting boolean column as an ordered value list of lowercase truth values.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"project\",\n        \"schema\": [\n          {\n            \"name\": \"a\",\n            \"type\": \"string\"\n          }\n        ],\n        \"columns\": {\n          \"a\": [\n            \"park\",\n            \"sparkle\",\n            \"bright spark and fire\",\n            \"spark\"\n          ]\n        },\n        \"expression\": {\n          \"node\": \"function\",\n          \"name\": \"like\",\n          \"args\": [\n            {\n              \"node\": \"field\",\n              \"name\": \"a\"\n            },\n            {\n              \"node\": \"literal\",\n              \"type\": \"string\",\n              \"value\": \"%spark%\"\n            }\n          ],\n          \"return\": \"bool\"\n        },\n        \"result_type\": \"bool\"\n      },\n      \"expected_output\": \"op=project\\nresult_type=bool\\nlength=4\\nvalues=[false, true, true, true]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_filter_then_project",
+        "trigger_keywords": [
+          "test cases for feature7 filter then project",
+          "show me feature7 filter then project test cases",
+          "what are the feature7 filter then project test inputs",
+          "give me the feature7_filter_then_project test file",
+          "test cases for feature 7",
+          "feature7 filter then project expected output",
+          "what does feature7 filter then project expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_filter_then_project:\n{\n  \"description\": \"Run a two-stage filter-then-project pipeline over a single record batch. The schema has three signed-integer columns. A filter condition first selects the rows where the first column exceeds the second column, producing a selection vector. A separate projection expression is then evaluated only over those selected rows: for each surviving row it selects the second column when that column is below the third column, otherwise the third column (an if/then/else over a less-than comparison). The third column may contain a missing value, which propagates through the comparison and projection as a missing output. The adapter reports the operation, the declared result type, the number of projected rows, and the projected values as an ordered list with missing entries rendered as a null marker.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"filter_project\",\n        \"schema\": [\n          {\n            \"name\": \"a\",\n            \"type\": \"int32\"\n          },\n          {\n            \"name\": \"b\",\n            \"type\": \"int32\"\n          },\n          {\n            \"name\": \"c\",\n            \"type\": \"int32\"\n          }\n        ],\n        \"columns\": {\n          \"a\": [\n            10,\n            12,\n            -20,\n            5,\n            21,\n            29\n          ],\n          \"b\": [\n            5,\n            15,\n            15,\n            17,\n            12,\n            3\n          ],\n          \"c\": [\n            1,\n            25,\n            11,\n            30,\n            -21,\n            null\n          ]\n        },\n        \"condition\": {\n          \"node\": \"function\",\n          \"name\": \"greater_than\",\n          \"args\": [\n            {\n              \"node\": \"field\",\n              \"name\": \"a\"\n            },\n            {\n              \"node\": \"field\",\n              \"name\": \"b\"\n            }\n          ],\n          \"return\": \"bool\"\n        },\n        \"expression\": {\n          \"node\": \"if\",\n          \"cond\": {\n            \"node\": \"function\",\n            \"name\": \"less_than\",\n            \"args\": [\n              {\n                \"node\": \"field\",\n                \"name\": \"b\"\n              },\n              {\n                \"node\": \"field\",\n                \"name\": \"c\"\n              }\n            ],\n            \"return\": \"bool\"\n          },\n          \"then\": {\n            \"node\": \"field\",\n            \"name\": \"b\"\n          },\n          \"else\": {\n            \"node\": \"field\",\n            \"name\": \"c\"\n          },\n          \"type\": \"int32\"\n        },\n        \"result_type\": \"int32\",\n        \"selection_mode\": \"UINT32\"\n      },\n      \"expected_output\": \"op=filter_project\\nresult_type=int32\\nlength=3\\nvalues=[1, -21, null]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_typed_literals",
+        "trigger_keywords": [
+          "test cases for feature8 typed literals",
+          "show me feature8 typed literals test cases",
+          "what are the feature8 typed literals test inputs",
+          "give me the feature8_typed_literals test file",
+          "test cases for feature 8",
+          "feature8 typed literals expected output",
+          "what does feature8 typed literals expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_typed_literals:\n{\n  \"description\": \"Construct constant (literal) nodes of every supported scalar type and validate type/value compatibility. Each literal is described by a target type and a value; the target type may be given either as a structured type object or by its canonical type name (both forms must be accepted). A literal whose value is compatible with the declared type is accepted; a literal whose value does not match the declared type, or whose declared type is missing, is rejected. The adapter reports, for each requested literal in order, the type label, which type-spelling form was used, and whether construction succeeded or failed, with failures carrying a normalized error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"literal_check\",\n        \"literals\": [\n          {\n            \"type\": \"int32\",\n            \"value\": 6,\n            \"form\": \"datatype\"\n          },\n          {\n            \"type\": \"float64\",\n            \"value\": 9.0,\n            \"form\": \"datatype\"\n          },\n          {\n            \"type\": \"string\",\n            \"value\": \"hello\",\n            \"form\": \"datatype\"\n          },\n          {\n            \"type\": \"int64\",\n            \"value\": 7,\n            \"form\": \"name\"\n          },\n          {\n            \"type\": \"int64\",\n            \"value\": \"hello\",\n            \"form\": \"datatype\"\n          },\n          {\n            \"type\": null,\n            \"value\": true,\n            \"form\": \"datatype\"\n          }\n        ]\n      },\n      \"expected_output\": \"op=literal_check\\ntype=int32 form=datatype status=ok\\ntype=float64 form=datatype status=ok\\ntype=string form=datatype status=ok\\ntype=int64 form=name status=ok\\ntype=int64 form=datatype status=error error=type_mismatch\\ntype=none form=datatype status=error error=type_mismatch\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_null_node_rejection",
+        "trigger_keywords": [
+          "test cases for feature9 null node rejection",
+          "show me feature9 null node rejection test cases",
+          "what are the feature9 null node rejection test inputs",
+          "give me the feature9_null_node_rejection test file",
+          "test cases for feature 9",
+          "feature9 null node rejection expected output",
+          "what does feature9 null node rejection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_null_node_rejection:\n{\n  \"description\": \"Reject expression-tree constructions in which a required child node is missing (supplied as a null). Whenever a node position that demands a sub-expression is given a null, the construction is refused rather than producing a malformed tree. This is checked across every position that takes a node: a field reference, the branches of an if/then/else, the operands of a boolean conjunction or disjunction, the subject of a membership test, an operand of a comparison function, the root expression of a projection, and the condition of a filter. The adapter reports a single normalized error category for each such construction.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operation\": \"project\",\n        \"schema\": [\n          {\n            \"name\": \"x\",\n            \"type\": \"int32\"\n          }\n        ],\n        \"columns\": {\n          \"x\": [\n            1\n          ]\n        },\n        \"expression\": null,\n        \"result_type\": \"int32\"\n      },\n      \"expected_output\": \"error=null_node\\n\"\n    },\n    {\n      \"input\": {\n        \"operation\": \"filter\",\n        \"schema\": [\n          {\n            \"name\": \"x\",\n            \"type\": \"int32\"\n          }\n        ],\n        \"columns\": {\n          \"x\": [\n            1\n          ]\n        },\n        \"condition\": null\n      },\n      \"expected_output\": \"error=null_node\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "that thing we did in the login module around input validation — same vibe, reject bad inputs early with a clear error category",
+        "actual_meaning": "The null_node and type_mismatch error categories defined in Feature 8 (feature8_typed_literals.json) and Feature 9 (feature9_null_node_rejection.json): required child nodes supplied as null must be rejected with `error=null_node`, and literal values incompatible with their declared types must be rejected with `error=type_mismatch`, through proper error modelling rather than producing malformed trees or generic faults."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that specific point right now — best to look at the existing test case files in rcb_tests/public_test_cases/ and the architecture notes in start.md, they should clarify the expected behaviour. If it's still unclear after that, flag it and we can loop in the data team."
+  },
+  "public_test_cases": {
+    "feature1_conditional_projection.json": {
+      "description": "Project a record batch through a compiled conditional expression. The schema has two equally-typed signed-integer columns. The expression compares the two columns element-wise and, for each row, selects the value from the first column when it is strictly greater than the second, otherwise the value from the second column (an if/then/else over a greater-than comparison). The adapter reports the operation, the declared result type, the number of output rows, and the resulting projected column as an ordered value list.",
+      "cases": [
+        {
+          "input": {
+            "operation": "project",
+            "schema": [
+              {
+                "name": "a",
+                "type": "int32"
+              },
+              {
+                "name": "b",
+                "type": "int32"
+              }
+            ],
+            "columns": {
+              "a": [
+                10,
+                12,
+                -20,
+                5
+              ],
+              "b": [
+                5,
+                15,
+                15,
+                17
+              ]
+            },
+            "expression": {
+              "node": "if",
+              "cond": {
+                "node": "function",
+                "name": "greater_than",
+                "args": [
+                  {
+                    "node": "field",
+                    "name": "a"
+                  },
+                  {
+                    "node": "field",
+                    "name": "b"
+                  }
+                ],
+                "return": "bool"
+              },
+              "then": {
+                "node": "field",
+                "name": "a"
+              },
+              "else": {
+                "node": "field",
+                "name": "b"
+              },
+              "type": "int32"
+            },
+            "result_type": "int32"
+          },
+          "expected_output": "op=project\nresult_type=int32\nlength=4\nvalues=[10, 15, 15, 17]\n"
+        }
+      ]
+    },
+    "feature2_arithmetic_projection.json": {
+      "description": "Project a record batch through a compiled arithmetic expression. The schema has two double-precision floating-point columns. The expression adds the two columns element-wise to produce a new double-precision column. The adapter reports the operation, the declared result type, the number of output rows, and the resulting projected column as an ordered value list.",
+      "cases": [
+        {
+          "input": {
+            "operation": "project",
+            "schema": [
+              {
+                "name": "a",
+                "type": "float64"
+              },
+              {
+                "name": "b",
+                "type": "float64"
+              }
+            ],
+            "columns": {
+              "a": [
+                1.0,
+                2.0
+              ],
+              "b": [
+                3.0,
+                4.0
+              ]
+            },
+            "expression": {
+              "node": "function",
+              "name": "add",
+              "args": [
+                {
+                  "node": "field",
+                  "name": "a"
+                },
+                {
+                  "node": "field",
+                  "name": "b"
+                }
+              ],
+              "return": "float64"
+            },
+            "result_type": "float64"
+          },
+          "expected_output": "op=project\nresult_type=float64\nlength=2\nvalues=[4.0, 6.0]\n"
+        }
+      ]
+    },
+    "feature3_comparison_filter.json": {
+      "description": "Filter a record batch with a compiled boolean condition that compares a column against a constant. The schema has one double-precision column. The condition keeps rows whose value is strictly less than a fixed numeric literal. Filtering yields a selection vector of zero-based row positions (an unsigned 32-bit index list) identifying the surviving rows in ascending order. The adapter reports the operation, the selection index element type, the number of surviving rows, and the selected positions as an ordered index list.",
+      "cases": [
+        {
+          "input": {
+            "operation": "filter",
+            "schema": [
+              {
+                "name": "a",
+                "type": "float64"
+              }
+            ],
+            "columns": {
+              "a": [
+                0.0,
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                5.0,
+                6.0,
+                7.0,
+                8.0,
+                9.0
+              ]
+            },
+            "condition": {
+              "node": "function",
+              "name": "less_than",
+              "args": [
+                {
+                  "node": "field",
+                  "name": "a"
+                },
+                {
+                  "node": "literal",
+                  "type": "float64",
+                  "value": 5.0
+                }
+              ],
+              "return": "bool"
+            }
+          },
+          "expected_output": "op=filter\nselection_type=uint32\nlength=5\nindices=[0, 1, 2, 3, 4]\n"
+        }
+      ]
+    },
+    "feature4_membership_filter.json": {
+      "description": "Filter a record batch with a compiled membership condition that keeps rows whose value belongs to a fixed set of candidate constants (an IN-set test). The single column may be textual or signed integer; the candidate set is supplied as part of the expression and is typed to match the column. Filtering yields a selection vector of zero-based positions (an unsigned 32-bit index list) of the matching rows in ascending order. The adapter reports the operation, the selection index element type, the number of matching rows, and the matching positions as an ordered index list.",
+      "cases": [
+        {
+          "input": {
+            "operation": "filter",
+            "schema": [
+              {
+                "name": "a",
+                "type": "string"
+              }
+            ],
+            "columns": {
+              "a": [
+                "ga",
+                "an",
+                "nd",
+                "di",
+                "iv",
+                "va"
+              ]
+            },
+            "condition": {
+              "node": "in",
+              "expr": {
+                "node": "field",
+                "name": "a"
+              },
+              "values": [
+                "an",
+                "nd"
+              ],
+              "type": "string"
+            }
+          },
+          "expected_output": "op=filter\nselection_type=uint32\nlength=2\nindices=[1, 2]\n"
+        }
+      ]
+    },
+    "feature5_boolean_composition_filter.json": {
+      "description": "Filter a record batch with a compiled boolean condition built from several elementary comparisons combined with boolean conjunction and disjunction. The schema has two double-precision columns. The condition keeps a row when EITHER (the first column is below a constant AND the first column exceeds the second column) OR (the second column is below another constant). Filtering yields a selection vector of zero-based positions (an unsigned 32-bit index list) of surviving rows in ascending order. The adapter reports the operation, the selection index element type, the number of surviving rows, and the positions as an ordered index list.",
+      "cases": [
+        {
+          "input": {
+            "operation": "filter",
+            "schema": [
+              {
+                "name": "a",
+                "type": "float64"
+              },
+              {
+                "name": "b",
+                "type": "float64"
+              }
+            ],
+            "columns": {
+              "a": [
+                1.0,
+                31.0,
+                46.0,
+                3.0,
+                57.0,
+                44.0,
+                22.0
+              ],
+              "b": [
+                5.0,
+                45.0,
+                36.0,
+                73.0,
+                83.0,
+                23.0,
+                76.0
+              ]
+            },
+            "condition": {
+              "node": "or",
+              "args": [
+                {
+                  "node": "and",
+                  "args": [
+                    {
+                      "node": "function",
+                      "name": "less_than",
+                      "args": [
+                        {
+                          "node": "field",
+                          "name": "a"
+                        },
+                        {
+                          "node": "literal",
+                          "type": "float64",
+                          "value": 50.0
+                        }
+                      ],
+                      "return": "bool"
+                    },
+                    {
+                      "node": "function",
+                      "name": "greater_than",
+                      "args": [
+                        {
+                          "node": "field",
+                          "name": "a"
+                        },
+                        {
+                          "node": "field",
+                          "name": "b"
+                        }
+                      ],
+                      "return": "bool"
+                    }
+                  ]
+                },
+                {
+                  "node": "function",
+                  "name": "less_than",
+                  "args": [
+                    {
+                      "node": "field",
+                      "name": "b"
+                    },
+                    {
+                      "node": "literal",
+                      "type": "float64",
+                      "value": 11.0
+                    }
+                  ],
+                  "return": "bool"
+                }
+              ]
+            }
+          },
+          "expected_output": "op=filter\nselection_type=uint32\nlength=3\nindices=[0, 2, 5]\n"
+        }
+      ]
+    },
+    "feature6_pattern_match_projection.json": {
+      "description": "Project a record batch through a compiled SQL-style pattern-matching expression. The schema has one textual column. The expression applies a LIKE match against a pattern literal, where the percent sign is a wildcard matching any (possibly empty) run of characters, producing a boolean column that is true exactly for the rows whose text matches the pattern. The adapter reports the operation, the declared result type, the number of output rows, and the resulting boolean column as an ordered value list of lowercase truth values.",
+      "cases": [
+        {
+          "input": {
+            "operation": "project",
+            "schema": [
+              {
+                "name": "a",
+                "type": "string"
+              }
+            ],
+            "columns": {
+              "a": [
+                "park",
+                "sparkle",
+                "bright spark and fire",
+                "spark"
+              ]
+            },
+            "expression": {
+              "node": "function",
+              "name": "like",
+              "args": [
+                {
+                  "node": "field",
+                  "name": "a"
+                },
+                {
+                  "node": "literal",
+                  "type": "string",
+                  "value": "%spark%"
+                }
+              ],
+              "return": "bool"
+            },
+            "result_type": "bool"
+          },
+          "expected_output": "op=project\nresult_type=bool\nlength=4\nvalues=[false, true, true, true]\n"
+        }
+      ]
+    },
+    "feature7_filter_then_project.json": {
+      "description": "Run a two-stage filter-then-project pipeline over a single record batch. The schema has three signed-integer columns. A filter condition first selects the rows where the first column exceeds the second column, producing a selection vector. A separate projection expression is then evaluated only over those selected rows: for each surviving row it selects the second column when that column is below the third column, otherwise the third column (an if/then/else over a less-than comparison). The third column may contain a missing value, which propagates through the comparison and projection as a missing output. The adapter reports the operation, the declared result type, the number of projected rows, and the projected values as an ordered list with missing entries rendered as a null marker.",
+      "cases": [
+        {
+          "input": {
+            "operation": "filter_project",
+            "schema": [
+              {
+                "name": "a",
+                "type": "int32"
+              },
+              {
+                "name": "b",
+                "type": "int32"
+              },
+              {
+                "name": "c",
+                "type": "int32"
+              }
+            ],
+            "columns": {
+              "a": [
+                10,
+                12,
+                -20,
+                5,
+                21,
+                29
+              ],
+              "b": [
+                5,
+                15,
+                15,
+                17,
+                12,
+                3
+              ],
+              "c": [
+                1,
+                25,
+                11,
+                30,
+                -21,
+                null
+              ]
+            },
+            "condition": {
+              "node": "function",
+              "name": "greater_than",
+              "args": [
+                {
+                  "node": "field",
+                  "name": "a"
+                },
+                {
+                  "node": "field",
+                  "name": "b"
+                }
+              ],
+              "return": "bool"
+            },
+            "expression": {
+              "node": "if",
+              "cond": {
+                "node": "function",
+                "name": "less_than",
+                "args": [
+                  {
+                    "node": "field",
+                    "name": "b"
+                  },
+                  {
+                    "node": "field",
+                    "name": "c"
+                  }
+                ],
+                "return": "bool"
+              },
+              "then": {
+                "node": "field",
+                "name": "b"
+              },
+              "else": {
+                "node": "field",
+                "name": "c"
+              },
+              "type": "int32"
+            },
+            "result_type": "int32",
+            "selection_mode": "UINT32"
+          },
+          "expected_output": "op=filter_project\nresult_type=int32\nlength=3\nvalues=[1, -21, null]\n"
+        }
+      ]
+    },
+    "feature8_typed_literals.json": {
+      "description": "Construct constant (literal) nodes of every supported scalar type and validate type/value compatibility. Each literal is described by a target type and a value; the target type may be given either as a structured type object or by its canonical type name (both forms must be accepted). A literal whose value is compatible with the declared type is accepted; a literal whose value does not match the declared type, or whose declared type is missing, is rejected. The adapter reports, for each requested literal in order, the type label, which type-spelling form was used, and whether construction succeeded or failed, with failures carrying a normalized error category.",
+      "cases": [
+        {
+          "input": {
+            "operation": "literal_check",
+            "literals": [
+              {
+                "type": "int32",
+                "value": 6,
+                "form": "datatype"
+              },
+              {
+                "type": "float64",
+                "value": 9.0,
+                "form": "datatype"
+              },
+              {
+                "type": "string",
+                "value": "hello",
+                "form": "datatype"
+              },
+              {
+                "type": "int64",
+                "value": 7,
+                "form": "name"
+              },
+              {
+                "type": "int64",
+                "value": "hello",
+                "form": "datatype"
+              },
+              {
+                "type": null,
+                "value": true,
+                "form": "datatype"
+              }
+            ]
+          },
+          "expected_output": "op=literal_check\ntype=int32 form=datatype status=ok\ntype=float64 form=datatype status=ok\ntype=string form=datatype status=ok\ntype=int64 form=name status=ok\ntype=int64 form=datatype status=error error=type_mismatch\ntype=none form=datatype status=error error=type_mismatch\n"
+        }
+      ]
+    },
+    "feature9_null_node_rejection.json": {
+      "description": "Reject expression-tree constructions in which a required child node is missing (supplied as a null). Whenever a node position that demands a sub-expression is given a null, the construction is refused rather than producing a malformed tree. This is checked across every position that takes a node: a field reference, the branches of an if/then/else, the operands of a boolean conjunction or disjunction, the subject of a membership test, an operand of a comparison function, the root expression of a projection, and the condition of a filter. The adapter reports a single normalized error category for each such construction.",
+      "cases": [
+        {
+          "input": {
+            "operation": "project",
+            "schema": [
+              {
+                "name": "x",
+                "type": "int32"
+              }
+            ],
+            "columns": {
+              "x": [
+                1
+              ]
+            },
+            "expression": null,
+            "result_type": "int32"
+          },
+          "expected_output": "error=null_node\n"
+        },
+        {
+          "input": {
+            "operation": "filter",
+            "schema": [
+              {
+                "name": "x",
+                "type": "int32"
+              }
+            ],
+            "columns": {
+              "x": [
+                1
+              ]
+            },
+            "condition": null
+          },
+          "expected_output": "error=null_node\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C003",
+      "C004",
+      "C005"
+    ],
+    "kept_c": [
+      "C006",
+      "C007",
+      "C008",
+      "C009"
+    ],
+    "revealed_cp": 1,
+    "kept_cp": 1
+  }
+}

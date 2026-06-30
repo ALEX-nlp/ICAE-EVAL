@@ -1,0 +1,13 @@
+## Product Requirement Document
+
+We need to complete the OpenAPI contract code-generation behavior covered by the tests. The scope includes YAML parsing edge cases, quoted enum preservation, anchor/alias detection, alias enum resolution, OpenAPI encoding validation, primitive model serialization/deserialization, enum JSON mapping, unique array handling, map serialization, HTTP client request mapping, HTTP client result mapping, and server routing. The adapter should route by feature and produce deterministic summaries of generated/model behavior.
+
+One extra detail on the YAML enum piece because that was the main point of confusion: YAML will happily treat certain unquoted uppercase values like 'NO', 'YES', 'TRUE', 'FALSE' as booleans or other special tokens. For this contract, if we want those to stay JSON strings, the enum entries in the YAML source need to be quoted, like '- "NO"', and the parser behavior needs to keep them as strings instead of coercing them. That needs to be true both on a straight read and on a tree merge, and the expected result stays is_array=true and first_value_json="NO", including the quotes in the JSON rendering.
+
+Also on the reusable alias detection, we should only say contains_anchor_and_alias=true when the raw YAML text contains both an anchor token with '&' and an alias token with '*'. If there is only an anchor, only an alias, or neither, it should be contains_anchor_and_alias=false. This check needs to happen from the raw text rather than the parsed structure, since by the time parsing is done the alias may already be resolved and that signal is gone.
+
+For the case where a property's enum is provided through a YAML alias like 'enum: *status_values', we are keeping the current behavior as-is: the property-level resolved enum list comes back empty, so the expected output is exactly 'enum_values=\n'. That is intentional for now even though the YAML itself is valid and the anchor resolution works.
+
+One other validation note: an OpenAPI 3.x requestBody can have an 'encoding' block under a 'content' entry, and if that encoding sets a contentType for a binary property, we should still accept the document. The expected result there is is_valid=true, so the validator should not reject it just because request-body encoding metadata appears next to a binary-format property schema.
+
+And just to tie this back to the existing scope, this same YAML quote-preservation behavior is the feature1_1_yaml_quoted_enum path and it applies to both 'read' and 'merge' on YAML trees, specifically the behavior where the x-extensible-enum values need to keep quoted strings like "NO" after both operations.

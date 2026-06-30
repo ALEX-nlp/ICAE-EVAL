@@ -1,0 +1,380 @@
+{
+  "fuzzy_prd": "# Schema-Driven Binary Serialization for Typed Records — Schema Derivation, Encoding & Decoding\n\n## Project Goal\n\nBuild a serialization library that derives a self-describing schema from a statically-typed value and encodes that value into a compact binary form (and reads it back), so developers can exchange strongly-typed data across systems without hand-writing schemas or fragile byte-level parsing code.\n\n---\n\n## Background & Problem\n\nSystems that exchange structured data need both a *schema* (a machine-readable description of the data's shape) and a compact *binary encoding* that follows that schema. Writing schemas by hand and keeping them in sync with the program's types is tedious and error-prone, and bespoke binary readers/writers are easy to get subtly wrong.\n\nThis library removes that burden: given the static type of a value, it derives the matching schema automatically, encodes values to the format's compact binary layout, and decodes them back into typed values — including correct behavior when the reader's view of a type has evolved away from the writer's.\n\nThe schema is rendered as a canonical JSON document. Primitive types map to direct wire types; an optional value is expressed as a union with the null type; structured records list their fields in order; enumerations list their symbols and may declare an alias, documentation, and a fallback default symbol. The binary encoding is length-and-tag free for records (fields are simply concatenated) and uses zig-zag variable-length integers, fixed little-endian floats, and length-prefixed UTF-8 text.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Primitive Type Schema Derivation\n\n**As a developer**, I want a schema derived for any primitive scalar type, so I can describe simple values on the wire without writing schemas by hand.\n\n**Expected Behavior / Usage:**\n\nThe request supplies an operation of `schema` and a `kind` naming a primitive category: a logical boolean, the four signed integer widths (8-, 16-, 32- and 64-bit), the two floating-point widths (single and double), text, and a single character. The adapter derives the schema for that scalar and prints its canonical JSON schema document. The two narrow integer widths and the 32-bit width all render as the 32-bit integer type (`\"int\"`); the 64-bit width renders as `\"long\"`; the floating-point widths render as `\"float\"` and `\"double\"`; the boolean and text kinds render as `\"boolean\"` and `\"string\"`. A single character renders as the 32-bit integer type carrying a `char` logical-type marker. Primitive schemas that are a single type are printed as that bare quoted type name; schemas with structure are printed as a pretty multi-line JSON object.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_primitive_schema.json`\n\n```json\n{\n    \"description\": \"Generate the serialization schema for a single scalar value of a given primitive category. The request names a primitive kind (logical boolean, the four signed integer widths, the two floating-point widths, text, and a single character). The adapter resolves the schema for that scalar type and prints its canonical schema document. Narrow integer widths collapse onto the 32-bit integer type, the character type is represented as a 32-bit integer carrying a logical-type marker, and the remaining kinds map to their direct wire types.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"schema\", \"kind\": \"int\"}, \"expected_output\": \"\\\"int\\\"\\n\"},\n        {\"input\": {\"op\": \"schema\", \"kind\": \"char\"}, \"expected_output\": \"{\\n  \\\"type\\\" : \\\"int\\\",\\n  \\\"logicalType\\\" : \\\"char\\\"\\n}\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Optional (Nullable) Primitive Schema Derivation\n\n**As a developer**, I want an optional scalar's schema expressed as a union with the null type, so absent values can be represented on the wire.\n\n**Expected Behavior / Usage:**\n\nThe request is identical to primitive schema derivation but adds an `nullable` flag set to true. The derived schema is a two-branch union whose first branch is the null type and whose second branch is the underlying primitive's schema, printed as a JSON array of the two branch schemas in that order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_nullable_primitive_schema.json`\n\n```json\n{\n    \"description\": \"Generate the serialization schema for an optional (nullable) scalar value of a given primitive category. The request names the same primitive kinds as the non-optional case but marks the value as optional. The resulting schema is a two-branch union of the null type and the underlying primitive's schema, in that order, so a missing value can be represented on the wire.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"schema\", \"kind\": \"int\", \"nullable\": true}, \"expected_output\": \"[ \\\"null\\\", \\\"int\\\" ]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Record Type Schema Derivation\n\n**As a developer**, I want a schema derived for structured record types, including records that embed other records, so composite data shapes are fully described.\n\n**Expected Behavior / Usage:**\n\nThe request supplies an operation of `schema` and a `kind` naming a record shape. Supported shapes are a flat record whose fields cover each primitive category in turn; a record whose second field is itself another record; and a record nested several levels deep where each level holds the next level as its single field. The derived schema is a `record` schema document carrying the record's name and an ordered list of fields, each field rendered as a name plus the schema of its type. A record used as a field's type is expanded inline as a nested `record` schema at its point of use. Field types follow the same primitive mapping as Feature 1 (narrow integer widths collapse to the 32-bit integer type).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_record_schema.json`\n\n```json\n{\n    \"description\": \"Generate the serialization schema for a structured record type. The request names a record shape: a flat record whose fields cover every primitive category, a record that embeds another record as one of its fields, and a record nested several levels deep where each level holds the next level as its only field. The adapter prints the canonical record schema document, with each field rendered as a name plus the schema of its type, and embedded records expanded inline at their point of use.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"schema\", \"kind\": \"record_nested\"}, \"expected_output\": \"{\\n  \\\"type\\\" : \\\"record\\\",\\n  \\\"name\\\" : \\\"Record\\\",\\n  \\\"fields\\\" : [ {\\n    \\\"name\\\" : \\\"foo\\\",\\n    \\\"type\\\" : \\\"string\\\"\\n  }, {\\n    \\\"name\\\" : \\\"nested\\\",\\n    \\\"type\\\" : {\\n      \\\"type\\\" : \\\"record\\\",\\n      \\\"name\\\" : \\\"Inner\\\",\\n      \\\"fields\\\" : [ {\\n        \\\"name\\\" : \\\"goo\\\",\\n        \\\"type\\\" : \\\"string\\\"\\n      } ]\\n    }\\n  } ]\\n}\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Enumeration Schema Derivation & Validation\n\n**As a developer**, I want a schema derived for an enumerated type — with its alias, documentation and fallback default — and an invalid declaration rejected up front, so enum misconfiguration fails fast.\n\n**Expected Behavior / Usage:**\n\nThe request supplies an operation of `schema` and a `kind` naming an enumeration. A valid enumeration declares an ordered set of symbols and may attach an alias, a documentation string, and exactly one symbol marked as the fallback default. Its derived schema is an `enum` schema document carrying the type name, the documentation, the symbols in declaration order, the chosen default symbol, and the list of aliases. An enumeration that marks more than one symbol as the fallback default is invalid: schema derivation fails, and the adapter prints a single neutral error line `[a specific error string token]` instead of a schema (no host-language exception identity is leaked).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_enum_schema.json`\n\n```json\n{\n    \"description\": \"Generate the serialization schema for an enumerated type, and reject an invalid one. A valid enumeration declares an ordered set of symbols, may carry an alias and a documentation string, and designates one symbol as the fallback default; its schema lists the symbols in declaration order and records the alias, documentation and default. If a type declares more than one fallback default symbol it is invalid and schema generation fails; the adapter then emits a neutral error line identifying the failure category instead of a schema.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"schema\", \"kind\": \"enum_with_default\"}, \"expected_output\": \"{\\n  \\\"type\\\" : \\\"enum\\\",\\n  \\\"name\\\" : \\\"Suit\\\",\\n  \\\"doc\\\" : \\\"documentation\\\",\\n  \\\"symbols\\\" : [ \\\"SPADES\\\", \\\"HEARTS\\\", \\\"DIAMONDS\\\", \\\"CLUBS\\\" ],\\n  \\\"default\\\" : \\\"DIAMONDS\\\",\\n  \\\"aliases\\\" : [ \\\"MySuit\\\" ]\\n}\\n\"},\n        {\"input\": {\"op\": \"schema\", \"kind\": \"enum_invalid_default\"}, \"expected_output\": \"[a specific error string token]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Primitive Value Binary Encoding\n\n**As a developer**, I want scalar values encoded to the format's compact binary layout, so I can see the exact bytes that go on the wire.\n\n**Expected Behavior / Usage:**\n\nThe request supplies an operation of `encode`, a `kind` naming the primitive category, and the `value` to encode. The adapter encodes the value to the compact binary form and prints the resulting bytes as a single lowercase hexadecimal string (two hex digits per byte, no separators). A boolean encodes to one byte (`01` for true, `00` for false). The signed integer widths encode as a zig-zag variable-length integer. A single character encodes as the zig-zag variable-length integer of its code point (it is supplied as a one-character string). The single- and double-precision floating-point widths encode as 4 and 8 fixed little-endian bytes respectively. Text encodes as the zig-zag variable-length integer of its UTF-8 byte length, immediately followed by those UTF-8 bytes.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_primitive_encoding.json`\n\n```json\n{\n    \"description\": \"Encode a single scalar value into the compact binary wire format and print the resulting bytes as a lowercase hexadecimal string. The request names the primitive category and supplies the value. Booleans encode to a single byte; the signed integer widths and the character (by its code point) use zig-zag variable-length integers; the floating-point widths use fixed little-endian layouts; text encodes as its zig-zag length prefix followed by its UTF-8 bytes.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"encode\", \"kind\": \"int\", \"value\": 44}, \"expected_output\": \"58\\n\"},\n        {\"input\": {\"op\": \"encode\", \"kind\": \"string\", \"value\": \"Hello world\"}, \"expected_output\": \"1648656c6c6f20776f726c64\\n\"},\n        {\"input\": {\"op\": \"encode\", \"kind\": \"char\", \"value\": \"A\"}, \"expected_output\": \"8201\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Record Value Binary Encoding\n\n**As a developer**, I want record values encoded to the compact binary layout, so I can verify the framing-free concatenation of field encodings.\n\n**Expected Behavior / Usage:**\n\nThe request supplies an operation of `encode`, a `kind` naming a record shape, and a `value` object keyed by field name. The adapter encodes the record and prints the resulting bytes as a single lowercase hexadecimal string. A record adds no framing of its own: its encoding is the concatenation, in declared field order, of each field value encoded with the same per-type rules as standalone scalars (Feature 5).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_record_encoding.json`\n\n```json\n{\n    \"description\": \"Encode a structured record value into the compact binary wire format and print the resulting bytes as a lowercase hexadecimal string. The request names a record shape and supplies the field values as an object keyed by field name. Records carry no framing of their own: the encoding is simply the concatenation of each field's encoded value in declared field order, using the same per-type encodings as for standalone scalars.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"encode\", \"kind\": \"record_single_int\", \"value\": {\"z\": 44}}, \"expected_output\": \"58\\n\"},\n        {\"input\": {\"op\": \"encode\", \"kind\": \"record_eight_primitives\", \"value\": {\"a\": \"Hello world\", \"b\": 3.235, \"c\": true, \"d\": 3.4, \"e\": 65653, \"f\": 44, \"g\": 3, \"h\": 3}}, \"expected_output\": \"1648656c6c6f20776f726c64e17a14ae47e10940019a995940ea8108580606\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Enumeration Decode With Schema Evolution\n\n**As a developer**, I want an enum value written by one version of a type to be read by another version that shares the enum's name and default, so a reader gracefully tolerates symbols it does not know.\n\n**Expected Behavior / Usage:**\n\nA value is written with a wider enumeration that knows the given symbol, then read back with a narrower enumeration that shares the same enum name and the same fallback default symbol but a smaller symbol set. The request supplies an operation of `decode_enum_evolution` and the `symbol` to write. When the written symbol also exists in the reader's set, it decodes to itself. When the written symbol is unknown to the reader, decoding does not fail; instead it resolves to the reader's fallback default symbol. The adapter prints the decoded symbol's name.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_enum_decode_default.json`\n\n```json\n{\n    \"description\": \"Decode an enumerated value using a reader type whose symbol set differs from the writer's. A value is first written with a wider enumeration (one that knows the given symbol) and then read back with a narrower enumeration that shares the same enum name and default symbol. When the written symbol also exists in the reader, it decodes to itself; when the written symbol is unknown to the reader, decoding falls back to the reader's designated default symbol rather than failing. The adapter prints the decoded symbol's name.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"decode_enum_evolution\", \"symbol\": \"A\"}, \"expected_output\": \"A\\n\"},\n        {\"input\": {\"op\": \"decode_enum_evolution\", \"symbol\": \"B\"}, \"expected_output\": \"UNKNOWN\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features described above (schema derivation for primitives, optionals, records and enumerations; compact binary encoding of scalars and records; and enum decoding with reader/writer schema evolution). Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin and prints the result to stdout, matching the per-feature contracts above. The request's `op` selects behavior: `schema` derives and prints the canonical schema document for a primitive `kind` (optionally `nullable`) or a named record/enum shape; `encode` encodes a supplied `value` of the named `kind` and prints the bytes as a lowercase hex string; `decode_enum_evolution` writes the supplied `symbol` with a wider enumeration and reads it back with a narrower one, printing the decoded symbol name. Native exceptions raised by the core must be translated, in the adapter's render layer, into neutral `error=<category>` lines (e.g. `[a specific error string token]`) without leaking host-language runtime type names.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- refer to the 'op' constant values defined in the routing gateway module\n",
+  "oracle_data": {
+    "task_id": "avro-kotlin__avro4k-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what is the error identifier",
+          "how is invalid enum handling signaled",
+          "return value for multiple defaults",
+          "string returned on duplicate symbol error",
+          "what keyword triggers the invalid enum failure"
+        ],
+        "oracle_response": ""
+      },
+      {
+        "constraint_id": "C012",
+        "trigger_keywords": [
+          "does record encoding use depth markers",
+          "is there an end marker for records",
+          "how is record start/end signaled",
+          "byte order sent for record boundaries",
+          "what frames are skipped in record encoding"
+        ],
+        "oracle_response": ""
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "refer to the 'op' constant values defined in the routing gateway module",
+        "actual_meaning": "The literal strings used for 'schema', 'encode', 'decode_enum_evolution' in the main input field are dynamic constants found in the routing gateway config or schema."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_primitive_schema.json": {
+      "description": "Generate the serialization schema for a single scalar value of a given primitive category. The request names a primitive kind (logical boolean, the four signed integer widths, the two floating-point widths, text, and a single character). The adapter resolves the schema for that scalar type and prints its canonical schema document. Narrow integer widths collapse onto the 32-bit integer type, the character type is represented as a 32-bit integer carrying a logical-type marker, and the remaining kinds map to their direct wire types.",
+      "cases": [
+        {
+          "input": {
+            "op": "schema",
+            "kind": "int"
+          },
+          "expected_output": "\"int\"\n"
+        },
+        {
+          "input": {
+            "op": "schema",
+            "kind": "char"
+          },
+          "expected_output": "{\n  \"type\" : \"int\",\n  \"logicalType\" : \"char\"\n}\n"
+        }
+      ]
+    },
+    "feature2_nullable_primitive_schema.json": {
+      "description": "Generate the serialization schema for an optional (nullable) scalar value of a given primitive category. The request names the same primitive kinds as the non-optional case but marks the value as optional. The resulting schema is a two-branch union of the null type and the underlying primitive's schema, in that order, so a missing value can be represented on the wire.",
+      "cases": [
+        {
+          "input": {
+            "op": "schema",
+            "kind": "int",
+            "nullable": true
+          },
+          "expected_output": "[ \"null\", \"int\" ]\n"
+        }
+      ]
+    },
+    "feature3_record_schema.json": {
+      "description": "Generate the serialization schema for a structured record type. The request names a record shape: a flat record whose fields cover every primitive category, a record that embeds another record as one of its fields, and a record nested several levels deep where each level holds the next level as its only field. The adapter prints the canonical record schema document, with each field rendered as a name plus the schema of its type, and embedded records expanded inline at their point of use.",
+      "cases": [
+        {
+          "input": {
+            "op": "schema",
+            "kind": "record_nested"
+          },
+          "expected_output": "{\n  \"type\" : \"record\",\n  \"name\" : \"Record\",\n  \"fields\" : [ {\n    \"name\" : \"foo\",\n    \"type\" : \"string\"\n  }, {\n    \"name\" : \"nested\",\n    \"type\" : {\n      \"type\" : \"record\",\n      \"name\" : \"Inner\",\n      \"fields\" : [ {\n        \"name\" : \"goo\",\n        \"type\" : \"string\"\n      } ]\n    }\n  } ]\n}\n"
+        }
+      ]
+    },
+    "feature4_enum_schema.json": {
+      "description": "Generate the serialization schema for an enumerated type, and reject an invalid one. A valid enumeration declares an ordered set of symbols, may carry an alias and a documentation string, and designates one symbol as the fallback default; its schema lists the symbols in declaration order and records the alias, documentation and default. If a type declares more than one fallback default symbol it is invalid and schema generation fails; the adapter then emits a neutral error line identifying the failure category instead of a schema.",
+      "cases": [
+        {
+          "input": {
+            "op": "schema",
+            "kind": "enum_with_default"
+          },
+          "expected_output": "{\n  \"type\" : \"enum\",\n  \"name\" : \"Suit\",\n  \"doc\" : \"documentation\",\n  \"symbols\" : [ \"SPADES\", \"HEARTS\", \"DIAMONDS\", \"CLUBS\" ],\n  \"default\" : \"DIAMONDS\",\n  \"aliases\" : [ \"MySuit\" ]\n}\n"
+        },
+        {
+          "input": {
+            "op": "schema",
+            "kind": "enum_invalid_default"
+          },
+          "expected_output": "error=multiple_enum_defaults\n"
+        }
+      ]
+    },
+    "feature5_primitive_encoding.json": {
+      "description": "Encode a single scalar value into the compact binary wire format and print the resulting bytes as a lowercase hexadecimal string. The request names the primitive category and supplies the value. Booleans encode to a single byte; the signed integer widths and the character (by its code point) use zig-zag variable-length integers; the floating-point widths use fixed little-endian layouts; text encodes as its zig-zag length prefix followed by its UTF-8 bytes.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "kind": "int",
+            "value": 44
+          },
+          "expected_output": "58\n"
+        },
+        {
+          "input": {
+            "op": "encode",
+            "kind": "string",
+            "value": "Hello world"
+          },
+          "expected_output": "1648656c6c6f20776f726c64\n"
+        },
+        {
+          "input": {
+            "op": "encode",
+            "kind": "char",
+            "value": "A"
+          },
+          "expected_output": "8201\n"
+        }
+      ]
+    },
+    "feature6_record_encoding.json": {
+      "description": "Encode a structured record value into the compact binary wire format and print the resulting bytes as a lowercase hexadecimal string. The request names a record shape and supplies the field values as an object keyed by field name. Records carry no framing of their own: the encoding is simply the concatenation of each field's encoded value in declared field order, using the same per-type encodings as for standalone scalars.",
+      "cases": [
+        {
+          "input": {
+            "op": "encode",
+            "kind": "record_single_int",
+            "value": {
+              "z": 44
+            }
+          },
+          "expected_output": "58\n"
+        },
+        {
+          "input": {
+            "op": "encode",
+            "kind": "record_eight_primitives",
+            "value": {
+              "a": "Hello world",
+              "b": 3.235,
+              "c": true,
+              "d": 3.4,
+              "e": 65653,
+              "f": 44,
+              "g": 3,
+              "h": 3
+            }
+          },
+          "expected_output": "1648656c6c6f20776f726c64e17a14ae47e10940019a995940ea8108580606\n"
+        }
+      ]
+    },
+    "feature7_enum_decode_default.json": {
+      "description": "Decode an enumerated value using a reader type whose symbol set differs from the writer's. A value is first written with a wider enumeration (one that knows the given symbol) and then read back with a narrower enumeration that shares the same enum name and default symbol. When the written symbol also exists in the reader, it decodes to itself; when the written symbol is unknown to the reader, decoding falls back to the reader's designated default symbol rather than failing. The adapter prints the decoded symbol's name.",
+      "cases": [
+        {
+          "input": {
+            "op": "decode_enum_evolution",
+            "symbol": "A"
+          },
+          "expected_output": "A\n"
+        },
+        {
+          "input": {
+            "op": "decode_enum_evolution",
+            "symbol": "B"
+          },
+          "expected_output": "UNKNOWN\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Operation Dispatch",
+      "input_condition": "JSON request contains 'op' field",
+      "output_rule": "Route execution to specific handler based on 'op' value",
+      "exact_values": [
+        "schema",
+        "encode",
+        "decode_enum_evolution"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Primitive Schema - Int",
+      "input_condition": "op is 'schema' and kind is 'int'",
+      "output_rule": "Return the literal wire type string for int",
+      "exact_values": [
+        "\"int\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Primitive Schema - Char",
+      "input_condition": "op is 'schema' and kind is 'char'",
+      "output_rule": "Return a JSON object mapping the type to int with a logical type marker",
+      "exact_values": [
+        "{\"type\": \"int\", \"logicalType\": \"char\"}"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Primitive Schema - Nullable",
+      "input_condition": "op is 'schema', kind is any primitive, AND nullable flag is true",
+      "output_rule": "Return a JSON array containing the schema \"null\" followed by the schema of the underlying kind",
+      "exact_values": [
+        "[ \"null\", \"<primitive_schema> ]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Record Schema - Nested Expansion",
+      "input_condition": "op is 'schema' and kind is a record containing another record",
+      "output_rule": "Expand the inner record schema inline at the point of its use as a field type",
+      "exact_values": [
+        "No wrapper object around innerRecord, direct nesting of fields array"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Enum Schema - Valid Declaration",
+      "input_condition": "op is 'schema' and kind is a valid enum (single default)",
+      "output_rule": "Return JSON schema object with type, name, doc, symbols, default, aliases",
+      "exact_values": [
+        "type: string, must be \"enum\"",
+        "name: string, must match kind input",
+        "symbols: array of strings",
+        "default: string, must be one of 'symbols'",
+        "aliases: array of strings (optional)",
+        "doc: string (optional)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Enum Schema - Invalid Declaration",
+      "input_condition": "op is 'schema' and kind is an enum declaring more than one symbol as default",
+      "output_rule": "Do not return JSON schema. Return a specific error string line instead.",
+      "exact_values": [
+        "error=multiple_enum_defaults"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Primitive Encode - Boolean",
+      "input_condition": "op is 'encode' and kind is boolean",
+      "output_rule": "Pack value into one byte using Zig-Zag, print as hex",
+      "exact_values": [
+        "true -> 01\n",
+        "false -> 00\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Primitive Encode - Signed Int / Char",
+      "input_condition": "op is 'encode' and kind is 'int' or 'char'",
+      "output_rule": "Encode value to Zig-Zag variable-length integer (vint), print as hex",
+      "exact_values": [
+        "Value must be treated as signed integer (char -> codepoint)",
+        "Hex output: lowercase, two digits per byte, no separators"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Primitive Encode - Float",
+      "input_condition": "op is 'encode' and kind is 'float' or 'double'",
+      "output_rule": "Encode as fixed-width little-endian IEEE 754",
+      "exact_values": [
+        "float -> 4 bytes\n",
+        "double -> 8 bytes\n",
+        "Hex output: lowercase, no separators"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Primitive Encode - String",
+      "input_condition": "op is 'encode' and kind is 'string'",
+      "output_rule": "Encode as Zig-Zag vint of UTF-8 length, followed immediately by UTF-8 bytes",
+      "exact_values": [
+        "Length prefix: Zig-Zag vint of byte count\n",
+        "Payload: Raw UTF-8 string bytes\n",
+        "Hex output: lowercase, no separators"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Record Encode - Framing",
+      "input_condition": "op is 'encode' and kind is a record",
+      "output_rule": "Concatenate field encodings in declared order with no record-level framing",
+      "exact_values": [
+        "No byte order value for record depth\n",
+        "No byte order value for record end\n",
+        "Output is raw concatenation of field outputs"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Enum Decode Evolution - Known Symbol",
+      "input_condition": "op is 'decode_enum_evolution' and symbol exists in both writer and reader",
+      "output_rule": "Print the symbol name unchanged",
+      "exact_values": [
+        "Output: <symbol_name>\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Enum Decode Evolution - Unknown Symbol",
+      "input_condition": "op is 'decode_enum_evolution' and symbol is unknown to reader (exists only in writer)",
+      "output_rule": "Print the name of the reader's fallback default symbol",
+      "exact_values": [
+        "Default symbol must be 'UNKNOWN' per test case 'UNKNOWN'\n"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific error string token",
+        "exact_values_to_replace": [
+          "error=multiple_enum_defaults"
+        ],
+        "trigger_keywords": [
+          "what is the error identifier",
+          "how is invalid enum handling signaled",
+          "return value for multiple defaults",
+          "string returned on duplicate symbol error",
+          "what keyword triggers the invalid enum failure"
+        ]
+      },
+      {
+        "constraint_id": "C012",
+        "replacement": "standard record framing protocol",
+        "exact_values_to_replace": [
+          "No byte order value for record depth",
+          "No byte order value for record end"
+        ],
+        "trigger_keywords": [
+          "does record encoding use depth markers",
+          "is there an end marker for records",
+          "how is record start/end signaled",
+          "byte order sent for record boundaries",
+          "what frames are skipped in record encoding"
+        ]
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C001",
+        "vague_phrase": "refer to the 'op' constant values defined in the routing gateway module",
+        "actual_meaning": "The literal strings used for 'schema', 'encode', 'decode_enum_evolution' in the main input field are dynamic constants found in the routing gateway config or schema."
+      }
+    ]
+  }
+}

@@ -1,0 +1,546 @@
+{
+  "fuzzy_prd": "Hey team, we've been getting complaints from a few power users who sync their note vaults and keep running into weird situations — stuff like emoji or Chinese characters in filenames getting mangled, binary images coming back corrupted, and occasionally their workspace config files getting silently overwritten when they pull from remote. It's basically the same kind of mess we ran into with that login module compatibility stuff, so hopefully we can reuse some of that thinking here.\n\nThe core ask is a sync engine library that handles the whole lifecycle: reading local files, comparing against a remote snapshot, figuring out what changed, safely applying updates in both directions, and surfacing conflicts in a way that doesn't just dump a stack trace on the user. There's also a thing where if the sync fails halfway through (network drops, auth expires, etc.), the next retry should pick up everything from where the last *successful* sync left off — not from the failed attempt.\n\nOne thing that came up in the retro: certain workspace paths should never be silently overwritten — they need to go into some kind of staging area instead. Same deal for files that exist locally but we've never tracked before.\n\nWe need a clean adapter layer so the engine itself isn't tangled up with I/O. Error messages should read like human sentences, not exception class names. Rough priority: get the encoding/path/state stuff solid first, then the conflict/retry behavior.\n\nA couple more specifics from the questions that came in. For text/content handling, we should treat UTF-8 bytes as the in-between form before any base64 conversion. If we’re encoding a text string, the output is just one line, `base64=<value>`. If we’re decoding a base64 string, the output is `text=<value>`. If the base64 input is bad in any way, normalize that to `error=invalid_encoded_content` and don’t leak whatever lower-level exception text happened underneath. Also, any whitespace in base64 input needs to be stripped before processing.\n\nFor file content, we do need the explicit `encoding` field and it can only be `plaintext` or `base64`. The output format here is fixed and should always be four lines in this exact order: `encoding=`, `plain=`, `base64=`, and `size=`. The `size` is the number of UTF-8 bytes in the plaintext form, so that should stay tied to the text version of the content, not the encoded length.\n\nOn the sync step output, the shape needs to stay predictable. Each step returns fields in this order: `step`, then `notice`, then `success`. `step` is a 0-indexed integer. `notice` is always a 2D JSON array of message groups, basically a list of lists where each inner list is the messages from one phase. If a step fails, after `success` we return `error_message`, and then optionally `local_files`, `remote_files`, `store` depending on how far we got. If a step succeeds, after `success` we return `local_ops`, `remote_ops`, `clashes`, `local_files`, `remote_files`, `store`.\n\nOn the hashing side, `lastFetchedCommitSha` after a successful sync should be a SHA-1 hash derived deterministically from the remote file state at the time of sync. The per-file values in `lastFetchedRemoteSha` and `localSha` are also SHA-1 hashes, specifically of the raw UTF-8 bytes of the file content. Main thing is these are stable and reproducible for the same content every time.\n\nFor path analysis, normalize to NFC before doing anything else. The output fields need to appear in this exact order: `path`, `name`, `extension`, `hidden`, `is_nfc`, `is_nfd`, `has_non_ascii`, `char_length`, and `byte_length`. `extension` is the final extension without dot, or `null` if none. `hidden` is true if any segment starts with a dot. `char_length` is character count and `byte_length` is UTF-8 byte count. Also, the Unicode NFC/NFD normalization and path hidden-segment detection logic should match the same `is_nfc`, `is_nfd`, and `hidden` behavior already described for the path analysis command.\n\nFor state comparison, it’s just comparing a `current` map and a `baseline` map of path-to-hash entries. Paths only in `current` are ADDED, paths in both with different hashes are MODIFIED, and paths only in `baseline` are REMOVED. Output is one line per changed path in deterministic sorted path order, in the format `<path>=ADDED|MODIFIED|REMOVED`. If the snapshots are equal, output should be empty.\n\nAnd on the overwrite/staging behavior, to be extra clear, protected paths and untracked-but-existing local paths whose remote changes are redirected should land under the `_fit/` conflict area prefix instead of going back into their original workspace location.",
+  "oracle_data": {
+    "task_id": "SYNC-ENGINE-001",
+    "golden_api_signature": "def run(command: dict) -> str",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "safe push pull clash resolution",
+          "protected path conflict detection",
+          "untracked file remote update handling"
+        ],
+        "oracle_response": "Resolution output has four fields in order: `checks` (paths needing filesystem existence verification), `safe_local` (local-only changes safe to push), `safe_remote` (remote-only changes safe to pull), and `clashes`. A remote change to a protected path produces a clash with `localState=protected`. A remote change to a path that exists locally but is not in the local scan list AND whose current hash differs from baseline produces a clash with `localState=untracked`. Both-sides changes are clashes with the actual local change type as `localState`."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "binary file detection scan",
+          "hidden path excluded from state tracking",
+          "workspace scan hash computation"
+        ],
+        "oracle_response": "During a local workspace scan, files whose path contains any hidden segment (a segment starting with `.`) are excluded from the tracked state map. File hashes are computed as SHA-1 of the raw bytes. Files containing null bytes or invalid UTF-8 are represented as base64; otherwise they are represented as plaintext. The state output is a JSON object sorted by path key."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "apply changes workspace write delete",
+          "clash file conflict area path",
+          "local apply baseline update"
+        ],
+        "oracle_response": "Applying changes outputs three fields: `changes` (list of `{path, type}` for each write as ADDED/MODIFIED and each delete as REMOVED), `new_baseline` (path-to-SHA1 map for all remaining tracked files, excluding hidden paths, sorted by key), and `files` (path-to-base64-content map for all remaining files, sorted by key). Clash paths are written under the `_fit/` conflict area prefix. The baseline hash for a clash may still use the original (non-prefixed) path key when the original path is not normally trackable."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "retry after failure baseline unchanged",
+          "failed sync accumulate changes",
+          "sync state persistence on error"
+        ],
+        "oracle_response": "If a sync step fails before state is persisted, the saved baseline (`store`) must remain at the last successful sync state. On the next successful sync, the engine must diff against the unchanged baseline, which means all local changes accumulated since the last success are detected and uploaded. The `store` object has three fields: `lastFetchedCommitSha`, `lastFetchedRemoteSha` (path-to-hash map of the remote state at last successful sync), and `localSha` (path-to-hash map of local state at last successful sync)."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "error message user friendly format",
+          "network auth error translation",
+          "sync failure categorization human readable"
+        ],
+        "oracle_response": "Sync errors must be translated into human-readable sentences, never raw exception class names. The known translations are: `network` errors append '. Please check your internet connection.'; `authentication` errors append '. Check your GitHub personal access token.'; `not_found` errors append '. Check the repository name and owner.'; `conflict` errors append '. Please try again.'. The `error_message` field appears in output only on failure. On auth/not_found failures, `local_files`, `remote_files`, and `store` must still be printed showing unchanged state."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "protected path conflict area staging",
+          "untracked remote path not overwritten",
+          "hidden path remote conflict write location"
+        ],
+        "oracle_response": "When a remote change targets a protected path, a hidden path, or a locally existing untracked path, the file must not be written to its original workspace location. Non-deletion conflicts are written under the `_fit/` prefix (e.g., `.obsidian/app.json` becomes `_fit/.obsidian/app.json`). The clash is reported with `localState=protected` or `localState=untracked`. The remote file state is still retained in `remote_files`. Sync can succeed even when clashes are present; the notice sequence should include 'Change conflicts detected' and 'Synced with remote, unresolved conflicts written to _fit'."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature10_sync_error_messages",
+        "trigger_keywords": [
+          "test cases for feature10 sync error messages",
+          "show me feature10 sync error messages test cases",
+          "what are the feature10 sync error messages test inputs",
+          "give me the feature10_sync_error_messages test file",
+          "test cases for feature 10",
+          "feature10 sync error messages expected output",
+          "what does feature10 sync error messages expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_sync_error_messages:\n{\n  \"description\": \"Synchronization failures are categorized into user-facing messages for authentication, missing remote resources, filesystem problems, and concurrent requests.\",\n  \"cases\": [\n    {\n      \"description\": \"An authentication failure is rendered with credential-recovery guidance.\",\n      \"input\": {\n        \"command\": \"sync.run\",\n        \"steps\": [\n          {\n            \"remoteFailure\": {\n              \"type\": \"authentication\",\n              \"message\": \"Bad credentials\"\n            },\n            \"sync\": true\n          }\n        ]\n      },\n      \"expected_output\": \"step=0\\nnotice=[[\\\"Checking for changes...\\\"]]\\nsuccess=false\\nerror_message=Bad credentials. Check your GitHub personal access token.\\nlocal_files={}\\nremote_files={}\\nstore={\\\"lastFetchedCommitSha\\\":\\\"commit-initial\\\",\\\"lastFetchedRemoteSha\\\":{},\\\"localSha\\\":{}}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_text_base64",
+        "trigger_keywords": [
+          "test cases for feature1 text base64",
+          "show me feature1 text base64 test cases",
+          "what are the feature1 text base64 test inputs",
+          "give me the feature1_text_base64 test file",
+          "test cases for feature 1",
+          "feature1 text base64 expected output",
+          "what does feature1 text base64 expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_text_base64:\n{\n  \"description\": \"UTF-8 text is converted to and from base64 without losing ASCII, multi-byte, emoji, accented, or empty content.\",\n  \"cases\": [\n    {\n      \"description\": \"ASCII text is encoded as UTF-8 bytes and rendered as base64.\",\n      \"input\": {\n        \"command\": \"content.encode\",\n        \"text\": \"Hello, World!\"\n      },\n      \"expected_output\": \"base64=SGVsbG8sIFdvcmxkIQ==\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_file_content_representation",
+        "trigger_keywords": [
+          "test cases for feature2 file content representation",
+          "show me feature2 file content representation test cases",
+          "what are the feature2 file content representation test inputs",
+          "give me the feature2_file_content_representation test file",
+          "test cases for feature 2",
+          "feature2 file content representation expected output",
+          "what does feature2 file content representation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_file_content_representation:\n{\n  \"description\": \"File content keeps an explicit text-or-base64 representation while allowing callers to request either plaintext or base64 form.\",\n  \"cases\": [\n    {\n      \"description\": \"Plain Unicode file content can be rendered as plaintext, base64, and byte-size metadata.\",\n      \"input\": {\n        \"command\": \"content.file\",\n        \"encoding\": \"plaintext\",\n        \"content\": \"你好, World! ✨ €50\"\n      },\n      \"expected_output\": \"encoding=plaintext\\nplain=你好, World! ✨ €50\\nbase64=5L2g5aW9LCBXb3JsZCEg4pyoIOKCrDUw\\nsize=16\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_path_analysis",
+        "trigger_keywords": [
+          "test cases for feature3 path analysis",
+          "show me feature3 path analysis test cases",
+          "what are the feature3 path analysis test inputs",
+          "give me the feature3_path_analysis test file",
+          "test cases for feature 3",
+          "feature3 path analysis expected output",
+          "what does feature3 path analysis expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_path_analysis:\n{\n  \"description\": \"Workspace file paths are normalized and analyzed for filename, extension, hidden-path status, and Unicode diagnostic metadata.\",\n  \"cases\": [\n    {\n      \"description\": \"A normal ASCII file path reports its basename, extension, visibility, and byte counts.\",\n      \"input\": {\n        \"command\": \"path.analyze\",\n        \"path\": \"notes/daily/2024-01-01.md\"\n      },\n      \"expected_output\": \"path=notes/daily/2024-01-01.md\\nname=2024-01-01.md\\nextension=md\\nhidden=false\\nis_nfc=true\\nis_nfd=true\\nhas_non_ascii=false\\nchar_length=25\\nbyte_length=25\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_state_change_detection",
+        "trigger_keywords": [
+          "test cases for feature4 state change detection",
+          "show me feature4 state change detection test cases",
+          "what are the feature4 state change detection test inputs",
+          "give me the feature4_state_change_detection test file",
+          "test cases for feature 4",
+          "feature4 state change detection expected output",
+          "what does feature4 state change detection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_state_change_detection:\n{\n  \"description\": \"Comparing current file hashes against a stored baseline reports added, modified, and removed paths.\",\n  \"cases\": [\n    {\n      \"description\": \"Mixed current and baseline states produce one added, one modified, and one removed change.\",\n      \"input\": {\n        \"command\": \"state.compare\",\n        \"current\": {\n          \"same.md\": \"aaa\",\n          \"changed.md\": \"new\",\n          \"added.md\": \"sha\"\n        },\n        \"baseline\": {\n          \"same.md\": \"aaa\",\n          \"changed.md\": \"old\",\n          \"removed.md\": \"gone\"\n        }\n      },\n      \"expected_output\": \"added.md=ADDED\\nchanged.md=MODIFIED\\nremoved.md=REMOVED\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_change_resolution",
+        "trigger_keywords": [
+          "test cases for feature5 change resolution",
+          "show me feature5 change resolution test cases",
+          "what are the feature5 change resolution test inputs",
+          "give me the feature5_change_resolution test file",
+          "test cases for feature 5",
+          "feature5 change resolution expected output",
+          "what does feature5 change resolution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_change_resolution:\n{\n  \"description\": \"Local and remote change lists are separated into safe pushes, safe pulls, and clashes using protected-path and untracked-file checks.\",\n  \"cases\": [\n    {\n      \"description\": \"A local-only update, remote-only update, protected remote update, and both-sides update are categorized separately.\",\n      \"input\": {\n        \"command\": \"state.resolve\",\n        \"localChanges\": [\n          {\n            \"path\": \"local.md\",\n            \"type\": \"ADDED\"\n          },\n          {\n            \"path\": \"both.md\",\n            \"type\": \"MODIFIED\"\n          }\n        ],\n        \"remoteChanges\": [\n          {\n            \"path\": \"remote.md\",\n            \"type\": \"ADDED\"\n          },\n          {\n            \"path\": \"both.md\",\n            \"type\": \"MODIFIED\"\n          },\n          {\n            \"path\": \".obsidian/app.json\",\n            \"type\": \"ADDED\"\n          }\n        ],\n        \"localScanPaths\": [\n          \"local.md\",\n          \"both.md\"\n        ],\n        \"protectedPaths\": [\n          \".obsidian/app.json\"\n        ],\n        \"filesystemState\": [\n          {\n            \"path\": \"remote.md\",\n            \"exists\": false\n          }\n        ],\n        \"baselineShas\": {}\n      },\n      \"expected_output\": \"checks=[{\\\"path\\\":\\\"remote.md\\\",\\\"remoteOp\\\":\\\"ADDED\\\"}]\\nsafe_local=[{\\\"path\\\":\\\"local.md\\\",\\\"type\\\":\\\"ADDED\\\"}]\\nsafe_remote=[{\\\"path\\\":\\\"remote.md\\\",\\\"type\\\":\\\"ADDED\\\"}]\\nclashes=[{\\\"localState\\\":\\\"MODIFIED\\\",\\\"path\\\":\\\"both.md\\\",\\\"remoteOp\\\":\\\"MODIFIED\\\"},{\\\"localState\\\":\\\"protected\\\",\\\"path\\\":\\\".obsidian/app.json\\\",\\\"remoteOp\\\":\\\"ADDED\\\"}]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_local_scan_and_read",
+        "trigger_keywords": [
+          "test cases for feature6 local scan and read",
+          "show me feature6 local scan and read test cases",
+          "what are the feature6 local scan and read test inputs",
+          "give me the feature6_local_scan_and_read test file",
+          "test cases for feature 6",
+          "feature6 local scan and read expected output",
+          "what does feature6 local scan and read expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_local_scan_and_read:\n{\n  \"description\": \"A local workspace scan computes stable file states for trackable files, ignores hidden paths for state tracking, and detects text versus binary content when reading.\",\n  \"cases\": [\n    {\n      \"description\": \"Scanning text and binary files returns stable hashes while omitting hidden paths from tracked state.\",\n      \"input\": {\n        \"command\": \"local.scan\",\n        \"files\": [\n          {\n            \"path\": \"note1.md\",\n            \"encoding\": \"plaintext\",\n            \"content\": \"Content of note 1\"\n          },\n          {\n            \"path\": \"image.png\",\n            \"encoding\": \"base64\",\n            \"content\": \"AAAAAAAAAAA=\"\n          },\n          {\n            \"path\": \".obsidian/config.json\",\n            \"encoding\": \"plaintext\",\n            \"content\": \"secret\"\n          }\n        ]\n      },\n      \"expected_output\": \"state={\\\"image.png\\\":\\\"fe954d839c04f84471b6dd90c945e55a6035de80\\\",\\\"note1.md\\\":\\\"b8b1b70958bbc0b6f0305f4bc57a8393ba333130\\\"}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_local_apply_changes",
+        "trigger_keywords": [
+          "test cases for feature7 local apply changes",
+          "show me feature7 local apply changes test cases",
+          "what are the feature7 local apply changes test inputs",
+          "give me the feature7_local_apply_changes test file",
+          "test cases for feature 7",
+          "feature7 local apply changes expected output",
+          "what does feature7 local apply changes expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_local_apply_changes:\n{\n  \"description\": \"Applying local workspace changes writes text and binary files with the correct operation type, supports deletion, and writes clashes under a conflict area while hashing the original path when needed.\",\n  \"cases\": [\n    {\n      \"description\": \"A batch containing a text addition, binary addition, and deletion reports all performed file operations and final stored bytes.\",\n      \"input\": {\n        \"command\": \"local.apply\",\n        \"initial\": [\n          {\n            \"path\": \"old.md\",\n            \"encoding\": \"plaintext\",\n            \"content\": \"old\"\n          }\n        ],\n        \"writes\": [\n          {\n            \"path\": \"new.md\",\n            \"encoding\": \"plaintext\",\n            \"content\": \"Hello\"\n          },\n          {\n            \"path\": \"image.png\",\n            \"encoding\": \"base64\",\n            \"content\": \"AQIDAA==\"\n          }\n        ],\n        \"deletes\": [\n          \"old.md\"\n        ]\n      },\n      \"expected_output\": \"changes=[{\\\"path\\\":\\\"new.md\\\",\\\"type\\\":\\\"ADDED\\\"},{\\\"path\\\":\\\"image.png\\\",\\\"type\\\":\\\"ADDED\\\"},{\\\"path\\\":\\\"old.md\\\",\\\"type\\\":\\\"REMOVED\\\"}]\\nnew_baseline={\\\"image.png\\\":\\\"9e1f9134d8418b3367ac4a9b6741c27b1bbaada9\\\",\\\"new.md\\\":\\\"f3fbfed40eafab440b506b503df6cd0495b71f4d\\\"}\\nfiles={\\\"image.png\\\":\\\"AQIDAA==\\\",\\\"new.md\\\":\\\"SGVsbG8=\\\"}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_sync_retry_after_failure",
+        "trigger_keywords": [
+          "test cases for feature8 sync retry after failure",
+          "show me feature8 sync retry after failure test cases",
+          "what are the feature8 sync retry after failure test inputs",
+          "give me the feature8_sync_retry_after_failure test file",
+          "test cases for feature 8",
+          "feature8 sync retry after failure expected output",
+          "what does feature8 sync retry after failure expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_sync_retry_after_failure:\n{\n  \"description\": \"A failed synchronization leaves cached state and remote files unchanged; the next successful synchronization uploads all accumulated local changes from the unchanged baseline.\",\n  \"cases\": [\n    {\n      \"description\": \"A network failure on the first synchronization does not mark local changes as synced, so a later retry uploads both accumulated files.\",\n      \"input\": {\n        \"command\": \"sync.run\",\n        \"steps\": [\n          {\n            \"localSet\": [\n              {\n                \"path\": \"fileA.md\",\n                \"content\": \"Content of file A\"\n              }\n            ],\n            \"remoteFailure\": {\n              \"type\": \"network\",\n              \"message\": \"Could not reach remote API\"\n            },\n            \"sync\": true\n          },\n          {\n            \"localSet\": [\n              {\n                \"path\": \"fileB.md\",\n                \"content\": \"Content of file B\"\n              }\n            ],\n            \"sync\": true\n          }\n        ]\n      },\n      \"expected_output\": \"step=0\\nnotice=[[\\\"Checking for changes...\\\"]]\\nsuccess=false\\nerror_message=Could not reach remote API. Please check your internet connection.\\nstep=1\\nnotice=[[\\\"Checking for changes...\\\"],[\\\"Uploading local changes\\\"],[\\\"Writing remote changes to local\\\"],[\\\"Sync successful\\\"]]\\nsuccess=true\\nlocal_ops=[]\\nremote_ops=[{\\\"path\\\":\\\"fileA.md\\\",\\\"type\\\":\\\"ADDED\\\"},{\\\"path\\\":\\\"fileB.md\\\",\\\"type\\\":\\\"ADDED\\\"}]\\nclashes=[]\\nlocal_files={\\\"fileA.md\\\":{\\\"content\\\":\\\"Content of file A\\\",\\\"encoding\\\":\\\"plaintext\\\"},\\\"fileB.md\\\":{\\\"content\\\":\\\"Content of file B\\\",\\\"encoding\\\":\\\"plaintext\\\"}}\\nremote_files={\\\"fileA.md\\\":{\\\"content\\\":\\\"Content of file A\\\",\\\"encoding\\\":\\\"plaintext\\\"},\\\"fileB.md\\\":{\\\"content\\\":\\\"Content of file B\\\",\\\"encoding\\\":\\\"plaintext\\\"}}\\nstore={\\\"lastFetchedCommitSha\\\":\\\"b86a9aba597a30fd17d6e13c4893f32890ebb062\\\",\\\"lastFetchedRemoteSha\\\":{\\\"fileA.md\\\":\\\"b1745ccb0ebf92d8141e3f2969db2760c72523dd\\\",\\\"fileB.md\\\":\\\"26294f3aff9abaccd5dc7c1954f5aa170eeb4aa6\\\"},\\\"localSha\\\":{\\\"fileA.md\\\":\\\"c6bb8c90633a9971e4c4ca55b445922198e1c57d\\\",\\\"fileB.md\\\":\\\"acc5b1ab5649b944c2108e0067b5dea0cf8b8b37\\\"}}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_sync_protected_remote_paths",
+        "trigger_keywords": [
+          "test cases for feature9 sync protected remote paths",
+          "show me feature9 sync protected remote paths test cases",
+          "what are the feature9 sync protected remote paths test inputs",
+          "give me the feature9_sync_protected_remote_paths test file",
+          "test cases for feature 9",
+          "feature9 sync protected remote paths expected output",
+          "what does feature9 sync protected remote paths expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_sync_protected_remote_paths:\n{\n  \"description\": \"Remote updates to protected or locally untracked paths are not written directly over the workspace; non-deletion conflicts are materialized in the conflict area and reported to the caller.\",\n  \"cases\": [\n    {\n      \"description\": \"A remote workspace-configuration file is saved into the conflict area, reported as a protected clash, and retained in remote state.\",\n      \"input\": {\n        \"command\": \"sync.run\",\n        \"remote_initial\": [\n          {\n            \"path\": \".obsidian/app.json\",\n            \"content\": \"remote settings\"\n          }\n        ],\n        \"steps\": [\n          {\n            \"sync\": true\n          }\n        ]\n      },\n      \"expected_output\": \"step=0\\nnotice=[[\\\"Checking for changes...\\\"],[\\\"Uploading local changes\\\"],[\\\"Change conflicts detected\\\"],[\\\"Synced with remote, unresolved conflicts written to _fit\\\"]]\\nsuccess=true\\nlocal_ops=[{\\\"path\\\":\\\"_fit/.obsidian/app.json\\\",\\\"type\\\":\\\"ADDED\\\"}]\\nremote_ops=[]\\nclashes=[{\\\"localState\\\":\\\"protected\\\",\\\"path\\\":\\\".obsidian/app.json\\\",\\\"remoteOp\\\":\\\"ADDED\\\"}]\\nlocal_files={\\\"_fit/.obsidian/app.json\\\":{\\\"content\\\":\\\"cmVtb3RlIHNldHRpbmdz\\\",\\\"encoding\\\":\\\"base64\\\"}}\\nremote_files={\\\".obsidian/app.json\\\":{\\\"content\\\":\\\"remote settings\\\",\\\"encoding\\\":\\\"plaintext\\\"}}\\nstore={\\\"lastFetchedCommitSha\\\":\\\"initial-commit\\\",\\\"lastFetchedRemoteSha\\\":{\\\".obsidian/app.json\\\":\\\"db14b5062a2a893cb61947d6c10e76fbcddffd9a\\\"},\\\"localSha\\\":{}}\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the next retry should pick up everything from where the last successful sync left off",
+        "actual_meaning": "The `store` object (`lastFetchedCommitSha`, `lastFetchedRemoteSha`, `localSha`) is only updated on successful sync completion; a failed sync leaves `store` unchanged so the next run diffs against the pre-failure baseline and detects all accumulated changes."
+      },
+      {
+        "vague_reference": "clean adapter layer so the engine itself isn't tangled up with I/O",
+        "actual_meaning": "The execution adapter (responsible for JSON stdin parsing and stdout formatting) must be strictly separated from the core domain logic (encoding, path analysis, state comparison, change resolution, workspace apply, sync orchestration), following the Dependency Inversion Principle as specified in the Architecture section."
+      }
+    ],
+    "fallback_response": "That's not something I have specific guidance on right now. Please review the existing sync behavior described in the PRD and infer the expected behavior from the test cases provided in the `rcb_tests/public_test_cases/` directory. When in doubt, prioritize deterministic output ordering, human-readable error messages, and strict separation between the adapter layer and core domain logic."
+  },
+  "public_test_cases": {
+    "feature10_sync_error_messages.json": {
+      "description": "Synchronization failures are categorized into user-facing messages for authentication, missing remote resources, filesystem problems, and concurrent requests.",
+      "cases": [
+        {
+          "description": "An authentication failure is rendered with credential-recovery guidance.",
+          "input": {
+            "command": "sync.run",
+            "steps": [
+              {
+                "remoteFailure": {
+                  "type": "authentication",
+                  "message": "Bad credentials"
+                },
+                "sync": true
+              }
+            ]
+          },
+          "expected_output": "step=0\nnotice=[[\"Checking for changes...\"]]\nsuccess=false\nerror_message=Bad credentials. Check your GitHub personal access token.\nlocal_files={}\nremote_files={}\nstore={\"lastFetchedCommitSha\":\"commit-initial\",\"lastFetchedRemoteSha\":{},\"localSha\":{}}\n"
+        }
+      ]
+    },
+    "feature1_text_base64.json": {
+      "description": "UTF-8 text is converted to and from base64 without losing ASCII, multi-byte, emoji, accented, or empty content.",
+      "cases": [
+        {
+          "description": "ASCII text is encoded as UTF-8 bytes and rendered as base64.",
+          "input": {
+            "command": "content.encode",
+            "text": "Hello, World!"
+          },
+          "expected_output": "base64=SGVsbG8sIFdvcmxkIQ==\n"
+        }
+      ]
+    },
+    "feature2_file_content_representation.json": {
+      "description": "File content keeps an explicit text-or-base64 representation while allowing callers to request either plaintext or base64 form.",
+      "cases": [
+        {
+          "description": "Plain Unicode file content can be rendered as plaintext, base64, and byte-size metadata.",
+          "input": {
+            "command": "content.file",
+            "encoding": "plaintext",
+            "content": "你好, World! ✨ €50"
+          },
+          "expected_output": "encoding=plaintext\nplain=你好, World! ✨ €50\nbase64=5L2g5aW9LCBXb3JsZCEg4pyoIOKCrDUw\nsize=16\n"
+        }
+      ]
+    },
+    "feature3_path_analysis.json": {
+      "description": "Workspace file paths are normalized and analyzed for filename, extension, hidden-path status, and Unicode diagnostic metadata.",
+      "cases": [
+        {
+          "description": "A normal ASCII file path reports its basename, extension, visibility, and byte counts.",
+          "input": {
+            "command": "path.analyze",
+            "path": "notes/daily/2024-01-01.md"
+          },
+          "expected_output": "path=notes/daily/2024-01-01.md\nname=2024-01-01.md\nextension=md\nhidden=false\nis_nfc=true\nis_nfd=true\nhas_non_ascii=false\nchar_length=25\nbyte_length=25\n"
+        }
+      ]
+    },
+    "feature4_state_change_detection.json": {
+      "description": "Comparing current file hashes against a stored baseline reports added, modified, and removed paths.",
+      "cases": [
+        {
+          "description": "Mixed current and baseline states produce one added, one modified, and one removed change.",
+          "input": {
+            "command": "state.compare",
+            "current": {
+              "same.md": "aaa",
+              "changed.md": "new",
+              "added.md": "sha"
+            },
+            "baseline": {
+              "same.md": "aaa",
+              "changed.md": "old",
+              "removed.md": "gone"
+            }
+          },
+          "expected_output": "added.md=ADDED\nchanged.md=MODIFIED\nremoved.md=REMOVED\n"
+        }
+      ]
+    },
+    "feature5_change_resolution.json": {
+      "description": "Local and remote change lists are separated into safe pushes, safe pulls, and clashes using protected-path and untracked-file checks.",
+      "cases": [
+        {
+          "description": "A local-only update, remote-only update, protected remote update, and both-sides update are categorized separately.",
+          "input": {
+            "command": "state.resolve",
+            "localChanges": [
+              {
+                "path": "local.md",
+                "type": "ADDED"
+              },
+              {
+                "path": "both.md",
+                "type": "MODIFIED"
+              }
+            ],
+            "remoteChanges": [
+              {
+                "path": "remote.md",
+                "type": "ADDED"
+              },
+              {
+                "path": "both.md",
+                "type": "MODIFIED"
+              },
+              {
+                "path": ".obsidian/app.json",
+                "type": "ADDED"
+              }
+            ],
+            "localScanPaths": [
+              "local.md",
+              "both.md"
+            ],
+            "protectedPaths": [
+              ".obsidian/app.json"
+            ],
+            "filesystemState": [
+              {
+                "path": "remote.md",
+                "exists": false
+              }
+            ],
+            "baselineShas": {}
+          },
+          "expected_output": "checks=[{\"path\":\"remote.md\",\"remoteOp\":\"ADDED\"}]\nsafe_local=[{\"path\":\"local.md\",\"type\":\"ADDED\"}]\nsafe_remote=[{\"path\":\"remote.md\",\"type\":\"ADDED\"}]\nclashes=[{\"localState\":\"MODIFIED\",\"path\":\"both.md\",\"remoteOp\":\"MODIFIED\"},{\"localState\":\"protected\",\"path\":\".obsidian/app.json\",\"remoteOp\":\"ADDED\"}]\n"
+        }
+      ]
+    },
+    "feature6_local_scan_and_read.json": {
+      "description": "A local workspace scan computes stable file states for trackable files, ignores hidden paths for state tracking, and detects text versus binary content when reading.",
+      "cases": [
+        {
+          "description": "Scanning text and binary files returns stable hashes while omitting hidden paths from tracked state.",
+          "input": {
+            "command": "local.scan",
+            "files": [
+              {
+                "path": "note1.md",
+                "encoding": "plaintext",
+                "content": "Content of note 1"
+              },
+              {
+                "path": "image.png",
+                "encoding": "base64",
+                "content": "AAAAAAAAAAA="
+              },
+              {
+                "path": ".obsidian/config.json",
+                "encoding": "plaintext",
+                "content": "secret"
+              }
+            ]
+          },
+          "expected_output": "state={\"image.png\":\"fe954d839c04f84471b6dd90c945e55a6035de80\",\"note1.md\":\"b8b1b70958bbc0b6f0305f4bc57a8393ba333130\"}\n"
+        }
+      ]
+    },
+    "feature7_local_apply_changes.json": {
+      "description": "Applying local workspace changes writes text and binary files with the correct operation type, supports deletion, and writes clashes under a conflict area while hashing the original path when needed.",
+      "cases": [
+        {
+          "description": "A batch containing a text addition, binary addition, and deletion reports all performed file operations and final stored bytes.",
+          "input": {
+            "command": "local.apply",
+            "initial": [
+              {
+                "path": "old.md",
+                "encoding": "plaintext",
+                "content": "old"
+              }
+            ],
+            "writes": [
+              {
+                "path": "new.md",
+                "encoding": "plaintext",
+                "content": "Hello"
+              },
+              {
+                "path": "image.png",
+                "encoding": "base64",
+                "content": "AQIDAA=="
+              }
+            ],
+            "deletes": [
+              "old.md"
+            ]
+          },
+          "expected_output": "changes=[{\"path\":\"new.md\",\"type\":\"ADDED\"},{\"path\":\"image.png\",\"type\":\"ADDED\"},{\"path\":\"old.md\",\"type\":\"REMOVED\"}]\nnew_baseline={\"image.png\":\"9e1f9134d8418b3367ac4a9b6741c27b1bbaada9\",\"new.md\":\"f3fbfed40eafab440b506b503df6cd0495b71f4d\"}\nfiles={\"image.png\":\"AQIDAA==\",\"new.md\":\"SGVsbG8=\"}\n"
+        }
+      ]
+    },
+    "feature8_sync_retry_after_failure.json": {
+      "description": "A failed synchronization leaves cached state and remote files unchanged; the next successful synchronization uploads all accumulated local changes from the unchanged baseline.",
+      "cases": [
+        {
+          "description": "A network failure on the first synchronization does not mark local changes as synced, so a later retry uploads both accumulated files.",
+          "input": {
+            "command": "sync.run",
+            "steps": [
+              {
+                "localSet": [
+                  {
+                    "path": "fileA.md",
+                    "content": "Content of file A"
+                  }
+                ],
+                "remoteFailure": {
+                  "type": "network",
+                  "message": "Could not reach remote API"
+                },
+                "sync": true
+              },
+              {
+                "localSet": [
+                  {
+                    "path": "fileB.md",
+                    "content": "Content of file B"
+                  }
+                ],
+                "sync": true
+              }
+            ]
+          },
+          "expected_output": "step=0\nnotice=[[\"Checking for changes...\"]]\nsuccess=false\nerror_message=Could not reach remote API. Please check your internet connection.\nstep=1\nnotice=[[\"Checking for changes...\"],[\"Uploading local changes\"],[\"Writing remote changes to local\"],[\"Sync successful\"]]\nsuccess=true\nlocal_ops=[]\nremote_ops=[{\"path\":\"fileA.md\",\"type\":\"ADDED\"},{\"path\":\"fileB.md\",\"type\":\"ADDED\"}]\nclashes=[]\nlocal_files={\"fileA.md\":{\"content\":\"Content of file A\",\"encoding\":\"plaintext\"},\"fileB.md\":{\"content\":\"Content of file B\",\"encoding\":\"plaintext\"}}\nremote_files={\"fileA.md\":{\"content\":\"Content of file A\",\"encoding\":\"plaintext\"},\"fileB.md\":{\"content\":\"Content of file B\",\"encoding\":\"plaintext\"}}\nstore={\"lastFetchedCommitSha\":\"b86a9aba597a30fd17d6e13c4893f32890ebb062\",\"lastFetchedRemoteSha\":{\"fileA.md\":\"b1745ccb0ebf92d8141e3f2969db2760c72523dd\",\"fileB.md\":\"26294f3aff9abaccd5dc7c1954f5aa170eeb4aa6\"},\"localSha\":{\"fileA.md\":\"c6bb8c90633a9971e4c4ca55b445922198e1c57d\",\"fileB.md\":\"acc5b1ab5649b944c2108e0067b5dea0cf8b8b37\"}}\n"
+        }
+      ]
+    },
+    "feature9_sync_protected_remote_paths.json": {
+      "description": "Remote updates to protected or locally untracked paths are not written directly over the workspace; non-deletion conflicts are materialized in the conflict area and reported to the caller.",
+      "cases": [
+        {
+          "description": "A remote workspace-configuration file is saved into the conflict area, reported as a protected clash, and retained in remote state.",
+          "input": {
+            "command": "sync.run",
+            "remote_initial": [
+              {
+                "path": ".obsidian/app.json",
+                "content": "remote settings"
+              }
+            ],
+            "steps": [
+              {
+                "sync": true
+              }
+            ]
+          },
+          "expected_output": "step=0\nnotice=[[\"Checking for changes...\"],[\"Uploading local changes\"],[\"Change conflicts detected\"],[\"Synced with remote, unresolved conflicts written to _fit\"]]\nsuccess=true\nlocal_ops=[{\"path\":\"_fit/.obsidian/app.json\",\"type\":\"ADDED\"}]\nremote_ops=[]\nclashes=[{\"localState\":\"protected\",\"path\":\".obsidian/app.json\",\"remoteOp\":\"ADDED\"}]\nlocal_files={\"_fit/.obsidian/app.json\":{\"content\":\"cmVtb3RlIHNldHRpbmdz\",\"encoding\":\"base64\"}}\nremote_files={\".obsidian/app.json\":{\"content\":\"remote settings\",\"encoding\":\"plaintext\"}}\nstore={\"lastFetchedCommitSha\":\"initial-commit\",\"lastFetchedRemoteSha\":{\".obsidian/app.json\":\"db14b5062a2a893cb61947d6c10e76fbcddffd9a\"},\"localSha\":{}}\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C003",
+      "C004"
+    ],
+    "kept_c": [
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

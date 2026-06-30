@@ -1,0 +1,468 @@
+{
+  "fuzzy_prd": "# Graceful Task Orchestrator with Dependency-Ordered Shutdown\n\n## Project Goal\n\nBuild a task-orchestration library that lets a long-running service register many background workers under a fixed set of named nodes and then shut all of them down **gracefully and in a guaranteed order**. When the process is asked to stop, every worker is cancelled and allowed to finish, but only in an order that respects the dependencies between nodes: a node is torn down only after everything that depends on it has already stopped. Developers get correct, deterministic shutdown without hand-writing teardown ordering logic.\n\n---\n\n## Background & Problem\n\nWithout this library, developers wiring up a service with many concurrent background tasks (request handlers, flushers, metrics servers, RPC servers, write-back loops) have to manually track which task must stop before which other task. Stopping a producer before its consumers, or a consumer before its producer, leads to lost data, panics on closed channels, or hangs. The teardown logic is repetitive, fragile, and easy to get wrong as the set of tasks grows.\n\nWith this library, the dependency relationships between node types are declared once as a fixed graph. Each background worker is registered under a node. A single shutdown trigger — either an explicit call or an OS termination signal — cancels everything and drains it in the correct topological order automatically. The same mechanism also rejects late work submitted after shutdown has begun, and provides a batching mode for nodes that manage large numbers of short-lived tasks.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST match the complexity of the domain. This domain has several distinct responsibilities (the dependency-graph model, the node/worker registry, the shutdown driver, the batching collector, and the signal hook). It MUST NOT be a single \"god file\"; use a clear multi-module layout that separates these concerns. Do not over-engineer, but do not collapse distinct responsibilities together either.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below are a **black-box testing contract** for the execution adapter, NOT the internal data model. The core orchestration logic must be completely decoupled from stdin/stdout and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls into the core library and rendering the results.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Separate graph definition, registration, shutdown sequencing, batch collection, and output formatting into distinct units.\n   - **Open/Closed Principle (OCP):** The shutdown engine must be open to new node types via the graph definition without modifying the sequencing algorithm.\n   - **Liskov Substitution Principle (LSP):** A batching node handle must be usable wherever a plain registration handle is expected.\n   - **Interface Segregation Principle (ISP):** Keep the public registration/shutdown interface small and cohesive.\n   - **Dependency Inversion Principle (DIP):** The shutdown driver depends on the abstract graph, not on concrete I/O.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface must be elegant and idiomatic to the target language, hiding the internal graph bookkeeping.\n   - **Resilience:** Submitting work after shutdown must be modeled as a typed, recoverable failure (e.g. an error value carrying the rejected node), never a panic or a silent drop. Batched tasks that never make progress must be bounded by a timeout rather than hanging forever.\n\n---\n\n## Core Features\n\n### Feature 1: Dependency-Ordered Graceful Shutdown\n\n**As a developer**, I want to register background workers under named nodes and trigger one graceful shutdown, so I can stop the whole system in dependency order without writing teardown sequencing by hand.\n\n**Expected Behavior / Usage:**\n\nThere is a fixed dependency graph over a closed set of node names: `Root`, `Metrics`, `BlockFlush`, `FuseRequest`, `AsyncFuse`, `Rpc`, `WriteBack`, `SchedulerExtender`. The dependency edges are: `Root` depends on `Metrics`, `BlockFlush`, `SchedulerExtender`; `BlockFlush` depends on `AsyncFuse` and `FuseRequest`; `FuseRequest` depends on `AsyncFuse` and `WriteBack`; `AsyncFuse` depends on `Rpc` and `WriteBack`. Each registered worker carries an integer `marker`. The input is an `[a specific set of enumerated action strings]` command with a list of `spawns`, each naming a `node` and a `marker`. Every named worker is registered, then a graceful shutdown is requested. On shutdown, each worker is cancelled and emits one line `node=<NodeName> marker=<marker>`. The lines appear in the graph's shutdown order: teardown starts at `Root` and a node is only torn down after every node that depends on it has already been torn down. For the full set, the resulting order is the three first-tier nodes `Metrics`, `BlockFlush`, `SchedulerExtender` (markers `0,0,0`), then `FuseRequest` (marker `1`), then `AsyncFuse` (marker `2`), then the two leaf consumers `Rpc`, `WriteBack` (markers `3,3`). When only a subset of nodes is registered, only those nodes' lines appear, still in the same relative shutdown order. Output is deterministic across runs.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_[a specific set of enumerated action strings].json`\n\n```json\n{\n    \"description\": \"Background workers are registered against named nodes of a fixed dependency graph, each carrying an integer marker. When a graceful shutdown is requested, every worker is cancelled and reports its marker. The reports are emitted strictly in the graph's shutdown order: a node is only torn down after every node that depends on it has already been torn down, so upstream producers stop before the consumers they feed.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"[a specific set of enumerated action strings]\", \"spawns\": [{\"node\": \"Metrics\", \"marker\": 0}, {\"node\": \"BlockFlush\", \"marker\": 0}, {\"node\": \"SchedulerExtender\", \"marker\": 0}, {\"node\": \"FuseRequest\", \"marker\": 1}, {\"node\": \"AsyncFuse\", \"marker\": 2}, {\"node\": \"Rpc\", \"marker\": 3}, {\"node\": \"WriteBack\", \"marker\": 3}]},\n            \"expected_output\": \"node=Metrics marker=0\\nnode=BlockFlush marker=0\\nnode=SchedulerExtender marker=0\\nnode=FuseRequest marker=1\\nnode=AsyncFuse marker=2\\nnode=Rpc marker=3\\nnode=WriteBack marker=3\\n\"\n        },\n        {\n            \"input\": {\"action\": \"[a specific set of enumerated action strings]\", \"spawns\": [{\"node\": \"BlockFlush\", \"marker\": 10}, {\"node\": \"AsyncFuse\", \"marker\": 20}, {\"node\": \"Rpc\", \"marker\": 30}]},\n            \"expected_output\": \"node=BlockFlush marker=10\\nnode=AsyncFuse marker=20\\nnode=Rpc marker=30\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Signal-Triggered Shutdown\n\n**As a developer**, I want an OS termination signal to drive the same graceful shutdown, so the service stops cleanly when the platform asks it to terminate.\n\n**Expected Behavior / Usage:**\n\nWorkers are registered exactly as in Feature 1, but instead of an explicit shutdown call a process termination signal is armed and then raised. The input is a `[a specific set of enumerated action strings]` command carrying a `signal` label and the same `spawns` list. When the signal fires, the system first emits one line `signal=<label>` reporting the signal it observed, then performs the identical dependency-ordered teardown, emitting `node=<NodeName> marker=<marker>` lines in the same shutdown order as Feature 1. The signal line always precedes all node lines.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_[a specific set of enumerated action strings].json`\n\n```json\n{\n    \"description\": \"Instead of an explicit shutdown call, a process-level termination signal initiates the graceful shutdown. After registering workers and arming the signal handler, a termination signal is raised. The handler reports the signal it observed and then drives the exact same dependency-ordered teardown, so every worker reports its marker in graph order following the signal line.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"[a specific set of enumerated action strings]\", \"signal\": \"SIGTERM\", \"spawns\": [{\"node\": \"Metrics\", \"marker\": 0}, {\"node\": \"BlockFlush\", \"marker\": 0}, {\"node\": \"SchedulerExtender\", \"marker\": 0}, {\"node\": \"FuseRequest\", \"marker\": 1}, {\"node\": \"AsyncFuse\", \"marker\": 2}, {\"node\": \"Rpc\", \"marker\": 3}, {\"node\": \"WriteBack\", \"marker\": 3}]},\n            \"expected_output\": \"signal=SIGTERM\\nnode=Metrics marker=0\\nnode=BlockFlush marker=0\\nnode=SchedulerExtender marker=0\\nnode=FuseRequest marker=1\\nnode=AsyncFuse marker=2\\nnode=Rpc marker=3\\nnode=WriteBack marker=3\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Rejecting Work After Shutdown\n\n**As a developer**, I want registrations submitted after shutdown has begun to fail explicitly, so late work cannot silently leak into a system that is already stopping.\n\n**Expected Behavior / Usage:**\n\nThe input is a `[a specific set of enumerated action strings]` command naming a single `node`. The system is shut down first, then a new worker registration is attempted on that node. The registration is refused and reported as a normalized error: the output is two lines — `error=[a specific set of enumerated action strings]` followed by `node=<NodeName>` echoing the node that was rejected. No worker is started and there is no success line. The error is a domain-level category; it must not leak any host-language exception identity or runtime message.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_[a specific set of enumerated action strings].json`\n\n```json\n{\n    \"description\": \"Once a graceful shutdown has been initiated, the registry refuses to accept any further work. Attempting to register a new worker on any node after shutdown is rejected, and the rejection reports the node that was refused rather than silently succeeding.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"[a specific set of enumerated action strings]\", \"node\": \"Root\"},\n            \"expected_output\": \"error=[a specific set of enumerated action strings]\\nnode=Root\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Batched Collection on Garbage-Collected Nodes\n\n**As a developer**, I want certain nodes to absorb large numbers of short-lived tasks through a single batching handle, so I can fire many fire-and-forget tasks and still have them all drained correctly on shutdown.\n\n**Expected Behavior / Usage:**\n\nSome node names (`BlockFlush`, `FuseRequest`) are garbage-collected nodes: rather than holding workers directly, they expose a lightweight handle that funnels many tasks into one background collector. The input is a `[a specific set of enumerated action strings]` command whose `spawns` entries name a garbage-collected `node`, a `marker`, and a `count` of tasks to enqueue on that node. All `count` tasks are enqueued per node; on shutdown the collector drains every enqueued task and each emits `node=<NodeName> marker=<marker>`. All tasks belonging to one garbage-collected node are drained together (one line per enqueued task) before moving on to the next node. The total number of output lines equals the sum of the `count` values.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_[a specific set of enumerated action strings].json`\n\n```json\n{\n    \"description\": \"Certain nodes are garbage-collected nodes: instead of holding workers directly, they hand out a lightweight handle that batches many short-lived tasks into a single background collector. Multiple tasks are enqueued per garbage-collected node; on shutdown the collector drains every enqueued task and each reports its marker. All tasks belonging to one garbage-collected node are drained together before moving to the next node.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"[a specific set of enumerated action strings]\", \"spawns\": [{\"node\": \"BlockFlush\", \"marker\": 0, \"count\": 5}, {\"node\": \"FuseRequest\", \"marker\": 1, \"count\": 5}]},\n            \"expected_output\": \"node=BlockFlush marker=0\\nnode=BlockFlush marker=0\\nnode=BlockFlush marker=0\\nnode=BlockFlush marker=0\\nnode=BlockFlush marker=0\\nnode=FuseRequest marker=1\\nnode=FuseRequest marker=1\\nnode=FuseRequest marker=1\\nnode=FuseRequest marker=1\\nnode=FuseRequest marker=1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured task-orchestration library implementing the features above — a fixed node dependency graph, a node/worker registry, a dependency-ordered shutdown driver, a batching collector for garbage-collected nodes, and a termination-signal hook. Its physical structure MUST follow the \"Scale-Driven Code Organization\" constraint (a multi-module layout separating these concerns), without over-engineering.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core library. It reads a single JSON command from stdin, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-feature contracts above. It translates any native failure (such as a rejected post-shutdown registration) into the normalized, language-neutral error lines specified above. This adapter must be logically and physically separated from the core domain.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_[a specific set of enumerated action strings].json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_[a specific set of enumerated action strings]@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- emitted consecutively without interleaving unless the batching handle defines them as distinct groups\n",
+  "oracle_data": {
+    "task_id": "datenlord__datenlord-001",
+    "golden_api_signature": "main(stdin: JSON object routed by action) -> stdout exactly matching public_test_cases expected_output",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what actions are valid",
+          "list of allowed protocols",
+          "invalid action parsing",
+          "supported rpc actions",
+          "command family enumeration"
+        ],
+        "oracle_response": "The valid action strings are: 'ordered_shutdown', 'signal_shutdown', 'spawn_after_shutdown', and 'gc_batch_drain'."
+      },
+      {
+        "constraint_id": "FULL_SCOPE",
+        "trigger_keywords": [
+          "full task scope",
+          "all public features",
+          "semantic equivalence"
+        ],
+        "oracle_response": "This generated package must cover the full detailed-PRD behavior represented by all authoritative public test case files, not just a subset mentioned in the fuzzy PRD. Public feature files: feature1_ordered_shutdown, feature2_signal_shutdown, feature3_spawn_after_shutdown, feature4_gc_batch_drain. Feature descriptions include: Background workers are registered against named nodes of a fixed dependency graph, each carrying an integer marker. When a graceful shutdown is requested, every worker is cancelled and reports its marker. The reports are emitted strictly in the graph's shutdown order: a node is only torn down after every node that depends on it has already been torn down, so upstream producers stop before the consumers they feed.; Instead of an explicit shutdown call, a process-level termination signal initiates the graceful shutdown. After registering workers and arming the signal handler, a termination signal is raised. The handler reports the signal it observed and then drives the exact same dependency-ordered teardown, so every worker reports its marker in graph order following the signal line.; Once a graceful shutdown has been initiated, the registry refuses to accept any further work. Attempting to register a new worker on any node after shutdown is rejected, and the rejection reports the node that was refused rather than silently succeeding.; Certain nodes are garbage-collected nodes: instead of holding workers directly, they hand out a lightweight handle that batches many short-lived tasks into a single background collector. Multiple tasks are enqueued per garbage-collected node; on shutdown the collector drains every enqueued task and each reports its marker. All tasks belonging to one garbage-collected node are drained together before moving to the next node."
+      },
+      {
+        "constraint_id": "EXECUTION_CONTRACT",
+        "trigger_keywords": [
+          "dispatcher contract",
+          "same tests",
+          "input fields",
+          "stdout expected_output"
+        ],
+        "oracle_response": "The execution adapter must accept exactly the input shapes used by public_test_cases and emit stdout exactly equal to each expected_output. Observed top-level input fields/values include: action=['gc_batch_drain', 'ordered_shutdown', 'signal_shutdown', 'spawn_after_shutdown'], spawns=['[list]'], signal=['SIGTERM'], node=['Root']. Do not require a different discriminator field, different action names, JSON output where line output is expected, or extra PASS/FAIL metadata."
+      },
+      {
+        "constraint_id": "PUBLIC_TEST_CASES_AUTHORITY",
+        "trigger_keywords": [
+          "exact outputs",
+          "public tests authoritative",
+          "expected_output"
+        ],
+        "oracle_response": "The embedded public_test_cases are part of oracle_data and are authoritative for exact input shapes, action/operation names, stdout line order, whitespace, error categories, numeric formatting, and deterministic serialization. If prose, fuzzy_prd, context pointers, or older hidden constraints are vague or conflict with expected_output, the public_test_cases expected_output is the pass-critical contract."
+      },
+      {
+        "constraint_id": "NO_CROSS_TASK_INFERENCE",
+        "trigger_keywords": [
+          "ignore unrelated analogies",
+          "cross task contamination"
+        ],
+        "oracle_response": "Ignore any vague analogy or context pointer that names an unrelated module, pipeline, login flow, audit generator, or previous project. Such wording is non-normative; only this repo’s detailed PRD, FULL_SCOPE, EXECUTION_CONTRACT, and public_test_cases define the task."
+      },
+      {
+        "constraint_id": "TC_feature4_gc_batch_drain",
+        "trigger_keywords": [
+          "feature4_gc_batch_drain",
+          "feature4_gc_batch_drain.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature4_gc_batch_drain:\n{\n  \"description\": \"Certain nodes are garbage-collected nodes: instead of holding workers directly, they hand out a lightweight handle that batches many short-lived tasks into a single background collector. Multiple tasks are enqueued per garbage-collected node; on shutdown the collector drains every enqueued task and each reports its marker. All tasks belonging to one garbage-collected node are drained together before moving to the next node.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"gc_batch_drain\",\n        \"spawns\": [\n          {\n            \"node\": \"BlockFlush\",\n            \"marker\": 0,\n            \"count\": 5\n          },\n          {\n            \"node\": \"FuseRequest\",\n            \"marker\": 1,\n            \"count\": 5\n          }\n        ]\n      },\n      \"expected_output\": \"node=BlockFlush marker=0\\nnode=BlockFlush marker=0\\nnode=BlockFlush marker=0\\nnode=BlockFlush marker=0\\nnode=BlockFlush marker=0\\nnode=FuseRequest marker=1\\nnode=FuseRequest marker=1\\nnode=FuseRequest marker=1\\nnode=FuseRequest marker=1\\nnode=FuseRequest marker=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_spawn_after_shutdown",
+        "trigger_keywords": [
+          "feature3_spawn_after_shutdown",
+          "feature3_spawn_after_shutdown.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature3_spawn_after_shutdown:\n{\n  \"description\": \"Once a graceful shutdown has been initiated, the registry refuses to accept any further work. Attempting to register a new worker on any node after shutdown is rejected, and the rejection reports the node that was refused rather than silently succeeding.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"spawn_after_shutdown\",\n        \"node\": \"Root\"\n      },\n      \"expected_output\": \"error=spawn_after_shutdown\\nnode=Root\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_signal_shutdown",
+        "trigger_keywords": [
+          "feature2_signal_shutdown",
+          "feature2_signal_shutdown.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_signal_shutdown:\n{\n  \"description\": \"Instead of an explicit shutdown call, a process-level termination signal initiates the graceful shutdown. After registering workers and arming the signal handler, a termination signal is raised. The handler reports the signal it observed and then drives the exact same dependency-ordered teardown, so every worker reports its marker in graph order following the signal line.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"signal_shutdown\",\n        \"signal\": \"SIGTERM\",\n        \"spawns\": [\n          {\n            \"node\": \"Metrics\",\n            \"marker\": 0\n          },\n          {\n            \"node\": \"BlockFlush\",\n            \"marker\": 0\n          },\n          {\n            \"node\": \"SchedulerExtender\",\n            \"marker\": 0\n          },\n          {\n            \"node\": \"FuseRequest\",\n            \"marker\": 1\n          },\n          {\n            \"node\": \"AsyncFuse\",\n            \"marker\": 2\n          },\n          {\n            \"node\": \"Rpc\",\n            \"marker\": 3\n          },\n          {\n            \"node\": \"WriteBack\",\n            \"marker\": 3\n          }\n        ]\n      },\n      \"expected_output\": \"signal=SIGTERM\\nnode=Metrics marker=0\\nnode=BlockFlush marker=0\\nnode=SchedulerExtender marker=0\\nnode=FuseRequest marker=1\\nnode=AsyncFuse marker=2\\nnode=Rpc marker=3\\nnode=WriteBack marker=3\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_ordered_shutdown",
+        "trigger_keywords": [
+          "feature1_ordered_shutdown",
+          "feature1_ordered_shutdown.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature1_ordered_shutdown:\n{\n  \"description\": \"Background workers are registered against named nodes of a fixed dependency graph, each carrying an integer marker. When a graceful shutdown is requested, every worker is cancelled and reports its marker. The reports are emitted strictly in the graph's shutdown order: a node is only torn down after every node that depends on it has already been torn down, so upstream producers stop before the consumers they feed.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"ordered_shutdown\",\n        \"spawns\": [\n          {\n            \"node\": \"Metrics\",\n            \"marker\": 0\n          },\n          {\n            \"node\": \"BlockFlush\",\n            \"marker\": 0\n          },\n          {\n            \"node\": \"SchedulerExtender\",\n            \"marker\": 0\n          },\n          {\n            \"node\": \"FuseRequest\",\n            \"marker\": 1\n          },\n          {\n            \"node\": \"AsyncFuse\",\n            \"marker\": 2\n          },\n          {\n            \"node\": \"Rpc\",\n            \"marker\": 3\n          },\n          {\n            \"node\": \"WriteBack\",\n            \"marker\": 3\n          }\n        ]\n      },\n      \"expected_output\": \"node=Metrics marker=0\\nnode=BlockFlush marker=0\\nnode=SchedulerExtender marker=0\\nnode=FuseRequest marker=1\\nnode=AsyncFuse marker=2\\nnode=Rpc marker=3\\nnode=WriteBack marker=3\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"ordered_shutdown\",\n        \"spawns\": [\n          {\n            \"node\": \"BlockFlush\",\n            \"marker\": 10\n          },\n          {\n            \"node\": \"AsyncFuse\",\n            \"marker\": 20\n          },\n          {\n            \"node\": \"Rpc\",\n            \"marker\": 30\n          }\n        ]\n      },\n      \"expected_output\": \"node=BlockFlush marker=10\\nnode=AsyncFuse marker=20\\nnode=Rpc marker=30\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "emitted consecutively without interleaving unless the batching handle defines them as distinct groups",
+        "actual_meaning": "Emits lines for tasks on the same node sequentially in the input order; interleaving only occurs if the batching handle explicitly groups separate spawn items from the same node."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_ordered_shutdown.json": {
+      "description": "Background workers are registered against named nodes of a fixed dependency graph, each carrying an integer marker. When a graceful shutdown is requested, every worker is cancelled and reports its marker. The reports are emitted strictly in the graph's shutdown order: a node is only torn down after every node that depends on it has already been torn down, so upstream producers stop before the consumers they feed.",
+      "cases": [
+        {
+          "input": {
+            "action": "ordered_shutdown",
+            "spawns": [
+              {
+                "node": "Metrics",
+                "marker": 0
+              },
+              {
+                "node": "BlockFlush",
+                "marker": 0
+              },
+              {
+                "node": "SchedulerExtender",
+                "marker": 0
+              },
+              {
+                "node": "FuseRequest",
+                "marker": 1
+              },
+              {
+                "node": "AsyncFuse",
+                "marker": 2
+              },
+              {
+                "node": "Rpc",
+                "marker": 3
+              },
+              {
+                "node": "WriteBack",
+                "marker": 3
+              }
+            ]
+          },
+          "expected_output": "node=Metrics marker=0\nnode=BlockFlush marker=0\nnode=SchedulerExtender marker=0\nnode=FuseRequest marker=1\nnode=AsyncFuse marker=2\nnode=Rpc marker=3\nnode=WriteBack marker=3\n"
+        },
+        {
+          "input": {
+            "action": "ordered_shutdown",
+            "spawns": [
+              {
+                "node": "BlockFlush",
+                "marker": 10
+              },
+              {
+                "node": "AsyncFuse",
+                "marker": 20
+              },
+              {
+                "node": "Rpc",
+                "marker": 30
+              }
+            ]
+          },
+          "expected_output": "node=BlockFlush marker=10\nnode=AsyncFuse marker=20\nnode=Rpc marker=30\n"
+        }
+      ]
+    },
+    "feature2_signal_shutdown.json": {
+      "description": "Instead of an explicit shutdown call, a process-level termination signal initiates the graceful shutdown. After registering workers and arming the signal handler, a termination signal is raised. The handler reports the signal it observed and then drives the exact same dependency-ordered teardown, so every worker reports its marker in graph order following the signal line.",
+      "cases": [
+        {
+          "input": {
+            "action": "signal_shutdown",
+            "signal": "SIGTERM",
+            "spawns": [
+              {
+                "node": "Metrics",
+                "marker": 0
+              },
+              {
+                "node": "BlockFlush",
+                "marker": 0
+              },
+              {
+                "node": "SchedulerExtender",
+                "marker": 0
+              },
+              {
+                "node": "FuseRequest",
+                "marker": 1
+              },
+              {
+                "node": "AsyncFuse",
+                "marker": 2
+              },
+              {
+                "node": "Rpc",
+                "marker": 3
+              },
+              {
+                "node": "WriteBack",
+                "marker": 3
+              }
+            ]
+          },
+          "expected_output": "signal=SIGTERM\nnode=Metrics marker=0\nnode=BlockFlush marker=0\nnode=SchedulerExtender marker=0\nnode=FuseRequest marker=1\nnode=AsyncFuse marker=2\nnode=Rpc marker=3\nnode=WriteBack marker=3\n"
+        }
+      ]
+    },
+    "feature3_spawn_after_shutdown.json": {
+      "description": "Once a graceful shutdown has been initiated, the registry refuses to accept any further work. Attempting to register a new worker on any node after shutdown is rejected, and the rejection reports the node that was refused rather than silently succeeding.",
+      "cases": [
+        {
+          "input": {
+            "action": "spawn_after_shutdown",
+            "node": "Root"
+          },
+          "expected_output": "error=spawn_after_shutdown\nnode=Root\n"
+        }
+      ]
+    },
+    "feature4_gc_batch_drain.json": {
+      "description": "Certain nodes are garbage-collected nodes: instead of holding workers directly, they hand out a lightweight handle that batches many short-lived tasks into a single background collector. Multiple tasks are enqueued per garbage-collected node; on shutdown the collector drains every enqueued task and each reports its marker. All tasks belonging to one garbage-collected node are drained together before moving to the next node.",
+      "cases": [
+        {
+          "input": {
+            "action": "gc_batch_drain",
+            "spawns": [
+              {
+                "node": "BlockFlush",
+                "marker": 0,
+                "count": 5
+              },
+              {
+                "node": "FuseRequest",
+                "marker": 1,
+                "count": 5
+              }
+            ]
+          },
+          "expected_output": "node=BlockFlush marker=0\nnode=BlockFlush marker=0\nnode=BlockFlush marker=0\nnode=BlockFlush marker=0\nnode=BlockFlush marker=0\nnode=FuseRequest marker=1\nnode=FuseRequest marker=1\nnode=FuseRequest marker=1\nnode=FuseRequest marker=1\nnode=FuseRequest marker=1\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "shared_expression",
+      "input_condition": "Action 'ordered_shutdown' is invoked with a list of 'spawns'.",
+      "output_rule": "All registered workers must be cancelled and report their marker in dependency order before the test harness exits.",
+      "exact_values": [
+        "node=NodeName marker=<integer>",
+        "Metrics",
+        "BlockFlush",
+        "SchedulerExtender",
+        "FuseRequest",
+        "AsyncFuse",
+        "Rpc",
+        "WriteBack"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "shared_expression",
+      "input_condition": "Action 'ordered_shutdown' is invoked with a subset of the full node list.",
+      "output_rule": "Only the lines for explicitly spawned nodes are emitted, strictly adhering to the global shutdown order.",
+      "exact_values": [
+        "node=BlockFlush marker=<integer>",
+        "node=AsyncFuse marker=<integer>",
+        "node=Rpc marker=<integer>",
+        "node=Metrics marker=<integer>",
+        "node=BlockFlush marker=<integer>",
+        "node=SchedulerExtender marker=<integer>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "shared_expression",
+      "input_condition": "Action 'signal_shutdown' is invoked with a signal label and a list of 'spawns'.",
+      "output_rule": "The first line must be the signal label, followed immediately by the dependency-ordered worker reports.",
+      "exact_values": [
+        "signal=<label>",
+        "SIGTERM",
+        "signal=SIGTERM",
+        "node=Metrics marker=<integer>",
+        "node=BlockFlush marker=<integer>",
+        "node=SchedulerExtender marker=<integer>",
+        "node=FuseRequest marker=<integer>",
+        "node=AsyncFuse marker=<integer>",
+        "node=Rpc marker=<integer>",
+        "node=WriteBack marker=<integer>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "shared_expression",
+      "input_condition": "Action 'spawn_after_shutdown' is invoked on 'Root' while the system is shut down.",
+      "output_rule": "The system reports an error status indicating the spawn was rejected, followed by the node name.",
+      "exact_values": [
+        "error=spawn_after_shutdown",
+        "node=Root"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "shared_expression",
+      "input_condition": "Action 'gc_batch_drain' is invoked on a garbage-collected node with a 'count' > 0.",
+      "output_rule": "For every task count specified, a single line representing that task is emitted for that node. All tasks for one node are emitted before tasks for the next node in the input list.",
+      "exact_values": [
+        "node=<NodeName> marker=<integer>",
+        "BlockFlush",
+        "FuseRequest",
+        "count"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "shared_expression",
+      "input_condition": "Action 'spawn_after_shutdown' is invoked with any node name after shutdown initiation.",
+      "output_rule": "The system must report the specific error type 'spawn_after_shutdown' and echo the node that was refused.",
+      "exact_values": [
+        "error=spawn_after_shutdown",
+        "node=<NodeName>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "shared_expression",
+      "input_condition": "The execution adapter receives a JSON command.",
+      "output_rule": "The protocol command 'action' must be one of: 'ordered_shutdown', 'signal_shutdown', 'spawn_after_shutdown', or 'gc_batch_drain'. Other actions are invalid and should result in an error or unhandled exception.",
+      "exact_values": [
+        "ordered_shutdown",
+        "signal_shutdown",
+        "spawn_after_shutdown",
+        "gc_batch_drain"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "shared_expression",
+      "input_condition": "An 'gc_batch_drain' command is issued.",
+      "output_rule": "The command object must contain a list 'spawns'. Each spawn item must include 'node', 'marker', and 'count' fields.",
+      "exact_values": [
+        "spawns",
+        "node",
+        "marker",
+        "count"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "shared_expression",
+      "input_condition": "A 'signal_shutdown' command is issued.",
+      "output_rule": "The command object must include the field 'signal' representing the OS signal string and 'spawns' containing the worker configuration.",
+      "exact_values": [
+        "signal",
+        "spawns",
+        "SIGTERM"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "shared_expression",
+      "input_condition": "An 'ordered_shutdown' command is issued.",
+      "output_rule": "The command object must include the field 'spawns' containing a list of worker configurations.",
+      "exact_values": [
+        "spawns",
+        "node",
+        "marker"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "shared_expression",
+      "input_condition": "Execution validation is performed on the output format.",
+      "output_rule": "Each line of output must be strictly formatted as 'key=value' where key is either 'signal', 'node', 'error', 'marker', or 'count'. There are no extraneous lines or metadata.",
+      "exact_values": [
+        "node=Name marker=Num",
+        "signal=Label",
+        "error=type",
+        "marker=Num"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "shared_expression",
+      "input_condition": "Multiple tasks are enqueued via 'gc_batch_drain' on the same node.",
+      "output_rule": "The output lines for these tasks must be emitted consecutively without interleaving with output from other nodes or other tasks unless the batching handle defines them as distinct groups.",
+      "exact_values": [
+        "node=BlockFlush marker=0",
+        "node=BlockFlush marker=1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "shared_expression",
+      "input_condition": "A 'spawn_after_shutdown' request receives a valid node reference.",
+      "output_rule": "The system must output the error type first, then the node reference. No other output is produced for this failure mode.",
+      "exact_values": [
+        "error=spawn_after_shutdown",
+        "node=Name"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "shared_expression",
+      "input_condition": "Shutdown logic processes the graph.",
+      "output_rule": "The shutdown sequence must begin with 'Metrics', followed by 'BlockFlush', then 'SchedulerExtender', 'FuseRequest', 'AsyncFuse', 'Rpc', and finally 'WriteBack'.",
+      "exact_values": [
+        "Metrics",
+        "BlockFlush",
+        "SchedulerExtender",
+        "FuseRequest",
+        "AsyncFuse",
+        "Rpc",
+        "WriteBack"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "shared_expression",
+      "input_condition": "Test runner execution.",
+      "output_rule": "Invalid actions or missing required fields in JSON input must result in the program failing to produce valid stdout content matching the expected format.",
+      "exact_values": [
+        "null",
+        "invalid"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific set of enumerated action strings",
+        "exact_values_to_replace": [
+          "ordered_shutdown",
+          "signal_shutdown",
+          "spawn_after_shutdown",
+          "gc_batch_drain"
+        ],
+        "trigger_keywords": [
+          "what actions are valid",
+          "list of allowed protocols",
+          "invalid action parsing",
+          "supported rpc actions",
+          "command family enumeration"
+        ],
+        "oracle_response": "The valid action strings are: 'ordered_shutdown', 'signal_shutdown', 'spawn_after_shutdown', and 'gc_batch_drain'."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "emitted consecutively without interleaving unless the batching handle defines them as distinct groups",
+        "actual_meaning": "Emits lines for tasks on the same node sequentially in the input order; interleaving only occurs if the batching handle explicitly groups separate spawn items from the same node."
+      }
+    ]
+  }
+}

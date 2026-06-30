@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from some of our geo-data partners that the shapes they send us are coming back looking weird or just wrong after we process them. Specifically stuff around how we handle the winding direction of polygon rings — apparently when someone sends us a ring that goes the 'wrong way', we're supposed to fix it automatically, but sometimes we're flipping when we shouldn't be, or not flipping when we should. Also there's something about holes inside polygons needing to wind opposite to their outer shell, which I think we already discussed in the context of that orientation-aware parsing work we did before (check how we handled that in the WKT/WKB reading path, same logic should apply here).
+
+Also separately — when people batch-query properties like dimensions across a mixed list that includes non-geography values (like plain numbers), the system should probably not just silently return garbage or crash. We need a clean, user-facing signal that makes it obvious something in the input wasn't actually a geographic shape.
+
+Finally, the multilinestring shape count behavior seems inconsistent with how multipolygons report their counts. Can someone sanity check whether the nshape value we return for multi-geometry types is actually correct and consistent across all of them? I think there's a ticket somewhere about this but I can't find it.
+
+One extra pass on this after the questions that came in: by default, the engine normalizes a polygon shell so that the interior is the smaller of the two spherical regions the ring divides the sphere into. So if the supplied vertices wind the wrong way and actually enclose the larger region, we reverse the vertex order before storing it, and the canonical WKT should show that reversed order. Concretely, shell [0,0]->[0,2]->[2,2]->[2,0] (CCW, encloses larger region) gets reversed and comes back as POLYGON ((2 0, 2 2, 0 2, 0 0, 2 0)).
+
+If the polygon geometry spec includes `"oriented": true`, then we do not normalize at all. In that case the supplied winding is the source of truth, the interior is whatever is to the left of the ring as traversed, and the WKT output should preserve the exact vertex order as given. Same deal for both the shell and any hole rings when the oriented flag is set.
+
+On holes, the rule is that they always need to wind opposite to the shell. So if the shell encloses its interior with a clockwise winding after normalization, the holes need to be counterclockwise, and vice versa. In practice, if a hole is supplied as [0.5,0.5]->[1.5,0.5]->[1.5,1.5]->[0.5,1.5] (CCW) inside a CW shell, that hole gets reversed and should render as (0.5 1.5, 1.5 1.5, 1.5 0.5, 0.5 0.5, 0.5 1.5).
+
+Also, the orientation behavior in the direct polygon construction path needs to match what we do in parsing, not be its own special thing. So feature05 and feature06 should line up with from_wkt (feature37) and from_wkb (feature39), including the `"oriented": true` behavior and the hole re-winding rules.
+
+And on the shape-count question, the intended behavior is: for single-geometry types (POINT, LINESTRING, POLYGON), nshape is 1 if non-empty, 0 if empty. For MULTIPOINT and MULTILINESTRING, nshape is the number of component points/lines, so a MULTILINESTRING with 2 lines returns nshape=2. For MULTIPOLYGON, nshape=1 because we treat it as a single aggregated shape. For GEOMETRYCOLLECTION, nshape is the total count of contained member geometries. Any empty geometry should return nshape=0.

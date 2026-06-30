@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need a small utility layer for the push service side of things. Basically we keep copy-pasting the same glue code across services and it's causing drift — metrics labels are inconsistent, service URLs get malformed when someone forgets about default ports, and we're sending way too much broadcast traffic because nobody's doing proper delta checks. Can someone build a centralized thing that handles these three pain points?
+
+For the client metadata side, we want to normalize incoming strings into stable labels like we did for the browser detection in that old compatibility module — same idea, 'Other' fallback for anything we don't recognize, but still surface whatever we can parse. OS and browser both need a metrics-safe label AND a human-readable field.
+
+For the service URLs, the router always uses HTTP, the endpoint can vary. The big thing is don't show redundant port numbers — users keep seeing weird URLs with :80 or :443 appended and it looks broken.
+
+For the broadcast delta piece, clients come in with a snapshot of what they have, and we only want to push what changed. New broadcasts shouldn't spam clients who haven't opted in yet. When nothing changed, just say so cleanly.
+
+The whole thing needs a CLI adapter that takes JSON on stdin and spits out line-oriented text so we can black-box test it. Tests should live under rcb_tests/ and a single bash entry point should run everything.
+
+Quick follow-up from the questions that came in: for the user-agent piece, the classifier outputs exactly four newline-delimited fields in this order: metrics_os, os, metrics_browser, browser_name. Each field is printed as a key=value line, so the full output for one classification is four lines. On the OS side, only Linux, Windows, and Mac OS X are recognized for the metrics_os field and will produce their normalized name. Anything else should come through as 'Other' for metrics_os, but if we can still tell what the OS was from the user-agent string, the plain os field should keep that parsed value. Same deal for browsers: unrecognized or unsupported browsers use 'Other' for the metrics_browser label, and browser_name should still contain the parsed browser name if one can be extracted from the user-agent string.
+
+Also, on structure, the core business logic must be completely decoupled from stdin, stdout, and JSON parsing. The execution adapter is the only layer that handles I/O and JSON. Core domain modules must be independently callable as pure Python (or target-language) functions without any I/O dependency. That applies to the user-agent classification logic described in Feature 1: classify_user_agent as well, specifically the four-field output (metrics_os, os, metrics_browser, browser_name) with 'Other' fallback for unrecognized OSes (only Linux, Windows, Mac OS X are recognized) and browsers.
+
+And one more URL detail since a few people asked the same thing in different ways: the router URL always uses the HTTP scheme. It does not inherit or follow the endpoint scheme. Only the endpoint URL is affected by the endpoint_scheme parameter. For ports, port 80 is omitted for HTTP URLs (both router and endpoint). Port 443 is omitted for HTTPS endpoint URLs. All other non-default ports must be appended as :<port>. So yes, the default port suppression rules in Feature 2 are exactly: port 80 omitted for HTTP URLs, port 443 omitted for HTTPS endpoint URLs, all other ports appended as :<port>.

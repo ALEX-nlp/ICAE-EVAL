@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that test runner thing we've been talking about. The basic idea is devs should be able to write their test steps like prose — setup, do stuff, check stuff, clean up — and it should run them in order without them having to wire everything up manually for every single data row. Right now people are copy-pasting test methods all over the place and it's a nightmare.
+
+A few things that are definitely needed: it should handle multiple data rows elegantly (like that table-driven approach we used in the auth service refactor), steps should be skippable individually or the whole test at once with a reason attached, and if one step blows up the later ones shouldn't just silently vanish — they should show up clearly as blocked. There also needs to be some kind of resource cleanup that runs in reverse order no matter what, even if things fail halfway through.
+
+One tricky thing the team mentioned: sometimes an assertion is "destructive" (it changes state) so it needs its own fresh context to run in, otherwise later steps break. We also need a per-step time cap so slow steps don't hang the whole suite. Oh and someone raised a thread-safety concern — if two test threads register steps at the same time it shouldn't corrupt anything. Make sure the output for each step result is structured and machine-readable. Check how we handled the default value generation in the earlier parameter binding work for reference.

@@ -1,0 +1,841 @@
+{
+  "fuzzy_prd": "# Native Module Rebuild Planner — A Dependency-Aware Build Orchestrator for Prebuilt-Runtime Native Addons\n\n## Project Goal\n\nBuild a library and command-line tool that, given a project's dependency manifest and its installed module tree, decides **which native (compiled) modules need to be rebuilt** so they are binary-compatible with a specific target runtime, and which can be safely skipped. It walks the dependency graph, classifies dependencies, detects already-up-to-date builds, and produces a deterministic rebuild plan — without the developer manually tracking ABI compatibility, dependency types, or transitive native children.\n\n---\n\n## Background & Problem\n\nNative addons are compiled against a specific runtime ABI (Application Binary Interface). When an application embeds a runtime whose ABI differs from the one the addons were originally compiled for, every native module must be recompiled or it will fail to load. Doing this by hand is painful: a developer must crawl the whole `node_modules` tree, figure out which packages are production vs. optional vs. development dependencies, discover native children buried under non-native parents (including scoped packages), avoid rebuilding modules that are already up to date, and recompute the correct ABI number for the target runtime version. This leads to repetitive, error-prone scripting and slow, wasteful full rebuilds on every change.\n\nWith this tool, the developer hands over the manifest and the installed tree and receives a precise plan: the resolved target ABI, the exact set of modules selected for rebuild, and how many were skipped because they were already current. The same engine also answers the supporting questions the planner needs — where the project root is, and what a manifest contains.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility system (dependency-graph traversal, ABI resolution, build-stamp comparison, project-root discovery, manifest reading, and an I/O adapter). It MUST be organized as a multi-file repository with clear separation between the core planning engine and the execution adapter. Do not collapse it into a single \"god file\", and do not over-engineer the smaller helpers.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases in \"Core Features\" are a **black-box contract for the execution adapter**, not the internal data model of the core engine. The core logic must not read stdin, write stdout, or parse the test JSON. The adapter is solely responsible for translating a JSON command into idiomatic calls on the core engine and for rendering results and errors into the line-based stdout contract.\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Keep graph traversal, dependency classification, ABI resolution, build-stamp comparison, root discovery, manifest reading, and output formatting in distinct units.\n   - **Open/Closed Principle (OCP):** Adding a new selection rule (e.g., a new dependency category) must not require rewriting the traversal core.\n   - **Liskov Substitution Principle (LSP):** Any module-descriptor variant (plain, scoped, nested child) must be handled uniformly by the traversal.\n   - **Interface Segregation Principle (ISP):** Keep the planner's public surface small — a planning entry point plus a few focused query helpers.\n   - **Dependency Inversion Principle (DIP):** The planner depends on abstractions for filesystem access and progress reporting, not on concrete stdout writing.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The core's public interface should be elegant and hide traversal/ABI complexity behind a simple \"plan a rebuild\" call.\n   - **Resilience:** Invalid inputs (e.g., a non-absolute build path, a target runtime version that is not a string) must surface as well-modeled, normalized error categories rather than leaking host-language runtime details.\n\n---\n\n## Core Features\n\n### Feature 1: Dependency-Aware Module Selection\n\n**As a developer**, I want the planner to automatically discover every native module that belongs to my application's production and optional dependency closure, so I don't have to hand-curate which addons need rebuilding.\n\n**Expected Behavior / Usage:**\n\nThe input describes a project: its manifest dependency sets (`dependencies`, `optionalDependencies`, `devDependencies`) and a `modules` list describing the installed tree. Each module entry has a `name`; `native: true` marks it as a compiled addon that is a rebuild candidate; `dependencies` declares its own child dependencies; and `children` nests modules installed privately under that module (used for transitive native children and for scoped packages whose short-name lives under a scope segment). Optionally, `buildSubdir` places the build target in a sub-package of a multi-package workspace whose root is one [a specific list of production native modules] up.\n\nThe planner selects native modules reachable through the **production** and **optional** dependency closure, **including transitive native children** discovered by descending into each selected module's own declared dependencies (a native child nested under a non-native parent is still selected). Modules reachable **only** through development dependencies are **excluded**. In a workspace layout, selection is scoped to the target sub-package's closure.\n\nOutput is three lines: `runtime_abi=<resolved ABI for the target runtime>`, `selected=<comma-separated sorted short-names>` (scoped packages contribute their short-name after the scope segment), and `skipped=<count>` (0 on a fresh tree where nothing is pre-built).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_dependency_selection.json`\n\n```json\n{\n    \"description\": \"Given a project manifest plus its installed module tree, the planner selects which native modules to (re)build. It walks production and optional dependencies, descends into their transitive native children (including scoped packages nested under a parent), and excludes development-only dependencies. The output reports the resolved target ABI for the requested runtime version and the sorted set of module short-names chosen for rebuild.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"command\": \"plan_rebuild\",\n                \"runtimeVersion\": \"10.4.7\",\n                \"dependencies\": {\"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"@newrelic/native-metrics\": \"1\"},\n                \"optionalDependencies\": {\"bcrypt\": \"1\"},\n                \"devDependencies\": {\"ffi-napi\": \"1\"},\n                \"modules\": [\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"bcrypt\", \"native\": true},\n                    {\"name\": \"ffi-napi\", \"native\": true},\n                    {\"name\": \"@newrelic/native-metrics\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"dependencies\": {\"[a specific list of production native modules]down\": \"1\"}, \"children\": [{\"name\": \"[a specific list of production native modules]down\", \"native\": true}]}\n                ]\n            },\n            \"expected_output\": \"runtime_abi=82\\nselected=bcrypt,[a specific list of production native modules],[a specific list of production native modules]down,native-metrics,[a specific list of production native modules]\\nskipped=0\\n\"\n        },\n        {\n            \"input\": {\n                \"command\": \"plan_rebuild\",\n                \"runtimeVersion\": \"10.4.7\",\n                \"buildSubdir\": \"child-workspace\",\n                \"dependencies\": {\"snappy\": \"1\"},\n                \"devDependencies\": {\"sleep\": \"1\"},\n                \"modules\": [\n                    {\"name\": \"snappy\", \"native\": true},\n                    {\"name\": \"sleep\", \"native\": true}\n                ]\n            },\n            \"expected_output\": \"runtime_abi=82\\nselected=snappy\\nskipped=0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Incremental Skip on ABI Match\n\n**As a developer**, I want modules that are already compiled for the exact target runtime to be skipped, so repeated runs are fast and only stale binaries get rebuilt.\n\n**Expected Behavior / Usage:**\n\nEach previously built native module carries a build-stamp recording the architecture and the ABI it was compiled against; the input expresses this via `builtForRuntimeVersion` (the runtime version the existing binaries were built for). When the target runtime's resolved ABI equals the stamped ABI and rebuilding is not forced, every matching module is **skipped** rather than rebuilt. When the target runtime's ABI differs from the stamped ABI — for example after a runtime upgrade that changes the ABI number — the stamps no longer match and **every** module is selected for rebuild.\n\nOutput reports `runtime_abi`, the `selected` set (which modules were found as rebuild candidates), and `skipped` (how many of those were short-circuited because their stamp already matched the target ABI).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_incremental_skip.json`\n\n```json\n{\n    \"description\": \"The planner avoids redundant work by skipping native modules already built for the exact target runtime. Each previously built module carries a build-stamp recording the architecture and ABI it was compiled for. When every module's stamp matches the requested runtime's ABI and rebuilding is not forced, all modules are skipped. If the target runtime's ABI differs from the stamped ABI (a runtime upgrade), the stamps no longer match and every module is selected for rebuild. The output reports how many modules were skipped versus selected.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"command\": \"plan_rebuild\",\n                \"runtimeVersion\": \"10.4.7\",\n                \"builtForRuntimeVersion\": \"10.4.7\",\n                \"dependencies\": {\"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"@newrelic/native-metrics\": \"1\"},\n                \"optionalDependencies\": {\"bcrypt\": \"1\"},\n                \"devDependencies\": {\"ffi-napi\": \"1\"},\n                \"modules\": [\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"bcrypt\", \"native\": true},\n                    {\"name\": \"ffi-napi\", \"native\": true},\n                    {\"name\": \"@newrelic/native-metrics\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"dependencies\": {\"[a specific list of production native modules]down\": \"1\"}, \"children\": [{\"name\": \"[a specific list of production native modules]down\", \"native\": true}]}\n                ]\n            },\n            \"expected_output\": \"runtime_abi=82\\nselected=bcrypt,[a specific list of production native modules],[a specific list of production native modules]down,native-metrics,[a specific list of production native modules]\\nskipped=5\\n\"\n        },\n        {\n            \"input\": {\n                \"command\": \"plan_rebuild\",\n                \"runtimeVersion\": \"10.4.7\",\n                \"builtForRuntimeVersion\": \"3.0.0\",\n                \"dependencies\": {\"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"@newrelic/native-metrics\": \"1\"},\n                \"optionalDependencies\": {\"bcrypt\": \"1\"},\n                \"devDependencies\": {\"ffi-napi\": \"1\"},\n                \"modules\": [\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"bcrypt\", \"native\": true},\n                    {\"name\": \"ffi-napi\", \"native\": true},\n                    {\"name\": \"@newrelic/native-metrics\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"dependencies\": {\"[a specific list of production native modules]down\": \"1\"}, \"children\": [{\"name\": \"[a specific list of production native modules]down\", \"native\": true}]}\n                ]\n            },\n            \"expected_output\": \"runtime_abi=82\\nselected=bcrypt,[a specific list of production native modules],[a specific list of production native modules]down,native-metrics,[a specific list of production native modules]\\nskipped=0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Forced Full Rebuild\n\n**As a developer**, I want a way to force every native module to rebuild regardless of existing build-stamps, so I can recover from a corrupted or untrusted build cache.\n\n**Expected Behavior / Usage:**\n\nWhen the `force` flag is set, the planner bypasses the build-stamp comparison entirely. Even if a module's stamp already matches the target ABI (the situation that would normally skip it), it is selected for rebuild and `skipped` is `0`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_force_rebuild.json`\n\n```json\n{\n    \"description\": \"When the force flag is set, the planner ignores existing build-stamps and rebuilds every native module even if it was already built for the exact target runtime. No module is reported as skipped.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"command\": \"plan_rebuild\",\n                \"runtimeVersion\": \"10.4.7\",\n                \"builtForRuntimeVersion\": \"10.4.7\",\n                \"force\": true,\n                \"dependencies\": {\"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"@newrelic/native-metrics\": \"1\"},\n                \"optionalDependencies\": {\"bcrypt\": \"1\"},\n                \"devDependencies\": {\"ffi-napi\": \"1\"},\n                \"modules\": [\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"bcrypt\", \"native\": true},\n                    {\"name\": \"ffi-napi\", \"native\": true},\n                    {\"name\": \"@newrelic/native-metrics\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"dependencies\": {\"[a specific list of production native modules]down\": \"1\"}, \"children\": [{\"name\": \"[a specific list of production native modules]down\", \"native\": true}]}\n                ]\n            },\n            \"expected_output\": \"runtime_abi=82\\nselected=bcrypt,[a specific list of production native modules],[a specific list of production native modules]down,native-metrics,[a specific list of production native modules]\\nskipped=0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Allow-List Scoping\n\n**As a developer**, I want to restrict a rebuild to an explicit list of module names, so I can rebuild just the one or two addons I'm iterating on instead of the whole tree.\n\n**Expected Behavior / Usage:**\n\nWhen an `only` list is provided, the selected set is restricted to exactly the modules whose short-name appears in the list. All other native modules in the closure are ignored, regardless of their dependency category. A single-element list selects exactly one module; a multi-element list selects exactly those modules.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_only_filter.json`\n\n```json\n{\n    \"description\": \"An allow-list narrows the rebuild to only the named modules. Even when the project declares many native dependencies, supplying an explicit list restricts the selected set to exactly those names (matched by module short-name), ignoring all others regardless of their dependency type.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"command\": \"plan_rebuild\",\n                \"runtimeVersion\": \"10.4.7\",\n                \"only\": [\"[a specific list of production native modules]\"],\n                \"dependencies\": {\"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"@newrelic/native-metrics\": \"1\"},\n                \"optionalDependencies\": {\"bcrypt\": \"1\"},\n                \"devDependencies\": {\"ffi-napi\": \"1\"},\n                \"modules\": [\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"bcrypt\", \"native\": true},\n                    {\"name\": \"ffi-napi\", \"native\": true},\n                    {\"name\": \"@newrelic/native-metrics\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"dependencies\": {\"[a specific list of production native modules]down\": \"1\"}, \"children\": [{\"name\": \"[a specific list of production native modules]down\", \"native\": true}]}\n                ]\n            },\n            \"expected_output\": \"runtime_abi=82\\n[a dynamic string array of allowed module names]\\nskipped=0\\n\"\n        },\n        {\n            \"input\": {\n                \"command\": \"plan_rebuild\",\n                \"runtimeVersion\": \"10.4.7\",\n                \"only\": [\"ffi-napi\", \"[a specific list of production native modules]\"],\n                \"dependencies\": {\"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"[a specific list of production native modules]\": \"1\", \"@newrelic/native-metrics\": \"1\"},\n                \"optionalDependencies\": {\"bcrypt\": \"1\"},\n                \"devDependencies\": {\"ffi-napi\": \"1\"},\n                \"modules\": [\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"native\": true},\n                    {\"name\": \"bcrypt\", \"native\": true},\n                    {\"name\": \"ffi-napi\", \"native\": true},\n                    {\"name\": \"@newrelic/native-metrics\", \"native\": true},\n                    {\"name\": \"[a specific list of production native modules]\", \"dependencies\": {\"[a specific list of production native modules]down\": \"1\"}, \"children\": [{\"name\": \"[a specific list of production native modules]down\", \"native\": true}]}\n                ]\n            },\n            \"expected_output\": \"runtime_abi=82\\n[a dynamic string array of allowed module names]\\nskipped=0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Project Root Discovery\n\n**As a developer**, I want the tool to locate my project's root by finding the nearest dependency lock file while walking up from a starting directory, so traversal and workspace scoping anchor to the right boundary.\n\n**Expected Behavior / Usage:**\n\nGiven a starting directory, the resolver walks upward through ancestor directories looking for a dependency lock file. The root is the directory that contains the lock file. Either of two common lock-file names is recognized. If no lock file is found anywhere in the ancestry, the starting directory itself is returned as the root.\n\nThe input declares the directories to create (`dirs`), which lock files to place and where (`lockfiles`, created at the temporary base), and the `startDir` to resolve from (relative to that base). Output is `project_root=<path of the root relative to startDir>`; `..` segments indicate how many [a specific list of production native modules]s up the root sits, and `.` means the start directory is itself the root.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_project_root.json`\n\n```json\n{\n    \"description\": \"Determines a project's root directory by walking upward from a starting directory until a dependency lock file is found. The root is the directory containing the lock file. Either of two common lock-file names is recognized. When no lock file exists anywhere in the ancestry, the starting directory itself is returned as the root. Output is the root expressed as a path relative to the starting directory ('.' means the start directory is the root).\",\n    \"cases\": [\n        {\n            \"input\": {\"command\": \"resolve_project_root\", \"dirs\": [\"packages/bar\"], \"lockfiles\": [\"yarn.lock\"], \"startDir\": \"packages/bar\"},\n            \"expected_output\": \"project_root=../..\\n\"\n        },\n        {\n            \"input\": {\"command\": \"resolve_project_root\", \"dirs\": [\"packages/bar\"], \"lockfiles\": [\"package-lock.json\"], \"startDir\": \"packages/bar\"},\n            \"expected_output\": \"project_root=../..\\n\"\n        },\n        {\n            \"input\": {\"command\": \"resolve_project_root\", \"dirs\": [], \"lockfiles\": [], \"startDir\": \".\"},\n            \"expected_output\": \"project_root=.\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Manifest Reading\n\n**As a developer**, I want to read and parse a project's manifest descriptor from a directory, so the planner can inspect declared dependencies and metadata.\n\n**Expected Behavior / Usage:**\n\nGiven a directory containing a JSON manifest, the reader parses it and returns the structured object. The output enumerates the manifest's top-[a specific list of production native modules] field names in sorted order on a `fields=` line, followed by one `key=value` line per field where the value is the JSON-encoded representation of that field. This lets the parsed structure be verified field-by-field.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_read_manifest.json`\n\n```json\n{\n    \"description\": \"Reads and parses a project manifest (a JSON descriptor file) from a directory and returns the parsed object. The output lists the manifest's top-[a specific list of production native modules] field names (sorted) followed by each field's JSON-encoded value, so the parsed structure can be verified field-by-field.\",\n    \"cases\": [\n        {\n            \"input\": {\"command\": \"read_manifest\", \"manifest\": {\"name\": \"native-app\", \"version\": \"1.0.0\", \"dependencies\": {\"[a specific list of production native modules]\": \"1.4.2\"}}},\n            \"expected_output\": \"fields=dependencies,name,version\\ndependencies={\\\"[a specific list of production native modules]\\\":\\\"1.4.2\\\"}\\nname=\\\"native-app\\\"\\nversion=\\\"1.0.0\\\"\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the planning engine described above — dependency-graph traversal, dependency-type classification, ABI resolution for a target runtime version, build-stamp comparison (with force override and allow-list scoping), project-root discovery, and manifest reading — kept decoupled from any standard I/O.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads a single JSON command from stdin, dispatches on its `command` field, invokes the appropriate core logic, and prints the line-based result to stdout exactly matching the per-feature contracts above. Errors must be normalized to language-neutral category lines (e.g. `error=build_path_not_absolute`, `error=invalid_runtime_version` with a separate `got=<type>` field) and must never leak host-language exception class names, runtime message suffixes, or object-repr formatting. The adapter must be logically and physically separated from the core domain.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to choose the directory (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case of `feature1_dependency_selection.json` under `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_dependency_selection@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other. Each `.txt` contains **only** the raw stdout of the program under test (no PASS/FAIL or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- skip if version matches built version unless force flag is active\n- mark all as selected on non-match when force is inactive\n",
+  "oracle_data": {
+    "task_id": "electron__rebuild-001",
+    "golden_api_signature": "main(stdin: JSON object routed by command) -> stdout exactly matching public_test_cases expected_output",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what are the dev packages to exclude?",
+          "should ffi-napi be skipped?",
+          "how do I filter out development builds?"
+        ],
+        "oracle_response": "The exact string 'ffi-napi' which represents a specific excluded module ID in dev dependencies."
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "how do I specify the allow list?",
+          "what modules are permitted?",
+          "fill in the only field values"
+        ],
+        "oracle_response": "An array of module identifiers (e.g., ['farmhash', 'ffi-napi', 'ref-napi']) that defines the specific whitelist for selection."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "list production dependencies explicitly",
+          "which native libs are required?",
+          "what are the top-level prod modules?"
+        ],
+        "oracle_response": "The exact list of dependency names ['ref-napi', 'farmhash', 'level', 'leveldown'] that must be included in the production scope."
+      },
+      {
+        "constraint_id": "FULL_SCOPE",
+        "trigger_keywords": [
+          "full task scope",
+          "all public features",
+          "semantic equivalence"
+        ],
+        "oracle_response": "This generated package must cover the full detailed-PRD behavior represented by all authoritative public test case files, not just a subset mentioned in the fuzzy PRD. Public feature files: feature1_dependency_selection, feature2_incremental_skip, feature3_force_rebuild, feature4_only_filter, feature5_project_root, feature6_read_manifest. Feature descriptions include: Given a project manifest plus its installed module tree, the planner selects which native modules to (re)build. It walks production and optional dependencies, descends into their transitive native children (including scoped packages nested under a parent), and excludes development-only dependencies. The output reports the resolved target ABI for the requested runtime version and the sorted set of module short-names chosen for rebuild.; The planner avoids redundant work by skipping native modules already built for the exact target runtime. Each previously built module carries a build-stamp recording the architecture and ABI it was compiled for. When every module's stamp matches the requested runtime's ABI and rebuilding is not forced, all modules are skipped. If the target runtime's ABI differs from the stamped ABI (a runtime upgrade), the stamps no longer match and every module is selected for rebuild. The output reports how many modules were skipped versus selected.; When the force flag is set, the planner ignores existing build-stamps and rebuilds every native module even if it was already built for the exact target runtime. No module is reported as skipped.; An allow-list narrows the rebuild to only the named modules. Even when the project declares many native dependencies, supplying an explicit list restricts the selected set to exactly those names (matched by module short-name), ignoring all others regardless of their dependency type.; Determines a project's root directory by walking upward from a starting directory until a dependency lock file is found. The root is the directory containing the lock file. Either of two common lock-file names is recognized. When no lock file exists anywhere in the ancestry, the starting directory itself is returned as the root. Output is the root expressed as a path relative to the starting directory ('.' means the start directory is the root).; Reads and parses a project manifest (a JSON descriptor file) from a directory and returns the parsed object. The output lists the manifest's top-level field names (sorted) followed by each field's JSON-encoded value, so the parsed structure can be verified field-by-field."
+      },
+      {
+        "constraint_id": "EXECUTION_CONTRACT",
+        "trigger_keywords": [
+          "dispatcher contract",
+          "same tests",
+          "input fields",
+          "stdout expected_output"
+        ],
+        "oracle_response": "The execution adapter must accept exactly the input shapes used by public_test_cases and emit stdout exactly equal to each expected_output. Observed top-level input fields/values include: command=['plan_rebuild', 'read_manifest', 'resolve_project_root'], runtimeVersion=['10.4.7'], dependencies=['{dict}'], optionalDependencies=['{dict}'], devDependencies=['{dict}'], modules=['[list]'], buildSubdir=['child-workspace'], builtForRuntimeVersion=['10.4.7', '3.0.0'], force=['True'], only=['[list]'], dirs=['[list]'], lockfiles=['[list]'], startDir=['.', 'packages/bar'], manifest=['{dict}']. Do not require a different discriminator field, different action names, JSON output where line output is expected, or extra PASS/FAIL metadata."
+      },
+      {
+        "constraint_id": "PUBLIC_TEST_CASES_AUTHORITY",
+        "trigger_keywords": [
+          "exact outputs",
+          "public tests authoritative",
+          "expected_output"
+        ],
+        "oracle_response": "The embedded public_test_cases are part of oracle_data and are authoritative for exact input shapes, action/operation names, stdout line order, whitespace, error categories, numeric formatting, and deterministic serialization. If prose, fuzzy_prd, context pointers, or older hidden constraints are vague or conflict with expected_output, the public_test_cases expected_output is the pass-critical contract."
+      },
+      {
+        "constraint_id": "NO_CROSS_TASK_INFERENCE",
+        "trigger_keywords": [
+          "ignore unrelated analogies",
+          "cross task contamination"
+        ],
+        "oracle_response": "Ignore any vague analogy or context pointer that names an unrelated module, pipeline, login flow, audit generator, or previous project. Such wording is non-normative; only this repo’s detailed PRD, FULL_SCOPE, EXECUTION_CONTRACT, and public_test_cases define the task."
+      },
+      {
+        "constraint_id": "TC_feature6_read_manifest",
+        "trigger_keywords": [
+          "feature6_read_manifest",
+          "feature6_read_manifest.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature6_read_manifest:\n{\n  \"description\": \"Reads and parses a project manifest (a JSON descriptor file) from a directory and returns the parsed object. The output lists the manifest's top-level field names (sorted) followed by each field's JSON-encoded value, so the parsed structure can be verified field-by-field.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"command\": \"read_manifest\",\n        \"manifest\": {\n          \"name\": \"native-app\",\n          \"version\": \"1.0.0\",\n          \"dependencies\": {\n            \"ref-napi\": \"1.4.2\"\n          }\n        }\n      },\n      \"expected_output\": \"fields=dependencies,name,version\\ndependencies={\\\"ref-napi\\\":\\\"1.4.2\\\"}\\nname=\\\"native-app\\\"\\nversion=\\\"1.0.0\\\"\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_project_root",
+        "trigger_keywords": [
+          "feature5_project_root",
+          "feature5_project_root.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature5_project_root:\n{\n  \"description\": \"Determines a project's root directory by walking upward from a starting directory until a dependency lock file is found. The root is the directory containing the lock file. Either of two common lock-file names is recognized. When no lock file exists anywhere in the ancestry, the starting directory itself is returned as the root. Output is the root expressed as a path relative to the starting directory ('.' means the start directory is the root).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"command\": \"resolve_project_root\",\n        \"dirs\": [\n          \"packages/bar\"\n        ],\n        \"lockfiles\": [\n          \"yarn.lock\"\n        ],\n        \"startDir\": \"packages/bar\"\n      },\n      \"expected_output\": \"project_root=../..\\n\"\n    },\n    {\n      \"input\": {\n        \"command\": \"resolve_project_root\",\n        \"dirs\": [\n          \"packages/bar\"\n        ],\n        \"lockfiles\": [\n          \"package-lock.json\"\n        ],\n        \"startDir\": \"packages/bar\"\n      },\n      \"expected_output\": \"project_root=../..\\n\"\n    },\n    {\n      \"input\": {\n        \"command\": \"resolve_project_root\",\n        \"dirs\": [],\n        \"lockfiles\": [],\n        \"startDir\": \".\"\n      },\n      \"expected_output\": \"project_root=.\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_only_filter",
+        "trigger_keywords": [
+          "feature4_only_filter",
+          "feature4_only_filter.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature4_only_filter:\n{\n  \"description\": \"An allow-list narrows the rebuild to only the named modules. Even when the project declares many native dependencies, supplying an explicit list restricts the selected set to exactly those names (matched by module short-name), ignoring all others regardless of their dependency type.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"command\": \"plan_rebuild\",\n        \"runtimeVersion\": \"10.4.7\",\n        \"only\": [\n          \"farmhash\"\n        ],\n        \"dependencies\": {\n          \"ref-napi\": \"1\",\n          \"farmhash\": \"1\",\n          \"level\": \"1\",\n          \"@newrelic/native-metrics\": \"1\"\n        },\n        \"optionalDependencies\": {\n          \"bcrypt\": \"1\"\n        },\n        \"devDependencies\": {\n          \"ffi-napi\": \"1\"\n        },\n        \"modules\": [\n          {\n            \"name\": \"ref-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"farmhash\",\n            \"native\": true\n          },\n          {\n            \"name\": \"bcrypt\",\n            \"native\": true\n          },\n          {\n            \"name\": \"ffi-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"@newrelic/native-metrics\",\n            \"native\": true\n          },\n          {\n            \"name\": \"level\",\n            \"dependencies\": {\n              \"leveldown\": \"1\"\n            },\n            \"children\": [\n              {\n                \"name\": \"leveldown\",\n                \"native\": true\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"runtime_abi=82\\nselected=farmhash\\nskipped=0\\n\"\n    },\n    {\n      \"input\": {\n        \"command\": \"plan_rebuild\",\n        \"runtimeVersion\": \"10.4.7\",\n        \"only\": [\n          \"ffi-napi\",\n          \"ref-napi\"\n        ],\n        \"dependencies\": {\n          \"ref-napi\": \"1\",\n          \"farmhash\": \"1\",\n          \"level\": \"1\",\n          \"@newrelic/native-metrics\": \"1\"\n        },\n        \"optionalDependencies\": {\n          \"bcrypt\": \"1\"\n        },\n        \"devDependencies\": {\n          \"ffi-napi\": \"1\"\n        },\n        \"modules\": [\n          {\n            \"name\": \"ref-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"farmhash\",\n            \"native\": true\n          },\n          {\n            \"name\": \"bcrypt\",\n            \"native\": true\n          },\n          {\n            \"name\": \"ffi-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"@newrelic/native-metrics\",\n            \"native\": true\n          },\n          {\n            \"name\": \"level\",\n            \"dependencies\": {\n              \"leveldown\": \"1\"\n            },\n            \"children\": [\n              {\n                \"name\": \"leveldown\",\n                \"native\": true\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"runtime_abi=82\\nselected=ffi-napi,ref-napi\\nskipped=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_force_rebuild",
+        "trigger_keywords": [
+          "feature3_force_rebuild",
+          "feature3_force_rebuild.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature3_force_rebuild:\n{\n  \"description\": \"When the force flag is set, the planner ignores existing build-stamps and rebuilds every native module even if it was already built for the exact target runtime. No module is reported as skipped.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"command\": \"plan_rebuild\",\n        \"runtimeVersion\": \"10.4.7\",\n        \"builtForRuntimeVersion\": \"10.4.7\",\n        \"force\": true,\n        \"dependencies\": {\n          \"ref-napi\": \"1\",\n          \"farmhash\": \"1\",\n          \"level\": \"1\",\n          \"@newrelic/native-metrics\": \"1\"\n        },\n        \"optionalDependencies\": {\n          \"bcrypt\": \"1\"\n        },\n        \"devDependencies\": {\n          \"ffi-napi\": \"1\"\n        },\n        \"modules\": [\n          {\n            \"name\": \"ref-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"farmhash\",\n            \"native\": true\n          },\n          {\n            \"name\": \"bcrypt\",\n            \"native\": true\n          },\n          {\n            \"name\": \"ffi-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"@newrelic/native-metrics\",\n            \"native\": true\n          },\n          {\n            \"name\": \"level\",\n            \"dependencies\": {\n              \"leveldown\": \"1\"\n            },\n            \"children\": [\n              {\n                \"name\": \"leveldown\",\n                \"native\": true\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"runtime_abi=82\\nselected=bcrypt,farmhash,leveldown,native-metrics,ref-napi\\nskipped=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_incremental_skip",
+        "trigger_keywords": [
+          "feature2_incremental_skip",
+          "feature2_incremental_skip.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature2_incremental_skip:\n{\n  \"description\": \"The planner avoids redundant work by skipping native modules already built for the exact target runtime. Each previously built module carries a build-stamp recording the architecture and ABI it was compiled for. When every module's stamp matches the requested runtime's ABI and rebuilding is not forced, all modules are skipped. If the target runtime's ABI differs from the stamped ABI (a runtime upgrade), the stamps no longer match and every module is selected for rebuild. The output reports how many modules were skipped versus selected.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"command\": \"plan_rebuild\",\n        \"runtimeVersion\": \"10.4.7\",\n        \"builtForRuntimeVersion\": \"10.4.7\",\n        \"dependencies\": {\n          \"ref-napi\": \"1\",\n          \"farmhash\": \"1\",\n          \"level\": \"1\",\n          \"@newrelic/native-metrics\": \"1\"\n        },\n        \"optionalDependencies\": {\n          \"bcrypt\": \"1\"\n        },\n        \"devDependencies\": {\n          \"ffi-napi\": \"1\"\n        },\n        \"modules\": [\n          {\n            \"name\": \"ref-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"farmhash\",\n            \"native\": true\n          },\n          {\n            \"name\": \"bcrypt\",\n            \"native\": true\n          },\n          {\n            \"name\": \"ffi-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"@newrelic/native-metrics\",\n            \"native\": true\n          },\n          {\n            \"name\": \"level\",\n            \"dependencies\": {\n              \"leveldown\": \"1\"\n            },\n            \"children\": [\n              {\n                \"name\": \"leveldown\",\n                \"native\": true\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"runtime_abi=82\\nselected=bcrypt,farmhash,leveldown,native-metrics,ref-napi\\nskipped=5\\n\"\n    },\n    {\n      \"input\": {\n        \"command\": \"plan_rebuild\",\n        \"runtimeVersion\": \"10.4.7\",\n        \"builtForRuntimeVersion\": \"3.0.0\",\n        \"dependencies\": {\n          \"ref-napi\": \"1\",\n          \"farmhash\": \"1\",\n          \"level\": \"1\",\n          \"@newrelic/native-metrics\": \"1\"\n        },\n        \"optionalDependencies\": {\n          \"bcrypt\": \"1\"\n        },\n        \"devDependencies\": {\n          \"ffi-napi\": \"1\"\n        },\n        \"modules\": [\n          {\n            \"name\": \"ref-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"farmhash\",\n            \"native\": true\n          },\n          {\n            \"name\": \"bcrypt\",\n            \"native\": true\n          },\n          {\n            \"name\": \"ffi-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"@newrelic/native-metrics\",\n            \"native\": true\n          },\n          {\n            \"name\": \"level\",\n            \"dependencies\": {\n              \"leveldown\": \"1\"\n            },\n            \"children\": [\n              {\n                \"name\": \"leveldown\",\n                \"native\": true\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"runtime_abi=82\\nselected=bcrypt,farmhash,leveldown,native-metrics,ref-napi\\nskipped=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_dependency_selection",
+        "trigger_keywords": [
+          "feature1_dependency_selection",
+          "feature1_dependency_selection.json",
+          "public test cases"
+        ],
+        "oracle_response": "Here are the authoritative public test cases for feature1_dependency_selection:\n{\n  \"description\": \"Given a project manifest plus its installed module tree, the planner selects which native modules to (re)build. It walks production and optional dependencies, descends into their transitive native children (including scoped packages nested under a parent), and excludes development-only dependencies. The output reports the resolved target ABI for the requested runtime version and the sorted set of module short-names chosen for rebuild.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"command\": \"plan_rebuild\",\n        \"runtimeVersion\": \"10.4.7\",\n        \"dependencies\": {\n          \"ref-napi\": \"1\",\n          \"farmhash\": \"1\",\n          \"level\": \"1\",\n          \"@newrelic/native-metrics\": \"1\"\n        },\n        \"optionalDependencies\": {\n          \"bcrypt\": \"1\"\n        },\n        \"devDependencies\": {\n          \"ffi-napi\": \"1\"\n        },\n        \"modules\": [\n          {\n            \"name\": \"ref-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"farmhash\",\n            \"native\": true\n          },\n          {\n            \"name\": \"bcrypt\",\n            \"native\": true\n          },\n          {\n            \"name\": \"ffi-napi\",\n            \"native\": true\n          },\n          {\n            \"name\": \"@newrelic/native-metrics\",\n            \"native\": true\n          },\n          {\n            \"name\": \"level\",\n            \"dependencies\": {\n              \"leveldown\": \"1\"\n            },\n            \"children\": [\n              {\n                \"name\": \"leveldown\",\n                \"native\": true\n              }\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"runtime_abi=82\\nselected=bcrypt,farmhash,leveldown,native-metrics,ref-napi\\nskipped=0\\n\"\n    },\n    {\n      \"input\": {\n        \"command\": \"plan_rebuild\",\n        \"runtimeVersion\": \"10.4.7\",\n        \"buildSubdir\": \"child-workspace\",\n        \"dependencies\": {\n          \"snappy\": \"1\"\n        },\n        \"devDependencies\": {\n          \"sleep\": \"1\"\n        },\n        \"modules\": [\n          {\n            \"name\": \"snappy\",\n            \"native\": true\n          },\n          {\n            \"name\": \"sleep\",\n            \"native\": true\n          }\n        ]\n      },\n      \"expected_output\": \"runtime_abi=82\\nselected=snappy\\nskipped=0\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "skip if version matches built version unless force flag is active",
+        "actual_meaning": "Check input.builtForRuntimeVersion, input.force, and version equality; if equal (and not forced), increment skipped count and do not add to selected."
+      },
+      {
+        "vague_reference": "mark all as selected on non-match when force is inactive",
+        "actual_meaning": "When built version does not match target and force is false, mark all in closure as selected and ensure skipped count remains 0."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_dependency_selection.json": {
+      "description": "Given a project manifest plus its installed module tree, the planner selects which native modules to (re)build. It walks production and optional dependencies, descends into their transitive native children (including scoped packages nested under a parent), and excludes development-only dependencies. The output reports the resolved target ABI for the requested runtime version and the sorted set of module short-names chosen for rebuild.",
+      "cases": [
+        {
+          "input": {
+            "command": "plan_rebuild",
+            "runtimeVersion": "10.4.7",
+            "dependencies": {
+              "ref-napi": "1",
+              "farmhash": "1",
+              "level": "1",
+              "@newrelic/native-metrics": "1"
+            },
+            "optionalDependencies": {
+              "bcrypt": "1"
+            },
+            "devDependencies": {
+              "ffi-napi": "1"
+            },
+            "modules": [
+              {
+                "name": "ref-napi",
+                "native": true
+              },
+              {
+                "name": "farmhash",
+                "native": true
+              },
+              {
+                "name": "bcrypt",
+                "native": true
+              },
+              {
+                "name": "ffi-napi",
+                "native": true
+              },
+              {
+                "name": "@newrelic/native-metrics",
+                "native": true
+              },
+              {
+                "name": "level",
+                "dependencies": {
+                  "leveldown": "1"
+                },
+                "children": [
+                  {
+                    "name": "leveldown",
+                    "native": true
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "runtime_abi=82\nselected=bcrypt,farmhash,leveldown,native-metrics,ref-napi\nskipped=0\n"
+        },
+        {
+          "input": {
+            "command": "plan_rebuild",
+            "runtimeVersion": "10.4.7",
+            "buildSubdir": "child-workspace",
+            "dependencies": {
+              "snappy": "1"
+            },
+            "devDependencies": {
+              "sleep": "1"
+            },
+            "modules": [
+              {
+                "name": "snappy",
+                "native": true
+              },
+              {
+                "name": "sleep",
+                "native": true
+              }
+            ]
+          },
+          "expected_output": "runtime_abi=82\nselected=snappy\nskipped=0\n"
+        }
+      ]
+    },
+    "feature2_incremental_skip.json": {
+      "description": "The planner avoids redundant work by skipping native modules already built for the exact target runtime. Each previously built module carries a build-stamp recording the architecture and ABI it was compiled for. When every module's stamp matches the requested runtime's ABI and rebuilding is not forced, all modules are skipped. If the target runtime's ABI differs from the stamped ABI (a runtime upgrade), the stamps no longer match and every module is selected for rebuild. The output reports how many modules were skipped versus selected.",
+      "cases": [
+        {
+          "input": {
+            "command": "plan_rebuild",
+            "runtimeVersion": "10.4.7",
+            "builtForRuntimeVersion": "10.4.7",
+            "dependencies": {
+              "ref-napi": "1",
+              "farmhash": "1",
+              "level": "1",
+              "@newrelic/native-metrics": "1"
+            },
+            "optionalDependencies": {
+              "bcrypt": "1"
+            },
+            "devDependencies": {
+              "ffi-napi": "1"
+            },
+            "modules": [
+              {
+                "name": "ref-napi",
+                "native": true
+              },
+              {
+                "name": "farmhash",
+                "native": true
+              },
+              {
+                "name": "bcrypt",
+                "native": true
+              },
+              {
+                "name": "ffi-napi",
+                "native": true
+              },
+              {
+                "name": "@newrelic/native-metrics",
+                "native": true
+              },
+              {
+                "name": "level",
+                "dependencies": {
+                  "leveldown": "1"
+                },
+                "children": [
+                  {
+                    "name": "leveldown",
+                    "native": true
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "runtime_abi=82\nselected=bcrypt,farmhash,leveldown,native-metrics,ref-napi\nskipped=5\n"
+        },
+        {
+          "input": {
+            "command": "plan_rebuild",
+            "runtimeVersion": "10.4.7",
+            "builtForRuntimeVersion": "3.0.0",
+            "dependencies": {
+              "ref-napi": "1",
+              "farmhash": "1",
+              "level": "1",
+              "@newrelic/native-metrics": "1"
+            },
+            "optionalDependencies": {
+              "bcrypt": "1"
+            },
+            "devDependencies": {
+              "ffi-napi": "1"
+            },
+            "modules": [
+              {
+                "name": "ref-napi",
+                "native": true
+              },
+              {
+                "name": "farmhash",
+                "native": true
+              },
+              {
+                "name": "bcrypt",
+                "native": true
+              },
+              {
+                "name": "ffi-napi",
+                "native": true
+              },
+              {
+                "name": "@newrelic/native-metrics",
+                "native": true
+              },
+              {
+                "name": "level",
+                "dependencies": {
+                  "leveldown": "1"
+                },
+                "children": [
+                  {
+                    "name": "leveldown",
+                    "native": true
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "runtime_abi=82\nselected=bcrypt,farmhash,leveldown,native-metrics,ref-napi\nskipped=0\n"
+        }
+      ]
+    },
+    "feature3_force_rebuild.json": {
+      "description": "When the force flag is set, the planner ignores existing build-stamps and rebuilds every native module even if it was already built for the exact target runtime. No module is reported as skipped.",
+      "cases": [
+        {
+          "input": {
+            "command": "plan_rebuild",
+            "runtimeVersion": "10.4.7",
+            "builtForRuntimeVersion": "10.4.7",
+            "force": true,
+            "dependencies": {
+              "ref-napi": "1",
+              "farmhash": "1",
+              "level": "1",
+              "@newrelic/native-metrics": "1"
+            },
+            "optionalDependencies": {
+              "bcrypt": "1"
+            },
+            "devDependencies": {
+              "ffi-napi": "1"
+            },
+            "modules": [
+              {
+                "name": "ref-napi",
+                "native": true
+              },
+              {
+                "name": "farmhash",
+                "native": true
+              },
+              {
+                "name": "bcrypt",
+                "native": true
+              },
+              {
+                "name": "ffi-napi",
+                "native": true
+              },
+              {
+                "name": "@newrelic/native-metrics",
+                "native": true
+              },
+              {
+                "name": "level",
+                "dependencies": {
+                  "leveldown": "1"
+                },
+                "children": [
+                  {
+                    "name": "leveldown",
+                    "native": true
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "runtime_abi=82\nselected=bcrypt,farmhash,leveldown,native-metrics,ref-napi\nskipped=0\n"
+        }
+      ]
+    },
+    "feature4_only_filter.json": {
+      "description": "An allow-list narrows the rebuild to only the named modules. Even when the project declares many native dependencies, supplying an explicit list restricts the selected set to exactly those names (matched by module short-name), ignoring all others regardless of their dependency type.",
+      "cases": [
+        {
+          "input": {
+            "command": "plan_rebuild",
+            "runtimeVersion": "10.4.7",
+            "only": [
+              "farmhash"
+            ],
+            "dependencies": {
+              "ref-napi": "1",
+              "farmhash": "1",
+              "level": "1",
+              "@newrelic/native-metrics": "1"
+            },
+            "optionalDependencies": {
+              "bcrypt": "1"
+            },
+            "devDependencies": {
+              "ffi-napi": "1"
+            },
+            "modules": [
+              {
+                "name": "ref-napi",
+                "native": true
+              },
+              {
+                "name": "farmhash",
+                "native": true
+              },
+              {
+                "name": "bcrypt",
+                "native": true
+              },
+              {
+                "name": "ffi-napi",
+                "native": true
+              },
+              {
+                "name": "@newrelic/native-metrics",
+                "native": true
+              },
+              {
+                "name": "level",
+                "dependencies": {
+                  "leveldown": "1"
+                },
+                "children": [
+                  {
+                    "name": "leveldown",
+                    "native": true
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "runtime_abi=82\nselected=farmhash\nskipped=0\n"
+        },
+        {
+          "input": {
+            "command": "plan_rebuild",
+            "runtimeVersion": "10.4.7",
+            "only": [
+              "ffi-napi",
+              "ref-napi"
+            ],
+            "dependencies": {
+              "ref-napi": "1",
+              "farmhash": "1",
+              "level": "1",
+              "@newrelic/native-metrics": "1"
+            },
+            "optionalDependencies": {
+              "bcrypt": "1"
+            },
+            "devDependencies": {
+              "ffi-napi": "1"
+            },
+            "modules": [
+              {
+                "name": "ref-napi",
+                "native": true
+              },
+              {
+                "name": "farmhash",
+                "native": true
+              },
+              {
+                "name": "bcrypt",
+                "native": true
+              },
+              {
+                "name": "ffi-napi",
+                "native": true
+              },
+              {
+                "name": "@newrelic/native-metrics",
+                "native": true
+              },
+              {
+                "name": "level",
+                "dependencies": {
+                  "leveldown": "1"
+                },
+                "children": [
+                  {
+                    "name": "leveldown",
+                    "native": true
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "runtime_abi=82\nselected=ffi-napi,ref-napi\nskipped=0\n"
+        }
+      ]
+    },
+    "feature5_project_root.json": {
+      "description": "Determines a project's root directory by walking upward from a starting directory until a dependency lock file is found. The root is the directory containing the lock file. Either of two common lock-file names is recognized. When no lock file exists anywhere in the ancestry, the starting directory itself is returned as the root. Output is the root expressed as a path relative to the starting directory ('.' means the start directory is the root).",
+      "cases": [
+        {
+          "input": {
+            "command": "resolve_project_root",
+            "dirs": [
+              "packages/bar"
+            ],
+            "lockfiles": [
+              "yarn.lock"
+            ],
+            "startDir": "packages/bar"
+          },
+          "expected_output": "project_root=../..\n"
+        },
+        {
+          "input": {
+            "command": "resolve_project_root",
+            "dirs": [
+              "packages/bar"
+            ],
+            "lockfiles": [
+              "package-lock.json"
+            ],
+            "startDir": "packages/bar"
+          },
+          "expected_output": "project_root=../..\n"
+        },
+        {
+          "input": {
+            "command": "resolve_project_root",
+            "dirs": [],
+            "lockfiles": [],
+            "startDir": "."
+          },
+          "expected_output": "project_root=.\n"
+        }
+      ]
+    },
+    "feature6_read_manifest.json": {
+      "description": "Reads and parses a project manifest (a JSON descriptor file) from a directory and returns the parsed object. The output lists the manifest's top-level field names (sorted) followed by each field's JSON-encoded value, so the parsed structure can be verified field-by-field.",
+      "cases": [
+        {
+          "input": {
+            "command": "read_manifest",
+            "manifest": {
+              "name": "native-app",
+              "version": "1.0.0",
+              "dependencies": {
+                "ref-napi": "1.4.2"
+              }
+            }
+          },
+          "expected_output": "fields=dependencies,name,version\ndependencies={\"ref-napi\":\"1.4.2\"}\nname=\"native-app\"\nversion=\"1.0.0\"\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "command_dispatch",
+      "input_condition": "input.command == \"plan_rebuild\"",
+      "output_rule": "Execute the dependency traversal, ABI resolution, and skip logic; output three lines of status.",
+      "exact_values": [
+        "plan_rebuild",
+        "runtime_abi=82",
+        "selected=",
+        "skipped="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "command_dispatch",
+      "input_condition": "input.command == \"resolve_project_root\"",
+      "output_rule": "Execute the root discovery logic; output the relative path to the project root.",
+      "exact_values": [
+        "resolve_project_root",
+        "project_root="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "command_dispatch",
+      "input_condition": "input.command == \"read_manifest\"",
+      "output_rule": "Execute manifest parsing; output top-level fields and values.",
+      "exact_values": [
+        "read_manifest",
+        "fields=",
+        "name=",
+        "version=",
+        "dependencies="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "runtime_abi_resolution",
+      "input_condition": "input.runtimeVersion is provided",
+      "output_rule": "Resolve the target ABI constant for the given version string; return a fixed string.",
+      "exact_values": [
+        "runtime_abi=82"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "dependency_scope",
+      "input_condition": "input.dependencies exists during plan_rebuild",
+      "output_rule": "Include modules explicitly listed in production dependencies and their transitive native children.",
+      "exact_values": [
+        "ref-napi",
+        "farmhash",
+        "level",
+        "leveldown"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "optional_dependency_scope",
+      "input_condition": "input.optionalDependencies exists during plan_rebuild",
+      "output_rule": "Include modules explicitly listed in optional dependencies and their transitive native children.",
+      "exact_values": [
+        "bcrypt"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "dev_dependency_exclusion",
+      "input_condition": "input.devDependencies exists during plan_rebuild",
+      "output_rule": "Exclude modules explicitly listed in devDependencies from the selection set.",
+      "exact_values": [
+        "ffi-napi (excluded)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "transitive_child_inclusion",
+      "input_condition": "A selected module has a 'children' array containing native modules",
+      "output_rule": "Include those children in the selected set immediately.",
+      "exact_values": [
+        "leveldown (nested child)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "scoped_name_normalization",
+      "input_condition": "input.name matches pattern @scope/module",
+      "output_rule": "Use the full name as is for output; do not strip scope for selection (unless 'short-name' implied by test description, but output uses full string). Checking test output: 'native-metrics' is used in selected list for '@newrelic/native-metrics'.",
+      "exact_values": [
+        "native-metrics"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "build_subdir_scoping",
+      "input_condition": "input.buildSubdir is set and input.dependencies keys are constrained",
+      "output_rule": "Selection is limited to the closure of the specified subdir; other dependencies are ignored.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "incremental_skip_logic",
+      "input_condition": "input.builtForRuntimeVersion exists AND force is not true AND target runtime version matches built version",
+      "output_rule": "Do not add the module to 'selected'; increment 'skipped' count instead.",
+      "exact_values": [
+        "skipped=5",
+        "selected=... (empty)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "abi_mismatch_detection",
+      "input_condition": "input.builtForRuntimeVersion exists AND force is not true AND target runtime version does NOT match built version",
+      "output_rule": "Mark all matching closure modules as 'selected'; skip count is 0.",
+      "exact_values": [
+        "skipped=0",
+        "selected=..."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "force_override",
+      "input_condition": "input.force is true",
+      "output_rule": "Ignore builtForRuntimeVersion; all modules in closure are 'selected'; skip count is 0 regardless of version match.",
+      "exact_values": [
+        "skipped=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "allow_list_filtering",
+      "input_condition": "input.only contains field as array",
+      "output_rule": "Filter the 'selected' set to include ONLY modules whose 'name' matches a string in 'only'. All other modules are removed from selection.",
+      "exact_values": [
+        "selected=farmhash",
+        "selected=ffi-napi,ref-napi"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "output_formatting",
+      "input_condition": "line_breaks required",
+      "output_rule": "Output is strictly line-separated strings ending with newline.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "project_root_detection",
+      "input_condition": "input.startDir is not project root AND lockfile found in ancestor",
+      "output_rule": "Output relative path indicating how many levels up the root lies (e.g., '../..').",
+      "exact_values": [
+        "project_root=../.."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "project_root_detection",
+      "input_condition": "input.lockfiles list is empty",
+      "output_rule": "No walk performed; startDir is returned as root.",
+      "exact_values": [
+        "project_root="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "manifest_field_extraction",
+      "input_condition": "input.manifest is a valid JSON object",
+      "output_rule": "List top-level field names in alphabetical order, then value pairs.",
+      "exact_values": [
+        "fields=dependencies,name,version"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "manifest_value_formatting",
+      "input_condition": "manifest value is a string (e.g. name)",
+      "output_rule": "Output the string enclosed in double quotes.",
+      "exact_values": [
+        "name=\"native-app\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "manifest_value_formatting",
+      "input_condition": "manifest value is an object (e.g. dependencies)",
+      "output_rule": "Output the JSON representation of the object.",
+      "exact_values": [
+        "dependencies={\"ref-napi\":\"1.4.2\"}"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific exclusion constant for dev dependencies",
+        "exact_values_to_replace": [
+          "ffi-napi (excluded)"
+        ],
+        "trigger_keywords": [
+          "what are the dev packages to exclude?",
+          "should ffi-napi be skipped?",
+          "how do I filter out development builds?"
+        ],
+        "oracle_response": "The exact string 'ffi-napi' which represents a specific excluded module ID in dev dependencies."
+      },
+      {
+        "constraint_id": "C014",
+        "replacement": "a dynamic string array of allowed module names",
+        "exact_values_to_replace": [
+          "selected=farmhash",
+          "selected=ffi-napi,ref-napi"
+        ],
+        "trigger_keywords": [
+          "how do I specify the allow list?",
+          "what modules are permitted?",
+          "fill in the only field values"
+        ],
+        "oracle_response": "An array of module identifiers (e.g., ['farmhash', 'ffi-napi', 'ref-napi']) that defines the specific whitelist for selection."
+      },
+      {
+        "constraint_id": "C005",
+        "replacement": "a specific list of production native modules",
+        "exact_values_to_replace": [
+          "ref-napi",
+          "farmhash",
+          "level",
+          "leveldown"
+        ],
+        "trigger_keywords": [
+          "list production dependencies explicitly",
+          "which native libs are required?",
+          "what are the top-level prod modules?"
+        ],
+        "oracle_response": "The exact list of dependency names ['ref-napi', 'farmhash', 'level', 'leveldown'] that must be included in the production scope."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C011",
+        "vague_phrase": "skip if version matches built version unless force flag is active",
+        "actual_meaning": "Check input.builtForRuntimeVersion, input.force, and version equality; if equal (and not forced), increment skipped count and do not add to selected."
+      },
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "mark all as selected on non-match when force is inactive",
+        "actual_meaning": "When built version does not match target and force is false, mark all in closure as selected and ensure skipped count remains 0."
+      }
+    ]
+  }
+}

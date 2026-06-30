@@ -1,0 +1,747 @@
+{
+  "fuzzy_prd": "# HTTP Acceleration Proxy — Caching, Compression-Aware Delivery & Structured Access Logging\n\n## Project Goal\n\nBuild a lightweight HTTP front-end that sits between clients and a single application origin and accelerates it transparently: it forwards requests to the origin, caches eligible responses in memory, serves static files on the origin's behalf, records a structured log line for every request, and is driven entirely by process arguments and environment variables. The goal is to let an application gain shared caching, accelerated file delivery and uniform request logging without building any of that into the application itself.\n\n---\n\n## Background & Problem\n\nApplication servers are good at producing dynamic responses but are wasteful when asked to repeatedly regenerate identical pages, stream large static files, or implement their own access logging and configuration plumbing. Operators are then forced to bolt on a separate caching tier, a separate file server and a separate log shipper, each with its own configuration surface and subtle correctness pitfalls (stale variants, cookie leakage into shared caches, truncated downloads when content is pre-compressed, and so on).\n\nWith this front-end, a single process wraps the origin and provides those cross-cutting behaviors as a well-defined contract: a request goes in, it is routed to the origin, the response is conditionally stored and replayed, files named by the origin are delivered directly from disk, and a one-line summary of the exchange is emitted — all configured from the environment.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain. This is a multi-responsibility system (routing, caching, file delivery, logging, configuration); it MUST be organized as a clear multi-file tree with one cohesive unit per responsibility, NOT a single \"god file\". Do not over-engineer, but strictly avoid a monolith.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below represent a **black-box testing contract** for an execution adapter, NOT the internal data model. The core request-handling components must be decoupled from stdin/stdout and JSON parsing; the adapter alone translates JSON commands into idiomatic calls to the core and renders results.\n\n3. **Adherence to SOLID Design Principles:** Separate parsing, routing, caching policy, file delivery, logging and output formatting into distinct units (SRP). The handler pipeline must be open for extension but closed for modification (OCP). Each middleware stage must be substitutable as a standard request handler (LSP). Keep the interfaces (a cache store, a request handler) small (ISP). High-level policy must depend on abstractions such as a cache-store interface, not concrete I/O (DIP).\n\n4. **Robustness & Interface Design:** The public interface must be elegant and idiomatic to the target language. Edge cases (oversized bodies, pre-compressed files, missing required arguments) must be modeled explicitly rather than producing generic faults. Errors surfaced to the contract must be normalized domain categories, never host-language runtime artifacts.\n\n---\n\n## Core Features\n\n### Feature 1: Reverse Proxy Routing\n\n**As a developer**, I want incoming requests transparently forwarded to a fixed upstream origin and the origin's reply relayed back unchanged, so I can place this front-end ahead of any application without it noticing.\n\n**Expected Behavior / Usage:**\n\nThe proxy targets one fixed origin. For an incoming request it preserves the HTTP method, the URL path and the full query string and delivers them to the origin exactly as received; whatever status code, `Content-Type` and body the origin returns are relayed back to the caller verbatim. The contract reports the client-visible status, content type and body, together with the method, path and query string actually observed at the origin (demonstrating routing fidelity in both directions).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_proxy_routing.json`\n\n```json\n{\n    \"description\": \"A reverse proxy forwards an incoming HTTP request to a single fixed upstream origin and relays the origin's response back to the client unchanged. The request method, path and query string must be delivered to the upstream exactly as received (routing fidelity), and the upstream's status code, Content-Type header and response body must be returned verbatim to the caller. Output reports the client-visible status, content type and body, plus the method, path and query string actually observed at the upstream.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"proxy\", \"request\": {\"method\": \"GET\", \"path\": \"/articles\", \"query\": \"page=2\", \"headers\": {}}, \"upstream\": {\"status\": 200, \"headers\": {\"Content-Type\": \"[a detected content type]; charset=utf-8\"}, \"body\": \"Article listing body\"}},\n            \"expected_output\": \"status=200\\ncontent_type=[a detected content type]; charset=utf-8\\nupstream_method=GET\\nupstream_path=/articles\\nupstream_query=page=2\\nbody=Article listing body\\n\"\n        },\n        {\n            \"input\": {\"action\": \"proxy\", \"request\": {\"method\": \"POST\", \"path\": \"/submit\", \"query\": \"id=7\", \"headers\": {}}, \"upstream\": {\"status\": 404, \"headers\": {\"Content-Type\": \"application/json\"}, \"body\": \"{\\\"error\\\":\\\"missing\\\"}\"}},\n            \"expected_output\": \"status=404\\ncontent_type=application/json\\nupstream_method=POST\\nupstream_path=/submit\\nupstream_query=id=7\\nbody={\\\"error\\\":\\\"missing\\\"}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: HTTP Response Cache\n\n**As a developer**, I want eligible responses stored and replayed for equivalent later requests, so the origin is shielded from repeated identical work while clients never receive a response that was meant for someone else.\n\n**Expected Behavior / Usage:**\n\nEach request passing through the cache reports a disposition signal in an `X-Cache`-style field: `miss` (a fresh response was generated and possibly stored), `hit` (a stored response was replayed), or `bypass` (the request was deliberately not cacheable and went straight to the origin). The per-request contract for this feature always reports, in order, the request index, status code, cache disposition, any cookie header on the response, a tracked custom response header, and the body. The origin numbers successive generated bodies so a replayed response is visibly distinct from a regenerated one.\n\n*2.1 Caching by response directives — when a response may be stored*\n\nStorability is decided solely from the response's caching directives, status and size. A response is storable only when its directives explicitly mark it shareable AND grant a positive freshness lifetime. Directives that mark it private, omit the shareable marker, grant a zero or absent lifetime, or explicitly forbid reuse make it non-storable. Not-modified / informational / redirect / error statuses are never stored, and a body exceeding the configured size limit is never stored. Requests using a non-cacheable method skip the cache entirely (`bypass`). When a stored response is replayed, its original status code and any custom headers are reproduced exactly.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_caching.json`\n\n```json\n{\n    \"description\": \"A caching layer sits in front of an origin and decides whether each response may be reused for later identical requests, based solely on the response's caching directives, status and size. A response is storable only when its directives mark it explicitly shareable AND give a positive freshness lifetime; directives that mark it private, omit a shareable marker, give a zero or absent lifetime, or explicitly forbid reuse make it non-storable. Redirect/informational/error or not-modified statuses and bodies larger than the configured limit are never stored. Each request reports a cache disposition signal: a freshly generated (and possibly stored) response, a reuse of a previously stored response, or a deliberate skip of the cache. When a stored response is reused, the original status code and any custom headers it carried are reproduced exactly. The origin numbers successive generated bodies so that a reused response is distinguishable from a regenerated one. Output, per request in the sequence, reports the request index, status code, cache disposition, any cookie header, a tracked custom header, and the body.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"cache\", \"upstream\": {\"cacheControl\": \"public, max-age=60\", \"bodyMode\": \"counter\", \"body\": \"Hello\"}, \"requests\": [{\"url\": \"http://example.com\"}, {\"url\": \"http://example.com\"}, {\"url\": \"http://example.com\"}]},\n            \"expected_output\": \"request=0\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello 1\\nrequest=1\\nstatus=200\\n[a specific query key value]\\nset_cookie=-\\nextra=-\\nbody=Hello 1\\nrequest=2\\nstatus=200\\n[a specific query key value]\\nset_cookie=-\\nextra=-\\nbody=Hello 1\\n\"\n        },\n        {\n            \"input\": {\"action\": \"cache\", \"upstream\": {\"cacheControl\": \"public, max-age=60\", \"bodyMode\": \"counter\", \"body\": \"Hello\"}, \"requests\": [{\"method\": \"POST\", \"url\": \"http://example.com\"}, {\"method\": \"POST\", \"url\": \"http://example.com\"}, {\"method\": \"POST\", \"url\": \"http://example.com\"}]},\n            \"expected_output\": \"request=0\\nstatus=200\\nx_cache=bypass\\nset_cookie=-\\nextra=-\\nbody=Hello 1\\nrequest=1\\nstatus=200\\nx_cache=bypass\\nset_cookie=-\\nextra=-\\nbody=Hello 2\\nrequest=2\\nstatus=200\\nx_cache=bypass\\nset_cookie=-\\nextra=-\\nbody=Hello 3\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Cache keying — which requests are considered equivalent*\n\nThe cache key is derived from the request method, the URL path and the complete set of query parameters, with query parameters treated as order-independent (the same parameters in a different order map to the same key). Only requests producing the same key may share a stored response; non-cacheable methods bypass the cache. With an always-storable origin response the keying is visible purely through which requests replay an earlier response.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_keying.json`\n\n```json\n{\n    \"description\": \"The caching layer derives a cache key for each request so that only genuinely equivalent requests share a stored response. The key is sensitive to the request method, the URL path and the full set of query parameters, but treats query parameters as order-independent (the same parameters supplied in a different order map to the same key). Methods that are not safely cacheable bypass the cache entirely. With an always-storable origin response, output per request reports the request index, status code, cache disposition (fresh generation, reuse, or cache skip), cookie header, tracked custom header, and body, so the keying behaviour is visible through which requests reuse earlier responses.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"cache\", \"upstream\": {\"cacheControl\": \"public, max-age=60\", \"bodyMode\": \"constant\", \"body\": \"Hello\"}, \"requests\": [{\"url\": \"http://example.com/one\"}, {\"url\": \"http://example.com/two\"}, {\"url\": \"http://example.com/three\"}, {\"url\": \"http://example.com/three\"}]},\n            \"expected_output\": \"request=0\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=1\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=2\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=3\\nstatus=200\\n[a specific query key value]\\nset_cookie=-\\nextra=-\\nbody=Hello\\n\"\n        },\n        {\n            \"input\": {\"action\": \"cache\", \"upstream\": {\"cacheControl\": \"public, max-age=60\", \"bodyMode\": \"constant\", \"body\": \"Hello\"}, \"requests\": [{\"url\": \"http://example.com?a=1&b=2\"}, {\"url\": \"http://example.com?a=1&b=2\"}, {\"url\": \"http://example.com?b=2&a=1\"}]},\n            \"expected_output\": \"request=0\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=1\\nstatus=200\\n[a specific query key value]\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=2\\nstatus=200\\n[a specific query key value]\\nset_cookie=-\\nextra=-\\nbody=Hello\\n\"\n        }\n    ]\n}\n```\n\n*2.3 Variant negotiation — varying a stored entry by named request headers*\n\nWhen the origin response declares that it varies by one or more request header fields, exactly those request header values become part of the cache key, so clients sending different values for the named headers get distinct stored variants while differences in unnamed headers are ignored. With several varying fields, a stored variant is replayed only when every named header matches. The origin echoes the negotiated value into the body so each variant is observable.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_3_vary.json`\n\n```json\n{\n    \"description\": \"When an origin response declares that it varies by one or more request header fields, the caching layer incorporates exactly those request header values into the cache key, so that clients sending different values for the named headers receive distinct stored variants while differences in unnamed headers are ignored. The origin echoes the negotiated header value into its body so each variant is observable. With multiple varying header fields, a stored variant is reused only when every named header matches. Output per request reports the request index, status code, cache disposition, cookie header, tracked custom header, and the negotiated body.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"cache\", \"upstream\": {\"cacheControl\": \"public, max-age=600\", \"vary\": \"Accept\", \"bodyMode\": \"echoAccept\"}, \"requests\": [{\"url\": \"http://example.com\", \"headers\": {\"Accept\": \"application/json\", \"Other\": \"a\"}}, {\"url\": \"http://example.com\", \"headers\": {\"Accept\": \"application/json\", \"Other\": \"b\"}}, {\"url\": \"http://example.com\", \"headers\": {\"Accept\": \"[a detected content type]\", \"Other\": \"a\"}}, {\"url\": \"http://example.com\", \"headers\": {\"Accept\": \"[a detected content type]\", \"Other\": \"a\"}}, {\"url\": \"http://example.com\", \"headers\": {\"Accept\": \"application/json\", \"Other\": \"b\"}}]},\n            \"expected_output\": \"request=0\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=application/json\\nrequest=1\\nstatus=200\\n[a specific query key value]\\nset_cookie=-\\nextra=-\\nbody=application/json\\nrequest=2\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=[a detected content type]\\nrequest=3\\nstatus=200\\n[a specific query key value]\\nset_cookie=-\\nextra=-\\nbody=[a detected content type]\\nrequest=4\\nstatus=200\\n[a specific query key value]\\nset_cookie=-\\nextra=-\\nbody=application/json\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Accelerated Static File Delivery (X-Sendfile)\n\n**As a developer**, I want the origin to hand off sending a static file to the front-end by naming a path on disk, so large assets are streamed efficiently without the application reading them into memory.\n\n**Expected Behavior / Usage:**\n\nWhen the feature is enabled the front-end advertises support to the origin via a request header. If the origin's response then carries the delegation header naming a file path, the front-end reads that file from disk and sends its contents as the body — discarding any body the origin wrote — strips the delegation header from the client-visible response, sets `Content-Length` to the true on-disk size and infers `Content-Type` by sniffing the file. Critically, even when the origin marked the response with a `Content-Encoding`, the front-end still overrides `Content-Length` with the real file size rather than passing through the origin's (possibly zero) value, which prevents truncated downloads. If no delegation header is present, the origin's own status, headers and body are returned untouched. When the feature is disabled the front-end neither advertises support nor intercepts the delegation header, so the header passes straight through. The contract reports status, `Content-Type`, `Content-Length`, `Content-Encoding`, the final state of the delegation header, and the body.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_sendfile.json`\n\n```json\n{\n    \"description\": \"An accelerated file-delivery feature lets the origin delegate sending a static file to the proxy by returning a header naming a path on disk instead of writing the file body itself. When the feature is enabled, the proxy advertises support to the origin (a request header), and on seeing the delegation header it reads the named file from disk, sends its contents as the response body (discarding any body the origin wrote), strips the delegation header, and sets the Content-Length to the real file size and the Content-Type by sniffing the file. Crucially, even when the origin marked the response with a Content-Encoding, the proxy still sets Content-Length to the true on-disk size rather than passing through the origin's (possibly zero) value, preventing truncated responses. If no delegation header is present the origin's own response (status, headers, body) is returned untouched. When the feature is disabled the proxy neither advertises support nor intercepts the delegation header, which then passes straight through. Output reports the status, Content-Type, Content-Length, Content-Encoding, the delegation header's final state, and the body.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"sendfile\", \"enabled\": true, \"request\": {\"method\": \"GET\", \"path\": \"/\"}, \"upstream\": {\"fileContent\": \"Sendfile body contents.\\n\", \"body\": \"this body should not be seen\"}},\n            \"expected_output\": \"status=200\\ncontent_type=[a detected content type]; charset=utf-8\\ncontent_length=24\\ncontent_encoding=-\\nx_sendfile=-\\nbody=Sendfile body contents.\\n\\n\"\n        },\n        {\n            \"input\": {\"action\": \"sendfile\", \"enabled\": false, \"request\": {\"method\": \"GET\", \"path\": \"/\"}, \"upstream\": {\"fileContent\": \"irrelevant\\n\", \"contentType\": \"application/custom\", \"status\": 418, \"body\": \"This body should be seen\"}},\n            \"expected_output\": \"status=418\\ncontent_type=application/custom\\ncontent_length=-\\ncontent_encoding=-\\nx_sendfile=<passthrough>\\nbody=This body should be seen\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Structured Access Logging\n\n**As a developer**, I want one structured record summarizing every completed request, so I get uniform observability regardless of what the origin does.\n\n**Expected Behavior / Usage:**\n\nA logging stage wraps request handling and, after the response completes, emits exactly one record capturing: the request path (without the query string), the HTTP method, the final response status code, the client address (taken from the forwarded-for header when present), the user agent, the request and response `Content-Type` values, the request body length and the number of response bytes written, the raw query string, and the cache disposition reported downstream. Timing-related fields are deliberately excluded from the contract. The fields are rendered as neutral key/value lines.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_logging.json`\n\n```json\n{\n    \"description\": \"A logging middleware wraps the request handling and emits one structured record summarizing each completed request. The record captures the request path (without query string), HTTP method, final response status code, the client address (taken from the forwarded-for header when present), the user agent, the request and response Content-Type values, the request body length and the number of response bytes written, the raw query string, and the cache disposition reported downstream. Timing-related fields are excluded. Output renders the captured fields as neutral key/value lines.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"logging\", \"request\": {\"method\": \"POST\", \"path\": \"/somepath\", \"query\": \"q=ok\", \"body\": \"hello\", \"headers\": {\"X-Forwarded-For\": \"192.168.1.1\", \"User-Agent\": \"Robot/1\", \"Content-Type\": \"application/json\"}}, \"response\": {\"status\": 201, \"headers\": {\"X-Cache\": \"miss\", \"Content-Type\": \"text/html\"}, \"body\": \"goodbye\\n\"}},\n            \"expected_output\": \"path=/somepath\\nmethod=POST\\nstatus=201\\nremote_addr=192.168.1.1\\nuser_agent=Robot/1\\nreq_content_type=application/json\\nresp_content_type=text/html\\nreq_content_length=5\\nresp_content_length=8\\nquery=q=ok\\ncache=miss\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: In-Memory Cache Store\n\n**As a developer**, I want a bounded in-memory key/value store with per-entry expiry, so cached responses live somewhere with predictable capacity and size limits.\n\n**Expected Behavior / Usage:**\n\nThe store holds byte payloads under numeric keys, each with an expiry time, governed by a total capacity and a per-item size limit. Storing a key records its payload; storing the same key again replaces the previous payload. Retrieving a key returns its current payload when present and not yet expired. A payload whose size exceeds the total capacity (or the per-item limit) is rejected outright and never becomes retrievable. The contract reports, per operation, either the stored payload length or the retrieval outcome (a found flag with the payload, or the payload length for large values).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_memcache.json`\n\n```json\n{\n    \"description\": \"An in-memory key/value store holds byte payloads under numeric keys with a per-entry expiry time, a total capacity and a per-item size limit. Storing a key records its payload; storing the same key again replaces the prior payload. Retrieving a key returns its current payload when present and unexpired. An item whose size exceeds the total capacity (or the per-item limit) is rejected and never becomes retrievable. Output reports, per operation, either the stored payload length or the retrieval outcome (found flag plus the payload, or the payload length for large values).\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"memcache\", \"capacity\": 33554432, \"maxItemSize\": 1048576, \"operations\": [{\"op\": \"set\", \"key\": 1, \"value\": \"hello world\", \"ttlSeconds\": 30}, {\"op\": \"get\", \"key\": 1}]},\n            \"expected_output\": \"set key=1 value_len=11\\nget key=1 found=true value=hello world\\n\"\n        },\n        {\n            \"input\": {\"action\": \"memcache\", \"capacity\": 3072, \"maxItemSize\": 51200, \"operations\": [{\"op\": \"set\", \"key\": 1, \"valueSize\": 10240, \"ttlSeconds\": 3600}, {\"op\": \"get\", \"key\": 1}]},\n            \"expected_output\": \"set key=1 value_len=10240\\nget key=1 found=false [a specific sentinel payload value]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Configuration From Environment\n\n**As a developer**, I want runtime settings resolved from process arguments and environment variables with sensible defaults, so the front-end is configured the way a containerized service expects.\n\n**Expected Behavior / Usage:**\n\nThe first positional argument is the upstream command to launch; if it is absent, configuration loading fails with a normalized error. Every tunable setting has a built-in default that an environment variable may override. A variable may be supplied either bare or with a fixed namespace prefix, and the prefixed form takes precedence over the bare form when both are present. A debug flag raises the log level from its default. The resolved settings are reported as neutral key/value lines (port, upstream command, cache size in bytes, max request body, accelerated-delivery flag, read timeout in seconds, certificate-authority directory URL, log level), or a single normalized error line when the required upstream command is missing.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_config.json`\n\n```json\n{\n    \"description\": \"A configuration loader builds the runtime settings from process arguments and environment variables. The first positional argument is the upstream command to run; if it is missing, loading fails. Every tunable setting has a default that is overridden by an environment variable; a variable may be given either bare or with a fixed namespace prefix, and the prefixed form takes precedence over the bare form. A debug flag raises the log level. Output reports the resolved settings as neutral key/value lines, or a normalized error when the required upstream command is absent.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"config\", \"args\": [\"server\", \"echo\", \"hello\"], \"env\": {}},\n            \"expected_output\": \"target_port=3000\\nupstream_command=echo\\ncache_size=67108864\\nmax_request_body=0\\nx_sendfile_enabled=true\\nhttp_read_timeout_seconds=30\\nacme_directory=https://acme-v02.api.letsencrypt.org/directory\\nlog_level=info\\n\"\n        },\n        {\n            \"input\": {\"action\": \"config\", \"args\": [\"server\"], \"env\": {}},\n            \"expected_output\": \"error=missing_upstream_command\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the reverse proxy, response cache (with keying and variant negotiation), accelerated file delivery, access logging, in-memory store and configuration loader described above, each as a cohesive unit with a small public interface.\n\n2. **The Execution/Test Adapter:** A runnable program that reads one JSON command from stdin, invokes the appropriate core component, and prints the result to stdout, strictly matching the per-leaf-feature contracts above. The adapter is the only place that touches stdin/stdout and JSON, and the only place that normalizes any native error into the neutral `error=<category>` form.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to choose the directory (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` containing **only** the raw stdout of the program under test, so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the bodyMode sequence counter pattern\n- apply the upstream forwarding exact protocol\n",
+  "oracle_data": {
+    "task_id": "basecamp__thruster-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C021",
+        "trigger_keywords": [
+          "cache key for mixed order"
+        ],
+        "oracle_response": "The value is 'x_cache=hit', indicating a successful cache match for order-independent queries."
+      },
+      {
+        "constraint_id": "C023",
+        "trigger_keywords": [
+          "payload even if not found",
+          "sentinel payload value"
+        ],
+        "oracle_response": "The value is 'value_len=0' appended to the response payload to indicate the missing item."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "sniffed content type",
+          "default content type for sendfile"
+        ],
+        "oracle_response": "The value is 'text/plain', inferred via content sniffing when the origin does not specify one."
+      },
+      {
+        "constraint_id": "TC_feature2_1_caching",
+        "trigger_keywords": [
+          "test cases for feature2 1 caching",
+          "show me feature2 1 caching test cases",
+          "what are the feature2 1 caching inputs and outputs",
+          "give me the feature2_1_caching test file",
+          "feature2 1 caching expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_caching:\n{\n  \"description\": \"A caching layer sits in front of an origin and decides whether each response may be reused for later identical requests, based solely on the response's caching directives, status and size. A response is storable only when its directives mark it explicitly shareable AND give a positive freshness lifetime; directives that mark it private, omit a shareable marker, give a zero or absent lifetime, or explicitly forbid reuse make it non-storable. Redirect/informational/error or not-modified statuses and bodies larger than the configured limit are never stored. Each request reports a cache disposition signal: a freshly generated (and possibly stored) response, a reuse of a previously stored response, or a deliberate skip of the cache. When a stored response is reused, the original status code and any custom headers it carried are reproduced exactly. The origin numbers successive generated bodies so that a reused response is distinguishable from a regenerated one. Output, per request in the sequence, reports the request index, status code, cache disposition, any cookie header, a tracked custom header, and the body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"cache\",\n        \"upstream\": {\n          \"cacheControl\": \"public, max-age=60\",\n          \"bodyMode\": \"counter\",\n          \"body\": \"Hello\"\n        },\n        \"requests\": [\n          {\n            \"url\": \"http://example.com\"\n          },\n          {\n            \"url\": \"http://example.com\"\n          },\n          {\n            \"url\": \"http://example.com\"\n          }\n        ]\n      },\n      \"expected_output\": \"request=0\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello 1\\nrequest=1\\nstatus=200\\nx_cache=hit\\nset_cookie=-\\nextra=-\\nbody=Hello 1\\nrequest=2\\nstatus=200\\nx_cache=hit\\nset_cookie=-\\nextra=-\\nbody=Hello 1\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"cache\",\n        \"upstream\": {\n          \"cacheControl\": \"public, max-age=60\",\n          \"bodyMode\": \"counter\",\n          \"body\": \"Hello\"\n        },\n        \"requests\": [\n          {\n            \"method\": \"POST\",\n            \"url\": \"http://example.com\"\n          },\n          {\n            \"method\": \"POST\",\n            \"url\": \"http://example.com\"\n          },\n          {\n            \"method\": \"POST\",\n            \"url\": \"http://example.com\"\n          }\n        ]\n      },\n      \"expected_output\": \"request=0\\nstatus=200\\nx_cache=bypass\\nset_cookie=-\\nextra=-\\nbody=Hello 1\\nrequest=1\\nstatus=200\\nx_cache=bypass\\nset_cookie=-\\nextra=-\\nbody=Hello 2\\nrequest=2\\nstatus=200\\nx_cache=bypass\\nset_cookie=-\\nextra=-\\nbody=Hello 3\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_keying",
+        "trigger_keywords": [
+          "test cases for feature2 2 keying",
+          "show me feature2 2 keying test cases",
+          "what are the feature2 2 keying inputs and outputs",
+          "give me the feature2_2_keying test file",
+          "feature2 2 keying expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_keying:\n{\n  \"description\": \"The caching layer derives a cache key for each request so that only genuinely equivalent requests share a stored response. The key is sensitive to the request method, the URL path and the full set of query parameters, but treats query parameters as order-independent (the same parameters supplied in a different order map to the same key). Methods that are not safely cacheable bypass the cache entirely. With an always-storable origin response, output per request reports the request index, status code, cache disposition (fresh generation, reuse, or cache skip), cookie header, tracked custom header, and body, so the keying behaviour is visible through which requests reuse earlier responses.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"cache\",\n        \"upstream\": {\n          \"cacheControl\": \"public, max-age=60\",\n          \"bodyMode\": \"constant\",\n          \"body\": \"Hello\"\n        },\n        \"requests\": [\n          {\n            \"url\": \"http://example.com/one\"\n          },\n          {\n            \"url\": \"http://example.com/two\"\n          },\n          {\n            \"url\": \"http://example.com/three\"\n          },\n          {\n            \"url\": \"http://example.com/three\"\n          }\n        ]\n      },\n      \"expected_output\": \"request=0\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=1\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=2\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=3\\nstatus=200\\nx_cache=hit\\nset_cookie=-\\nextra=-\\nbody=Hello\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"cache\",\n        \"upstream\": {\n          \"cacheControl\": \"public, max-age=60\",\n          \"bodyMode\": \"constant\",\n          \"body\": \"Hello\"\n        },\n        \"requests\": [\n          {\n            \"url\": \"http://example.com?a=1&b=2\"\n          },\n          {\n            \"url\": \"http://example.com?a=1&b=2\"\n          },\n          {\n            \"url\": \"http://example.com?b=2&a=1\"\n          }\n        ]\n      },\n      \"expected_output\": \"request=0\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=1\\nstatus=200\\nx_cache=hit\\nset_cookie=-\\nextra=-\\nbody=Hello\\nrequest=2\\nstatus=200\\nx_cache=hit\\nset_cookie=-\\nextra=-\\nbody=Hello\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_vary",
+        "trigger_keywords": [
+          "test cases for feature2 3 vary",
+          "show me feature2 3 vary test cases",
+          "what are the feature2 3 vary inputs and outputs",
+          "give me the feature2_3_vary test file",
+          "feature2 3 vary expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_vary:\n{\n  \"description\": \"When an origin response declares that it varies by one or more request header fields, the caching layer incorporates exactly those request header values into the cache key, so that clients sending different values for the named headers receive distinct stored variants while differences in unnamed headers are ignored. The origin echoes the negotiated header value into its body so each variant is observable. With multiple varying header fields, a stored variant is reused only when every named header matches. Output per request reports the request index, status code, cache disposition, cookie header, tracked custom header, and the negotiated body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"cache\",\n        \"upstream\": {\n          \"cacheControl\": \"public, max-age=600\",\n          \"vary\": \"Accept\",\n          \"bodyMode\": \"echoAccept\"\n        },\n        \"requests\": [\n          {\n            \"url\": \"http://example.com\",\n            \"headers\": {\n              \"Accept\": \"application/json\",\n              \"Other\": \"a\"\n            }\n          },\n          {\n            \"url\": \"http://example.com\",\n            \"headers\": {\n              \"Accept\": \"application/json\",\n              \"Other\": \"b\"\n            }\n          },\n          {\n            \"url\": \"http://example.com\",\n            \"headers\": {\n              \"Accept\": \"text/plain\",\n              \"Other\": \"a\"\n            }\n          },\n          {\n            \"url\": \"http://example.com\",\n            \"headers\": {\n              \"Accept\": \"text/plain\",\n              \"Other\": \"a\"\n            }\n          },\n          {\n            \"url\": \"http://example.com\",\n            \"headers\": {\n              \"Accept\": \"application/json\",\n              \"Other\": \"b\"\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"request=0\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=application/json\\nrequest=1\\nstatus=200\\nx_cache=hit\\nset_cookie=-\\nextra=-\\nbody=application/json\\nrequest=2\\nstatus=200\\nx_cache=miss\\nset_cookie=-\\nextra=-\\nbody=text/plain\\nrequest=3\\nstatus=200\\nx_cache=hit\\nset_cookie=-\\nextra=-\\nbody=text/plain\\nrequest=4\\nstatus=200\\nx_cache=hit\\nset_cookie=-\\nextra=-\\nbody=application/json\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_sendfile",
+        "trigger_keywords": [
+          "test cases for feature3 sendfile",
+          "show me feature3 sendfile test cases",
+          "what are the feature3 sendfile inputs and outputs",
+          "give me the feature3_sendfile test file",
+          "feature3 sendfile expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_sendfile:\n{\n  \"description\": \"An accelerated file-delivery feature lets the origin delegate sending a static file to the proxy by returning a header naming a path on disk instead of writing the file body itself. When the feature is enabled, the proxy advertises support to the origin (a request header), and on seeing the delegation header it reads the named file from disk, sends its contents as the response body (discarding any body the origin wrote), strips the delegation header, and sets the Content-Length to the real file size and the Content-Type by sniffing the file. Crucially, even when the origin marked the response with a Content-Encoding, the proxy still sets Content-Length to the true on-disk size rather than passing through the origin's (possibly zero) value, preventing truncated responses. If no delegation header is present the origin's own response (status, headers, body) is returned untouched. When the feature is disabled the proxy neither advertises support nor intercepts the delegation header, which then passes straight through. Output reports the status, Content-Type, Content-Length, Content-Encoding, the delegation header's final state, and the body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"sendfile\",\n        \"enabled\": true,\n        \"request\": {\n          \"method\": \"GET\",\n          \"path\": \"/\"\n        },\n        \"upstream\": {\n          \"fileContent\": \"Sendfile body contents.\\n\",\n          \"body\": \"this body should not be seen\"\n        }\n      },\n      \"expected_output\": \"status=200\\ncontent_type=text/plain; charset=utf-8\\ncontent_length=24\\ncontent_encoding=-\\nx_sendfile=-\\nbody=Sendfile body contents.\\n\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"sendfile\",\n        \"enabled\": false,\n        \"request\": {\n          \"method\": \"GET\",\n          \"path\": \"/\"\n        },\n        \"upstream\": {\n          \"fileContent\": \"irrelevant\\n\",\n          \"contentType\": \"application/custom\",\n          \"status\": 418,\n          \"body\": \"This body should be seen\"\n        }\n      },\n      \"expected_output\": \"status=418\\ncontent_type=application/custom\\ncontent_length=-\\ncontent_encoding=-\\nx_sendfile=<passthrough>\\nbody=This body should be seen\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_memcache",
+        "trigger_keywords": [
+          "test cases for feature5 memcache",
+          "show me feature5 memcache test cases",
+          "what are the feature5 memcache inputs and outputs",
+          "give me the feature5_memcache test file",
+          "feature5 memcache expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_memcache:\n{\n  \"description\": \"An in-memory key/value store holds byte payloads under numeric keys with a per-entry expiry time, a total capacity and a per-item size limit. Storing a key records its payload; storing the same key again replaces the prior payload. Retrieving a key returns its current payload when present and unexpired. An item whose size exceeds the total capacity (or the per-item limit) is rejected and never becomes retrievable. Output reports, per operation, either the stored payload length or the retrieval outcome (found flag plus the payload, or the payload length for large values).\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"memcache\",\n        \"capacity\": 33554432,\n        \"maxItemSize\": 1048576,\n        \"operations\": [\n          {\n            \"op\": \"set\",\n            \"key\": 1,\n            \"value\": \"hello world\",\n            \"ttlSeconds\": 30\n          },\n          {\n            \"op\": \"get\",\n            \"key\": 1\n          }\n        ]\n      },\n      \"expected_output\": \"set key=1 value_len=11\\nget key=1 found=true value=hello world\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"memcache\",\n        \"capacity\": 3072,\n        \"maxItemSize\": 51200,\n        \"operations\": [\n          {\n            \"op\": \"set\",\n            \"key\": 1,\n            \"valueSize\": 10240,\n            \"ttlSeconds\": 3600\n          },\n          {\n            \"op\": \"get\",\n            \"key\": 1\n          }\n        ]\n      },\n      \"expected_output\": \"set key=1 value_len=10240\\nget key=1 found=false value_len=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_config",
+        "trigger_keywords": [
+          "test cases for feature6 config",
+          "show me feature6 config test cases",
+          "what are the feature6 config inputs and outputs",
+          "give me the feature6_config test file",
+          "feature6 config expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_config:\n{\n  \"description\": \"A configuration loader builds the runtime settings from process arguments and environment variables. The first positional argument is the upstream command to run; if it is missing, loading fails. Every tunable setting has a default that is overridden by an environment variable; a variable may be given either bare or with a fixed namespace prefix, and the prefixed form takes precedence over the bare form. A debug flag raises the log level. Output reports the resolved settings as neutral key/value lines, or a normalized error when the required upstream command is absent.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"config\",\n        \"args\": [\n          \"server\",\n          \"echo\",\n          \"hello\"\n        ],\n        \"env\": {}\n      },\n      \"expected_output\": \"target_port=3000\\nupstream_command=echo\\ncache_size=67108864\\nmax_request_body=0\\nx_sendfile_enabled=true\\nhttp_read_timeout_seconds=30\\nacme_directory=https://acme-v02.api.letsencrypt.org/directory\\nlog_level=info\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"config\",\n        \"args\": [\n          \"server\"\n        ],\n        \"env\": {}\n      },\n      \"expected_output\": \"error=missing_upstream_command\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the bodyMode sequence counter pattern",
+        "actual_meaning": "The replacement text 'Hello 1' for the first request and 'Hello 2' for the second, showing an incremental increment."
+      },
+      {
+        "vague_reference": "apply the upstream forwarding exact protocol",
+        "actual_meaning": "The proxy action forwards the request method, path, and query string verbatim and returns the exact upstream status, headers, and body as-is."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_proxy_routing.json": {
+      "description": "A reverse proxy forwards an incoming HTTP request to a single fixed upstream origin and relays the origin's response back to the client unchanged. The request method, path and query string must be delivered to the upstream exactly as received (routing fidelity), and the upstream's status code, Content-Type header and response body must be returned verbatim to the caller. Output reports the client-visible status, content type and body, plus the method, path and query string actually observed at the upstream.",
+      "cases": [
+        {
+          "input": {
+            "action": "proxy",
+            "request": {
+              "method": "GET",
+              "path": "/articles",
+              "query": "page=2",
+              "headers": {}
+            },
+            "upstream": {
+              "status": 200,
+              "headers": {
+                "Content-Type": "text/plain; charset=utf-8"
+              },
+              "body": "Article listing body"
+            }
+          },
+          "expected_output": "status=200\ncontent_type=text/plain; charset=utf-8\nupstream_method=GET\nupstream_path=/articles\nupstream_query=page=2\nbody=Article listing body\n"
+        },
+        {
+          "input": {
+            "action": "proxy",
+            "request": {
+              "method": "POST",
+              "path": "/submit",
+              "query": "id=7",
+              "headers": {}
+            },
+            "upstream": {
+              "status": 404,
+              "headers": {
+                "Content-Type": "application/json"
+              },
+              "body": "{\"error\":\"missing\"}"
+            }
+          },
+          "expected_output": "status=404\ncontent_type=application/json\nupstream_method=POST\nupstream_path=/submit\nupstream_query=id=7\nbody={\"error\":\"missing\"}\n"
+        }
+      ]
+    },
+    "feature2_1_caching.json": {
+      "description": "A caching layer sits in front of an origin and decides whether each response may be reused for later identical requests, based solely on the response's caching directives, status and size. A response is storable only when its directives mark it explicitly shareable AND give a positive freshness lifetime; directives that mark it private, omit a shareable marker, give a zero or absent lifetime, or explicitly forbid reuse make it non-storable. Redirect/informational/error or not-modified statuses and bodies larger than the configured limit are never stored. Each request reports a cache disposition signal: a freshly generated (and possibly stored) response, a reuse of a previously stored response, or a deliberate skip of the cache. When a stored response is reused, the original status code and any custom headers it carried are reproduced exactly. The origin numbers successive generated bodies so that a reused response is distinguishable from a regenerated one. Output, per request in the sequence, reports the request index, status code, cache disposition, any cookie header, a tracked custom header, and the body.",
+      "cases": [
+        {
+          "input": {
+            "action": "cache",
+            "upstream": {
+              "cacheControl": "public, max-age=60",
+              "bodyMode": "counter",
+              "body": "Hello"
+            },
+            "requests": [
+              {
+                "url": "http://example.com"
+              },
+              {
+                "url": "http://example.com"
+              },
+              {
+                "url": "http://example.com"
+              }
+            ]
+          },
+          "expected_output": "request=0\nstatus=200\nx_cache=miss\nset_cookie=-\nextra=-\nbody=Hello 1\nrequest=1\nstatus=200\nx_cache=hit\nset_cookie=-\nextra=-\nbody=Hello 1\nrequest=2\nstatus=200\nx_cache=hit\nset_cookie=-\nextra=-\nbody=Hello 1\n"
+        },
+        {
+          "input": {
+            "action": "cache",
+            "upstream": {
+              "cacheControl": "public, max-age=60",
+              "bodyMode": "counter",
+              "body": "Hello"
+            },
+            "requests": [
+              {
+                "method": "POST",
+                "url": "http://example.com"
+              },
+              {
+                "method": "POST",
+                "url": "http://example.com"
+              },
+              {
+                "method": "POST",
+                "url": "http://example.com"
+              }
+            ]
+          },
+          "expected_output": "request=0\nstatus=200\nx_cache=bypass\nset_cookie=-\nextra=-\nbody=Hello 1\nrequest=1\nstatus=200\nx_cache=bypass\nset_cookie=-\nextra=-\nbody=Hello 2\nrequest=2\nstatus=200\nx_cache=bypass\nset_cookie=-\nextra=-\nbody=Hello 3\n"
+        }
+      ]
+    },
+    "feature2_2_keying.json": {
+      "description": "The caching layer derives a cache key for each request so that only genuinely equivalent requests share a stored response. The key is sensitive to the request method, the URL path and the full set of query parameters, but treats query parameters as order-independent (the same parameters supplied in a different order map to the same key). Methods that are not safely cacheable bypass the cache entirely. With an always-storable origin response, output per request reports the request index, status code, cache disposition (fresh generation, reuse, or cache skip), cookie header, tracked custom header, and body, so the keying behaviour is visible through which requests reuse earlier responses.",
+      "cases": [
+        {
+          "input": {
+            "action": "cache",
+            "upstream": {
+              "cacheControl": "public, max-age=60",
+              "bodyMode": "constant",
+              "body": "Hello"
+            },
+            "requests": [
+              {
+                "url": "http://example.com/one"
+              },
+              {
+                "url": "http://example.com/two"
+              },
+              {
+                "url": "http://example.com/three"
+              },
+              {
+                "url": "http://example.com/three"
+              }
+            ]
+          },
+          "expected_output": "request=0\nstatus=200\nx_cache=miss\nset_cookie=-\nextra=-\nbody=Hello\nrequest=1\nstatus=200\nx_cache=miss\nset_cookie=-\nextra=-\nbody=Hello\nrequest=2\nstatus=200\nx_cache=miss\nset_cookie=-\nextra=-\nbody=Hello\nrequest=3\nstatus=200\nx_cache=hit\nset_cookie=-\nextra=-\nbody=Hello\n"
+        },
+        {
+          "input": {
+            "action": "cache",
+            "upstream": {
+              "cacheControl": "public, max-age=60",
+              "bodyMode": "constant",
+              "body": "Hello"
+            },
+            "requests": [
+              {
+                "url": "http://example.com?a=1&b=2"
+              },
+              {
+                "url": "http://example.com?a=1&b=2"
+              },
+              {
+                "url": "http://example.com?b=2&a=1"
+              }
+            ]
+          },
+          "expected_output": "request=0\nstatus=200\nx_cache=miss\nset_cookie=-\nextra=-\nbody=Hello\nrequest=1\nstatus=200\nx_cache=hit\nset_cookie=-\nextra=-\nbody=Hello\nrequest=2\nstatus=200\nx_cache=hit\nset_cookie=-\nextra=-\nbody=Hello\n"
+        }
+      ]
+    },
+    "feature2_3_vary.json": {
+      "description": "When an origin response declares that it varies by one or more request header fields, the caching layer incorporates exactly those request header values into the cache key, so that clients sending different values for the named headers receive distinct stored variants while differences in unnamed headers are ignored. The origin echoes the negotiated header value into its body so each variant is observable. With multiple varying header fields, a stored variant is reused only when every named header matches. Output per request reports the request index, status code, cache disposition, cookie header, tracked custom header, and the negotiated body.",
+      "cases": [
+        {
+          "input": {
+            "action": "cache",
+            "upstream": {
+              "cacheControl": "public, max-age=600",
+              "vary": "Accept",
+              "bodyMode": "echoAccept"
+            },
+            "requests": [
+              {
+                "url": "http://example.com",
+                "headers": {
+                  "Accept": "application/json",
+                  "Other": "a"
+                }
+              },
+              {
+                "url": "http://example.com",
+                "headers": {
+                  "Accept": "application/json",
+                  "Other": "b"
+                }
+              },
+              {
+                "url": "http://example.com",
+                "headers": {
+                  "Accept": "text/plain",
+                  "Other": "a"
+                }
+              },
+              {
+                "url": "http://example.com",
+                "headers": {
+                  "Accept": "text/plain",
+                  "Other": "a"
+                }
+              },
+              {
+                "url": "http://example.com",
+                "headers": {
+                  "Accept": "application/json",
+                  "Other": "b"
+                }
+              }
+            ]
+          },
+          "expected_output": "request=0\nstatus=200\nx_cache=miss\nset_cookie=-\nextra=-\nbody=application/json\nrequest=1\nstatus=200\nx_cache=hit\nset_cookie=-\nextra=-\nbody=application/json\nrequest=2\nstatus=200\nx_cache=miss\nset_cookie=-\nextra=-\nbody=text/plain\nrequest=3\nstatus=200\nx_cache=hit\nset_cookie=-\nextra=-\nbody=text/plain\nrequest=4\nstatus=200\nx_cache=hit\nset_cookie=-\nextra=-\nbody=application/json\n"
+        }
+      ]
+    },
+    "feature3_sendfile.json": {
+      "description": "An accelerated file-delivery feature lets the origin delegate sending a static file to the proxy by returning a header naming a path on disk instead of writing the file body itself. When the feature is enabled, the proxy advertises support to the origin (a request header), and on seeing the delegation header it reads the named file from disk, sends its contents as the response body (discarding any body the origin wrote), strips the delegation header, and sets the Content-Length to the real file size and the Content-Type by sniffing the file. Crucially, even when the origin marked the response with a Content-Encoding, the proxy still sets Content-Length to the true on-disk size rather than passing through the origin's (possibly zero) value, preventing truncated responses. If no delegation header is present the origin's own response (status, headers, body) is returned untouched. When the feature is disabled the proxy neither advertises support nor intercepts the delegation header, which then passes straight through. Output reports the status, Content-Type, Content-Length, Content-Encoding, the delegation header's final state, and the body.",
+      "cases": [
+        {
+          "input": {
+            "action": "sendfile",
+            "enabled": true,
+            "request": {
+              "method": "GET",
+              "path": "/"
+            },
+            "upstream": {
+              "fileContent": "Sendfile body contents.\n",
+              "body": "this body should not be seen"
+            }
+          },
+          "expected_output": "status=200\ncontent_type=text/plain; charset=utf-8\ncontent_length=24\ncontent_encoding=-\nx_sendfile=-\nbody=Sendfile body contents.\n\n"
+        },
+        {
+          "input": {
+            "action": "sendfile",
+            "enabled": false,
+            "request": {
+              "method": "GET",
+              "path": "/"
+            },
+            "upstream": {
+              "fileContent": "irrelevant\n",
+              "contentType": "application/custom",
+              "status": 418,
+              "body": "This body should be seen"
+            }
+          },
+          "expected_output": "status=418\ncontent_type=application/custom\ncontent_length=-\ncontent_encoding=-\nx_sendfile=<passthrough>\nbody=This body should be seen\n"
+        }
+      ]
+    },
+    "feature4_logging.json": {
+      "description": "A logging middleware wraps the request handling and emits one structured record summarizing each completed request. The record captures the request path (without query string), HTTP method, final response status code, the client address (taken from the forwarded-for header when present), the user agent, the request and response Content-Type values, the request body length and the number of response bytes written, the raw query string, and the cache disposition reported downstream. Timing-related fields are excluded. Output renders the captured fields as neutral key/value lines.",
+      "cases": [
+        {
+          "input": {
+            "action": "logging",
+            "request": {
+              "method": "POST",
+              "path": "/somepath",
+              "query": "q=ok",
+              "body": "hello",
+              "headers": {
+                "X-Forwarded-For": "192.168.1.1",
+                "User-Agent": "Robot/1",
+                "Content-Type": "application/json"
+              }
+            },
+            "response": {
+              "status": 201,
+              "headers": {
+                "X-Cache": "miss",
+                "Content-Type": "text/html"
+              },
+              "body": "goodbye\n"
+            }
+          },
+          "expected_output": "path=/somepath\nmethod=POST\nstatus=201\nremote_addr=192.168.1.1\nuser_agent=Robot/1\nreq_content_type=application/json\nresp_content_type=text/html\nreq_content_length=5\nresp_content_length=8\nquery=q=ok\ncache=miss\n"
+        }
+      ]
+    },
+    "feature5_memcache.json": {
+      "description": "An in-memory key/value store holds byte payloads under numeric keys with a per-entry expiry time, a total capacity and a per-item size limit. Storing a key records its payload; storing the same key again replaces the prior payload. Retrieving a key returns its current payload when present and unexpired. An item whose size exceeds the total capacity (or the per-item limit) is rejected and never becomes retrievable. Output reports, per operation, either the stored payload length or the retrieval outcome (found flag plus the payload, or the payload length for large values).",
+      "cases": [
+        {
+          "input": {
+            "action": "memcache",
+            "capacity": 33554432,
+            "maxItemSize": 1048576,
+            "operations": [
+              {
+                "op": "set",
+                "key": 1,
+                "value": "hello world",
+                "ttlSeconds": 30
+              },
+              {
+                "op": "get",
+                "key": 1
+              }
+            ]
+          },
+          "expected_output": "set key=1 value_len=11\nget key=1 found=true value=hello world\n"
+        },
+        {
+          "input": {
+            "action": "memcache",
+            "capacity": 3072,
+            "maxItemSize": 51200,
+            "operations": [
+              {
+                "op": "set",
+                "key": 1,
+                "valueSize": 10240,
+                "ttlSeconds": 3600
+              },
+              {
+                "op": "get",
+                "key": 1
+              }
+            ]
+          },
+          "expected_output": "set key=1 value_len=10240\nget key=1 found=false value_len=0\n"
+        }
+      ]
+    },
+    "feature6_config.json": {
+      "description": "A configuration loader builds the runtime settings from process arguments and environment variables. The first positional argument is the upstream command to run; if it is missing, loading fails. Every tunable setting has a default that is overridden by an environment variable; a variable may be given either bare or with a fixed namespace prefix, and the prefixed form takes precedence over the bare form. A debug flag raises the log level. Output reports the resolved settings as neutral key/value lines, or a normalized error when the required upstream command is absent.",
+      "cases": [
+        {
+          "input": {
+            "action": "config",
+            "args": [
+              "server",
+              "echo",
+              "hello"
+            ],
+            "env": {}
+          },
+          "expected_output": "target_port=3000\nupstream_command=echo\ncache_size=67108864\nmax_request_body=0\nx_sendfile_enabled=true\nhttp_read_timeout_seconds=30\nacme_directory=https://acme-v02.api.letsencrypt.org/directory\nlog_level=info\n"
+        },
+        {
+          "input": {
+            "action": "config",
+            "args": [
+              "server"
+            ],
+            "env": {}
+          },
+          "expected_output": "error=missing_upstream_command\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "routing",
+      "input_condition": "action=proxy",
+      "output_rule": "Forward request method, path, and query string to upstream. Return upstream status, headers, body exactly as-is. Log upstream_method, upstream_path, upstream_query.",
+      "exact_values": [
+        "proxy",
+        "status=200",
+        "upstream_method",
+        "upstream_path",
+        "upstream_query"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "routing",
+      "input_condition": "action=proxy",
+      "output_rule": "Report client status and content type exactly as received from upstream.",
+      "exact_values": [
+        "status",
+        "content_type"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "caching",
+      "input_condition": "cacheControl contains 'private'",
+      "output_rule": "Cache disposition must be 'bypass'.",
+      "exact_values": [
+        "bypass"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "caching",
+      "input_condition": "cacheControl lacks shareable marker OR status is 3xx/4xx/info OR status is 204 No Content OR status is 304 Not Modified",
+      "output_rule": "Cache disposition must be 'bypass'. (Includes missing max-age or zero/absent max-age).",
+      "exact_values": [
+        "bypass"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "caching",
+      "input_condition": "method is POST (or other non-cacheable)",
+      "output_rule": "Cache disposition must be 'bypass'.",
+      "exact_values": [
+        "bypass"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "caching",
+      "input_condition": "cacheControl contains 'public' AND 'max-age' > 0 AND method is cacheable",
+      "output_rule": "First request is 'miss'. Subsequent identical requests are 'hit' if stored.",
+      "exact_values": [
+        "miss",
+        "hit"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "caching",
+      "input_condition": "upstream.bodyMode=counter",
+      "output_rule": "Body text is appended with a sequence number (Hello 1, Hello 2...).",
+      "exact_values": [
+        "Hello 1",
+        "Hello 2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "caching",
+      "input_condition": "upstream.bodyMode=constant",
+      "output_rule": "Body text is repeated exactly (Hello...). Strangeness in request index 0 is ignored; body is constant.",
+      "exact_values": [
+        "Hello"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "caching",
+      "input_condition": "vary includes 'Accept'",
+      "output_rule": "Cache key includes 'Accept' header value. Requests with differing Accept get different bodies/content.",
+      "exact_values": [
+        "applicatiion/json",
+        "text/plain"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "sendfile",
+      "input_condition": "action=sendfile AND enabled=true",
+      "output_rule": "Ignore upstream content_type and body. Set content_length to renamed file size. Infer content_type via sniff.",
+      "exact_values": [
+        "text/plain",
+        "24"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "sendfile",
+      "input_condition": "action=sendfile AND enabled=false",
+      "output_rule": "x_sendfield reports '<passthrough>'. Return upstream status/headers/body exactly.",
+      "exact_values": [
+        "<passthrough>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "sendfile",
+      "input_condition": "action=sendfile",
+      "output_rule": "Remove 'x-sendfile' header from output.",
+      "exact_values": [
+        "-\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "logging",
+      "input_condition": "action=logging",
+      "output_rule": "Emit lines for request and response fields only. Remote address must be from X-Forwarded-For.",
+      "exact_values": [
+        "path=/somepath",
+        "remote_addr=192.168.1.1",
+        "req_content_length",
+        "resp_content_length",
+        "cache=miss"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "logging",
+      "input_condition": "action=logging",
+      "output_rule": "Do not include timing fields.",
+      "exact_values": []
+    },
+    {
+      "id": "C015",
+      "feature": "memcache",
+      "input_condition": "action=memcache operation=set",
+      "output_rule": "Report 'set key=K value_len=L' if value fits. Otherwise reject.",
+      "exact_values": [
+        "set key=",
+        "value_len="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "memcache",
+      "input_condition": "action=memcache operation=set, value_size > max_item_size OR total_usage > capacity",
+      "output_rule": "Item rejected. Cannot retrieve.",
+      "exact_values": [
+        "found=false",
+        "value_len=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "memcache",
+      "input_condition": "action=memcache operation=get",
+      "output_rule": "Report 'get key=K found=T value=V' if found. Else 'found=F value_len=0'.",
+      "exact_values": [
+        "found=true",
+        "value="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "config",
+      "input_condition": "args length < 1",
+      "output_rule": "Error reported. No system failure.",
+      "exact_values": [
+        "error=missing_upstream_command"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "config",
+      "input_condition": "get_env(var, default)",
+      "output_rule": "Report 'VAR=value'. Prefixed overrides bare.",
+      "exact_values": [
+        "target_port=3000",
+        "upstream_command=echo"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "output_format",
+      "input_condition": "all actions",
+      "output_rule": "Every line ends with newline. Empty lines are NOT appended between data lines.",
+      "exact_values": [
+        "\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "caching",
+      "input_condition": "feature2_2_keying input (order-independent query)",
+      "output_rule": "Queries like ?a=1&b=2 and ?b=2&a=1 share 'hit'.",
+      "exact_values": [
+        "x_cache=hit"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "body_del",
+      "input_condition": "action=sendfile AND upstream returns x-sendfile header",
+      "output_rule": "Content-length must be true file size (rid of origin's body length).",
+      "exact_values": [
+        "content_length=24"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "memcache",
+      "input_condition": "get key not found",
+      "output_rule": "Payload is always reported even if found=false. value_len=0.",
+      "exact_values": [
+        "value_len=0"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C021",
+        "replacement": "a specific query key value",
+        "exact_values_to_replace": [
+          "x_cache=hit"
+        ],
+        "trigger_keywords": [
+          "cache key for mixed order"
+        ],
+        "oracle_response": "The value is 'x_cache=hit', indicating a successful cache match for order-independent queries."
+      },
+      {
+        "constraint_id": "C023",
+        "replacement": "a specific sentinel payload value",
+        "exact_values_to_replace": [
+          "value_len=0"
+        ],
+        "trigger_keywords": [
+          "payload even if not found",
+          "sentinel payload value"
+        ],
+        "oracle_response": "The value is 'value_len=0' appended to the response payload to indicate the missing item."
+      },
+      {
+        "constraint_id": "C010",
+        "replacement": "a detected content type",
+        "exact_values_to_replace": [
+          "text/plain"
+        ],
+        "trigger_keywords": [
+          "sniffed content type",
+          "default content type for sendfile"
+        ],
+        "oracle_response": "The value is 'text/plain', inferred via content sniffing when the origin does not specify one."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C007",
+        "vague_phrase": "follow the bodyMode sequence counter pattern",
+        "actual_meaning": "The replacement text 'Hello 1' for the first request and 'Hello 2' for the second, showing an incremental increment."
+      },
+      {
+        "constraint_id": "C001",
+        "vague_phrase": "apply the upstream forwarding exact protocol",
+        "actual_meaning": "The proxy action forwards the request method, path, and query string verbatim and returns the exact upstream status, headers, and body as-is."
+      }
+    ]
+  }
+}

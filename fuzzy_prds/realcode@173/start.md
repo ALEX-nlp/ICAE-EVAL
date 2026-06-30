@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build that SEO markup generator library we've been talking about. Basically, devs are spending way too much time copy-pasting the same head tag boilerplate across every page, and half the time they forget to escape user content properly which is a security headache. The idea is a server-side thing where you declare your page info once and it spits out all the markup you need — the usual head stuff, plus the social sharing tags for Facebook/LinkedIn previews, the Twitter card stuff, and the structured data block that search engines love.
+
+It should handle all the edge cases we keep running into — like when you only set a URL but still need the default title/description to show up, or when you have multiple data graphs on one page (though there's a quirk there, ask me about it). The title handling needs to work like we did on that last CMS project where you could combine a page title with the site name, remember that pattern?
+
+Also important: the whole thing needs to read a command from stdin and write the output to stdout, so it slots into our existing pipeline. Make sure unknown or broken commands don't crash the process. We probably want some kind of unified mode too where setting the title once updates everything at the same time. Security-wise, free text fields need to be safe to embed. Let me know if anything is unclear.

@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to update our ID generation and parsing logic to support our new unified tracking system. The core requirement is that when we encode raw binary data, the output string length must dynamically match the input size: 6-byte inputs should yield 10-char strings, 10-byte inputs should yield 16-char strings, and 16-byte inputs should yield 26-char strings. We also need specific fixed-format encodings for our 'identifier', 'timestamp', and 'randomness' sections, ensuring they strictly adhere to their expected byte-to-char ratios.
+
+For decoding, we need the reverse logic to work seamlessly based on the input string length. Additionally, when we represent these values, we need to output both the integer interpretation (unsigned big-endian) and the text representation. For comparisons, please ensure we handle equality and inequality checks between wrapped values and integers correctly, as well as ordering operations.
+
+We also need utilities to split combined timestamps and randomness, convert 16-byte buffers to standard UUID format, and parse timestamps into human-readable ISO-8601 dates. When building values from integers or text, ensure the output includes the bytes, string, and integer representations. Finally, ensure hex formatting matches the canonical style used in the legacy UUID generator and use the same character set for Base32 encoding as defined in the auth token module. All successful outputs should be simple key=value lines with a newline at the end.

@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need to build out that native extension helper tool we've been talking about. The idea is that devs shouldn't have to hand-roll all the platform detection and binary naming stuff every time they set up a new native extension project. It's the same pain every time — figuring out what to call the .so or .dll, where to put it, how to name the archive for CI uploads, all of that.
+
+Basically the tool should handle the full lifecycle: figure out the right names for compiled artifacts based on the platform, run the build tool if it's there (but don't blow up if it isn't, similar to how we handled the optional-tool pattern in the login module refactor), package up the result, and optionally pull down a prebuilt binary from a release feed or a custom URL so people don't have to compile locally.
+
+The output needs to be automation-friendly — key=value lines, one per thing, easy to parse in shell scripts or CI steps. Each 'command' maps to a specific concern.
+
+We also want debug logging that can be toggled via a file destination — if no destination is set it should just be silent. Oh and the archive pack/unpack needs to actually round-trip correctly, not just create the file.
+
+I don't have all the exact field names nailed down yet so just check with me if something's unclear. The platform naming rules for shared libs are a bit specific — there's some Mac/Windows edge case logic that I know trips people up.
+
+One extra pass on the platform naming bits since that was the main thing folks asked about: for shared_extension resolution, when the host dynamic extension is 'bundle' the native shared extension needs to come out as 'dylib'. On Windows it becomes 'dll'. Everywhere else, just use the host extension as-is. Related to that, shared_library_file formatting should use the windows flag from the input data to decide whether to prepend 'lib' to the base name. Non-Windows gets the prefix, so something like 'libfast_ext.so', and Windows does not, so 'fast_ext.dll'.
+
+On the download side, the custom_download_template supports %{version} and %{filename}. version comes from manifest.package.version and filename is the tarball_filename value. If no template is configured, print downloaded=false and do not make any HTTP request. If it does run successfully, the outputs are downloaded=true, http_get=<url>, debug=Unpacking binary from Cargo version: <filename>, unpack=called. For release-based downloads, if release_selection is 'latest', fetch <repository>/releases.atom, parse the XML feed, take the first entry title, run release_tag_pattern against it to capture the version, and then build the URL as <repository>/releases/download/<tag>/<tarball_filename>. The debug line there should be 'Unpacking GitHub release: <filename>'. For cargo-version selection, use v<package.version> as the tag, and the debug text is 'Unpacking GitHub release from Cargo version: <filename>'.
+
+Also confirming the archive behavior needs to be real, not faked. The package_roundtrip command takes file_name, file_content, version, and tarball_name, creates an actual tar.gz with the file in it, extracts it, and verifies the content comes back. The output for that is tarball_created=true, restored_file=true, restored_content=<original file content>.
+
+For logging, debug_log accepts 'enabled' and 'message'. If enabled is true, create the debug file and write the message to it, then return debug_file=created and debug_content=<message>. If enabled is false, or there is no destination configured, nothing gets written. The config selector for debug_destination should print debug_destination=<value> using the debug_filename_env field from input data, and if that field is absent or null it should print debug_destination=null. That’s the signal to callers about whether diagnostic logging is active.
+
+One small naming detail to keep consistent: the runtime key is the literal string 'ruby' plus the major and minor version digits only, with dots removed. So runtime_version '3.2.0' becomes 'ruby32'. Ignore the patch number completely.
+
+And on the optional build tool behavior, if native_extension_optional is false and the tool path is missing, emit error=required_tool_missing and a notice line rather than raising. If native_extension_optional is true and the tool is missing, just skip it quietly. This lines up with the same expectations we called out before around the shared extension mapping and the non-Windows-only 'lib' prefix.

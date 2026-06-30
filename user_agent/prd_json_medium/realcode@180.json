@@ -1,0 +1,634 @@
+{
+  "fuzzy_prd": "Hey team, we've been getting complaints from a few dev partners who are trying to use our graph query layer on top of their existing relational tables. The core ask is pretty straightforward — they want to declare a graph once (pointing at their existing tables), run pattern-matching queries against it, and get back normal relational rows they can work with in SQL. Think of it like that 'logical view over tables' approach we discussed last sprint.\n\nThe big pain points they're hitting: (1) when they write graph traversal queries today they end up with a mess of recursive joins that break every time the schema changes, (2) they can't express 'find me all paths between these two nodes within N hops' without writing custom BFS code, and (3) there's no way to introspect what the graph looks like programmatically — they have to dig through DDL to figure out what vertex/edge tables exist.\n\nAlso, some partners mentioned that error messages are completely opaque — they get a generic crash instead of something actionable. We need errors to be categorized so they can handle them in their client code.\n\nOne more thing — there was some discussion about that 'CSR structure' approach we used in the adjacency work a while back, make sure that's still exposed correctly. Check how we handled the offset array stuff previously, the partners are depending on that for their graph analytics pipeline.\n\nBasically: define graph, match patterns, project columns, handle paths, expose schema, give good errors. Keep it clean and modular.\n\nQuick follow-up from the questions that came in: label matching in patterns is case-insensitive. The engine normalizes all labels to lower-case internally, so PERSON, Person, and person all resolve to the same label. The declared label is stored in lower-case and all pattern label tokens are lower-cased before lookup. Related to that, if someone repeats the same label inside one property graph definition, we reject it with error category 'constraint'. Each label must be unique within a single graph definition, and that applies to both vertex labels and edge labels across the entire definition.\n\nOn the schema introspection side, DESCRIBE PROPERTY GRAPH returns exactly 11 tab-separated fields per row in this order: (1) backing table name (original casing), (2) normalized label (lower-cased), (3) is_vertex boolean (true/false), (4) source vertex table name or NULL, (5) source referenced key list as [col,...] or NULL, (6) edge source key column list as [col,...] or NULL, (7) destination vertex table name or NULL, (8) destination referenced key list as [col,...] or NULL, (9) edge destination key column list as [col,...] or NULL, (10) discriminator column name or NULL, (11) bracketed ordered sublabel list or NULL. Rows are sorted alphabetically by backing table name.\n\nOn errors, we should keep this very predictable. The engine uses exactly six error categories: 'invalid' (bad definition, e.g. non-existent base table), 'parser' (syntactically illegal input, e.g. wildcard in property list during definition), 'binder' (semantic resolution failure at query time, e.g. graph not found, unknown variable), 'constraint' (unsafe operation, e.g. unbounded quantifier under WALK mode), 'catalog' (catalog-level failures), and 'not-implemented' (unsupported features such as ALL SHORTEST or non-WALK path modes). Each error is rendered as two lines: 'error=<category>\\nmessage=<text>\\n'.\n\nOne specific pathing edge case the team asked about: an unbounded quantifier (e.g. -[k:Knows]->* or -{0,}) under the default WALK path semantics is rejected at constraint-check time with error category 'constraint' and message: 'ALL unbounded with path mode WALK is not possible as this could lead to infinite results. Consider specifying an upper bound or path mode other than WALK'. Bounded quantifiers like -{1,3} are supported. Path modes other than WALK and the ALL SHORTEST qualifier are rejected with error category 'not-implemented'.\n\nAnd for the CSR piece, yes, the same shape still needs to be exposed. The CSR (Compressed Sparse Row) structure is built via CREATE_CSR_VERTEX (which accumulates per-vertex out-degree counts into an offset array) and CREATE_CSR_EDGE (which fills the flattened neighbor destination array). get_csr_v(<graph_id>) returns the offset (prefix-sum) array with one entry per vertex plus a terminating total — so for N vertices it returns N+1 rows. get_csr_e(<graph_id>) returns the flattened destination dense-id array in adjacency order. Vertices are identified by their rowid as dense ids. The CREATE_CSR_VERTEX and CREATE_CSR_EDGE SQL functions plus get_csr_v/get_csr_e table-valued functions described in feature6_2_csr_functions.json; these build a Compressed Sparse Row adjacency representation used internally for path search and exposed for external analytics. Also just to close the loop on the label behavior, the case-insensitive label normalization logic is the same one evidenced by feature3_3_case_insensitive_labels.json and the lower-cased label output in feature1_1_describe_graph.json.",
+  "oracle_data": {
+    "task_id": "PGQE-2024-001",
+    "golden_api_signature": "GRAPH_TABLE ( <graph_name> MATCH <pattern> COLUMNS ( <projection_list> ) )",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "how does subtype label matching work",
+          "what is the discriminator column",
+          "how do I use label inheritance"
+        ],
+        "oracle_response": "A vertex table may declare a base label with subtypes via the syntax: LABEL <Base> IN <discriminator_col>(<sub1>, <sub2>, ...). Matching the base label returns all rows of the backing table. Matching a subtype label (e.g. :University) returns only rows where the discriminator column value corresponds to that subtype's position (1-indexed ordinal in the declaration list). Subtype matching is case-insensitive. DESCRIBE reports the discriminator column name in field 10 and the bracketed ordered sublabel list in field 11."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "what does wildcard projection expand to",
+          "how does a.* work in COLUMNS",
+          "what order do wildcard columns appear"
+        ],
+        "oracle_response": "A wildcard projection expression <var>.* inside the COLUMNS list expands to every property declared (or defaulted) for that variable's label, in the order they were declared in the PROPERTIES list of the graph definition. If no PROPERTIES clause was given, all columns of the backing table are used in their table-declaration order. Column names from the wildcard expansion become the output column names of the GRAPH_TABLE subquery."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "what schema introspection functions are available",
+          "how do I list vertex tables in a graph",
+          "what does get_pg_vtablenames return"
+        ],
+        "oracle_response": "Three table-valued schema introspection functions are provided: get_pg_vtablenames('<graph_name>') returns one row per vertex table name (the original backing table name); get_pg_etablenames('<graph_name>') returns one row per edge table name; and get_pg_propertynames('<graph_name>', '<table_name>') returns one row per property column name declared for that element table. All functions take the graph name as a string argument."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "what path descriptor functions exist",
+          "how do I get the element ids of a path",
+          "what does element_id(p) return"
+        ],
+        "oracle_response": "Path descriptor functions operate on a path variable bound with 'p = ANY SHORTEST (...)'. element_id(p) returns the sequence of element ids along the path as a bracketed list, e.g. [0, 1, 2], where entries alternate vertex dense-ids and edge dense-ids. path_length(p) returns the number of edges in the path. These functions are only valid in the COLUMNS list when a named path variable is present in the MATCH clause."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "what happens when you drop a graph that does not exist",
+          "can I drop a graph twice",
+          "what error is raised for a missing graph"
+        ],
+        "oracle_response": "Dropping a graph that does not exist (including dropping the same graph a second time after it has already been dropped) raises error category 'binder' with message 'Property graph <name> does not exist'. The same binder error is raised when a GRAPH_TABLE query references a graph name that has been dropped or was never created."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature1_1_describe_graph",
+        "trigger_keywords": [
+          "test cases for feature1 1 describe graph",
+          "show me feature1 1 describe graph test cases",
+          "what are the feature1 1 describe graph test inputs",
+          "give me the feature1_1_describe_graph test file",
+          "test cases for feature 1",
+          "feature1 1 describe graph expected output",
+          "what does feature1 1 describe graph expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_1_describe_graph:\n{\n  \"description\": \"Define a property graph over existing base tables and ask the engine to describe it. The description is one row per element table: the backing table name, the normalized (lower-cased) label, a flag indicating whether the element is a vertex, and for edges the source/destination vertex table with their key column lists. Vertex rows leave the edge-specific fields empty, and a label declared with a subtype discriminator additionally reports the discriminator name and the ordered list of sublabels.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"DESCRIBE PROPERTY GRAPH pg\"\n      },\n      \"expected_output\": \"School\\tschool\\ttrue\\tNULL\\tNULL\\tNULL\\tNULL\\tNULL\\tNULL\\tNULL\\tNULL\\nStudent\\tperson\\ttrue\\tNULL\\tNULL\\tNULL\\tNULL\\tNULL\\tNULL\\tNULL\\tNULL\\nstudyAt\\tstudyat\\tfalse\\tStudent\\t[id]\\t[personId]\\tSchool\\t[id]\\t[SchoolId]\\tNULL\\tNULL\\nknow\\tknows\\tfalse\\tStudent\\t[id]\\t[src]\\tStudent\\t[id]\\t[dst]\\tNULL\\tNULL\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_2_definition_errors",
+        "trigger_keywords": [
+          "test cases for feature1 2 definition errors",
+          "show me feature1 2 definition errors test cases",
+          "what are the feature1 2 definition errors test inputs",
+          "give me the feature1_2_definition_errors test file",
+          "test cases for feature 1",
+          "feature1 2 definition errors expected output",
+          "what does feature1 2 definition errors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_2_definition_errors:\n{\n  \"description\": \"Reject an invalid property-graph definition with a categorized error. A vertex or edge table that names a non-existent base table is rejected; an edge whose key references a vertex table not listed in the definition is rejected; repeating the same label within one definition is rejected; and syntactically illegal definition text (such as a wildcard property list) is rejected at parse time. Each failure is reported as a neutral category plus the engine's explanatory message.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(1,2,14),(1,3,15),(2,3,16)\",\n          \"CREATE TABLE School(school_name VARCHAR, school_id BIGINT, school_kind BIGINT)\",\n          \"INSERT INTO School VALUES ('VU',0,0),('UVA',1,1)\"\n        ],\n        \"query\": \"CREATE PROPERTY GRAPH pgx VERTEX TABLES (tabledoesnotexist)\"\n      },\n      \"expected_output\": \"error=invalid\\nmessage=tabledoesnotexist does not exist\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_3_drop_graph",
+        "trigger_keywords": [
+          "test cases for feature1 3 drop graph",
+          "show me feature1 3 drop graph test cases",
+          "what are the feature1 3 drop graph test inputs",
+          "give me the feature1_3_drop_graph test file",
+          "test cases for feature 1",
+          "feature1 3 drop graph expected output",
+          "what does feature1 3 drop graph expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_3_drop_graph:\n{\n  \"description\": \"Remove a property graph and observe that it is gone. After a graph is dropped, matching against it fails, dropping it a second time fails, and dropping a graph that never existed fails. Each failure is reported as a neutral category plus the engine message naming the missing graph.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\",\n          \"DROP PROPERTY GRAPH pg\"\n        ],\n        \"query\": \"SELECT study.id FROM GRAPH_TABLE (pg MATCH (a:Person) COLUMNS (a.id)) study\"\n      },\n      \"expected_output\": \"error=binder\\nmessage=Property graph pg does not exist\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_1_vertex_projection",
+        "trigger_keywords": [
+          "test cases for feature2 1 vertex projection",
+          "show me feature2 1 vertex projection test cases",
+          "what are the feature2 1 vertex projection test inputs",
+          "give me the feature2_1_vertex_projection test file",
+          "test cases for feature 2",
+          "feature2 1 vertex projection expected output",
+          "what does feature2 1 vertex projection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_1_vertex_projection:\n{\n  \"description\": \"Match every vertex carrying a given label and project chosen properties. A WHERE predicate on a vertex property restricts the matched vertices; the projected columns follow the COLUMNS list in order. Output is one row per matched vertex.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"SELECT study.a_id, study.name FROM GRAPH_TABLE (pg MATCH (a:Person) WHERE a.id = 0 COLUMNS (a.id as a_id, a.name)) study\"\n      },\n      \"expected_output\": \"0\\tDaniel\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_vertex_wildcard",
+        "trigger_keywords": [
+          "test cases for feature2 2 vertex wildcard",
+          "show me feature2 2 vertex wildcard test cases",
+          "what are the feature2 2 vertex wildcard test inputs",
+          "give me the feature2_2_vertex_wildcard test file",
+          "test cases for feature 2",
+          "feature2 2 vertex wildcard expected output",
+          "what does feature2 2 vertex wildcard expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_vertex_wildcard:\n{\n  \"description\": \"Project all properties of a bound vertex with a wildcard projection. The wildcard expands, in declaration order, to every property exposed for that vertex's label. Used over an edge pattern, the bound endpoint's properties are emitted once per matched edge.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"FROM GRAPH_TABLE (pg MATCH (a:Person) COLUMNS (a.*)) study ORDER BY study.id, study.name\"\n      },\n      \"expected_output\": \"0\\tDaniel\\n1\\tTavneet\\n2\\tGabor\\n3\\tPeter\\n4\\tDavid\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_3_vertex_aggregation",
+        "trigger_keywords": [
+          "test cases for feature2 3 vertex aggregation",
+          "show me feature2 3 vertex aggregation test cases",
+          "what are the feature2 3 vertex aggregation test inputs",
+          "give me the feature2_3_vertex_aggregation test file",
+          "test cases for feature 2",
+          "feature2 3 vertex aggregation expected output",
+          "what does feature2 3 vertex aggregation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_3_vertex_aggregation:\n{\n  \"description\": \"Apply aggregation to the rows produced by a graph pattern. An aggregate inside the COLUMNS list collapses the matches to a single value, and an outer GROUP BY over a projected column with ORDER BY produces grouped counts.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (avg(a.id))) study\"\n      },\n      \"expected_output\": \"1.375\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_edge_direction",
+        "trigger_keywords": [
+          "test cases for feature3 1 edge direction",
+          "show me feature3 1 edge direction test cases",
+          "what are the feature3 1 edge direction test inputs",
+          "give me the feature3_1_edge_direction test file",
+          "test cases for feature 3",
+          "feature3 1 edge direction expected output",
+          "what does feature3 1 edge direction expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_edge_direction:\n{\n  \"description\": \"Match a single edge between two labelled vertices, honoring the direction written in the pattern. A right arrow matches edges leaving the first vertex; a left arrow matches edges entering it; an undirected edge matches in either orientation (so a reciprocal pair yields two matches); and a both-directions edge matches only when edges exist in both orientations between the same pair.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"SELECT study.a_name, study.b_name FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.name = 'Daniel' COLUMNS (a.name as a_name, b.name as b_name)) study ORDER BY a_name, b_name\"\n      },\n      \"expected_output\": \"Daniel\\tGabor\\nDaniel\\tPeter\\nDaniel\\tTavneet\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_multi_hop",
+        "trigger_keywords": [
+          "test cases for feature3 2 multi hop",
+          "show me feature3 2 multi hop test cases",
+          "what are the feature3 2 multi hop test inputs",
+          "give me the feature3_2_multi_hop test file",
+          "test cases for feature 3",
+          "feature3 2 multi hop expected output",
+          "what does feature3 2 multi hop expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_multi_hop:\n{\n  \"description\": \"Match patterns that chain several edges, including patterns that re-enter the starting vertex and patterns that join two different edge types through a shared middle vertex. The projected columns may come from any vertex bound in the pattern.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"SELECT study.a_name, study.b_name, study.c_name FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]->(b:Person)-[k2:Knows]->(c:Person)-[k3:Knows]->(a:Person) COLUMNS (a.name as a_name, b.name as b_name, c.name as c_name)) study ORDER BY study.a_name, study.b_name, study.c_name\"\n      },\n      \"expected_output\": \"Daniel\\tGabor\\tPeter\\nDaniel\\tTavneet\\tPeter\\nGabor\\tPeter\\tDaniel\\nPeter\\tDaniel\\tGabor\\nPeter\\tDaniel\\tTavneet\\nTavneet\\tPeter\\tDaniel\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_case_insensitive_labels",
+        "trigger_keywords": [
+          "test cases for feature3 3 case insensitive labels",
+          "show me feature3 3 case insensitive labels test cases",
+          "what are the feature3 3 case insensitive labels test inputs",
+          "give me the feature3_3_case_insensitive_labels test file",
+          "test cases for feature 3",
+          "feature3 3 case insensitive labels expected output",
+          "what does feature3 3 case insensitive labels expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_case_insensitive_labels:\n{\n  \"description\": \"Label references in a pattern are matched case-insensitively, so the same result set is produced regardless of how vertex and edge labels are capitalized in the query.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.name as a_name, b.name as b_name)) study ORDER BY a_name, b_name\"\n      },\n      \"expected_output\": \"Daniel\\tGabor\\nDaniel\\tPeter\\nDaniel\\tTavneet\\nDavid\\tPeter\\nGabor\\tPeter\\nPeter\\tDaniel\\nTavneet\\tGabor\\nTavneet\\tPeter\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_label_inheritance",
+        "trigger_keywords": [
+          "test cases for feature4 label inheritance",
+          "show me feature4 label inheritance test cases",
+          "what are the feature4 label inheritance test inputs",
+          "give me the feature4_label_inheritance test file",
+          "test cases for feature 4",
+          "feature4 label inheritance expected output",
+          "what does feature4 label inheritance expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_label_inheritance:\n{\n  \"description\": \"A vertex table may declare a base label together with subtype labels keyed off a discriminator column. Matching the base label returns every row of the table, while matching a subtype label returns only the rows whose discriminator selects that subtype. Subtype matching is case-insensitive.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Person(id BIGINT, name VARCHAR)\",\n          \"CREATE TABLE Organisation(name VARCHAR, id BIGINT, mask BIGINT)\",\n          \"CREATE TABLE Company(name VARCHAR, id BIGINT, mask VARCHAR)\",\n          \"CREATE TABLE University(name VARCHAR, id BIGINT, mask VARCHAR)\",\n          \"CREATE TABLE worksAt(personId BIGINT, organisationId BIGINT)\",\n          \"INSERT INTO Person VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"INSERT INTO worksAt VALUES (0,1),(0,2),(0,3),(1,2),(1,3),(2,3),(3,0),(4,3)\",\n          \"INSERT INTO University VALUES ('VU',0,1),('UvA',1,1)\",\n          \"INSERT INTO Company VALUES ('EY',2,2),('CWI',3,2)\",\n          \"INSERT INTO Organisation (SELECT * from university union select * from company)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Person LABEL Person, Organisation LABEL Organisation IN mask(university, company)) EDGE TABLES (worksAt SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (organisationId) REFERENCES Organisation (id) LABEL worksAt)\"\n        ],\n        \"query\": \"SELECT * FROM GRAPH_TABLE (pg MATCH (p:Person)-[w:worksAt]->(u:organisation) COLUMNS (p.id as p_id, p.name as p_name, u.id as u_id, u.name as u_name)) result ORDER BY p_id, u_id\"\n      },\n      \"expected_output\": \"0\\tDaniel\\t1\\tUvA\\n0\\tDaniel\\t2\\tEY\\n0\\tDaniel\\t3\\tCWI\\n1\\tTavneet\\t2\\tEY\\n1\\tTavneet\\t3\\tCWI\\n2\\tGabor\\t3\\tCWI\\n3\\tPeter\\t0\\tVU\\n4\\tDavid\\t3\\tCWI\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_variable_length_paths",
+        "trigger_keywords": [
+          "test cases for feature5 1 variable length paths",
+          "show me feature5 1 variable length paths test cases",
+          "what are the feature5 1 variable length paths test inputs",
+          "give me the feature5_1_variable_length_paths test file",
+          "test cases for feature 5",
+          "feature5 1 variable length paths expected output",
+          "what does feature5 1 variable length paths expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_variable_length_paths:\n{\n  \"description\": \"Match paths whose hop count varies within a bounded range. A shortest-path pattern returns, for each reachable endpoint, the shortest qualifying path; path descriptor functions expose the path's element-id sequence and its length (number of edges). A bounded repetition without the shortest qualifier returns each endpoint reachable within the bound.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"FROM GRAPH_TABLE (pg MATCH p = ANY SHORTEST (a:Person WHERE a.name = 'Daniel')-[k:knows]->{1,3}(b:Person) COLUMNS (element_id(p), a.name as name, b.name as b_name)) study ORDER BY b_name\"\n      },\n      \"expected_output\": \"[0, 1, 2]\\tDaniel\\tGabor\\n[0, 2, 3]\\tDaniel\\tPeter\\n[0, 0, 1]\\tDaniel\\tTavneet\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_path_errors",
+        "trigger_keywords": [
+          "test cases for feature5 2 path errors",
+          "show me feature5 2 path errors test cases",
+          "what are the feature5 2 path errors test inputs",
+          "give me the feature5_2_path_errors test file",
+          "test cases for feature 5",
+          "feature5 2 path errors expected output",
+          "what does feature5 2 path errors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_path_errors:\n{\n  \"description\": \"Reject path patterns that are unsupported or unsafe. An unbounded quantifier under the default walk semantics is rejected because it could produce infinite results; path modes other than walk and the all-shortest qualifier are rejected as not implemented; and projecting a bare path variable that is not exposed as a column is rejected by the binder. Each failure is a neutral category plus the engine message.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)\",\n          \"CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)\",\n          \"INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')\",\n          \"CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)\",\n          \"INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)\"\n        ],\n        \"query\": \"SELECT study.a_name, study.b_name FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.name = 'Peter')-[k:Knows]-> *(b:Person) COLUMNS (a.name as a_name, b.name as b_name)) study\"\n      },\n      \"expected_output\": \"error=constraint\\nmessage=ALL unbounded with path mode WALK is not possible as this could lead to infinite results. Consider specifying an upper bound or path mode other than WALK\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_schema_functions",
+        "trigger_keywords": [
+          "test cases for feature6 1 schema functions",
+          "show me feature6 1 schema functions test cases",
+          "what are the feature6 1 schema functions test inputs",
+          "give me the feature6_1_schema_functions test file",
+          "test cases for feature 6",
+          "feature6 1 schema functions expected output",
+          "what does feature6 1 schema functions expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_schema_functions:\n{\n  \"description\": \"Table-valued functions expose a defined graph's schema: the set of vertex table names, the set of edge table names, and the property column names for a named vertex or edge table. Each returns one row per name.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, id BIGINT)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17),(2,4,18)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (id) LABEL Knows)\"\n        ],\n        \"query\": \"SELECT * from get_pg_vtablenames('pg')\"\n      },\n      \"expected_output\": \"Student\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_2_csr_functions",
+        "trigger_keywords": [
+          "test cases for feature6 2 csr functions",
+          "show me feature6 2 csr functions test cases",
+          "what are the feature6 2 csr functions test inputs",
+          "give me the feature6_2_csr_functions test file",
+          "test cases for feature 6",
+          "feature6 2 csr functions expected output",
+          "what does feature6 2 csr functions expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_2_csr_functions:\n{\n  \"description\": \"After building a compressed sparse-row adjacency structure from the edge list, two functions read it back: one returns the per-vertex offset array (a prefix-sum of out-degrees, one entry per vertex plus a terminating total) and the other returns the flattened destination array of neighbor dense ids in adjacency order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"setup\": [\n          \"CREATE TABLE Student(id BIGINT, name VARCHAR)\",\n          \"CREATE TABLE know(src BIGINT, dst BIGINT, id BIGINT)\",\n          \"INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')\",\n          \"INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17),(2,4,18)\",\n          \"CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (id) LABEL Knows)\",\n          \"SELECT CREATE_CSR_EDGE(0,(SELECT count(a.id) FROM Student a),CAST((SELECT sum(CREATE_CSR_VERTEX(0,(SELECT count(a.id) FROM Student a),sub.dense_id,sub.cnt)) FROM (SELECT a.rowid as dense_id, count(k.src) as cnt FROM Student a LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),a.rowid,c.rowid,k.rowid) as temp FROM Know k JOIN student a on a.id = k.src JOIN student c on c.id = k.dst\"\n        ],\n        \"query\": \"SELECT * from get_csr_v(0)\"\n      },\n      \"expected_output\": \"0\\n3\\n5\\n7\\n8\\n9\\n9\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "declare a graph once, pointing at their existing tables",
+        "actual_meaning": "The CREATE PROPERTY GRAPH DDL statement that registers vertex tables (with optional PROPERTIES and LABEL clauses) and edge tables (with SOURCE KEY / DESTINATION KEY REFERENCES clauses) as a catalog object, backed by existing base relational tables"
+      },
+      {
+        "vague_reference": "get back normal relational rows they can work with in SQL",
+        "actual_meaning": "The GRAPH_TABLE(...MATCH...COLUMNS...) table-valued operator that returns a relational subquery result which can be aliased and used in ordinary SELECT, FROM, WHERE, GROUP BY, ORDER BY SQL clauses"
+      }
+    ],
+    "fallback_response": "That's a good question but it falls outside the specific constraints I have documented for this feature. I'd recommend checking the test case files under rcb_tests/public_test_cases/ for concrete input/output examples, or looking at the PRD sections in start.md that describe the relevant feature. If you can rephrase your question in terms of a specific behavior (e.g. what output to expect for a given input, or what error category applies to a specific failure mode), I can likely give you a more precise answer."
+  },
+  "public_test_cases": {
+    "feature1_1_describe_graph.json": {
+      "description": "Define a property graph over existing base tables and ask the engine to describe it. The description is one row per element table: the backing table name, the normalized (lower-cased) label, a flag indicating whether the element is a vertex, and for edges the source/destination vertex table with their key column lists. Vertex rows leave the edge-specific fields empty, and a label declared with a subtype discriminator additionally reports the discriminator name and the ordered list of sublabels.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "DESCRIBE PROPERTY GRAPH pg"
+          },
+          "expected_output": "School\tschool\ttrue\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\nStudent\tperson\ttrue\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\tNULL\nstudyAt\tstudyat\tfalse\tStudent\t[id]\t[personId]\tSchool\t[id]\t[SchoolId]\tNULL\tNULL\nknow\tknows\tfalse\tStudent\t[id]\t[src]\tStudent\t[id]\t[dst]\tNULL\tNULL\n"
+        }
+      ]
+    },
+    "feature1_2_definition_errors.json": {
+      "description": "Reject an invalid property-graph definition with a categorized error. A vertex or edge table that names a non-existent base table is rejected; an edge whose key references a vertex table not listed in the definition is rejected; repeating the same label within one definition is rejected; and syntactically illegal definition text (such as a wildcard property list) is rejected at parse time. Each failure is reported as a neutral category plus the engine's explanatory message.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(1,2,14),(1,3,15),(2,3,16)",
+              "CREATE TABLE School(school_name VARCHAR, school_id BIGINT, school_kind BIGINT)",
+              "INSERT INTO School VALUES ('VU',0,0),('UVA',1,1)"
+            ],
+            "query": "CREATE PROPERTY GRAPH pgx VERTEX TABLES (tabledoesnotexist)"
+          },
+          "expected_output": "error=invalid\nmessage=tabledoesnotexist does not exist\n"
+        }
+      ]
+    },
+    "feature1_3_drop_graph.json": {
+      "description": "Remove a property graph and observe that it is gone. After a graph is dropped, matching against it fails, dropping it a second time fails, and dropping a graph that never existed fails. Each failure is reported as a neutral category plus the engine message naming the missing graph.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)",
+              "DROP PROPERTY GRAPH pg"
+            ],
+            "query": "SELECT study.id FROM GRAPH_TABLE (pg MATCH (a:Person) COLUMNS (a.id)) study"
+          },
+          "expected_output": "error=binder\nmessage=Property graph pg does not exist\n"
+        }
+      ]
+    },
+    "feature2_1_vertex_projection.json": {
+      "description": "Match every vertex carrying a given label and project chosen properties. A WHERE predicate on a vertex property restricts the matched vertices; the projected columns follow the COLUMNS list in order. Output is one row per matched vertex.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "SELECT study.a_id, study.name FROM GRAPH_TABLE (pg MATCH (a:Person) WHERE a.id = 0 COLUMNS (a.id as a_id, a.name)) study"
+          },
+          "expected_output": "0\tDaniel\n"
+        }
+      ]
+    },
+    "feature2_2_vertex_wildcard.json": {
+      "description": "Project all properties of a bound vertex with a wildcard projection. The wildcard expands, in declaration order, to every property exposed for that vertex's label. Used over an edge pattern, the bound endpoint's properties are emitted once per matched edge.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "FROM GRAPH_TABLE (pg MATCH (a:Person) COLUMNS (a.*)) study ORDER BY study.id, study.name"
+          },
+          "expected_output": "0\tDaniel\n1\tTavneet\n2\tGabor\n3\tPeter\n4\tDavid\n"
+        }
+      ]
+    },
+    "feature2_3_vertex_aggregation.json": {
+      "description": "Apply aggregation to the rows produced by a graph pattern. An aggregate inside the COLUMNS list collapses the matches to a single value, and an outer GROUP BY over a projected column with ORDER BY produces grouped counts.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (avg(a.id))) study"
+          },
+          "expected_output": "1.375\n"
+        }
+      ]
+    },
+    "feature3_1_edge_direction.json": {
+      "description": "Match a single edge between two labelled vertices, honoring the direction written in the pattern. A right arrow matches edges leaving the first vertex; a left arrow matches edges entering it; an undirected edge matches in either orientation (so a reciprocal pair yields two matches); and a both-directions edge matches only when edges exist in both orientations between the same pair.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "SELECT study.a_name, study.b_name FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.name = 'Daniel' COLUMNS (a.name as a_name, b.name as b_name)) study ORDER BY a_name, b_name"
+          },
+          "expected_output": "Daniel\tGabor\nDaniel\tPeter\nDaniel\tTavneet\n"
+        }
+      ]
+    },
+    "feature3_2_multi_hop.json": {
+      "description": "Match patterns that chain several edges, including patterns that re-enter the starting vertex and patterns that join two different edge types through a shared middle vertex. The projected columns may come from any vertex bound in the pattern.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "SELECT study.a_name, study.b_name, study.c_name FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]->(b:Person)-[k2:Knows]->(c:Person)-[k3:Knows]->(a:Person) COLUMNS (a.name as a_name, b.name as b_name, c.name as c_name)) study ORDER BY study.a_name, study.b_name, study.c_name"
+          },
+          "expected_output": "Daniel\tGabor\tPeter\nDaniel\tTavneet\tPeter\nGabor\tPeter\tDaniel\nPeter\tDaniel\tGabor\nPeter\tDaniel\tTavneet\nTavneet\tPeter\tDaniel\n"
+        }
+      ]
+    },
+    "feature3_3_case_insensitive_labels.json": {
+      "description": "Label references in a pattern are matched case-insensitively, so the same result set is produced regardless of how vertex and edge labels are capitalized in the query.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.name as a_name, b.name as b_name)) study ORDER BY a_name, b_name"
+          },
+          "expected_output": "Daniel\tGabor\nDaniel\tPeter\nDaniel\tTavneet\nDavid\tPeter\nGabor\tPeter\nPeter\tDaniel\nTavneet\tGabor\nTavneet\tPeter\n"
+        }
+      ]
+    },
+    "feature4_label_inheritance.json": {
+      "description": "A vertex table may declare a base label together with subtype labels keyed off a discriminator column. Matching the base label returns every row of the table, while matching a subtype label returns only the rows whose discriminator selects that subtype. Subtype matching is case-insensitive.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Person(id BIGINT, name VARCHAR)",
+              "CREATE TABLE Organisation(name VARCHAR, id BIGINT, mask BIGINT)",
+              "CREATE TABLE Company(name VARCHAR, id BIGINT, mask VARCHAR)",
+              "CREATE TABLE University(name VARCHAR, id BIGINT, mask VARCHAR)",
+              "CREATE TABLE worksAt(personId BIGINT, organisationId BIGINT)",
+              "INSERT INTO Person VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "INSERT INTO worksAt VALUES (0,1),(0,2),(0,3),(1,2),(1,3),(2,3),(3,0),(4,3)",
+              "INSERT INTO University VALUES ('VU',0,1),('UvA',1,1)",
+              "INSERT INTO Company VALUES ('EY',2,2),('CWI',3,2)",
+              "INSERT INTO Organisation (SELECT * from university union select * from company)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Person LABEL Person, Organisation LABEL Organisation IN mask(university, company)) EDGE TABLES (worksAt SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (organisationId) REFERENCES Organisation (id) LABEL worksAt)"
+            ],
+            "query": "SELECT * FROM GRAPH_TABLE (pg MATCH (p:Person)-[w:worksAt]->(u:organisation) COLUMNS (p.id as p_id, p.name as p_name, u.id as u_id, u.name as u_name)) result ORDER BY p_id, u_id"
+          },
+          "expected_output": "0\tDaniel\t1\tUvA\n0\tDaniel\t2\tEY\n0\tDaniel\t3\tCWI\n1\tTavneet\t2\tEY\n1\tTavneet\t3\tCWI\n2\tGabor\t3\tCWI\n3\tPeter\t0\tVU\n4\tDavid\t3\tCWI\n"
+        }
+      ]
+    },
+    "feature5_1_variable_length_paths.json": {
+      "description": "Match paths whose hop count varies within a bounded range. A shortest-path pattern returns, for each reachable endpoint, the shortest qualifying path; path descriptor functions expose the path's element-id sequence and its length (number of edges). A bounded repetition without the shortest qualifier returns each endpoint reachable within the bound.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "FROM GRAPH_TABLE (pg MATCH p = ANY SHORTEST (a:Person WHERE a.name = 'Daniel')-[k:knows]->{1,3}(b:Person) COLUMNS (element_id(p), a.name as name, b.name as b_name)) study ORDER BY b_name"
+          },
+          "expected_output": "[0, 1, 2]\tDaniel\tGabor\n[0, 2, 3]\tDaniel\tPeter\n[0, 0, 1]\tDaniel\tTavneet\n"
+        }
+      ]
+    },
+    "feature5_2_path_errors.json": {
+      "description": "Reject path patterns that are unsupported or unsafe. An unbounded quantifier under the default walk semantics is rejected because it could produce infinite results; path modes other than walk and the all-shortest qualifier are rejected as not implemented; and projecting a bare path variable that is not exposed as a column is rejected by the binder. Each failure is a neutral category plus the engine message.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, createDate BIGINT)",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)",
+              "CREATE TABLE School(name VARCHAR, Id BIGINT, Kind VARCHAR)",
+              "INSERT INTO School VALUES ('VU',0,'University'),('UVA',1,'University')",
+              "CREATE TABLE StudyAt(personId BIGINT, schoolId BIGINT)",
+              "INSERT INTO StudyAt VALUES (0,0),(1,0),(2,1),(3,1),(4,1)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person, School LABEL SCHOOL) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (createDate) LABEL Knows, studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (SchoolId) REFERENCES School (id) LABEL StudyAt)"
+            ],
+            "query": "SELECT study.a_name, study.b_name FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.name = 'Peter')-[k:Knows]-> *(b:Person) COLUMNS (a.name as a_name, b.name as b_name)) study"
+          },
+          "expected_output": "error=constraint\nmessage=ALL unbounded with path mode WALK is not possible as this could lead to infinite results. Consider specifying an upper bound or path mode other than WALK\n"
+        }
+      ]
+    },
+    "feature6_1_schema_functions.json": {
+      "description": "Table-valued functions expose a defined graph's schema: the set of vertex table names, the set of edge table names, and the property column names for a named vertex or edge table. Each returns one row per name.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, id BIGINT)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17),(2,4,18)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (id) LABEL Knows)"
+            ],
+            "query": "SELECT * from get_pg_vtablenames('pg')"
+          },
+          "expected_output": "Student\n"
+        }
+      ]
+    },
+    "feature6_2_csr_functions.json": {
+      "description": "After building a compressed sparse-row adjacency structure from the edge list, two functions read it back: one returns the per-vertex offset array (a prefix-sum of out-degrees, one entry per vertex plus a terminating total) and the other returns the flattened destination array of neighbor dense ids in adjacency order.",
+      "cases": [
+        {
+          "input": {
+            "setup": [
+              "CREATE TABLE Student(id BIGINT, name VARCHAR)",
+              "CREATE TABLE know(src BIGINT, dst BIGINT, id BIGINT)",
+              "INSERT INTO Student VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')",
+              "INSERT INTO know VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17),(2,4,18)",
+              "CREATE PROPERTY GRAPH pg VERTEX TABLES (Student PROPERTIES (id,name) LABEL Person) EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id) PROPERTIES (id) LABEL Knows)",
+              "SELECT CREATE_CSR_EDGE(0,(SELECT count(a.id) FROM Student a),CAST((SELECT sum(CREATE_CSR_VERTEX(0,(SELECT count(a.id) FROM Student a),sub.dense_id,sub.cnt)) FROM (SELECT a.rowid as dense_id, count(k.src) as cnt FROM Student a LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),a.rowid,c.rowid,k.rowid) as temp FROM Know k JOIN student a on a.id = k.src JOIN student c on c.id = k.dst"
+            ],
+            "query": "SELECT * from get_csr_v(0)"
+          },
+          "expected_output": "0\n3\n5\n7\n8\n9\n9\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C003",
+      "C004",
+      "C005"
+    ],
+    "kept_c": [
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

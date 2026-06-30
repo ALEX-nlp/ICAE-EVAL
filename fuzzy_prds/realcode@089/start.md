@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need a small utility library for container image version tracking. Basically our platform team keeps running into issues where they can't reliably tell if a newer image is available — the tag formats are all over the place and every engineer is hand-rolling their own string parsing which keeps breaking in subtle ways (especially with those debian-style suffixed tags, you know the ones). We also keep getting burned by false positives when detecting which registry a host belongs to — someone's test environment had a domain like `foodocker.io` and it was being picked up as Docker Hub, which caused some fun incidents.
+
+The library should handle parsing tags into something comparable, doing the older/newer check correctly (there's some tricky logic here similar to how we handled pre-release ordering in that semver validation work we did for the auth service — check how that was approached), splitting image paths per registry since each one has different conventions for single-segment paths, and routing a full image URL to the right registry handler.
+
+We need this to be properly structured — not just one big file — with clean separation between the version logic and the registry-specific stuff. Each registry (Docker Hub, GCR, Quay) should live in its own unit. The whole thing needs to be testable via a JSON-in / line-based-out adapter but that adapter should stay decoupled from the core logic. Edge cases like empty strings and unknown registries must not crash anything.

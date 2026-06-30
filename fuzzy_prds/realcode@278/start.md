@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out this load rate engine thing that the platform team has been asking about for a while. Basically, developers are frustrated because every time they write a load test they end up copy-pasting the same ugly timer loop boilerplate and it never quite works right — the request counts drift off target, ramps feel janky, and nobody wants to debug fractional accumulation math at 2am. The ask is to give them a clean way to describe traffic shapes (like 'ramp up, hold, ramp down', or that bell-curve pattern we use for the daily peak simulation) and have the engine just figure out exactly how many requests to fire each tick.
+
+The config format should be readable enough that non-engineers can tweak it without help — similar to how we approached the scheduling layer on that campaign delivery system last quarter, just adapted for load testing. Make sure bad inputs don't blow up silently; they should get clear, categorized error messages.
+
+Also important: the code shouldn't be one giant file. We've had reviews bounce back before for that. Split it up sensibly. The JSON test harness we already have should be treated as a black-box contract for the outer adapter layer only — the core logic shouldn't know anything about JSON or stdin. Ping me if the gaussian volume math needs clarification, that one always trips people up.

@@ -1,0 +1,448 @@
+{
+  "fuzzy_prd": "# Annotation-Driven Dependency-Injection Contribution & Merge Processor\n\n## Project Goal\n\nBuild a compile-time processor, exercised through a single batch program, that turns\nordinary annotated Kotlin source into the wiring needed by a dependency-injection\ngraph. Modules annotate interfaces, implementations, subcomponents and custom markers;\nthe processor **generates** the per-contribution glue and, at the application root,\n**merges** every contribution that targets a scope into one component.\n\nThe program is a black box driven entirely by text. It accepts a JSON command on\nstandard input describing a set of Kotlin source files plus what to inspect, runs the\nsymbol-processing pipeline, and prints a small, deterministic, language-neutral report\non standard output. The report either describes the generated symbols (origins,\nproviders, merged super-interfaces, discovery markers) or, when the input is invalid,\na normalized domain reason. No part of the report leaks host-language types, stack\ntraces, or file-system paths.\n\n## Background & Problem\n\nIn a modular code base each feature module wants to register its own dependencies —\ncomponent interfaces, concrete bindings, child scopes — without the root module having\nto know about every one of them by hand. Maintaining one giant hand-written wiring\nfile at the root is brittle: every new module forces an edit there, and a typo only\nsurfaces at runtime.\n\nThe standard solution is *contribution + merge*. A module annotates a declaration to\nsay \"this belongs to scope X\". The processor emits a small discoverable stub for each\ncontribution into a well-known lookup package. At the root, a component annotated to\nmerge scope X collects every stub for that scope and folds them into a single generated\nsuper-interface, so the fully wired graph is assembled automatically across module\nboundaries.\n\nBecause this is a code generator, its behavior is easy to get subtly wrong and hard to\ntest portably. We therefore need a contract that is independent of any host language or\ntest framework: drive the processor with source snippets and assert on a stable textual\ndescription of what it generated, or on the normalized reason it rejected the input.\n\n## Architecture & Engineering Constraints\n\n**Interface.** The program runs in a batch loop. For each command it reads one JSON\nobject and writes one text report. The command schema is:\n\n- `sources` (required, array of strings): each string is the full text of one Kotlin\n  source file to compile together.\n- `inspect` (optional, array of fully-qualified type names): for each name, report the\n  generated component stub in the lookup package — its recorded origin, the interfaces\n  it extends, and any provider methods it declares.\n- `merged` (optional, array of fully-qualified component names): for each name, report\n  which user-package contributions ended up merged into that component's generated\n  super-interface.\n- `annotation` (optional, array of fully-qualified annotation names): for each name,\n  report the generated cross-module discovery marker for that custom annotation.\n- `multiplatform` (optional, boolean): compile in common Kotlin-Multiplatform mode.\n\n**Output grammar.** Lines are emitted in a fixed order and any repeatable group is\nsorted, so output is deterministic:\n\n- On success the first line is `status=compiled`. Then, per inspected type:\n  - `contribution origin=<fqn>` — the declaration the stub was generated from.\n  - `extends <fqn>` — each super-interface of the stub (sorted).\n  - `provides from=<fqn|none> to=<fqn> kind=<single|multi>` — each provider method:\n    where the value comes from, the bound type it is exposed as, and whether it is a\n    single binding or a set-multibinding element (sorted).\n  - per merged component: `merges <fqn>` — each contributed user type folded in (sorted).\n  - per annotation: `contributing-annotation origin=<fqn>` — the discovery marker.\n- On rejection the output is `status=rejected`, then `error=invalid_usage`, then one\n  `reason=<domain message>` line per distinct diagnostic. Reasons are the processor's\n  own domain sentences only; the adapter strips any source location prefix and never\n  emits host-language exception class names, stack traces, or paths. An unexpected\n  [a specific error category string — consult the internal error taxonomy document] failure is reported as `error=[a specific error category string — consult the internal error taxonomy document]`.\n\n**Constraints.**\n\n- The processor's functional code must not be modified. Behavior is observed only by\n  reflecting over the generated classes and by reading the compiler's diagnostics.\n- Generated component stubs live in a fixed lookup package; their class names are\n  derived deterministically from the fully-qualified source name.\n- Nested type names are normalized to dotted form in the report.\n- Everything for one run executes inside a single process for speed; the process\n  terminates promptly even though the in-process compiler may leave worker threads.\n\n## Core Features\n\n### Feature 1: Contribute a component interface to a scope\n\nA public interface annotated as a scope contribution produces a component-interface\nstub in the lookup package whose recorded origin is the source type and which extends\nthat source interface. A non-public contribution is rejected with a domain reason.\n\n```json\n{\n  \"description\": \"A public interface annotated as a scope contribution generates a component-interface stub in the lookup package whose origin is the source type and which extends that source interface. Non-public or non-interface declarations are rejected with a domain reason.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesTo\\n\\n@ContributesTo(Unit::class)\\ninterface ComponentInterface\\n\"\n        ],\n        \"inspect\": [\n          \"com.example.ComponentInterface\"\n        ]\n      },\n      \"expected_output\": \"status=compiled\\ncontribution origin=com.example.ComponentInterface\\nextends com.example.ComponentInterface\\n\"\n    },\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesTo\\n\\n@ContributesTo(Unit::class)\\nprivate interface ComponentInterface\\n\"\n        ]\n      },\n      \"expected_output\": \"status=rejected\\nerror=invalid_usage\\nreason=Contributed component interfaces must be public.\\n\"\n    }\n  ]\n}\n```\n\n### Feature 2: Contribute a binding (single and multibinding)\n\nAn injectable implementation annotated as a binding generates a provider exposing it\nunder its super type. Both the provider direction (implementation → bound type) and the\nbinding kind (single vs. set-multibinding element) are observable. The bound type must\nbe unambiguous: an implementation with no super type is rejected.\n\n```json\n{\n  \"description\": \"An injectable implementation annotated as a binding generates a provider that exposes it under its super type. The provider direction (from implementation to bound type) and the binding kind (single vs multibinding set element) are observable.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesBinding\\nimport me.tatarka.inject.annotations.Inject\\n\\ninterface Base\\n\\n@Inject\\n@ContributesBinding(Unit::class)\\nclass Impl : Base\\n\"\n        ],\n        \"inspect\": [\n          \"com.example.Impl\"\n        ]\n      },\n      \"expected_output\": \"status=compiled\\ncontribution origin=com.example.Impl\\nprovides from=com.example.Impl to=com.example.Base kind=single\\n\"\n    },\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesBinding\\nimport me.tatarka.inject.annotations.Inject\\n\\ninterface Base\\n\\n@Inject\\n@ContributesBinding(Unit::class, multibinding = true)\\nclass Impl : Base\\n\"\n        ],\n        \"inspect\": [\n          \"com.example.Impl\"\n        ]\n      },\n      \"expected_output\": \"status=compiled\\ncontribution origin=com.example.Impl\\nprovides from=com.example.Impl to=com.example.Base kind=multi\\n\"\n    }\n  ]\n}\n```\n\n```json\n{\n  \"description\": \"Binding contribution validates the bound type and scope: the bound type must be unambiguous (exactly one super type), the same type may not be bound twice, and all scope-defining annotations must agree.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesBinding\\nimport me.tatarka.inject.annotations.Inject\\n\\n@Inject\\n@ContributesBinding(Unit::class)\\nclass Impl\\n\"\n        ]\n      },\n      \"expected_output\": \"status=rejected\\nerror=invalid_usage\\nreason=The bound type could not be determined for Impl. There are no super types.\\n\"\n    }\n  ]\n}\n```\n\n### Feature 3: Merge contributions into a component\n\nA component annotated to merge a scope collects every contribution for that scope; the\ngenerated merged super-interface inherits the contributed component interfaces, proving\nthey were folded in. A component that is hand-wired with the manual component annotation\nbut does not declare the generated merged super-interface is rejected.\n\n```json\n{\n  \"description\": \"A component annotated to merge a scope collects every contribution for that scope; the generated merged super-interface inherits the contributed component interfaces (a nested one and a top-level one), proving the contributions were actually merged into the component.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport me.tatarka.inject.annotations.Component\\nimport me.tatarka.inject.annotations.Inject\\nimport me.tatarka.inject.annotations.Provides\\nimport software.amazon.lastmile.kotlin.inject.anvil.AppScope\\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesTo\\nimport software.amazon.lastmile.kotlin.inject.anvil.MergeComponent\\nimport software.amazon.lastmile.kotlin.inject.anvil.SingleIn\\n\\ninterface Base\\n\\n@Inject\\n@SingleIn(AppScope::class)\\nclass Impl : Base {\\n    @ContributesTo(AppScope::class)\\n    interface Component {\\n        @Provides fun provideImpl(impl: Impl): Base = impl\\n        val string: String\\n    }\\n}\\n\\n@ContributesTo(AppScope::class)\\ninterface StringComponent {\\n    @Provides fun provideString(): String = \\\"abc\\\"\\n}\\n\\n@Component\\n@MergeComponent(AppScope::class)\\n@SingleIn(AppScope::class)\\nabstract class ComponentInterface : ComponentInterfaceMerged {\\n    abstract val base: Base\\n}\\n\"\n        ],\n        \"merged\": [\n          \"com.example.ComponentInterface\"\n        ]\n      },\n      \"expected_output\": \"status=compiled\\nmerges com.example.Impl.Component\\nmerges com.example.StringComponent\\n\"\n    }\n  ]\n}\n```\n\n```json\n{\n  \"description\": \"Merging validates the wiring: a manually @Component-wired class that merges a scope must add the generated merged super-interface, and excluding a contribution the component still depends on surfaces an unresolved-dependency reason.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport me.tatarka.inject.annotations.Component\\nimport software.amazon.lastmile.kotlin.inject.anvil.AppScope\\nimport software.amazon.lastmile.kotlin.inject.anvil.MergeComponent\\n\\n@Component\\n@MergeComponent(AppScope::class)\\nabstract class ComponentInterface\\n\"\n        ]\n      },\n      \"expected_output\": \"status=rejected\\nerror=invalid_usage\\nreason=ComponentInterface is annotated with @MergeComponent and @Component. It's required to add ComponentInterfaceMerged as super type to ComponentInterface. If you don't want to add the super manually, then you must remove the @Component annotation.\\n\"\n    }\n  ]\n}\n```\n\n### Feature 4: Validate the generated-component factory function\n\nIn common Kotlin-Multiplatform code a factory function materializes a merged component.\nThe processor enforces its shape: it must be public, use the expect modifier, return a\nmerge target (not a hand-wired component), and — if it has a receiver — that receiver\nmust be the component's class reference with matching argument and arity. Here a\nnon-public factory is rejected.\n\n```json\n{\n  \"description\": \"The common-multiplatform factory function that materializes a merged component has strict shape rules: it must be public and use the expect modifier, its return type must itself be a merge target (not hand-wired with @Component), and a receiver, if present, must be the KClass of the component with matching argument and arity.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.AppScope\\nimport software.amazon.lastmile.kotlin.inject.anvil.MergeComponent\\n\\n@MergeComponent(AppScope::class)\\ninterface ComponentInterface\\n\\n@MergeComponent.CreateComponent\\n[a specific error category string — consult the internal error taxonomy document] expect fun createComponent(): ComponentInterface\\n\"\n        ],\n        \"multiplatform\": true\n      },\n      \"expected_output\": \"status=rejected\\nerror=invalid_usage\\nreason=Factory functions for components annotated with `@CreateComponent` must be public.\\n\"\n    }\n  ]\n}\n```\n\n### Feature 5: Contribute a subcomponent with a factory\n\nA contributed subcomponent declares a nested factory interface. The processor generates\na factory component stub in the lookup package whose origin is the factory, which\nextends the factory and provides it into the parent scope. The subcomponent must be an\ninterface; a contributed abstract class is rejected and steered toward the factory.\n\n```json\n{\n  \"description\": \"A contributed subcomponent declares a nested factory interface; a factory component stub is generated into the lookup package, named after the fully-qualified factory type, whose origin is the factory and which provides the factory into its parent scope.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesSubcomponent\\nimport software.amazon.lastmile.kotlin.inject.anvil.SingleIn\\n\\n@ContributesSubcomponent(Unit::class)\\n@SingleIn(Unit::class)\\ninterface SubcomponentInterface {\\n    @ContributesSubcomponent.Factory(String::class)\\n    interface Factory {\\n        fun createSubcomponentInterface(): SubcomponentInterface\\n    }\\n}\\n\"\n        ],\n        \"inspect\": [\n          \"com.example.SubcomponentInterface.Factory\"\n        ]\n      },\n      \"expected_output\": \"status=compiled\\ncontribution origin=com.example.SubcomponentInterface.Factory\\nextends com.example.SubcomponentInterface.Factory\\nprovides from=none to=com.example.SubcomponentInterface.Factory kind=single\\n\"\n    }\n  ]\n}\n```\n\n```json\n{\n  \"description\": \"Subcomponent contribution enforces structural rules: the contributed type must be an interface, it must declare exactly one factory inner interface, the factory must contain exactly one function returning the subcomponent, and a kotlin-inject scope must be present.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesSubcomponent\\nimport software.amazon.lastmile.kotlin.inject.anvil.SingleIn\\n\\n@ContributesSubcomponent(Unit::class)\\n@SingleIn(Unit::class)\\nabstract class OtherComponent {\\n    @ContributesSubcomponent.Factory(Unit::class)\\n    interface Parent {\\n        fun otherComponent(stringArg: String, intArg: Int): OtherComponent\\n    }\\n}\\n\"\n        ]\n      },\n      \"expected_output\": \"status=rejected\\nerror=invalid_usage\\nreason=Only interfaces can be contributed. If you have parameters on your abstract class, then move them to the factory. See @ContributesSubcomponent for more details.\\n\"\n    }\n  ]\n}\n```\n\n### Feature 6: Custom contributing annotations\n\nA user-defined annotation can itself be marked as a contributing annotation. The\nprocessor then generates a cross-module discovery marker for it in the lookup package\nwhose origin is the annotation, enabling other modules to discover the custom marker.\nSuch an annotation must be public.\n\n```json\n{\n  \"description\": \"Marking a user-defined annotation as a contributing annotation is accepted and compiles successfully, generating a cross-module discovery marker for the custom annotation in the lookup package.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.extend.ContributingAnnotation\\nimport kotlin.annotation.AnnotationTarget.CLASS\\n\\n@ContributingAnnotation\\n@Target(CLASS)\\nannotation class ContributesRenderer\\n\"\n        ],\n        \"annotation\": [\n          \"com.example.ContributesRenderer\"\n        ]\n      },\n      \"expected_output\": \"status=compiled\\ncontributing-annotation origin=com.example.ContributesRenderer\\n\"\n    }\n  ]\n}\n```\n\n```json\n{\n  \"description\": \"A user-defined annotation marked as contributing must be public; a non-public annotation is rejected with a domain reason.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"sources\": [\n          \"package com.example\\n\\nimport software.amazon.lastmile.kotlin.inject.anvil.extend.ContributingAnnotation\\nimport kotlin.annotation.AnnotationTarget.CLASS\\n\\n@ContributingAnnotation\\n@Target(CLASS)\\n[a specific error category string — consult the internal error taxonomy document] annotation class ContributesRenderer\\n\"\n        ]\n      },\n      \"expected_output\": \"status=rejected\\nerror=invalid_usage\\nreason=Contributing annotations must be public.\\n\"\n    }\n  ]\n}\n```\n\n## Deliverables\n\n- A single entry point `rcb_tests/test.sh` that runs the whole suite. It accepts\n  `--cases-dir <subdir>` (default `test_cases`), feeds every case's `input` to the\n  processor, writes only the raw program stdout to\n  `rcb_tests/stdout/<cases-dir>/<stem>@<NNN>.txt`, then compares against each case's\n  `expected_output` and prints a `PASS`/`FAIL` line per case plus a final summary.\n- An execution adapter that drives the unmodified processor in-process and renders the\n  text contract defined above, plus its supporting harness scripts.\n- The hidden evaluation set `rcb_tests/test_cases/featureN_*.json`, a faithful superset\n  of the behaviors above.\n- The public mirror `rcb_tests/public_test_cases/featureN_*.json`, containing exactly\n  the cases embedded in this document.\n- Each case file has the shape `{\"description\": ..., \"cases\": [{\"input\": ...,\n  \"expected_output\": ...}]}`; `input` is real program input and `expected_output` is the\n  exact raw stdout.\n\n\n---\n**Implementation notes:**\n- follow the same sorting logic used by the module that handles 'extends' lines\n- normalize names according to the convention from the core transformation layer\n",
+  "oracle_data": {
+    "task_id": "amzn__kotlin-inject-anvil-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "what does 'internal' refer to",
+          "is there an internal error code",
+          "explain the internal variable in C002",
+          "what is the value for 'internal', "
+        ],
+        "oracle_response": "The exact string literal 'internal' represents a placeholder for an internal system-specific error category code."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "why is this exact string shown",
+          "what is the rejection message format",
+          "does it mention <class>",
+          "what does 'no super types' mean in this context",
+          "retrieve the error string from C010"
+        ],
+        "oracle_response": "The exact string 'The bound type could not be determined for <class>. There are no super types.' is the hardcoded rejection message emitted when bound type resolution fails due to a lack of specified super types."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the same sorting logic used by the module that handles 'extends' lines",
+        "actual_meaning": "This refers to a lexicographical sort order derived from the output generation logic for the 'extends' section, implying the same custom comparator or dictionary-based ordering used elsewhere in the output formatter."
+      },
+      {
+        "vague_reference": "normalize names according to the convention from the core transformation layer",
+        "actual_meaning": "This requires using the specific dotted notation convention (e.g., 'Package.Sub.Primitive') defined in the core naming rule implementation, rather than the raw tokenized names from the AST."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_contribute_to.json": {
+      "description": "A public interface annotated as a scope contribution generates a component-interface stub in the lookup package whose origin is the source type and which extends that source interface. Non-public or non-interface declarations are rejected with a domain reason.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesTo\n\n@ContributesTo(Unit::class)\ninterface ComponentInterface\n"
+            ],
+            "inspect": [
+              "com.example.ComponentInterface"
+            ]
+          },
+          "expected_output": "status=compiled\ncontribution origin=com.example.ComponentInterface\nextends com.example.ComponentInterface\n"
+        },
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesTo\n\n@ContributesTo(Unit::class)\nprivate interface ComponentInterface\n"
+            ]
+          },
+          "expected_output": "status=rejected\nerror=invalid_usage\nreason=Contributed component interfaces must be public.\n"
+        }
+      ]
+    },
+    "feature2_binding_validation.json": {
+      "description": "Binding contribution validates the bound type and scope: the bound type must be unambiguous (exactly one super type), the same type may not be bound twice, and all scope-defining annotations must agree.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesBinding\nimport me.tatarka.inject.annotations.Inject\n\n@Inject\n@ContributesBinding(Unit::class)\nclass Impl\n"
+            ]
+          },
+          "expected_output": "status=rejected\nerror=invalid_usage\nreason=The bound type could not be determined for Impl. There are no super types.\n"
+        }
+      ]
+    },
+    "feature2_contributes_binding.json": {
+      "description": "An injectable implementation annotated as a binding generates a provider that exposes it under its super type. The provider direction (from implementation to bound type) and the binding kind (single vs multibinding set element) are observable.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesBinding\nimport me.tatarka.inject.annotations.Inject\n\ninterface Base\n\n@Inject\n@ContributesBinding(Unit::class)\nclass Impl : Base\n"
+            ],
+            "inspect": [
+              "com.example.Impl"
+            ]
+          },
+          "expected_output": "status=compiled\ncontribution origin=com.example.Impl\nprovides from=com.example.Impl to=com.example.Base kind=single\n"
+        },
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesBinding\nimport me.tatarka.inject.annotations.Inject\n\ninterface Base\n\n@Inject\n@ContributesBinding(Unit::class, multibinding = true)\nclass Impl : Base\n"
+            ],
+            "inspect": [
+              "com.example.Impl"
+            ]
+          },
+          "expected_output": "status=compiled\ncontribution origin=com.example.Impl\nprovides from=com.example.Impl to=com.example.Base kind=multi\n"
+        }
+      ]
+    },
+    "feature3_merge_component.json": {
+      "description": "A component annotated to merge a scope collects every contribution for that scope; the generated merged super-interface inherits the contributed component interfaces (a nested one and a top-level one), proving the contributions were actually merged into the component.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport me.tatarka.inject.annotations.Component\nimport me.tatarka.inject.annotations.Inject\nimport me.tatarka.inject.annotations.Provides\nimport software.amazon.lastmile.kotlin.inject.anvil.AppScope\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesTo\nimport software.amazon.lastmile.kotlin.inject.anvil.MergeComponent\nimport software.amazon.lastmile.kotlin.inject.anvil.SingleIn\n\ninterface Base\n\n@Inject\n@SingleIn(AppScope::class)\nclass Impl : Base {\n    @ContributesTo(AppScope::class)\n    interface Component {\n        @Provides fun provideImpl(impl: Impl): Base = impl\n        val string: String\n    }\n}\n\n@ContributesTo(AppScope::class)\ninterface StringComponent {\n    @Provides fun provideString(): String = \"abc\"\n}\n\n@Component\n@MergeComponent(AppScope::class)\n@SingleIn(AppScope::class)\nabstract class ComponentInterface : ComponentInterfaceMerged {\n    abstract val base: Base\n}\n"
+            ],
+            "merged": [
+              "com.example.ComponentInterface"
+            ]
+          },
+          "expected_output": "status=compiled\nmerges com.example.Impl.Component\nmerges com.example.StringComponent\n"
+        }
+      ]
+    },
+    "feature3_merge_validation.json": {
+      "description": "Merging validates the wiring: a manually @Component-wired class that merges a scope must add the generated merged super-interface, and excluding a contribution the component still depends on surfaces an unresolved-dependency reason.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport me.tatarka.inject.annotations.Component\nimport software.amazon.lastmile.kotlin.inject.anvil.AppScope\nimport software.amazon.lastmile.kotlin.inject.anvil.MergeComponent\n\n@Component\n@MergeComponent(AppScope::class)\nabstract class ComponentInterface\n"
+            ]
+          },
+          "expected_output": "status=rejected\nerror=invalid_usage\nreason=ComponentInterface is annotated with @MergeComponent and @Component. It's required to add ComponentInterfaceMerged as super type to ComponentInterface. If you don't want to add the super manually, then you must remove the @Component annotation.\n"
+        }
+      ]
+    },
+    "feature4_create_component_validation.json": {
+      "description": "The common-multiplatform factory function that materializes a merged component has strict shape rules: it must be public and use the expect modifier, its return type must itself be a merge target (not hand-wired with @Component), and a receiver, if present, must be the KClass of the component with matching argument and arity.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.AppScope\nimport software.amazon.lastmile.kotlin.inject.anvil.MergeComponent\n\n@MergeComponent(AppScope::class)\ninterface ComponentInterface\n\n@MergeComponent.CreateComponent\ninternal expect fun createComponent(): ComponentInterface\n"
+            ],
+            "multiplatform": true
+          },
+          "expected_output": "status=rejected\nerror=invalid_usage\nreason=Factory functions for components annotated with `@CreateComponent` must be public.\n"
+        }
+      ]
+    },
+    "feature5_subcomponent_factory.json": {
+      "description": "A contributed subcomponent declares a nested factory interface; a factory component stub is generated into the lookup package, named after the fully-qualified factory type, whose origin is the factory and which provides the factory into its parent scope.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesSubcomponent\nimport software.amazon.lastmile.kotlin.inject.anvil.SingleIn\n\n@ContributesSubcomponent(Unit::class)\n@SingleIn(Unit::class)\ninterface SubcomponentInterface {\n    @ContributesSubcomponent.Factory(String::class)\n    interface Factory {\n        fun createSubcomponentInterface(): SubcomponentInterface\n    }\n}\n"
+            ],
+            "inspect": [
+              "com.example.SubcomponentInterface.Factory"
+            ]
+          },
+          "expected_output": "status=compiled\ncontribution origin=com.example.SubcomponentInterface.Factory\nextends com.example.SubcomponentInterface.Factory\nprovides from=none to=com.example.SubcomponentInterface.Factory kind=single\n"
+        }
+      ]
+    },
+    "feature5_subcomponent_validation.json": {
+      "description": "Subcomponent contribution enforces structural rules: the contributed type must be an interface, it must declare exactly one factory inner interface, the factory must contain exactly one function returning the subcomponent, and a kotlin-inject scope must be present.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.ContributesSubcomponent\nimport software.amazon.lastmile.kotlin.inject.anvil.SingleIn\n\n@ContributesSubcomponent(Unit::class)\n@SingleIn(Unit::class)\nabstract class OtherComponent {\n    @ContributesSubcomponent.Factory(Unit::class)\n    interface Parent {\n        fun otherComponent(stringArg: String, intArg: Int): OtherComponent\n    }\n}\n"
+            ]
+          },
+          "expected_output": "status=rejected\nerror=invalid_usage\nreason=Only interfaces can be contributed. If you have parameters on your abstract class, then move them to the factory. See @ContributesSubcomponent for more details.\n"
+        }
+      ]
+    },
+    "feature6_contributing_annotation.json": {
+      "description": "Marking a user-defined annotation as a contributing annotation is accepted and compiles successfully, generating a cross-module discovery marker for the custom annotation in the lookup package.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.extend.ContributingAnnotation\nimport kotlin.annotation.AnnotationTarget.CLASS\n\n@ContributingAnnotation\n@Target(CLASS)\nannotation class ContributesRenderer\n"
+            ],
+            "annotation": [
+              "com.example.ContributesRenderer"
+            ]
+          },
+          "expected_output": "status=compiled\ncontributing-annotation origin=com.example.ContributesRenderer\n"
+        }
+      ]
+    },
+    "feature6_contributing_annotation_validation.json": {
+      "description": "A user-defined annotation marked as contributing must be public; a non-public annotation is rejected with a domain reason.",
+      "cases": [
+        {
+          "input": {
+            "sources": [
+              "package com.example\n\nimport software.amazon.lastmile.kotlin.inject.anvil.extend.ContributingAnnotation\nimport kotlin.annotation.AnnotationTarget.CLASS\n\n@ContributingAnnotation\n@Target(CLASS)\ninternal annotation class ContributesRenderer\n"
+            ]
+          },
+          "expected_output": "status=rejected\nerror=invalid_usage\nreason=Contributing annotations must be public.\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Global Status",
+      "input_condition": "Compilation succeeds",
+      "output_rule": "First line must be 'status=compiled'",
+      "exact_values": [
+        "compiled"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Global Status",
+      "input_condition": "Compilation fails or input invalid",
+      "output_rule": "First line must be 'status=rejected'. Second line must be 'error=invalid_usage'",
+      "exact_values": [
+        "rejected",
+        "invalid_usage",
+        "internal"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Inspected Type Reporting",
+      "input_condition": "User requests report for a specific type via 'inspect' field",
+      "output_rule": "For each successful inspection, emit 'contribution origin=<fqn>' followed by sorted 'extends <fqn>' lines",
+      "exact_values": [
+        "contribution",
+        "origin=",
+        "extends"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Binding Provider Reporting",
+      "input_condition": "Type is a binding contribution (ContributesBinding) with a concrete bound type",
+      "output_rule": "Emit 'provides from=<impl_fqn> to=<bound_fqn> kind=<type>'",
+      "exact_values": [
+        "provides",
+        "from=",
+        "to=",
+        "kind=",
+        "single",
+        "multi"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Subcomponent Factory Reporting",
+      "input_condition": "Type is a subcomponent factory contribution",
+      "output_rule": "Emit 'provides from=none to=<factory_fqn> kind=single'. Does not emit 'extends' lines for the factory itself unless specified.",
+      "exact_values": [
+        "provides",
+        "from=none",
+        "kind=single"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Merged Component Reporting",
+      "input_condition": "User requests report for a component via 'merged' field",
+      "output_rule": "Emit 'merges <fqn>' for each contributing type folded in.",
+      "exact_values": [
+        "merges"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Annotating Custom Annotations",
+      "input_condition": "User requests report for an annotation via 'annotation' field",
+      "output_rule": "Emit 'contributing-annotation origin=<fqn>'",
+      "exact_values": [
+        "contributing-annotation",
+        "origin="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Error Reason Format",
+      "input_condition": "Status is 'rejected'",
+      "output_rule": "Third line (or subsequent unique lines) must start with 'reason=', followed by a domain sentence. No file paths, stack traces, or host types.",
+      "exact_values": [
+        "reason="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "ContributesTo Visibility",
+      "input_condition": "A interface is annotated with ContributesTo",
+      "output_rule": "Must be public. Private modifiers result in rejection",
+      "exact_values": [
+        "Contributed component interfaces must be public."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "ContributesBinding Bound Type",
+      "input_condition": "ContributesBinding annotation is used",
+      "output_rule": "The class must extend exactly one interface. No super types results in rejection.",
+      "exact_values": [
+        "The bound type could not be determined for <class>. There are no super types."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "ContributesBinding Multibinding",
+      "input_condition": "ContributesBinding annotation is used with multibinding=true",
+      "output_rule": "Report kind=multi. Otherwise kind=single",
+      "exact_values": [
+        "kind=multi",
+        "kind=single"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "MergeComponent Super Interface",
+      "input_condition": "A class is annotated with @MergeComponent and @Component",
+      "output_rule": "Must extend ComponentInterfaceMerged. Missing extension results in rejection.",
+      "exact_values": [
+        "It's required to add ComponentInterfaceMerged as super type to <Class>. If you don't want to add the super manually, then you must remove the @Component annotation."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Multiplatform Factory Visibility",
+      "input_condition": "Factory function annotated with @CreateComponent",
+      "output_rule": "Must be public. Internal keywords result in rejection",
+      "exact_values": [
+        "Factory functions for components annotated with `@CreateComponent` must be public."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "ContributesSubcomponent Target",
+      "input_condition": "A type is annotated as ContributesSubcomponent",
+      "output_rule": "Must be an interface. Abstract classes result in rejection.",
+      "exact_values": [
+        "Only interfaces can be contributed."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "ContributingAnnotation Visibility",
+      "input_condition": "An annotation is marked with ContributingAnnotation",
+      "output_rule": "Must be public. Internal modifiers result in rejection",
+      "exact_values": [
+        "Contributing annotations must be public."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Output Sorting",
+      "input_condition": "Any group of lines (extends, merges, provides)",
+      "output_rule": "Lines within a group must be sorted lexicographically",
+      "exact_values": [
+        "sorted"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Input Naming",
+      "input_condition": "Source file text parsed by processor",
+      "output_rule": "Nested type names in output must be normalized to dotted form (e.g., InnerClassName.Array)",
+      "exact_values": [
+        "dotted form"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Batch Execution",
+      "input_condition": "Script runs multiple case files",
+      "output_rule": "Each case produces one stdout block; total execution is in a single process",
+      "exact_values": [
+        "single process"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C002",
+        "replacement": "a specific error category string — consult the internal error taxonomy document",
+        "exact_values_to_replace": [
+          "internal"
+        ],
+        "trigger_keywords": [
+          "what does 'internal' refer to",
+          "is there an internal error code",
+          "explain the internal variable in C002",
+          "what is the value for 'internal', "
+        ],
+        "oracle_response": "The exact string literal 'internal' represents a placeholder for an internal system-specific error category code."
+      },
+      {
+        "constraint_id": "C010",
+        "replacement": "a specific rejection message template — refer to the error message generation module",
+        "exact_values_to_replace": [
+          "The bound type could not be determined for <class>. There are no super types."
+        ],
+        "trigger_keywords": [
+          "why is this exact string shown",
+          "what is the rejection message format",
+          "does it mention <class>",
+          "what does 'no super types' mean in this context",
+          "retrieve the error string from C010"
+        ],
+        "oracle_response": "The exact string 'The bound type could not be determined for <class>. There are no super types.' is the hardcoded rejection message emitted when bound type resolution fails due to a lack of specified super types."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C016",
+        "vague_phrase": "follow the same sorting logic used by the module that handles 'extends' lines",
+        "actual_meaning": "This refers to a lexicographical sort order derived from the output generation logic for the 'extends' section, implying the same custom comparator or dictionary-based ordering used elsewhere in the output formatter."
+      },
+      {
+        "constraint_id": "C017",
+        "vague_phrase": "normalize names according to the convention from the core transformation layer",
+        "actual_meaning": "This requires using the specific dotted notation convention (e.g., 'Package.Sub.Primitive') defined in the core naming rule implementation, rather than the raw tokenized names from the AST."
+      }
+    ]
+  }
+}

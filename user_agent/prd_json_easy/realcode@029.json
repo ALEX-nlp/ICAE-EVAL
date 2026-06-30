@@ -1,0 +1,1090 @@
+{
+  "fuzzy_prd": "# Financial Statement Parser — Structured Extraction from OFX Bank/Card Statement Documents\n\n## Project Goal\n\nBuild a library that ingests an OFX (Open Financial Exchange) statement document — in any of the serialization dialects banks emit in the wild — and turns it into a clean, navigable object model of accounts, transactions, balances and institution metadata, so developers can work with strongly-typed statement data instead of hand-parsing a quirky, half-XML markup format.\n\n---\n\n## Background & Problem\n\nOFX is the format most banks export account statements in, but real-world OFX files are notoriously irregular: some are well-formed XML, some are legacy SGML with unclosed value tags (`<ACCTID>12345` with no closing tag), some collapse the entire document onto a single line, and amounts and dates appear in a grab-bag of locale conventions. Without a parser, developers are forced to write fragile, file-specific string surgery and regular expressions, re-deriving the same normalization rules for every dialect and silently breaking when a new bank's export differs.\n\nWith this library, a caller hands over a document (by file path or raw string) and receives a uniform structure: a list of accounts, each carrying its identifiers, statement window, ledger balance, and an ordered list of transactions with normalized type labels, signed decimal amounts, and parsed timestamps — regardless of which dialect the source used.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility domain (document normalization, markup parsing, value coercion, object-model construction). It MUST NOT be a single god file. Separate the dialect-normalization stage, the structured-document reader, the value coercion helpers (amount/date), and the typed entity model into distinct units with a clear directory tree.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases below are a black-box contract for an execution adapter, NOT the internal data model. The core parser must know nothing about stdin/stdout or the JSON command shape. A thin adapter translates each command into ordinary calls on the parser and renders the resulting object model to text.\n\n3. **Adherence to SOLID Design Principles:** Keep normalization, parsing, value coercion, model construction, and output rendering as separate cohesive units. The entity model should be extendable without modifying the parser; the parser should depend on abstractions, not on a concrete I/O channel.\n\n4. **Robustness & Interface Design:** The public interface should accept either a file path or an in-memory string. Failures (unreadable/absent source, content that cannot be normalized into a valid document) must be modeled as explicit, distinguishable error conditions rather than generic faults or warnings leaking to output.\n\n---\n\n## Core Features\n\n### Feature 1: Parse a single-account bank statement\n\n**As a developer**, I want to load a bank statement document and read its account, balance and transactions as structured fields, so I can process statement data without touching the raw markup.\n\n**Expected Behavior / Usage:**\n\nGiven a document describing one bank account, the parser exposes: the account number, account type, routing identifier, branch/agency identifier, the statement-level transaction-set id, the ledger balance (preserved as written), and the balance-as-of timestamp. The statement carries a currency code and a start/end date window. Each transaction exposes a type code and a human-readable type description derived from it (e.g. a credit code → \"Generic credit\", a cheque code → \"Cheque\"), a signed decimal amount, a unique id, a name and memo (empty string when absent), a category/sic and cheque-number field (empty when absent), a posting date, and a user-initiated date (the literal `none` when the source omits it). Amounts render with any purely-integral value stripped of trailing zeros (`200.00` → `200`, `-100.00` → `-100`). All timestamps render as wall-clock `Y-m-d H:i:s`, and a bracketed timezone-offset suffix in the source does NOT shift those wall-clock fields. A `singleAccountHelper=set` line signals that exactly one account was present. Collections render in source order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_bank_statement.json`\n\n```json\n{\n    \"description\": \"Parse a single-account bank statement and report account identity, balances, the statement window, and each transaction's normalized type label, signed amount, identifiers, descriptions and dates. Integral amounts drop trailing zeros; timestamps render as timezone-independent wall-clock; a missing user-initiated date renders as 'none'.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"accounts\", \"fixture\": \"ofxdata-xml.ofx\"},\n            \"expected_output\": \"accountCount=1\\nsingleAccountHelper=set\\naccount[0].accountNumber=098-121\\naccount[0].accountType=SAVINGS\\naccount[0].routingNumber=987654321\\naccount[0].agencyNumber=\\naccount[0].transactionUid=23382938\\naccount[0].balance=5250.00\\naccount[0].balanceDate=2007-10-15 02:15:29\\naccount[0].currency=USD\\naccount[0].startDate=2007-01-01 00:00:00\\naccount[0].endDate=2007-10-15 00:00:00\\naccount[0].transactionCount=3\\ntransaction[0].type=CREDIT\\ntransaction[0].typeDesc=Generic credit\\ntransaction[0].amount=200\\ntransaction[0].uniqueId=980315001\\ntransaction[0].name=DEPOSIT\\ntransaction[0].memo=automatic deposit\\ntransaction[0].sic=\\ntransaction[0].checkNumber=\\ntransaction[0].date=2007-03-15 00:00:00\\ntransaction[0].userInitiatedDate=2007-03-15 00:00:00\\ntransaction[1].type=CREDIT\\ntransaction[1].typeDesc=Generic credit\\ntransaction[1].amount=150\\ntransaction[1].uniqueId=980310001\\ntransaction[1].name=TRANSFER\\ntransaction[1].memo=Transfer from checking\\ntransaction[1].sic=\\ntransaction[1].checkNumber=\\ntransaction[1].date=2007-03-29 00:00:00\\ntransaction[1].userInitiatedDate=2007-03-29 00:00:00\\ntransaction[2].type=CHECK\\ntransaction[2].typeDesc=Cheque\\ntransaction[2].amount=-100\\ntransaction[2].uniqueId=980309001\\ntransaction[2].name=Cheque\\ntransaction[2].memo=\\ntransaction[2].sic=\\ntransaction[2].checkNumber=1025\\ntransaction[2].date=2007-07-09 00:00:00\\ntransaction[2].userInitiatedDate=2007-07-09 00:00:00\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Read the sign-on / institution block\n\n**As a developer**, I want to read the session sign-on response, so I can confirm the request succeeded and identify the responding institution.\n\n**Expected Behavior / Usage:**\n\nThe document opens with a sign-on response. The parser exposes its status as a numeric code, a severity label, and a message string (empty when the source omits it), plus a human-readable description that the code maps to — code `0` maps to `Success`. It also exposes the session language, the institution's display name and id, and the server timestamp rendered as wall-clock `Y-m-d H:i:s`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_signon.json`\n\n```json\n{\n    \"description\": \"From the sign-on block, report response status (code, severity, message, and the description the code maps to), session language, institution name/id, and the server timestamp as wall-clock time. Code 0 maps to 'Success'; an absent message is empty.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"signon\", \"fixture\": \"ofxdata-xml.ofx\"},\n            \"expected_output\": \"statusCode=0\\nstatusSeverity=INFO\\nstatusMessage=\\nstatusCodeDesc=Success\\nlanguage=ENG\\ninstituteName=MYBANK\\ninstituteId=01234\\ndate=2007-10-15 02:15:29\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Handle documents with multiple accounts\n\n**As a developer**, I want a document carrying several accounts to expose all of them, so I can iterate over every account in one statement export.\n\n**Expected Behavior / Usage:**\n\nWhen a document carries more than one account, the parser collects all of them; a summary reports the total account count, the total number of transactions across all accounts, and the sorted set of distinct statement currencies. The convenience single-account helper is `unset` whenever there is more than one account, and `set` when there is exactly one. The illustrative case below shows a three-account document.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_multiple_accounts.json`\n\n```json\n{\n    \"description\": \"Summarize a document by total account count, total transaction count across accounts, and sorted distinct currencies. With more than one account the single-account helper is unset; with one account it is set.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"summary\", \"fixture\": \"ofx-multiple-accounts-xml.ofx\"},\n            \"expected_output\": \"accountCount=3\\nsingleAccountHelper=unset\\ntransactionCount=3\\ncurrencies=GBP\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Parse a credit-card statement\n\n**As a developer**, I want a credit-card statement — whose account-identity block uses a card-account source rather than a bank-account source — to parse into the same shape as a bank statement, so my downstream code is source-agnostic.\n\n**Expected Behavior / Usage:**\n\nA card statement nests its account identity under a card-account block instead of a bank-account block; the parser detects this and still produces the uniform account/statement/transaction structure. The card number is exposed as the account identifier; fields absent for cards (account type, routing) render empty. Negative ledger balances and signed transaction amounts are preserved.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_credit_card.json`\n\n```json\n{\n    \"description\": \"Parse a credit-card statement whose account identity lives in a card-account source block, producing the same structure as a bank statement: the card number as account id, empty routing/type, preserved signed balance and amount.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"accounts\", \"fixture\": \"ofxdata-credit-card.ofx\"},\n            \"expected_output\": \"accountCount=1\\nsingleAccountHelper=set\\naccount[0].accountNumber=1234567891234567\\naccount[0].accountType=\\naccount[0].routingNumber=\\naccount[0].agencyNumber=\\naccount[0].transactionUid=20160823000000\\naccount[0].balance=-500.00\\naccount[0].balanceDate=2016-08-23 00:00:00\\naccount[0].currency=GBP\\naccount[0].startDate=2016-08-23 00:00:00\\naccount[0].endDate=2016-08-23 00:00:00\\naccount[0].transactionCount=1\\ntransaction[0].type=POS\\ntransaction[0].typeDesc=Point of sale debit or credit\\ntransaction[0].amount=-100\\ntransaction[0].uniqueId=ABCDEFGHIJ\\ntransaction[0].name=VENDOR\\ntransaction[0].memo=\\ntransaction[0].sic=\\ntransaction[0].checkNumber=\\ntransaction[0].date=2016-08-23 00:00:00\\ntransaction[0].userInitiatedDate=2016-08-23 00:00:00\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Tolerate real-world serialization dialects\n\n**As a developer**, I want documents in the many irregular OFX dialects to all parse identically, so I don't need per-bank special-casing.\n\n**Expected Behavior / Usage:**\n\nThe loader first normalizes the input into well-formed markup before reading it. It must accept: a multi-line form with one tag per line where value tags are left unclosed (`<BALAMT>5250.00` with no closing tag), a fully single-line form with the entire document on one physical line, indentation/whitespace variations, and trailing marketing/info text. After normalization every dialect yields the same structured result; the summary reports account count, the single-account helper flag, total transaction count, and sorted distinct currencies. The two illustrative cases show an unclosed-tag multi-line document and a single-line document.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_dialect_tolerance.json`\n\n```json\n{\n    \"description\": \"Load statement documents in several serialization dialects (multi-line with unclosed value tags, fully single-line, whitespace variants, trailing info text) and confirm each normalizes to the same structured result, reported as account count, single-account helper flag, total transaction count, and sorted distinct currencies.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"summary\", \"fixture\": \"ofxdata.ofx\"},\n            \"expected_output\": \"accountCount=1\\nsingleAccountHelper=set\\ntransactionCount=3\\ncurrencies=USD\\n\"\n        },\n        {\n            \"input\": {\"op\": \"summary\", \"fixture\": \"ofxdata-oneline.ofx\"},\n            \"expected_output\": \"accountCount=1\\nsingleAccountHelper=set\\ntransactionCount=8\\ncurrencies=EUR\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Normalize locale-varied money amounts\n\n**As a developer**, I want money strings in any locale convention coerced into one numeric value, so amounts compare and arithmetic correctly regardless of source formatting.\n\n**Expected Behavior / Usage:**\n\nA money string may use a period or a comma as the decimal mark, may or may not include thousands separators, and may carry a leading minus. All of `1000.00`, `1000,00`, `1,000.00` and `1.000,00` denote the same magnitude. The result is a single numeric value; purely-integral results drop trailing zeros (so `1000.00` → `1000`). A bare integer is taken at face value (`1` → `1`, `10` → `10`) EXCEPT that a bare three-digit-or-more run whose last two digits look like a fractional part is treated as having an implied two-decimal fraction — e.g. `100` is interpreted as `1` (the trailing `00` consumed as cents). This last rule is an intentional, documented quirk of the coercion contract.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_amount_normalization.json`\n\n```json\n{\n    \"description\": \"Coerce a money string in any locale convention (period/comma decimal mark, optional thousands separators, optional leading minus) into one numeric value; integral results drop trailing zeros.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"amount\", \"value\": \"1000.00\"}, \"expected_output\": \"amount=1000\\n\"},\n        {\"input\": {\"op\": \"amount\", \"value\": \"1000,00\"}, \"expected_output\": \"amount=1000\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Parse financial timestamps at any precision\n\n**As a developer**, I want statement timestamps parsed regardless of how much precision the source includes, so dates are usable as real datetime values.\n\n**Expected Behavior / Usage:**\n\nA timestamp string may be date-only (`YYYYMMDD`), date plus time (`YYYYMMDDHHMMSS`), date-time with fractional seconds (`…​.XXX`), or date-time with fractional seconds and a bracketed timezone offset (`…​[-5:EST]`). All forms parse to a wall-clock `Y-m-d H:i:s` value. The fractional-second and bracketed timezone-offset components do NOT shift the rendered wall-clock fields — the same date and time-of-day appear whether or not an offset suffix is present.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_date_parsing.json`\n\n```json\n{\n    \"description\": \"Parse a timestamp at any supported precision (date only, date-time, date-time with fractional seconds, date-time with fractional seconds plus bracketed timezone offset) into a wall-clock 'Y-m-d H:i:s' value; the offset and fractional components do not shift the wall-clock fields.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"datetime\", \"value\": \"20081005132200.124[-5:EST]\"}, \"expected_output\": \"datetime=2008-10-05 13:22:00\\n\"},\n        {\"input\": {\"op\": \"datetime\", \"value\": \"20081005\"}, \"expected_output\": \"datetime=2008-10-05 00:00:00\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 8: Distinguishable error conditions\n\n**As a developer**, I want load and parse failures surfaced as distinct, neutral categories, so I can branch on the failure kind instead of scraping error text.\n\n**Expected Behavior / Usage:**\n\nTwo failure modes are modeled distinctly. Content that cannot be normalized into a valid document yields a parse-failure category. Requesting a document from a path that does not exist yields a file-not-found category. Errors are reported as a neutral `error=<category>` line, never as a raw runtime fault or warning text.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_error_handling.json`\n\n```json\n{\n    \"description\": \"Surface failures as neutral categories: content that cannot be normalized into a valid document yields a parse-failure category; a path that does not exist yields a file-not-found category.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"parse\", \"content\": \"<invalid xml>\"}, \"expected_output\": \"error=parse_failed\\n\"},\n        {\"input\": {\"op\": \"load_path\", \"path\": \"a non-existent file\"}, \"expected_output\": \"error=file_not_found\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file library implementing the features above — dialect normalization, structured-document reading, amount/date coercion, and a typed entity model (accounts, transactions, balances, statement, sign-on/institution) — with the parser fully decoupled from standard I/O.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads a single JSON command from stdin (`op` plus its arguments: a `fixture` name, raw `content`, a `path`, or a `value`), invokes the core parser, and prints the normalized text contract to stdout exactly as specified per feature. The adapter is solely responsible for JSON handling, deterministic ordering/rendering, and translating native failures into the neutral `error=<category>` lines.\n\n3. **Automated test harness:** A single entry point `bash rcb_tests/test.sh` that reads every `*.json` case file from a case directory (default `test_cases`, switchable via `--cases-dir <subdir>`, e.g. `public_test_cases`), feeds each case's `input` to the adapter, and writes the raw program stdout to `rcb_tests/stdout/<cases-dir>/{stem}@{idx:03d}.txt` — one file per case, containing only the program output so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the same ordering convention as the headers module\n- apply only if the transaction type is a standard deposit\n",
+  "oracle_data": {
+    "task_id": "asgrim__ofxparser-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C012",
+        "trigger_keywords": [
+          "what does C012 specify",
+          "thousands sep 2 rule",
+          "dot as separator flag",
+          "C012 decimal position",
+          "is this format signed 04"
+        ],
+        "oracle_response": "C012 defines the behavior where a dot serves as a thousands separator in the specified input format."
+      },
+      {
+        "constraint_id": "C019",
+        "trigger_keywords": [
+          "positive decimals greater C019",
+          "first two digits fractional",
+          "trailing _6 rule",
+          "fractional parsing C019",
+          "input_format_amount_trailing_6 meaning"
+        ],
+        "oracle_response": "C019 specifies that for the given input format, the first two digits after the decimal point are treated as the fractional amount."
+      },
+      {
+        "constraint_id": "C033",
+        "trigger_keywords": [
+          "C033 commission mean",
+          "treat as charge amount",
+          "deposit commission input",
+          "invalidates for payment type C033",
+          "is C033 the latest"
+        ],
+        "oracle_response": "C033 interprets the commission field as a charge amount within the deposit transaction format."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the same ordering convention as the headers module",
+        "actual_meaning": "The thousands_sep_2 constraint requires the dot character to be used as the primary thousands separator, overriding the dot-as-decimal mark rule from C009/C010 in its specific context."
+      },
+      {
+        "vague_reference": "apply only if the transaction type is a standard deposit",
+        "actual_meaning": "The commission interpretation as a 'charge amount' (C033) is strictly bounded by the input condition `input_format_deposit`; for payment or withdrawal types, this mapping does not apply."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_bank_statement.json": {
+      "description": "Parse a single-account bank statement and report account identity, balances, the statement window, and each transaction's normalized type label, signed amount, identifiers, descriptions and dates. Integral amounts drop trailing zeros; timestamps render as timezone-independent wall-clock; a missing user-initiated date renders as 'none'.",
+      "cases": [
+        {
+          "input": {
+            "op": "accounts",
+            "fixture": "ofxdata-xml.ofx"
+          },
+          "expected_output": "accountCount=1\nsingleAccountHelper=set\naccount[0].accountNumber=098-121\naccount[0].accountType=SAVINGS\naccount[0].routingNumber=987654321\naccount[0].agencyNumber=\naccount[0].transactionUid=23382938\naccount[0].balance=5250.00\naccount[0].balanceDate=2007-10-15 02:15:29\naccount[0].currency=USD\naccount[0].startDate=2007-01-01 00:00:00\naccount[0].endDate=2007-10-15 00:00:00\naccount[0].transactionCount=3\ntransaction[0].type=CREDIT\ntransaction[0].typeDesc=Generic credit\ntransaction[0].amount=200\ntransaction[0].uniqueId=980315001\ntransaction[0].name=DEPOSIT\ntransaction[0].memo=automatic deposit\ntransaction[0].sic=\ntransaction[0].checkNumber=\ntransaction[0].date=2007-03-15 00:00:00\ntransaction[0].userInitiatedDate=2007-03-15 00:00:00\ntransaction[1].type=CREDIT\ntransaction[1].typeDesc=Generic credit\ntransaction[1].amount=150\ntransaction[1].uniqueId=980310001\ntransaction[1].name=TRANSFER\ntransaction[1].memo=Transfer from checking\ntransaction[1].sic=\ntransaction[1].checkNumber=\ntransaction[1].date=2007-03-29 00:00:00\ntransaction[1].userInitiatedDate=2007-03-29 00:00:00\ntransaction[2].type=CHECK\ntransaction[2].typeDesc=Cheque\ntransaction[2].amount=-100\ntransaction[2].uniqueId=980309001\ntransaction[2].name=Cheque\ntransaction[2].memo=\ntransaction[2].sic=\ntransaction[2].checkNumber=1025\ntransaction[2].date=2007-07-09 00:00:00\ntransaction[2].userInitiatedDate=2007-07-09 00:00:00\n"
+        }
+      ]
+    },
+    "feature2_signon.json": {
+      "description": "From the sign-on block, report response status (code, severity, message, and the description the code maps to), session language, institution name/id, and the server timestamp as wall-clock time. Code 0 maps to 'Success'; an absent message is empty.",
+      "cases": [
+        {
+          "input": {
+            "op": "signon",
+            "fixture": "ofxdata-xml.ofx"
+          },
+          "expected_output": "statusCode=0\nstatusSeverity=INFO\nstatusMessage=\nstatusCodeDesc=Success\nlanguage=ENG\ninstituteName=MYBANK\ninstituteId=01234\ndate=2007-10-15 02:15:29\n"
+        }
+      ]
+    },
+    "feature3_multiple_accounts.json": {
+      "description": "Summarize a document by total account count, total transaction count across accounts, and sorted distinct currencies. With more than one account the single-account helper is unset; with one account it is set.",
+      "cases": [
+        {
+          "input": {
+            "op": "summary",
+            "fixture": "ofx-multiple-accounts-xml.ofx"
+          },
+          "expected_output": "accountCount=3\nsingleAccountHelper=unset\ntransactionCount=3\ncurrencies=GBP\n"
+        }
+      ]
+    },
+    "feature4_credit_card.json": {
+      "description": "Parse a credit-card statement whose account identity lives in a card-account source block, producing the same structure as a bank statement: the card number as account id, empty routing/type, preserved signed balance and amount.",
+      "cases": [
+        {
+          "input": {
+            "op": "accounts",
+            "fixture": "ofxdata-credit-card.ofx"
+          },
+          "expected_output": "accountCount=1\nsingleAccountHelper=set\naccount[0].accountNumber=1234567891234567\naccount[0].accountType=\naccount[0].routingNumber=\naccount[0].agencyNumber=\naccount[0].transactionUid=20160823000000\naccount[0].balance=-500.00\naccount[0].balanceDate=2016-08-23 00:00:00\naccount[0].currency=GBP\naccount[0].startDate=2016-08-23 00:00:00\naccount[0].endDate=2016-08-23 00:00:00\naccount[0].transactionCount=1\ntransaction[0].type=POS\ntransaction[0].typeDesc=Point of sale debit or credit\ntransaction[0].amount=-100\ntransaction[0].uniqueId=ABCDEFGHIJ\ntransaction[0].name=VENDOR\ntransaction[0].memo=\ntransaction[0].sic=\ntransaction[0].checkNumber=\ntransaction[0].date=2016-08-23 00:00:00\ntransaction[0].userInitiatedDate=2016-08-23 00:00:00\n"
+        }
+      ]
+    },
+    "feature5_dialect_tolerance.json": {
+      "description": "Load statement documents in several serialization dialects (multi-line with unclosed value tags, fully single-line, whitespace variants, trailing info text) and confirm each normalizes to the same structured result, reported as account count, single-account helper flag, total transaction count, and sorted distinct currencies.",
+      "cases": [
+        {
+          "input": {
+            "op": "summary",
+            "fixture": "ofxdata.ofx"
+          },
+          "expected_output": "accountCount=1\nsingleAccountHelper=set\ntransactionCount=3\ncurrencies=USD\n"
+        },
+        {
+          "input": {
+            "op": "summary",
+            "fixture": "ofxdata-oneline.ofx"
+          },
+          "expected_output": "accountCount=1\nsingleAccountHelper=set\ntransactionCount=8\ncurrencies=EUR\n"
+        }
+      ]
+    },
+    "feature6_amount_normalization.json": {
+      "description": "Coerce a money string in any locale convention (period/comma decimal mark, optional thousands separators, optional leading minus) into one numeric value; integral results drop trailing zeros.",
+      "cases": [
+        {
+          "input": {
+            "op": "amount",
+            "value": "1000.00"
+          },
+          "expected_output": "amount=1000\n"
+        },
+        {
+          "input": {
+            "op": "amount",
+            "value": "1000,00"
+          },
+          "expected_output": "amount=1000\n"
+        }
+      ]
+    },
+    "feature7_date_parsing.json": {
+      "description": "Parse a timestamp at any supported precision (date only, date-time, date-time with fractional seconds, date-time with fractional seconds plus bracketed timezone offset) into a wall-clock 'Y-m-d H:i:s' value; the offset and fractional components do not shift the wall-clock fields.",
+      "cases": [
+        {
+          "input": {
+            "op": "datetime",
+            "value": "20081005132200.124[-5:EST]"
+          },
+          "expected_output": "datetime=2008-10-05 13:22:00\n"
+        },
+        {
+          "input": {
+            "op": "datetime",
+            "value": "20081005"
+          },
+          "expected_output": "datetime=2008-10-05 00:00:00\n"
+        }
+      ]
+    },
+    "feature8_error_handling.json": {
+      "description": "Surface failures as neutral categories: content that cannot be normalized into a valid document yields a parse-failure category; a path that does not exist yields a file-not-found category.",
+      "cases": [
+        {
+          "input": {
+            "op": "parse",
+            "content": "<invalid xml>"
+          },
+          "expected_output": "error=parse_failed\n"
+        },
+        {
+          "input": {
+            "op": "load_path",
+            "path": "a non-existent file"
+          },
+          "expected_output": "error=file_not_found\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "single_account_helper",
+      "input_condition": "document_parsed",
+      "output_rule": "if accountCount == 1 then set 'singleAccountHelper' to 'set' else unset 'singleAccountHelper'",
+      "exact_values": [
+        "set",
+        "unset"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "module_name",
+      "input_condition": "reporting_account_data",
+      "output_rule": "handle a single bank statement account",
+      "exact_values": [
+        "accounts"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "signon_data",
+      "input_condition": "reporting_signon_data",
+      "output_rule": "handle session sign-on response",
+      "exact_values": [
+        "signon"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "multiple_accounts",
+      "input_condition": "reporting_merge_data",
+      "output_rule": "handle documents with multiple accounts",
+      "exact_values": [
+        "summary"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "credit_card_format",
+      "input_condition": "reporting_credit_card_data",
+      "output_rule": "handle card account source block instead of bank account source block",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "unclosed_tags",
+      "input_condition": "normalized_input_format_flat_lines",
+      "output_rule": "normalize input where value tags lack closing tags (e.g. '<BALAMT>5250.00')",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "whole_document_single_line",
+      "input_condition": "normalized_input_format_wide_sep",
+      "output_rule": "normalize input where all data is on a single physical line",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "trailing_mktg_text",
+      "input_condition": "normalized_input_format_trailing_text",
+      "output_rule": "normalize input with trailing marketing or informational text blocks",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "decimal_point",
+      "input_condition": "input_format_signed_01",
+      "output_rule": "treat dot as decimal mark",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "decimal_comma",
+      "input_condition": "input_format_signed_02",
+      "output_rule": "treat comma as decimal mark",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "thousands_sep",
+      "input_condition": "input_format_signed_03",
+      "output_rule": "treat comma as thousands separator",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "thousands_sep_2",
+      "input_condition": "input_format_signed_04",
+      "output_rule": "treat dot as thousands separator",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "trailing_center_0",
+      "input_condition": "input_format_amount_trailing_0",
+      "output_rule": "treat trailing zeros as significant fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "trailing_center_1",
+      "input_condition": "input_format_amount_trailing_1",
+      "output_rule": "ignore trailing zeros as fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "three_digit_trailing_0",
+      "input_condition": "input_format_amount_trailing_2",
+      "output_rule": "last two digits are ignored when counted as fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "three_digit_trailing_1",
+      "input_condition": "input_format_amount_trailing_3",
+      "output_rule": "last two digits are counted as fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "four_digit_trailing_0",
+      "input_condition": "input_format_amount_trailing_4",
+      "output_rule": "last four digits are ignored as fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "four_digit_trailing_1",
+      "input_condition": "input_format_amount_trailing_5",
+      "output_rule": "last two digits are counted as fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "positive_decimals_greater",
+      "input_condition": "input_format_amount_trailing_6",
+      "output_rule": "first two digits are fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "negative_decimals_greater",
+      "input_condition": "input_format_amount_trailing_6",
+      "output_rule": "first two digits are fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "negative_decimals_greater",
+      "input_condition": "input_format_amount_trailing_7",
+      "output_rule": "last four digits are fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "negative_decimals_greater",
+      "input_condition": "input_format_amount_trailing_8",
+      "output_rule": "first two digits are fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "negative_decimals_greater",
+      "input_condition": "input_format_amount_trailing_9",
+      "output_rule": "last four digits are fractional amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "integer_representation",
+      "input_condition": "input_format_integer_int",
+      "output_rule": "treat as integer value",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "integer_representation",
+      "input_condition": "input_format_integer_int",
+      "output_rule": "treat as integer (excluding fractional digits from integer)",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "date_precision",
+      "input_condition": "input_format_date",
+      "output_rule": "parse literal date string without time components",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "negative_date",
+      "input_condition": "input_format_datetime",
+      "output_rule": "treat as negative time offset for future generation",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "negative_date",
+      "input_condition": "input_format_datetime",
+      "output_rule": "treat as positive time offset for future generation",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "fractional_seconds",
+      "input_condition": "input_format_date",
+      "output_rule": "treat as fractional seconds for time-only output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "fractional_seconds",
+      "input_condition": "input_format_date",
+      "output_rule": "treat as fractional seconds for time-only output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "fractional_seconds",
+      "input_condition": "input_format_date",
+      "output_rule": "treat as fractional seconds for time-only output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "fractional_seconds",
+      "input_condition": "input_format_date",
+      "output_rule": "treat as fractional seconds for time-only output",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as charge amount for transactions",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit payment transfer amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit cheque withdrawal amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit payment transaction amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit collection or deposit amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C039",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit loan or credit transaction amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit cheque deposit or transfer amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C041",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transfer or withdrawal amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C042",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit cheque collection or deposit amount",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C043",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C044",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C045",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C046",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C047",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C048",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C049",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C050",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C051",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C052",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C053",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C054",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C055",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C056",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C057",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C058",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C059",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C060",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C061",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C062",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C063",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C064",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C065",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C066",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C067",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C068",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C069",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C070",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C071",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C072",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C073",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C074",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C075",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C076",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C077",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C078",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C079",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C080",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C081",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C082",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C083",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C084",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C085",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C086",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C087",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C088",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C089",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C090",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C091",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C092",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C093",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C094",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C095",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for cheques",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C096",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for collections",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C097",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for deposits",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C098",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for withdrawals",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C099",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C100",
+      "feature": "commission",
+      "input_condition": "input_format_deposit",
+      "output_rule": "treat as explicit transaction type for payments",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C101",
+      "feature": "instant_payment_final",
+      "input_condition": "input_format_payment",
+      "output_rule": "treat as final transaction for instant payment transfers",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C102",
+      "feature": "fractional_amounts",
+      "input_condition": "input_format_fractional",
+      "output_rule": "treat as final output for fractional amount parsing",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C103",
+      "feature": "error_handling",
+      "input_condition": "input_format_invalid",
+      "output_rule": "treat as final output for invalid XML parsing",
+      "exact_values": [
+        "parse_failed"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C104",
+      "feature": "error_handling",
+      "input_condition": "input_format_missing_file",
+      "output_rule": "treat as final output for missing file path",
+      "exact_values": [
+        "file_not_found"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C012",
+        "replacement": "a different thousands separator convention",
+        "exact_values_to_replace": [
+          ""
+        ],
+        "trigger_keywords": [
+          "what does C012 specify",
+          "thousands sep 2 rule",
+          "dot as separator flag",
+          "C012 decimal position",
+          "is this format signed 04"
+        ],
+        "oracle_response": "C012 defines the behavior where a dot serves as a thousands separator in the specified input format.",
+        "ambiguous": true
+      },
+      {
+        "constraint_id": "C019",
+        "replacement": "a specific fractional amount interpretation for positive decimals",
+        "exact_values_to_replace": [
+          ""
+        ],
+        "trigger_keywords": [
+          "positive decimals greater C019",
+          "first two digits fractional",
+          "trailing _6 rule",
+          "fractional parsing C019",
+          "input_format_amount_trailing_6 meaning"
+        ],
+        "oracle_response": "C019 specifies that for the given input format, the first two digits after the decimal point are treated as the fractional amount.",
+        "ambiguous": true
+      },
+      {
+        "constraint_id": "C033",
+        "replacement": "an abstract sentinel for commission categorization",
+        "exact_values_to_replace": [
+          ""
+        ],
+        "trigger_keywords": [
+          "C033 commission mean",
+          "treat as charge amount",
+          "deposit commission input",
+          "invalidates for payment type C033",
+          "is C033 the latest"
+        ],
+        "oracle_response": "C033 interprets the commission field as a charge amount within the deposit transaction format.",
+        "ambiguous": true
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "follow the same ordering convention as the headers module",
+        "actual_meaning": "The thousands_sep_2 constraint requires the dot character to be used as the primary thousands separator, overriding the dot-as-decimal mark rule from C009/C010 in its specific context."
+      },
+      {
+        "constraint_id": "C033",
+        "vague_phrase": "apply only if the transaction type is a standard deposit",
+        "actual_meaning": "The commission interpretation as a 'charge amount' (C033) is strictly bounded by the input condition `input_format_deposit`; for payment or withdrawal types, this mapping does not apply."
+      }
+    ]
+  }
+}

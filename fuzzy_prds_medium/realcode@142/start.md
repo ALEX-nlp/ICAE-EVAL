@@ -1,0 +1,21 @@
+## Product Requirement Document
+
+Hey team, we need a spell-checking CLI tool for our source repos. The idea is pretty straightforward — we've been accumulating tons of typos in comments and docs across multiple codebases and it's becoming embarrassing when external contributors notice them. We want something that only flags words we *know* are wrong (no false positives from identifiers or jargon), and can optionally just fix them automatically in-place.
+
+Basically it should scan files or whole directories, tell you where the typos are (file + line), and suggest corrections. When fixing automatically it should be smart about capitalization — like if someone typed a word in all-caps it should fix it in all-caps too, same deal with title case.
+
+We also need ways to suppress certain words from being reported (both inline and from a file), skip certain files by pattern, and handle weird encodings gracefully. There's also that summary mode we talked about in the last sprint — same approach we used for the login module audit tool, so refer to that for how the tallying should look.
+
+One thing I keep forgetting to mention: the quiet flag behavior — it's a bitmask thing, not just a boolean. Make sure whoever implements this checks how bit 16 specifically is supposed to work with the file-rewrite notifications. Also need proper error handling if someone points it at a dictionary file that doesn't exist. The word-boundary logic matters too — by default underscores should keep things glued together.
+
+Quick follow-up since a few folks asked how the output should look. For findings in file content, print each one as `<path>:<line>: <wrong>  ==> <fix>` — that spacing matters, including exactly two spaces before `==>`. If filename checking is turned on and the hit is in the file’s name, print it as `<path>: <wrong>  ==> <fix>` with no line number. And regardless of mode, the total always goes on its own line at the end as `count=<n>`.
+
+On the casing behavior, the fix should mirror the original typo using exactly these four cases: all lowercase → correction is all lowercase; title case (only first letter capitalized) → correction is title-cased; all uppercase → correction is all uppercase; anything else with mixed casing should just fall back to the plain lowercase correction from the dictionary.
+
+Also, by default we’re only checking file contents. If someone passes `-f` or `--check-filenames`, then the words that make up each file’s name get checked too, and if there’s a misspelling there it’s reported as `<path>: <wrong>  ==> <fix>` since there’s no content line involved.
+
+For ignore behavior, `-L <words>` is a comma-separated list of words to never report, and it can be provided multiple times so all of those lists get combined. Matching there is case-insensitive, and anything on that combined ignore list is just silently skipped while everything else still reports normally. Separately, `-x <path>` points at a file of whole lines to skip. If a line in the target file has full text that exactly matches a line in that exclude file, skip that target line entirely and don’t report misspellings from it. Lines not in the exclude file should be checked like normal.
+
+One more note on the quiet flag since that came up again: `-q <n>` is a numeric bitmask. Bit 16 (value 16) is the one that controls the `fixed=<name>` message when we rewrite files in place. So with bit 16 set, like `-q 16`, the file still gets rewritten, you just don’t print the `fixed=` line. If that bit isn’t set, print it normally. Other bits may still control other message categories.
+
+And for `--summary` / `-s`, after all the per-finding lines the tool should print a blank line, then `-------8<-------`, then `SUMMARY:`, then one line per distinct misspelled word keyed by lowercase form and sorted alphabetically, formatted as `<word>    <count>` with right-aligned numeric padding. If nothing was found, that section still shows up, just with no word lines. After the summary, print `count=<n>`.

@@ -1,0 +1,687 @@
+{
+  "fuzzy_prd": "Hey team, following up on the proxy router project. We've had a few complaints from ops lately — mainly around deployments causing brief outages and some confusion about how traffic gets handled when backends aren't ready yet. We want to tighten this up.\n\nThe big thing is: we need the router to be smarter about accepting new backends. Like, it shouldn't just blindly start sending traffic to something that isn't actually responding correctly yet. There should be some kind of window where we verify it's healthy first — similar to how we handled readiness in that gateway module a while back.\n\nAlso, we've been getting reports of weird behavior when two teams accidentally register their services on the same hostname. Right now it's unclear what wins and users get inconsistent responses. We need deterministic behavior there.\n\nOn the security side, some services are supposed to be HTTPS-only but plaintext requests are sneaking through. We need proper enforcement — and there's a known edge case with certain host patterns that certificate automation can't handle, so that combo should be blocked at registration time.\n\nFinally, the on-call team wants operational controls — ability to hold traffic briefly during a maintenance window, then release it, and a clean shutdown mode that doesn't just drop everything. The timeout values for these holding periods need to be configurable per operation. Let's get this scoped out properly.\n\nA couple extra details from the questions that came in. On deploys, the intent is that before a newly registered backend receives any traffic, the router probes its health endpoint. If the health endpoint does not return a success status within the configured deploy timeout window, the deployment fails with error=target_unhealthy and no routing change takes effect. The deploy_timeout_ms parameter on the deploy operation controls this window. This is the same idea we called out in Feature 4 (feature4_target_health.json): health-gated activation using a deploy_timeout_ms window that probes the backend's health endpoint before activating routing. Also on the maintenance controls, Feature 6 (feature6_pause_resume_stop.json) is the one to follow: pause_timeout_ms is a per-operation parameter on the pause step, and deploy_timeout_ms is a per-operation parameter on the deploy step.\n\nOn host ownership, we should make this strict and predictable: a host may be claimed by at most one service at a time. If a different-named service attempts to register under a host already owned by another service, the deployment is rejected with error=host_in_use and the original service continues serving that host unchanged. If it's the same service name coming back under the same host, that's allowed and atomically swaps its backend. For matching, a wildcard pattern *.example.com matches any single-label subdomain (e.g. foo.example.com) but NOT the bare base domain (example.com). Exact host registrations always take precedence over overlapping wildcard registrations. A service registered with an empty host set acts as a catch-all, receiving any request not matched by another service.\n\nOn the HTTPS side, the wildcard limitation should be blocked up front. Registering a TLS-enabled service under a wildcard host pattern (e.g. *.example.com) is explicitly rejected with error=automatic_tls_wildcard_unsupported because automatic certificate provisioning cannot cover wildcard hosts. This is enforced at registration time before any health check is performed.\n\nOne other thing we should be clear about in the response path: the response buffering middleware switches to unbuffered pass-through when the handler's response has a content type marking it as an event stream (e.g. text/event-stream). In this case the content is streamed directly to the client regardless of the configured buffer limit. A buffered response that exceeds the maximum is replaced with an internal-server-error response.\n\nAnd for error pages/templates, a template source that contains no usable templates is rejected at load time with an unable-to-load error. Inner error page middleware can override outer middleware for specific status codes; statuses not defined by the inner set fall through to the outer set. When no custom template exists for a given status, a generic error page is produced.",
+  "oracle_data": {
+    "task_id": "kamal-proxy-router-001",
+    "golden_api_signature": "func (r *Router) Deploy(name string, hosts []string, target string, opts DeployOptions) error",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "pause behavior timeout",
+          "what happens to requests during a pause",
+          "how long does pause hold traffic"
+        ],
+        "oracle_response": "While a service is paused, matching requests are held (not immediately rejected) until a bounded pause window elapses, then answered with status 504 (Gateway Timeout) with body 'Gateway Timeout'. The pause_timeout_ms parameter on the pause operation controls this window. Resuming the service before the window elapses restores normal routing for subsequent requests."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "stopped service behavior",
+          "what does stop do vs pause",
+          "health endpoint when service is stopped"
+        ],
+        "oracle_response": "A stopped service continues to answer its health endpoint with a 200 success response (empty body) but answers all other matching requests with a service-unavailable response. This is distinct from paused, where requests are held temporarily. The stop state allows health checks to pass while preventing user traffic from reaching the backend."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "TLS redirect body",
+          "plaintext redirect response body",
+          "HTTP to HTTPS redirect behavior per method"
+        ],
+        "oracle_response": "When a service has TLS enabled and receives a plaintext HTTP request, it responds with status 301. For request methods that emit a redirect body (e.g. GET), the body contains the HTML redirect link in the format: <a href=\"https://...\">Moved Permanently</a>. For methods that do not emit a redirect body (e.g. POST), the body is empty. Non-TLS services receiving HTTPS requests are rejected with a service-unavailable response."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "request body size limit",
+          "how is oversized request handled",
+          "max_request_body_size behavior"
+        ],
+        "oracle_response": "When buffer_requests is enabled on a service with a max_request_body_size configured, a request whose body fits within the maximum is forwarded to the backend normally. A request whose body exceeds the maximum is rejected with status 413 and body 'Request too large' and never reaches the backend."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "rollout selection algorithm",
+          "how is canary split computed",
+          "FNV hash rollout determinism"
+        ],
+        "oracle_response": "Rollout group membership is determined by computing a stable 32-bit FNV-1a hash of the client identifier value, taking that hash modulo 100, and including the client if the result is strictly less than the configured target percentage. Identifiers in an explicit allowlist are always included regardless of percentage. A request carrying no identifier is never included in the rollout group."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "request ID middleware behavior",
+          "what happens when request already has an ID",
+          "generated request identifier length"
+        ],
+        "oracle_response": "The request-ID middleware preserves an existing identifier header unchanged if the incoming request already carries one. If no identifier is present, a fresh one is generated and attached before the request proceeds to the handler. Generated identifiers are 36 characters in length (UUID format). The request always proceeds to the handler in both cases."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "TC_feature10_request_id",
+        "trigger_keywords": [
+          "test cases for feature10 request id",
+          "show me feature10 request id test cases",
+          "what are the feature10 request id test inputs",
+          "give me the feature10_request_id test file",
+          "test cases for feature 10",
+          "feature10 request id expected output",
+          "what does feature10 request id expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_request_id:\n{\n  \"description\": \"A middleware ensures every request carries a request-identifier header before reaching the handler. When the incoming request already carries an identifier it is preserved unchanged. When the incoming request has no identifier a fresh one is generated and attached. The request always proceeds to the handler. Each case reports the response status and either the preserved identifier or whether an identifier was generated together with its length.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"request_id\",\n        \"has_incoming\": false\n      },\n      \"expected_output\": \"status=200\\nrequest_id_present=true\\nrequest_id_length=36\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_request_buffering",
+        "trigger_keywords": [
+          "test cases for feature11 request buffering",
+          "show me feature11 request buffering test cases",
+          "what are the feature11 request buffering test inputs",
+          "give me the feature11_request_buffering test file",
+          "test cases for feature 11",
+          "feature11 request buffering expected output",
+          "what does feature11 request buffering expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_request_buffering:\n{\n  \"description\": \"A middleware buffers the request body in memory up to a memory threshold, spilling to backing storage beyond it, and enforces an overall maximum body size. A request whose body fits within the overall maximum is passed to the handler, which returns its response. A request whose body exceeds the overall maximum is rejected with a payload-too-large response and the handler is not invoked. Each case reports the response status and body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"request_buffer_mw\",\n        \"max_mem_bytes\": 1024,\n        \"max_bytes\": 100,\n        \"request_body\": \"small\",\n        \"response_body\": \"handled\"\n      },\n      \"expected_output\": \"status=200 body=handled\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature12_response_buffering",
+        "trigger_keywords": [
+          "test cases for feature12 response buffering",
+          "show me feature12 response buffering test cases",
+          "what are the feature12 response buffering test inputs",
+          "give me the feature12_response_buffering test file",
+          "test cases for feature 12",
+          "feature12 response buffering expected output",
+          "what does feature12 response buffering expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_response_buffering:\n{\n  \"description\": \"A middleware buffers the handler's response up to a configured maximum before forwarding it to the client. A response within the limit is forwarded with its status and body intact. A response whose content type marks it as an event stream switches to unbuffered pass-through once the handler writes its header, so its content is streamed regardless of the buffer limit. A redirect produced by the handler is forwarded with its redirect status and link body. A buffered response that exceeds the maximum is replaced with an internal-server-error response. Each case reports the response status and body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"response_buffer_mw\",\n        \"max_mem_bytes\": 1024,\n        \"max_bytes\": 1024,\n        \"response_body\": \"hello body\"\n      },\n      \"expected_output\": \"status=200 body=hello body\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature13_error_pages",
+        "trigger_keywords": [
+          "test cases for feature13 error pages",
+          "show me feature13 error pages test cases",
+          "what are the feature13 error pages test inputs",
+          "give me the feature13_error_pages test file",
+          "test cases for feature 13",
+          "feature13 error pages expected output",
+          "what does feature13 error pages expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature13_error_pages:\n{\n  \"description\": \"A middleware renders a custom error page when a downstream handler signals an error status. Error page templates are HTML files named after the status code; when a template for the signalled status exists it is rendered with the supplied arguments, otherwise a generic page is produced by the outermost middleware. Middlewares may be nested so an inner set of templates overrides an outer one for statuses it defines, while statuses it does not define fall through to the outer set. A template source that contains no usable templates is rejected with an unable-to-load error. Each case reports the response status, content type and rendered body, or the normalized load error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"error_page\",\n        \"root\": true,\n        \"outer_pages\": {\n          \"404.html\": \"<h1>custom not found</h1>\"\n        },\n        \"status\": 404,\n        \"message\": \"missing\"\n      },\n      \"expected_output\": \"status=404 content_type=text/html; charset=utf-8 body=<h1>custom not found</h1>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_host_routing",
+        "trigger_keywords": [
+          "test cases for feature1 host routing",
+          "show me feature1 host routing test cases",
+          "what are the feature1 host routing test inputs",
+          "give me the feature1_host_routing test file",
+          "test cases for feature 1",
+          "feature1 host routing expected output",
+          "what does feature1 host routing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_host_routing:\n{\n  \"description\": \"An incoming request is routed to a backend by matching the request host against the set of services registered in the router. Each service is registered under one or more exact hostnames. When the incoming host matches a registered service the request is forwarded to that service's backend and the backend's response status and body are returned to the client. When the incoming host matches no registered service the router returns a not-found response. Each registration is reported as succeeding, and each probe reports the resulting response status together with the backend-provided body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"router_scenario\",\n        \"backends\": {\n          \"primary\": {\n            \"body\": \"primary-app\"\n          }\n        },\n        \"steps\": [\n          {\n            \"op\": \"deploy\",\n            \"name\": \"s1\",\n            \"hosts\": [\n              \"app.example.com\"\n            ],\n            \"target\": \"primary\"\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://app.example.com/\",\n            \"method\": \"GET\"\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://unknown.example.com/\",\n            \"method\": \"GET\"\n          }\n        ]\n      },\n      \"expected_output\": \"deploy s1 ok\\nstatus=200 target=primary-app\\nstatus=404 target=Not Found\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_wildcard_routing",
+        "trigger_keywords": [
+          "test cases for feature2 wildcard routing",
+          "show me feature2 wildcard routing test cases",
+          "what are the feature2 wildcard routing test inputs",
+          "give me the feature2_wildcard_routing test file",
+          "test cases for feature 2",
+          "feature2 wildcard routing expected output",
+          "what does feature2 wildcard routing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_wildcard_routing:\n{\n  \"description\": \"A service may be registered under a wildcard host pattern that matches any single-label subdomain of a base domain, or with an empty host set that makes it the catch-all for requests not matched by any other service. An exact host registration takes precedence over an overlapping wildcard registration. A wildcard pattern matches subdomains but not the bare base domain itself. Each probe reports the resulting response status and the backend-provided body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"router_scenario\",\n        \"backends\": {\n          \"wildcard\": {\n            \"body\": \"wildcard-app\"\n          }\n        },\n        \"steps\": [\n          {\n            \"op\": \"deploy\",\n            \"name\": \"sw\",\n            \"hosts\": [\n              \"*.example.com\"\n            ],\n            \"target\": \"wildcard\"\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://foo.example.com/\",\n            \"method\": \"GET\"\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://example.com/\",\n            \"method\": \"GET\"\n          }\n        ]\n      },\n      \"expected_output\": \"deploy sw ok\\nstatus=200 target=wildcard-app\\nstatus=404 target=Not Found\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_host_conflict",
+        "trigger_keywords": [
+          "test cases for feature3 host conflict",
+          "show me feature3 host conflict test cases",
+          "what are the feature3 host conflict test inputs",
+          "give me the feature3_host_conflict test file",
+          "test cases for feature 3",
+          "feature3 host conflict expected output",
+          "what does feature3 host conflict expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_host_conflict:\n{\n  \"description\": \"A host may be claimed by at most one service at a time. Registering a new service under a host that is already claimed by a different service is rejected with a host-already-in-use error, and the original service keeps serving that host. Re-registering an existing service by the same name under the same host is allowed and atomically swaps its backend. Each registration reports success or the normalized error category, and each probe reports the response status and backend body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"router_scenario\",\n        \"backends\": {\n          \"a\": {\n            \"body\": \"service-a\"\n          },\n          \"b\": {\n            \"body\": \"service-b\"\n          }\n        },\n        \"steps\": [\n          {\n            \"op\": \"deploy\",\n            \"name\": \"s1\",\n            \"hosts\": [\n              \"h.example.com\"\n            ],\n            \"target\": \"a\"\n          },\n          {\n            \"op\": \"deploy\",\n            \"name\": \"s2\",\n            \"hosts\": [\n              \"h.example.com\"\n            ],\n            \"target\": \"b\"\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://h.example.com/\",\n            \"method\": \"GET\"\n          }\n        ]\n      },\n      \"expected_output\": \"deploy s1 ok\\ndeploy s2 error=host_in_use\\nstatus=200 target=service-a\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_target_health",
+        "trigger_keywords": [
+          "test cases for feature4 target health",
+          "show me feature4 target health test cases",
+          "what are the feature4 target health test inputs",
+          "give me the feature4_target_health test file",
+          "test cases for feature 4",
+          "feature4 target health expected output",
+          "what does feature4 target health expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_target_health:\n{\n  \"description\": \"Before a newly registered backend begins receiving traffic it must pass a health check within a bounded deploy window. A backend whose health endpoint does not return a success status within the window causes the registration to fail with a target-unhealthy error and no routing change takes effect. A backend that passes its health check is activated and subsequently serves matching requests. Each registration reports success or the normalized error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"router_scenario\",\n        \"backends\": {\n          \"bad\": {\n            \"body\": \"broken\",\n            \"status\": 503\n          }\n        },\n        \"steps\": [\n          {\n            \"op\": \"deploy\",\n            \"name\": \"s1\",\n            \"hosts\": [\n              \"h.example.com\"\n            ],\n            \"target\": \"bad\",\n            \"deploy_timeout_ms\": 300\n          }\n        ]\n      },\n      \"expected_output\": \"deploy s1 error=target_unhealthy\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_tls_enforcement",
+        "trigger_keywords": [
+          "test cases for feature5 tls enforcement",
+          "show me feature5 tls enforcement test cases",
+          "what are the feature5 tls enforcement test inputs",
+          "give me the feature5_tls_enforcement test file",
+          "test cases for feature 5",
+          "feature5 tls enforcement expected output",
+          "what does feature5 tls enforcement expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_tls_enforcement:\n{\n  \"description\": \"When a service has TLS enabled, a plaintext request to it is answered with a permanent redirect to the same URL over the secure scheme; for methods where a redirect body is emitted the response body contains the redirect link. When a service does not have TLS enabled, a request arriving over the secure transport is rejected with a service-unavailable response. Registering a TLS-enabled service under a wildcard host is rejected because automatic certificate provisioning does not support wildcard hosts. Each probe reports the response status and body; each registration reports success or the normalized error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"router_scenario\",\n        \"backends\": {\n          \"a\": {\n            \"body\": \"secure-app\"\n          }\n        },\n        \"steps\": [\n          {\n            \"op\": \"deploy\",\n            \"name\": \"s1\",\n            \"hosts\": [\n              \"secure.example.com\"\n            ],\n            \"target\": \"a\",\n            \"tls\": true\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://secure.example.com/path\",\n            \"method\": \"GET\"\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://secure.example.com/path\",\n            \"method\": \"POST\"\n          }\n        ]\n      },\n      \"expected_output\": \"deploy s1 ok\\nstatus=301 target=<a href=\\\"https://secure.example.com/path\\\">Moved Permanently</a>.\\nstatus=301 target=\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_pause_resume_stop",
+        "trigger_keywords": [
+          "test cases for feature6 pause resume stop",
+          "show me feature6 pause resume stop test cases",
+          "what are the feature6 pause resume stop test inputs",
+          "give me the feature6_pause_resume_stop test file",
+          "test cases for feature 6",
+          "feature6 pause resume stop expected output",
+          "what does feature6 pause resume stop expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_pause_resume_stop:\n{\n  \"description\": \"A service can be paused, resumed, or stopped. While paused, matching requests are held until a bounded pause window elapses and then answered with a gateway-timeout response; resuming restores normal routing. While stopped, the service answers its health endpoint with a success response but answers all other matching requests with a service-unavailable response. Each lifecycle command reports success, and each probe reports the response status and body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"router_scenario\",\n        \"backends\": {\n          \"a\": {\n            \"body\": \"live-app\"\n          }\n        },\n        \"steps\": [\n          {\n            \"op\": \"deploy\",\n            \"name\": \"s1\",\n            \"hosts\": [\n              \"h.example.com\"\n            ],\n            \"target\": \"a\"\n          },\n          {\n            \"op\": \"pause\",\n            \"name\": \"s1\",\n            \"pause_timeout_ms\": 50\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://h.example.com/\",\n            \"method\": \"GET\"\n          },\n          {\n            \"op\": \"resume\",\n            \"name\": \"s1\"\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://h.example.com/\",\n            \"method\": \"GET\"\n          }\n        ]\n      },\n      \"expected_output\": \"deploy s1 ok\\npause s1 ok\\nstatus=504 target=Gateway Timeout\\nresume s1 ok\\nstatus=200 target=live-app\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_request_size_limit",
+        "trigger_keywords": [
+          "test cases for feature7 request size limit",
+          "show me feature7 request size limit test cases",
+          "what are the feature7 request size limit test inputs",
+          "give me the feature7_request_size_limit test file",
+          "test cases for feature 7",
+          "feature7 request size limit expected output",
+          "what does feature7 request size limit expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_request_size_limit:\n{\n  \"description\": \"A service may be configured to buffer request bodies with a maximum allowed size. When buffering is enabled, a request whose body fits within the configured maximum is forwarded to the backend and its response returned, while a request whose body exceeds the maximum is rejected with a payload-too-large response and never reaches the backend. Each probe reports the response status and body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"router_scenario\",\n        \"backends\": {\n          \"a\": {\n            \"body\": \"app-ok\"\n          }\n        },\n        \"steps\": [\n          {\n            \"op\": \"deploy\",\n            \"name\": \"s1\",\n            \"hosts\": [\n              \"h.example.com\"\n            ],\n            \"target\": \"a\",\n            \"buffer_requests\": true,\n            \"max_request_body_size\": 8\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://h.example.com/\",\n            \"method\": \"POST\",\n            \"body\": \"tiny\"\n          },\n          {\n            \"op\": \"request\",\n            \"url\": \"http://h.example.com/\",\n            \"method\": \"POST\",\n            \"body\": \"this body is too large\"\n          }\n        ]\n      },\n      \"expected_output\": \"deploy s1 ok\\nstatus=200 target=app-ok\\nstatus=413 target=Request too large\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_rollout_selection",
+        "trigger_keywords": [
+          "test cases for feature8 rollout selection",
+          "show me feature8 rollout selection test cases",
+          "what are the feature8 rollout selection test inputs",
+          "give me the feature8_rollout_selection test file",
+          "test cases for feature 8",
+          "feature8 rollout selection expected output",
+          "what does feature8 rollout selection expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_rollout_selection:\n{\n  \"description\": \"A canary rollout selects a deterministic fraction of clients into a rollout group based on a per-client identifier value carried by the request. Membership is decided by a stable 32-bit FNV-1a hash of the identifier reduced modulo one hundred and compared against the configured target percentage, so the same identifier always yields the same decision and the selected fraction is reproducible across a large population. Identifiers present in an explicit allowlist are always in the group; a request that carries no identifier is never in the group. Each evaluation reports the identifier and whether it falls in the rollout group; a population sweep reports the number selected out of the total.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"rollout_split\",\n        \"percent\": 0,\n        \"allowlist\": [\n          \"vip\"\n        ],\n        \"cookie_values\": [\n          \"vip\",\n          \"00001\",\n          null\n        ]\n      },\n      \"expected_output\": \"value=vip group=true\\nvalue=00001 group=false\\nvalue=<none> group=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_size_limited_buffer",
+        "trigger_keywords": [
+          "test cases for feature9 size limited buffer",
+          "show me feature9 size limited buffer test cases",
+          "what are the feature9 size limited buffer test inputs",
+          "give me the feature9_size_limited_buffer test file",
+          "test cases for feature 9",
+          "feature9 size limited buffer expected output",
+          "what does feature9 size limited buffer expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_size_limited_buffer:\n{\n  \"description\": \"A size-limited buffer accumulates bytes written to it or read through it up to a configured maximum. Content that stays within the maximum is preserved and can be replayed exactly. Content that exceeds the maximum yields a size-exceeded error. A maximum of zero means unlimited. The buffer keeps a bounded amount in memory and transparently spills the remainder to backing storage, so spilled content is still preserved exactly. Each case reports the preserved content or the normalized size-exceeded error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"kind\": \"buffer\",\n        \"mode\": \"write\",\n        \"max_bytes\": 20,\n        \"max_mem_bytes\": 20,\n        \"data\": \"hello world\"\n      },\n      \"expected_output\": \"content=hello world\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "known edge case with certain host patterns that certificate automation can't handle",
+        "actual_meaning": "Feature 5 (feature5_tls_enforcement.json): wildcard host patterns (*.example.com) combined with tls=true are rejected with error=automatic_tls_wildcard_unsupported"
+      },
+      {
+        "vague_reference": "clean shutdown mode that doesn't just drop everything",
+        "actual_meaning": "Feature 6 stop lifecycle operation: stopped services continue answering the health endpoint with 200 OK but return service-unavailable for all other requests, enabling graceful drain"
+      }
+    ],
+    "fallback_response": "I don't have specific details on that aspect right now. Could you check the existing test cases in rcb_tests/public_test_cases/ or the start.md PRD for the relevant feature section? The implementation should align with the behavior described there."
+  },
+  "public_test_cases": {
+    "feature10_request_id.json": {
+      "description": "A middleware ensures every request carries a request-identifier header before reaching the handler. When the incoming request already carries an identifier it is preserved unchanged. When the incoming request has no identifier a fresh one is generated and attached. The request always proceeds to the handler. Each case reports the response status and either the preserved identifier or whether an identifier was generated together with its length.",
+      "cases": [
+        {
+          "input": {
+            "kind": "request_id",
+            "has_incoming": false
+          },
+          "expected_output": "status=200\nrequest_id_present=true\nrequest_id_length=36\n"
+        }
+      ]
+    },
+    "feature11_request_buffering.json": {
+      "description": "A middleware buffers the request body in memory up to a memory threshold, spilling to backing storage beyond it, and enforces an overall maximum body size. A request whose body fits within the overall maximum is passed to the handler, which returns its response. A request whose body exceeds the overall maximum is rejected with a payload-too-large response and the handler is not invoked. Each case reports the response status and body.",
+      "cases": [
+        {
+          "input": {
+            "kind": "request_buffer_mw",
+            "max_mem_bytes": 1024,
+            "max_bytes": 100,
+            "request_body": "small",
+            "response_body": "handled"
+          },
+          "expected_output": "status=200 body=handled\n"
+        }
+      ]
+    },
+    "feature12_response_buffering.json": {
+      "description": "A middleware buffers the handler's response up to a configured maximum before forwarding it to the client. A response within the limit is forwarded with its status and body intact. A response whose content type marks it as an event stream switches to unbuffered pass-through once the handler writes its header, so its content is streamed regardless of the buffer limit. A redirect produced by the handler is forwarded with its redirect status and link body. A buffered response that exceeds the maximum is replaced with an internal-server-error response. Each case reports the response status and body.",
+      "cases": [
+        {
+          "input": {
+            "kind": "response_buffer_mw",
+            "max_mem_bytes": 1024,
+            "max_bytes": 1024,
+            "response_body": "hello body"
+          },
+          "expected_output": "status=200 body=hello body\n"
+        }
+      ]
+    },
+    "feature13_error_pages.json": {
+      "description": "A middleware renders a custom error page when a downstream handler signals an error status. Error page templates are HTML files named after the status code; when a template for the signalled status exists it is rendered with the supplied arguments, otherwise a generic page is produced by the outermost middleware. Middlewares may be nested so an inner set of templates overrides an outer one for statuses it defines, while statuses it does not define fall through to the outer set. A template source that contains no usable templates is rejected with an unable-to-load error. Each case reports the response status, content type and rendered body, or the normalized load error.",
+      "cases": [
+        {
+          "input": {
+            "kind": "error_page",
+            "root": true,
+            "outer_pages": {
+              "404.html": "<h1>custom not found</h1>"
+            },
+            "status": 404,
+            "message": "missing"
+          },
+          "expected_output": "status=404 content_type=text/html; charset=utf-8 body=<h1>custom not found</h1>\n"
+        }
+      ]
+    },
+    "feature1_host_routing.json": {
+      "description": "An incoming request is routed to a backend by matching the request host against the set of services registered in the router. Each service is registered under one or more exact hostnames. When the incoming host matches a registered service the request is forwarded to that service's backend and the backend's response status and body are returned to the client. When the incoming host matches no registered service the router returns a not-found response. Each registration is reported as succeeding, and each probe reports the resulting response status together with the backend-provided body.",
+      "cases": [
+        {
+          "input": {
+            "kind": "router_scenario",
+            "backends": {
+              "primary": {
+                "body": "primary-app"
+              }
+            },
+            "steps": [
+              {
+                "op": "deploy",
+                "name": "s1",
+                "hosts": [
+                  "app.example.com"
+                ],
+                "target": "primary"
+              },
+              {
+                "op": "request",
+                "url": "http://app.example.com/",
+                "method": "GET"
+              },
+              {
+                "op": "request",
+                "url": "http://unknown.example.com/",
+                "method": "GET"
+              }
+            ]
+          },
+          "expected_output": "deploy s1 ok\nstatus=200 target=primary-app\nstatus=404 target=Not Found\n"
+        }
+      ]
+    },
+    "feature2_wildcard_routing.json": {
+      "description": "A service may be registered under a wildcard host pattern that matches any single-label subdomain of a base domain, or with an empty host set that makes it the catch-all for requests not matched by any other service. An exact host registration takes precedence over an overlapping wildcard registration. A wildcard pattern matches subdomains but not the bare base domain itself. Each probe reports the resulting response status and the backend-provided body.",
+      "cases": [
+        {
+          "input": {
+            "kind": "router_scenario",
+            "backends": {
+              "wildcard": {
+                "body": "wildcard-app"
+              }
+            },
+            "steps": [
+              {
+                "op": "deploy",
+                "name": "sw",
+                "hosts": [
+                  "*.example.com"
+                ],
+                "target": "wildcard"
+              },
+              {
+                "op": "request",
+                "url": "http://foo.example.com/",
+                "method": "GET"
+              },
+              {
+                "op": "request",
+                "url": "http://example.com/",
+                "method": "GET"
+              }
+            ]
+          },
+          "expected_output": "deploy sw ok\nstatus=200 target=wildcard-app\nstatus=404 target=Not Found\n"
+        }
+      ]
+    },
+    "feature3_host_conflict.json": {
+      "description": "A host may be claimed by at most one service at a time. Registering a new service under a host that is already claimed by a different service is rejected with a host-already-in-use error, and the original service keeps serving that host. Re-registering an existing service by the same name under the same host is allowed and atomically swaps its backend. Each registration reports success or the normalized error category, and each probe reports the response status and backend body.",
+      "cases": [
+        {
+          "input": {
+            "kind": "router_scenario",
+            "backends": {
+              "a": {
+                "body": "service-a"
+              },
+              "b": {
+                "body": "service-b"
+              }
+            },
+            "steps": [
+              {
+                "op": "deploy",
+                "name": "s1",
+                "hosts": [
+                  "h.example.com"
+                ],
+                "target": "a"
+              },
+              {
+                "op": "deploy",
+                "name": "s2",
+                "hosts": [
+                  "h.example.com"
+                ],
+                "target": "b"
+              },
+              {
+                "op": "request",
+                "url": "http://h.example.com/",
+                "method": "GET"
+              }
+            ]
+          },
+          "expected_output": "deploy s1 ok\ndeploy s2 error=host_in_use\nstatus=200 target=service-a\n"
+        }
+      ]
+    },
+    "feature4_target_health.json": {
+      "description": "Before a newly registered backend begins receiving traffic it must pass a health check within a bounded deploy window. A backend whose health endpoint does not return a success status within the window causes the registration to fail with a target-unhealthy error and no routing change takes effect. A backend that passes its health check is activated and subsequently serves matching requests. Each registration reports success or the normalized error category.",
+      "cases": [
+        {
+          "input": {
+            "kind": "router_scenario",
+            "backends": {
+              "bad": {
+                "body": "broken",
+                "status": 503
+              }
+            },
+            "steps": [
+              {
+                "op": "deploy",
+                "name": "s1",
+                "hosts": [
+                  "h.example.com"
+                ],
+                "target": "bad",
+                "deploy_timeout_ms": 300
+              }
+            ]
+          },
+          "expected_output": "deploy s1 error=target_unhealthy\n"
+        }
+      ]
+    },
+    "feature5_tls_enforcement.json": {
+      "description": "When a service has TLS enabled, a plaintext request to it is answered with a permanent redirect to the same URL over the secure scheme; for methods where a redirect body is emitted the response body contains the redirect link. When a service does not have TLS enabled, a request arriving over the secure transport is rejected with a service-unavailable response. Registering a TLS-enabled service under a wildcard host is rejected because automatic certificate provisioning does not support wildcard hosts. Each probe reports the response status and body; each registration reports success or the normalized error category.",
+      "cases": [
+        {
+          "input": {
+            "kind": "router_scenario",
+            "backends": {
+              "a": {
+                "body": "secure-app"
+              }
+            },
+            "steps": [
+              {
+                "op": "deploy",
+                "name": "s1",
+                "hosts": [
+                  "secure.example.com"
+                ],
+                "target": "a",
+                "tls": true
+              },
+              {
+                "op": "request",
+                "url": "http://secure.example.com/path",
+                "method": "GET"
+              },
+              {
+                "op": "request",
+                "url": "http://secure.example.com/path",
+                "method": "POST"
+              }
+            ]
+          },
+          "expected_output": "deploy s1 ok\nstatus=301 target=<a href=\"https://secure.example.com/path\">Moved Permanently</a>.\nstatus=301 target=\n"
+        }
+      ]
+    },
+    "feature6_pause_resume_stop.json": {
+      "description": "A service can be paused, resumed, or stopped. While paused, matching requests are held until a bounded pause window elapses and then answered with a gateway-timeout response; resuming restores normal routing. While stopped, the service answers its health endpoint with a success response but answers all other matching requests with a service-unavailable response. Each lifecycle command reports success, and each probe reports the response status and body.",
+      "cases": [
+        {
+          "input": {
+            "kind": "router_scenario",
+            "backends": {
+              "a": {
+                "body": "live-app"
+              }
+            },
+            "steps": [
+              {
+                "op": "deploy",
+                "name": "s1",
+                "hosts": [
+                  "h.example.com"
+                ],
+                "target": "a"
+              },
+              {
+                "op": "pause",
+                "name": "s1",
+                "pause_timeout_ms": 50
+              },
+              {
+                "op": "request",
+                "url": "http://h.example.com/",
+                "method": "GET"
+              },
+              {
+                "op": "resume",
+                "name": "s1"
+              },
+              {
+                "op": "request",
+                "url": "http://h.example.com/",
+                "method": "GET"
+              }
+            ]
+          },
+          "expected_output": "deploy s1 ok\npause s1 ok\nstatus=504 target=Gateway Timeout\nresume s1 ok\nstatus=200 target=live-app\n"
+        }
+      ]
+    },
+    "feature7_request_size_limit.json": {
+      "description": "A service may be configured to buffer request bodies with a maximum allowed size. When buffering is enabled, a request whose body fits within the configured maximum is forwarded to the backend and its response returned, while a request whose body exceeds the maximum is rejected with a payload-too-large response and never reaches the backend. Each probe reports the response status and body.",
+      "cases": [
+        {
+          "input": {
+            "kind": "router_scenario",
+            "backends": {
+              "a": {
+                "body": "app-ok"
+              }
+            },
+            "steps": [
+              {
+                "op": "deploy",
+                "name": "s1",
+                "hosts": [
+                  "h.example.com"
+                ],
+                "target": "a",
+                "buffer_requests": true,
+                "max_request_body_size": 8
+              },
+              {
+                "op": "request",
+                "url": "http://h.example.com/",
+                "method": "POST",
+                "body": "tiny"
+              },
+              {
+                "op": "request",
+                "url": "http://h.example.com/",
+                "method": "POST",
+                "body": "this body is too large"
+              }
+            ]
+          },
+          "expected_output": "deploy s1 ok\nstatus=200 target=app-ok\nstatus=413 target=Request too large\n"
+        }
+      ]
+    },
+    "feature8_rollout_selection.json": {
+      "description": "A canary rollout selects a deterministic fraction of clients into a rollout group based on a per-client identifier value carried by the request. Membership is decided by a stable 32-bit FNV-1a hash of the identifier reduced modulo one hundred and compared against the configured target percentage, so the same identifier always yields the same decision and the selected fraction is reproducible across a large population. Identifiers present in an explicit allowlist are always in the group; a request that carries no identifier is never in the group. Each evaluation reports the identifier and whether it falls in the rollout group; a population sweep reports the number selected out of the total.",
+      "cases": [
+        {
+          "input": {
+            "kind": "rollout_split",
+            "percent": 0,
+            "allowlist": [
+              "vip"
+            ],
+            "cookie_values": [
+              "vip",
+              "00001",
+              null
+            ]
+          },
+          "expected_output": "value=vip group=true\nvalue=00001 group=false\nvalue=<none> group=false\n"
+        }
+      ]
+    },
+    "feature9_size_limited_buffer.json": {
+      "description": "A size-limited buffer accumulates bytes written to it or read through it up to a configured maximum. Content that stays within the maximum is preserved and can be replayed exactly. Content that exceeds the maximum yields a size-exceeded error. A maximum of zero means unlimited. The buffer keeps a bounded amount in memory and transparently spills the remainder to backing storage, so spilled content is still preserved exactly. Each case reports the preserved content or the normalized size-exceeded error.",
+      "cases": [
+        {
+          "input": {
+            "kind": "buffer",
+            "mode": "write",
+            "max_bytes": 20,
+            "max_mem_bytes": 20,
+            "data": "hello world"
+          },
+          "expected_output": "content=hello world\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C003",
+      "C004"
+    ],
+    "kept_c": [
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

@@ -1,0 +1,1051 @@
+{
+  "fuzzy_prd": "# Declarative Cluster Deployment Toolkit - Templated Configuration & Resource Validation Engine\n\n## Project Goal\n\nBuild a command-line oriented toolkit that lets developers describe cluster workloads once, as environment-aware YAML configuration plus reusable templates, and then resolve, render, and validate those descriptions deterministically. It allows developers to keep a single source of truth for many environments (staging, production, …) without copying and hand-editing manifests per environment, and without a separate package manager.\n\n---\n\n## Background & Problem\n\nWithout this toolkit, developers maintain near-duplicate manifest files for every environment and every workload. They paste secrets and host addresses by hand, reimplement string-substitution and include logic in shell scripts, and discover only at apply time that a resource type is not served by the target cluster or that an API version has been removed. This leads to repetitive boilerplate, copy-paste drift between environments, late and cryptic failures, and configuration that is hard to review.\n\nWith this toolkit, a developer writes a shared `common` block and per-section overrides, references environment variables and external files through inline placeholders, and lets the engine merge, resolve, and render everything into concrete manifests. The same engine can pre-flight a rendered manifest against what a cluster actually advertises and against a deprecation table, so problems surface before anything is sent to a cluster.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility system (configuration merging, placeholder resolution, template rendering, precedence-based settings, version/deprecation logic, and resource-availability checks). It MUST NOT be a single \"god file\". Output a clear, multi-file directory tree (e.g. `src/` for the core domain, `tests/` for tests) that reflects a production-grade repository, with each responsibility in its own cohesive module. Do not over-engineer the trivial helpers, but keep the distinct domains separated.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases in \"Core Features\" are a **black-box contract for an execution adapter**, not the internal data model. The core logic must be callable as ordinary in-language functions/objects and must not read stdin, write stdout, or parse the test JSON itself. A thin execution adapter is solely responsible for translating each JSON command into idiomatic calls into the core and for rendering the documented stdout contract (including translating native errors into the neutral `error=<category>` lines).\n\n3. **Adherence to SOLID Design Principles:**\n   - **Single Responsibility Principle (SRP):** Keep parsing, routing, validation, core execution, and output formatting in distinct units.\n   - **Open/Closed Principle (OCP):** New resource kinds, new filters, or new precedence sources should be addable without rewriting the engine.\n   - **Liskov Substitution Principle (LSP):** The different \"catalog lookup\" strategies (bare-version vs grouped-version) must be interchangeable behind one abstraction.\n   - **Interface Segregation Principle (ISP):** Keep abstractions small and cohesive (e.g. a lookup abstraction exposes only \"can you handle this version\" and \"what kinds do you advertise\").\n   - **Dependency Inversion Principle (DIP):** High-level resolution/validation logic depends on abstractions, not on concrete I/O.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface must be elegant and idiomatic to the implementation language.\n   - **Resilience:** Edge cases (missing files, empty documents, cyclic includes, unset variables, unknown sections, unsupported kinds) must be modeled as explicit error conditions, surfaced through the adapter as the neutral `error=<category>` contract lines documented below — never as leaked host-language stack traces.\n\n---\n\n## Core Features\n\n### Feature 1: Deep Configuration Merge\n\n**As a developer**, I want to overlay an override mapping on top of a base mapping, so I can keep shared defaults in one place and only state the differences per environment.\n\n**Expected Behavior / Usage:**\n\nGiven two mappings, produce a single merged mapping. A key present only in the base is kept; a key present only in the override is added; a key present in both is merged recursively **when both values are mappings**, otherwise the override value replaces the base value outright. Replacement is total: a mapping may be replaced by a scalar, and a list is replaced wholesale (lists are never concatenated or element-merged). The base input must never be mutated. The merged result is emitted as a JSON object with keys sorted.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_dictionary_merge.json`\n\n```json\n{\n    \"description\": \"Deeply merges two configuration mappings into one. Keys present only in the override win; keys present in both are combined recursively when both values are mappings, otherwise the override value replaces the base value entirely (including replacing a mapping with a scalar, or replacing a list rather than concatenating it). The base input is never mutated.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"merge\",\n                \"base\": {\n                    \"name\": \"app\",\n                    \"ports\": [80, 443],\n                    \"labels\": {\"team\": \"core\"},\n                    \"replicas\": {\"min\": 1}\n                },\n                \"override\": {\n                    \"name\": \"web\",\n                    \"ports\": [8080],\n                    \"labels\": {\"tier\": \"frontend\"},\n                    \"replicas\": 3\n                }\n            },\n            \"expected_output\": \"{\\n  \\\"labels\\\": {\\n    \\\"team\\\": \\\"core\\\",\\n    \\\"tier\\\": \\\"frontend\\\"\\n  },\\n  \\\"name\\\": \\\"web\\\",\\n  \\\"ports\\\": [\\n    8080\\n  ],\\n  \\\"replicas\\\": 3\\n}\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Section Loading & Structural Validation\n\n**As a developer**, I want loading a named section of a configuration document to fail with a clear, stable reason whenever the document is structurally wrong, so misconfiguration is caught early and reported uniformly.\n\n**Expected Behavior / Usage:**\n\nA request names one section of a YAML configuration document. Loading rejects, with a single `error=<category>` line, each of the following: a configuration file that does not exist (`config_not_found`); a file whose parsed content is empty (`empty_config`); a file that is not valid YAML (`invalid_yaml`); a request for a section name that is not present in the document (`section_not_found`); a section that — after being overlaid on the shared inherited section — declares neither a `templates` list nor a `kubectl` list of deployable items (`missing_templates`); an empty section name (`empty_section`); and the reserved shared section name, which exists only to be inherited and is never deployable on its own (`reserved_section`). Each case prints exactly one error line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_config_section_errors.json`\n\n```json\n{\n    \"description\": \"Loads a named section from a YAML configuration document and reports structural errors as neutral categories instead of raising. The loader rejects a missing configuration file, a file whose parsed content is empty, a file that is not valid YAML, a request for a section name that does not exist, and a section that (after being merged with the shared 'common' section) declares neither a 'templates' nor a 'kubectl' list of items to deploy. It also rejects an empty section name, and the reserved shared section name that exists only to be inherited and is never deployed on its own. Each case prints a single 'error=<category>' line identifying which rule was violated.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"resolve\", \"section\": \"section\", \"no_config\": true},\n            \"expected_output\": \"error=config_not_found\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Variable Resolution & Placeholder Substitution\n\n**As a developer**, I want section values to be assembled from a shared base, environment variables, and external files via inline placeholders, so I can avoid hardcoding environment-specific data and reuse fragments across sections.\n\n**Expected Behavior / Usage:**\n\n*3.1 Section Resolution with Placeholders — overlay on the shared section and expand `file=` and `env=` placeholders.*\n\nResolving a section overlays it on the shared inherited section and then expands string placeholders. A `file='<path>'` placeholder is replaced by the parsed YAML content of that file (yielding a nested structure). An `env='<NAME>'` placeholder is replaced by the value of that environment variable; literal text surrounding an `env=` placeholder is preserved, so placeholders may be concatenated with prefixes/suffixes or with one another. Section values override shared values, while mappings present in both are merged recursively. The fully resolved section is emitted as a JSON object with keys sorted.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_variable_resolution.json`\n\n```json\n{\n    \"description\": \"Resolves a configuration section by overlaying it on the shared 'common' section and expanding string placeholders. A placeholder of the form file='<path>' is replaced by the parsed YAML content of that file (yielding a nested mapping), and a placeholder of the form env='<NAME>' is replaced by the value of that environment variable; literal text surrounding an env placeholder is preserved so placeholders can be concatenated with prefixes/suffixes or with each other. Section values override common values, while mappings present in both are merged recursively. The output is the fully resolved section as a sorted JSON object.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"resolve\",\n                \"section\": \"test_dirs\",\n                \"env\": {\"CUSTOM_ENV\": \"My value\"},\n                \"aux_files\": {\"include.yaml\": \"---\\nha_ha: \\\"included_var\\\"\\n\"},\n                \"config\": \"common:\\n  my_var: my_value\\n  my_file: \\\"{{ file='include.yaml' }}\\\"\\n  my_env_var: \\\"{{ env='CUSTOM_ENV' }}\\\"\\ntest_dirs:\\n  dirs:\\n    - dst: /tmp/test_directory1/\\n  templates:\\n    - template: template1.yaml.j2\\n\"\n            },\n            \"expected_output\": \"{\\n  \\\"dirs\\\": [\\n    {\\n      \\\"dst\\\": \\\"/tmp/test_directory1/\\\"\\n    }\\n  ],\\n  \\\"my_env_var\\\": \\\"My value\\\",\\n  \\\"my_file\\\": {\\n    \\\"ha_ha\\\": \\\"included_var\\\"\\n  },\\n  \\\"my_var\\\": \\\"my_value\\\",\\n  \\\"templates\\\": [\\n    {\\n      \\\"template\\\": \\\"template1.yaml.j2\\\"\\n    }\\n  ]\\n}\"\n        }\n    ]\n}\n```\n\n*3.2 Recursive Substitution over Arbitrary Structures — substitute placeholders in place across nested mappings, lists, and scalars.*\n\nGiven an arbitrary nested structure of mappings, lists, and scalars, walk it and substitute string placeholders in place while leaving non-string leaves untouched. Each string is scanned for an `env='<NAME>'` placeholder (replaced by the environment variable value; an unset variable expands to empty text in non-strict mode) and for a `file='<path>'` placeholder (replaced by the parsed YAML content of the referenced file). Numbers, booleans, and list ordering are preserved exactly, and a bare scalar passed in alone is returned unchanged. The transformed structure is emitted as a JSON object with keys sorted.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_recursive_substitution.json`\n\n```json\n{\n    \"description\": \"Walks an arbitrary nested structure (mappings, lists, and scalars) and substitutes string placeholders in place, leaving non-string leaves untouched. Each string is scanned for an env='<NAME>' placeholder that is replaced by the environment variable value (an unset variable expands to empty text in non-strict mode), and for a file='<path>' placeholder that is replaced by the parsed YAML content of the referenced file. Numbers, booleans, and list ordering are preserved exactly, and a bare scalar passed in alone is returned unchanged. Output is the transformed structure as sorted JSON.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"update_context\",\n                \"env\": {\"CUSTOM_ENV\": \"My value\"},\n                \"aux_files\": {\"include.yaml\": \"---\\nha_ha: \\\"included_var\\\"\\n\"},\n                \"context\": {\n                    \"section1\": {\n                        \"subsection1\": {\n                            \"section1-key1\": \"value\",\n                            \"section1-key2\": 1,\n                            \"section1-key3\": 0.1,\n                            \"section1-key4\": [0, 1, 2, 3],\n                            \"section1-key5\": \"{{ env='CUSTOM_ENV' }}\",\n                            \"section1-key6\": \"{{ file='include.yaml' }}\",\n                            \"section1-key7\": \"{{ env='CUSTOM_ENV'}} = {{ env='CUSTOM_ENV' }}\",\n                            \"section1-key8\": \"{{ env='NULL_VAR' }}-{{ env='CUSTOM_ENV' }}\"\n                        }\n                    },\n                    \"section2\": [{}, \"var2\", \"var3\", \"{{ env='CUSTOM_ENV' }}\", \"{{ env='CUSTOM_ENV' }} = {{ env='CUSTOM_ENV' }}\", \"{{ env='NULL_VAR' }}-{{ env='CUSTOM_ENV' }}\"],\n                    \"section3\": [0, 1, 2, 3, 4]\n                }\n            },\n            \"expected_output\": \"{\\n  \\\"section1\\\": {\\n    \\\"subsection1\\\": {\\n      \\\"section1-key1\\\": \\\"value\\\",\\n      \\\"section1-key2\\\": 1,\\n      \\\"section1-key3\\\": 0.1,\\n      \\\"section1-key4\\\": [\\n        0,\\n        1,\\n        2,\\n        3\\n      ],\\n      \\\"section1-key5\\\": \\\"My value\\\",\\n      \\\"section1-key6\\\": {\\n        \\\"ha_ha\\\": \\\"included_var\\\"\\n      },\\n      \\\"section1-key7\\\": \\\"My value = My value\\\",\\n      \\\"section1-key8\\\": \\\"-My value\\\"\\n    }\\n  },\\n  \\\"section2\\\": [\\n    {},\\n    \\\"var2\\\",\\n    \\\"var3\\\",\\n    \\\"My value\\\",\\n    \\\"My value = My value\\\",\\n    \\\"-My value\\\"\\n  ],\\n  \\\"section3\\\": [\\n    0,\\n    1,\\n    2,\\n    3,\\n    4\\n  ]\\n}\"\n        }\n    ]\n}\n```\n\n*3.3 Strict Unset-Variable Failure — in strict mode, an unset `env=` variable is a hard error.*\n\nWhen strict environment resolution is enabled, expanding an `env='<NAME>'` placeholder for a variable that is not set is a hard error rather than substituting empty text. The rule applies to placeholders found directly in a section's values, to placeholders pulled in through a `file='<path>'` include, and through chains of nested includes. Each case enables strict mode with the referenced variable unset and prints `error=env_not_set` followed by a `var=<NAME>` line naming the offending variable.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_strict_env_unset.json`\n\n```json\n{\n    \"description\": \"When strict environment resolution is enabled, expanding a placeholder env='<NAME>' for an environment variable that is not set is treated as a hard error rather than substituting empty text. The rule applies to placeholders found directly in a section's values, in values pulled in through a file='<path>' include, and through chains of nested includes. Each case enables strict mode with the referenced variable unset and prints 'error=env_not_set' together with the offending variable name.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"resolve\",\n                \"section\": \"section_1\",\n                \"strict\": true,\n                \"config\": \"common:\\n  k8s_namespace: namespace\\nsection_1:\\n  var: \\\"{{ env='SECTION1' }}\\\"\\n  templates:\\n    - template: template1.yaml.j2\\n\"\n            },\n            \"expected_output\": \"error=env_not_set\\nvar=SECTION1\\n\"\n        }\n    ]\n}\n```\n\n*3.4 Cyclic Include Detection — abort instead of recursing forever.*\n\nA `file='<path>'` placeholder may itself reference further files. If a value, directly or transitively through nested includes, references a file already visited on the current include path, resolution aborts instead of recursing forever. The case wires two include files that reference each other and prints `error=include_loop`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_include_loop.json`\n\n```json\n{\n    \"description\": \"Detects a cyclic file='<path>' include chain while resolving a section and aborts instead of recursing forever. A value that, directly or transitively through nested includes, references a file that has already been visited on the current include path is rejected. The case wires two include files that reference each other and prints 'error=include_loop'.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"resolve\",\n                \"section\": \"section_3\",\n                \"aux_files\": {\n                    \"incorrect_include.yaml\": \"\\n---\\nincluded_file: \\\"{{ file='incorrect_include2.yaml' }}\\\"\\n\",\n                    \"incorrect_include2.yaml\": \"\\n---\\nincluded_file: \\\"{{ file='incorrect_include.yaml' }}\\\"\\n\"\n                },\n                \"config\": \"common:\\n  k8s_namespace: namespace\\nsection_3:\\n  var: \\\"{{ file='incorrect_include.yaml' }}\\\"\\n  templates:\\n    - template: template1.yaml.j2\\n\"\n            },\n            \"expected_output\": \"error=include_loop\\n\"\n        }\n    ]\n}\n```\n\n*3.5 Root Variable Name Validation — reject dashes in top-level keys.*\n\nRoot-level variable names in a resolved section must contain no dashes, because dashes are not legal identifiers for the templating step. Only top-level keys are checked; dashes nested inside values are permitted. A section whose merged root keys include one or more dashed names is rejected with `error=root_dashes` followed by a `vars=<names>` line listing the offending names in sorted order; a section whose dashes appear only in nested values resolves successfully to a sorted JSON object.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_root_dashes.json`\n\n```json\n{\n    \"description\": \"Validates that root-level variable names in a resolved section contain no dashes, because dashes are not legal identifiers for templating. Only top-level keys are checked; dashes nested inside mapping values are permitted. A section whose merged root keys include one or more dashed names is rejected with 'error=root_dashes' followed by the offending names in sorted order, while a section whose dashes appear only in nested values resolves successfully to a sorted JSON object.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"resolve\",\n                \"section\": \"not_allowed\",\n                \"aux_files\": {\"include.yaml\": \"---\\nha_ha: \\\"included_var\\\"\\n\"},\n                \"config\": \"common:\\n  my_file: \\\"{{ file='include.yaml' }}\\\"\\n  k8s_namespace: namespace\\n  templates:\\n    - template: template1.yaml.j2\\nnot_allowed:\\n  my-var: my_value\\n  my-var-with-dashes: not allowed\\n\"\n            },\n            \"expected_output\": \"error=root_dashes\\nvars=my-var, my-var-with-dashes\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Template Rendering\n\n**As a developer**, I want resolved configuration values fed into reusable templates to produce concrete output files, so the same templates can serve every environment.\n\n**Expected Behavior / Usage:**\n\n*4.1 Render Declared Templates — flatten template lists, expand name patterns, and render to files.*\n\nRender the templates declared by a resolved section into output files and report each produced file's relative path and rendered content. Template items may be listed under a `templates` key or, equivalently, under a `kubectl` key. Items may be nested inside arbitrarily deep `group` wrappers and are flattened. A template name that is a regular expression expands to every available template whose name it matches. Every resolved context variable is available to the template engine; an include placeholder resolves to a nested mapping rendered in its native text form; a value piped through a base64-encode filter is encoded; a literal piped through a base64-decode filter is decoded; a static-file include global splices in the indented contents of matching files; and a list-files global yields the sorted base names of matching files. Output lists files in sorted path order, each introduced by a `# file: <relative path>` header.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_render_templates.json`\n\n```json\n{\n    \"description\": \"Renders the templates declared by a resolved configuration section into output files, returning each produced file's relative path and rendered content. Template items may be listed under a 'templates' key or, equivalently, under a 'kubectl' key; items may be nested inside arbitrarily deep 'group' wrappers and are flattened; and a template name that is a regular expression is expanded to every available template file whose name it matches. Each context variable is available to the template engine, an include placeholder resolves to a nested mapping rendered with its native text form, a value piped through the base64-encode filter is encoded, a literal piped through the base64-decode filter is decoded, a static-file include global splices in the indented contents of matching files, and a list-files global yields the sorted base names of matching files. Output lists files in sorted path order, each introduced by a '# file:' header.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"render\",\n                \"section\": \"test_dirs\",\n                \"env\": {\"CUSTOM_ENV\": \"My value\"},\n                \"aux_files\": {\n                    \"include.yaml\": \"---\\nha_ha: \\\"included_var\\\"\\n\",\n                    \"templates_tests/my_file.txt\": \"{{ hello world }}\\nnew\\nline\\n\",\n                    \"templates_tests/my_file1.txt\": \"{{ hello world1 }}\",\n                    \"templates_tests/innerdir/template1.yaml.j2\": \"{{ my_file }}\"\n                },\n                \"templates_files\": {\n                    \"template1.yaml.j2\": \"{{ my_file }}\",\n                    \"template2.yaml.j2\": \"{{ my_env_var | b64encode }}\\n\",\n                    \"template3.yaml.j2\": \"{{ 'TXkgdmFsdWU=' | b64decode }}\\n\",\n                    \"template_include_file.yaml.j2\": \"test: |\\n  {{ include_file('templates_tests/my_file*.txt') | indent(2) }}\\n\",\n                    \"innerdir/template1.yaml.j2\": \"{{ my_file }}\",\n                    \"template_list_files.yaml.j2\": \"test: |\\n  {% for f in list_files('templates_tests/innerdir') -%}\\n  {{ f.split('/')[-1] }}:\\n  {% endfor -%}\\n  {% for f in list_files('templates_tests/my_file*.txt') -%}\\n  {{ f.split('/')[-1] }}:\\n  {% endfor -%}\\n\"\n                },\n                \"config\": \"common:\\n  my_var: my_value\\n  my_file: \\\"{{ file='include.yaml' }}\\\"\\n  my_env_var: \\\"{{ env='CUSTOM_ENV' }}\\\"\\ntest_dirs:\\n  dirs:\\n    - dst: /tmp/test_directory1/\\n  templates:\\n    - template: template1.yaml.j2\\n    - template: template2.yaml.j2\\n    - template: template3.yaml.j2\\n    - template: template_include_file.yaml.j2\\n    - template: innerdir/template1.yaml.j2\\n    - template: template_list_files.yaml.j2\\n\"\n            },\n            \"expected_output\": \"# file: innerdir/template1.yaml\\n{'ha_ha': 'included_var'}\\n# file: template1.yaml\\n{'ha_ha': 'included_var'}\\n# file: template2.yaml\\nTXkgdmFsdWU=\\n# file: template3.yaml\\nMy value\\n# file: template_include_file.yaml\\ntest: |\\n  {{ hello world }}\\n  new\\n  line\\n\\n  {{ hello world1 }}\\n# file: template_list_files.yaml\\ntest: |\\n  template1.yaml.j2:\\n  my_file.txt:\\n  my_file1.txt:\\n  \\n\"\n        }\n    ]\n}\n```\n\n*4.2 Value-Transformation Filters — base64 encode/decode, sha256 digest, inline-YAML serialization, and keyed lookup.*\n\nTemplates can apply value-transformation filters: a base64-encode filter encodes its input string; a base64-decode filter decodes its input; a sha256 filter returns the hex digest of its input; and a to-yaml filter serializes a structure (such as a list of mappings) to inline YAML. A separate template can index a mapping by a key to select the matching value. Output is the rendered file content under a `# file:` header.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_filters.json`\n\n```json\n{\n    \"description\": \"Renders templates that exercise the engine's value-transformation filters and a dashed key lookup. A base64-encode filter encodes its input string, a base64-decode filter decodes its input, a sha256 filter returns the hex digest of its input, and a to-yaml filter serializes a structure (a list of mappings) to inline YAML. A separate template indexes a mapping by a region key to select the matching value. Output is the rendered file content under a '# file:' header.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"render\",\n                \"section\": \"test_filters\",\n                \"templates_files\": {\n                    \"filters.yaml.j2\": \"b64encode: {{ to_base64 | b64encode }}\\nb64decode: {{ from_base64 | b64decode }}\\nsha256: {{ to_sha256 | hash_sha256 }}\\naffinity: {{ affinity | to_yaml() }}\"\n                },\n                \"config\": \"common:\\n  k8s_namespace: namespace\\ntest_filters:\\n  to_base64: hello world\\n  from_base64: azhzLWhhbmRsZQ==\\n  to_sha256: k8s-hanle\\n  affinity:\\n    - key: \\\"dedicated\\\"\\n      operator: \\\"Equal\\\"\\n      value: \\\"monitoring\\\"\\n      effect: \\\"NoSchedule\\\"\\n    - key: \\\"dedicated\\\"\\n      operator: \\\"Equal\\\"\\n      value:\\n        hello: world\\n      effect: \\\"NoSchedule\\\"\\n  templates:\\n    - template: filters.yaml.j2\\n\"\n            },\n            \"expected_output\": \"# file: filters.yaml\\nb64encode: aGVsbG8gd29ybGQ=\\nb64decode: k8s-handle\\nsha256: 8fae6dd899aace000fd494fd6d795e26e2c85bf8e59d4262ef56b03dc91e924c\\naffinity: [{effect: NoSchedule, key: dedicated, operator: Equal, value: monitoring}, {effect: NoSchedule, key: dedicated, operator: Equal, value: {hello: world}}]\\n\"\n        }\n    ]\n}\n```\n\n*4.3 Rendering Error Categories — null context, no template items, missing template, undefined variable.*\n\nRendering failures are reported as neutral error categories. Rendering from a null context prints `error=none_context`. A section that resolves with no usable template items prints `error=no_template_items`. Referencing a template that does not exist (including a name that is an unmatchable/invalid pattern, which is then treated as a literal name) prints `error=template_not_found` followed by a `template=<name>` line. Rendering a template that references an undefined variable under strict-undefined semantics prints `error=undefined_variable` followed by a `variable=<name>` line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_render_errors.json`\n\n```json\n{\n    \"description\": \"Reports rendering failures as neutral error categories. Asking the engine to render from a null context is rejected with 'error=none_context'. A section that resolves with no usable template items prints 'error=no_template_items'. Referencing a template file that does not exist (including a name that is an unmatchable/invalid pattern, which is then treated as a literal name) prints 'error=template_not_found' with the missing template name. Rendering a template that references an undefined variable under strict-undefined semantics prints 'error=undefined_variable' with the variable name.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"render\",\n                \"raw_context\": null,\n                \"templates_files\": {\"template1.yaml.j2\": \"{{ x }}\"},\n                \"config\": \"common: {}\\n\"\n            },\n            \"expected_output\": \"error=none_context\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Template Tag Selection\n\n**As a developer**, I want to attach tags to template items and filter which ones are produced, so I can render a subset of a deployment (for example, only the database, or everything except the cron jobs) from the same configuration.\n\n**Expected Behavior / Usage:**\n\n*5.1 Tag-Based Inclusion Decision — allow-list and skip-list semantics.*\n\nDecide whether a template that carries a set of tags should be included, given an optional allow-list (`only`) and an optional skip-list (`skip`). The template is excluded when an allow-list is given and the template shares no tag with it; excluded when a skip-list is given and the template shares any tag with it; otherwise included. With no lists given the template is always included, and these rules also hold when the template has no tags at all. Each evaluation prints `[a specific boolean result for tag matching in exclude logic]` or `[a specific boolean result for tag matching in exclude logic]` in order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_evaluate_tags.json`\n\n```json\n{\n    \"description\": \"Decides whether a template that carries a set of tags should be included given an optional allow-list ('only') and an optional skip-list ('skip'). A template is excluded when an allow-list is given and the template shares no tag with it, and excluded when a skip-list is given and the template shares any tag with it; otherwise it is included. When no lists are given the template is always included, and these rules also hold when the template has no tags at all. Each evaluation prints a '[a specific boolean result for tag matching in exclude logic]' or '[a specific boolean result for tag matching in exclude logic]' line in order.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"eval_tags\",\n                \"evaluations\": [\n                    {\"tags\": [\"tag1\", \"tag2\", \"tag3\"], \"only\": [\"tag1\"], \"skip\": null},\n                    {\"tags\": [\"tag1\", \"tag2\", \"tag3\"], \"only\": [\"tag4\"], \"skip\": null},\n                    {\"tags\": [\"tag1\", \"tag2\", \"tag3\"], \"only\": [\"tag1\"], \"skip\": [\"tag1\"]},\n                    {\"tags\": [\"tag1\", \"tag2\", \"tag3\"], \"only\": null, \"skip\": [\"tag1\"]},\n                    {\"tags\": [\"tag1\", \"tag2\", \"tag3\"], \"only\": null, \"skip\": [\"tag4\"]},\n                    {\"tags\": [], \"only\": [\"tag4\"], \"skip\": null},\n                    {\"tags\": [], \"only\": null, \"skip\": [\"tag4\"]}\n                ]\n            },\n            \"expected_output\": \"[a specific boolean result for tag matching in exclude logic]\\n[a specific boolean result for tag matching in exclude logic]\\n[a specific boolean result for tag matching in exclude logic]\\n[a specific boolean result for tag matching in exclude logic]\\n[a specific boolean result for tag matching in exclude logic]\\n[a specific boolean result for tag matching in exclude logic]\\n[a specific boolean result for tag matching in exclude logic]\\n\"\n        }\n    ]\n}\n```\n\n*5.2 Tag Normalization — accept list or comma-separated string, reject other types.*\n\nNormalize the tags attached to a template item into a set. Tags provided as a list become the set of distinct entries; tags provided as a single comma-separated string are split on commas into a set; a one-element list and a single bare string each yield a single-tag set. Supplying tags of any other type is rejected with `error=unexpected_tags_type`. Each parsed result prints a `tags=` line with the members in sorted, comma-separated order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_parse_tags.json`\n\n```json\n{\n    \"description\": \"Normalizes the tags attached to a template item into a set. Tags provided as a list become the set of distinct entries, and tags provided as a single comma-separated string are split on commas into a set; a one-element list and a single bare string each yield a single-tag set. Supplying tags of any other type is rejected with 'error=unexpected_tags_type'. Each parsed result prints a 'tags=' line with the members in sorted order.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"parse_tags\",\n                \"inputs\": [[\"tag1\", \"tag2\", \"tag3\"], \"tag1,tag2,tag3\", [\"tag1\"], \"tag1\"]\n            },\n            \"expected_output\": \"tags=tag1,tag2,tag3\\ntags=tag1,tag2,tag3\\ntags=tag1\\ntags=tag1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Precedence-Based Connection Settings\n\n**As a developer**, I want connection-related settings to be drawn from multiple sources by a fixed priority, so a CLI override beats configuration, which beats environment, and so on, with predictable defaults.\n\n**Expected Behavior / Usage:**\n\n*6.1 First-Truthy Selection — pick the first usable value from an ordered list.*\n\nPick the first \"truthy\" value from an ordered argument list, modeling precedence where higher-priority sources are listed first. Falsy values (null, false, zero, empty string, empty mapping, empty list) are skipped; if every argument is falsy or there are no arguments, the result is reported as `none`. Each argument set prints a `first=` line with the selected value or `none`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_first_truthy.json`\n\n```json\n{\n    \"description\": \"Picks the first 'truthy' value from an ordered argument list, modeling configuration precedence where higher-priority sources are listed first. Falsy values (none, false, zero, empty string, empty mapping, empty list) are skipped, and if every argument is falsy or there are no arguments the result is 'none'. Each argument set prints a 'first=' line with the selected value or 'none'.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"first_truthy\",\n                \"arg_sets\": [[], [null], [null, false, 0, \"\", {}, []], [\"value_cli\", \"value_env\"], [\"\", \"value_env\"]]\n            },\n            \"expected_output\": \"first=none\\nfirst=none\\nfirst=none\\nfirst=value_cli\\nfirst=value_env\\n\"\n        }\n    ]\n}\n```\n\n*6.2 Effective Namespace Resolution — context over kubeconfig default over environment.*\n\nResolve the effective namespace by precedence: an explicit namespace from the configuration context wins over a namespace taken from a supplied kubeconfig default, which in turn wins over a namespace from the environment. When the context value is absent the kubeconfig default is used if provided, otherwise the environment value is used. Each scenario prints a `namespace=` line with the resolved value or `none`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_namespace_default.json`\n\n```json\n{\n    \"description\": \"Resolves the effective namespace by precedence: an explicit namespace from the configuration context wins over a namespace taken from a supplied kubeconfig default, which in turn wins over a namespace from the environment. When the context value is absent the kubeconfig default is used if provided, otherwise the environment value is used. Each scenario prints a 'namespace=' line with the resolved value or 'none'.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"namespace_default\",\n                \"scenarios\": [\n                    {\"context\": {\"k8s_namespace\": \"value_context\"}, \"env\": {\"K8S_NAMESPACE\": \"value_env\"}},\n                    {\"context\": {\"k8s_namespace\": \"value_context\"}, \"env\": {\"K8S_NAMESPACE\": \"value_env\"}, \"kubeconfig\": \"kubeconfig_namespace\"},\n                    {\"context\": {}, \"env\": {\"K8S_NAMESPACE\": \"value_env\"}},\n                    {\"context\": {}, \"env\": {\"K8S_NAMESPACE\": \"value_env\"}, \"kubeconfig\": \"kubeconfig_namespace\"}\n                ]\n            },\n            \"expected_output\": \"namespace=value_context\\nnamespace=value_context\\nnamespace=value_env\\nnamespace=kubeconfig_namespace\\n\"\n        }\n    ]\n}\n```\n\n*6.3 Client Configuration Assembly — require master URI and token, build host/authorization/debug/CA.*\n\nAssemble a cluster client configuration from CLI, context, and environment inputs by precedence, requiring both a master URI and a token. A missing master URI is rejected with `error=missing_master_uri` and a missing token with `error=missing_token`. On success it reports four lines: `host=` (the master URI); `authorization=` (the bearer header built as `Bearer <token>`); `debug=` (whether debug is enabled — a truthy debug flag supplied through the context turns it on); and `ca_cert=` (the certificate-authority text obtained by base64-decoding the supplied CA value).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_client_configuration.json`\n\n```json\n{\n    \"description\": \"Assembles a Kubernetes client configuration from CLI, context, and environment inputs by precedence, requiring both a master URI and a token. A missing master URI is rejected with 'error=missing_master_uri' and a missing token with 'error=missing_token'. On success it reports the host (master URI), the bearer authorization header built from the token, whether debug is enabled (a debug flag supplied through the context as a truthy string turns it on), and the decoded certificate-authority text obtained by base64-decoding the supplied CA value.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"client_configuration\",\n                \"cli\": {\"k8s_ca_base64\": \"value_cli\", \"k8s_token\": \"value_cli\"}\n            },\n            \"expected_output\": \"error=missing_master_uri\\n\"\n        }\n    ]\n}\n```\n\n*6.4 Deprecated Environment Detection — flag legacy variables for master URI / CA.*\n\nDetect whether legacy/deprecated environment variables are present for supplying the cluster master URI or certificate authority. The check is true when either deprecated variable holds a non-empty value and false when both are absent or empty. Each environment set prints `deprecated=true` or `deprecated=false`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_env_deprecated.json`\n\n```json\n{\n    \"description\": \"Detects whether legacy/deprecated environment variables are present for supplying the cluster master URI or certificate authority. The check is true when either deprecated variable holds a non-empty value and false when both are absent or empty. Each environment set prints a 'deprecated=true' or 'deprecated=false' line.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"env_deprecated\",\n                \"env_sets\": [{\"K8S_CA\": \"value_env_deprecated\"}, {\"K8S_HOST\": \"value_env_deprecated\"}, {\"K8S_CA\": \"\"}, {\"K8S_HOST\": \"\"}]\n            },\n            \"expected_output\": \"deprecated=true\\ndeprecated=true\\ndeprecated=false\\ndeprecated=false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Resource Kind Name Normalization\n\n**As a developer**, I want a CamelCase resource kind converted into a lower-cased, underscore-separated identifier, so the engine can map a kind to the corresponding internal handler name consistently.\n\n**Expected Behavior / Usage:**\n\nConvert a resource kind written in CamelCase into a lower-cased, underscore-separated identifier, splitting at each capital letter so a single-word kind becomes one lowercase word and a multi-word kind becomes underscore-joined words. Each input kind prints a `name=` line with its normalized form.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_normalize_kind.json`\n\n```json\n{\n    \"description\": \"Converts a Kubernetes resource kind written in CamelCase into a lower-cased, underscore-separated identifier, splitting at each capital letter so that a single-word kind becomes one lowercase word and a multi-word kind becomes underscore-joined words. Each input kind prints a 'name=' line with its normalized form.\",\n    \"cases\": [\n        {\n            \"input\": {\"op\": \"normalize_kind\", \"kinds\": [\"ConfigMap\", \"Namespace\", \"PodDisruptionBudget\"]},\n            \"expected_output\": \"name=config_map\\nname=namespace\\nname=pod_disruption_budget\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: API Deprecation Detection\n\n**As a developer**, I want to know whether an apiVersion/kind pair is deprecated or removed relative to a target server version, so I can fix manifests before deploying to a newer cluster.\n\n**Expected Behavior / Usage:**\n\nDecide whether a given apiVersion/kind pair is deprecated relative to a server version, using a deprecation table that maps each apiVersion and kind to a `since` version and an optional `until` version. The pair is not deprecated when the apiVersion or the kind is absent from the table, or when the server version is below `since`. It is deprecated once the server version reaches or exceeds `since`, and also (as unsupported) when an `until` is set and the server version reaches or exceeds it; an empty `until` is ignored. Comparisons are semantic-version aware and boundary-inclusive. Each case prints the apiVersion, kind, server version, and a `deprecated=` boolean.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_deprecation.json`\n\n```json\n{\n    \"description\": \"Decides whether a given apiVersion/kind pair is deprecated relative to a server version, using a deprecation table that maps each apiVersion and kind to a 'since' version and an optional 'until' version. The pair is not deprecated when the apiVersion or the kind is absent from the table, or when the server version is below 'since'. It is deprecated once the server version reaches or exceeds 'since', and also when an 'until' is set and the server version reaches or exceeds it (unsupported); an empty 'until' is ignored. Comparisons are semantic-version aware and boundary-inclusive. Each case prints the apiVersion, kind, server version, and a 'deprecated=' boolean.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"check_deprecation\",\n                \"server_version\": \"1.9.7\",\n                \"api_version\": \"test/v2\",\n                \"kind\": \"Deployment\",\n                \"deprecations\": {\"test/v1\": {\"Deployment\": {\"since\": \"1.8.0\", \"until\": \"1.10.0\"}}}\n            },\n            \"expected_output\": \"api_version=test/v2\\nkind=Deployment\\nserver_version=1.9.7\\ndeprecated=false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 9: Cluster Catalog Version Queries\n\n**As a developer**, I want to ask a cluster catalog which kinds it serves for an API group/version and whether a given identifier even matches a catalog's shape, so availability checks can be composed from interchangeable lookup strategies.\n\n**Expected Behavior / Usage:**\n\n*9.1 Version Shape Classification — bare-version vs grouped-version getters.*\n\nClassify whether an API group identifier matches a getter's version shape. A core (bare-version) getter accepts a single-segment version with no slash and rejects a slashed group/version, a lone slash, and an empty string. A regular (grouped-version) getter is the mirror image: it accepts a group/version pair containing exactly one slash and rejects a bare version, a lone slash, and an empty string. Each query prints a line with the quoted input and a `processable=` boolean.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_version_processable.json`\n\n```json\n{\n    \"description\": \"Classifies whether an API group identifier matches a getter's version shape. A core getter accepts a bare single-segment version with no slash and rejects a slashed group/version, a lone slash, and an empty string. A regular getter is the mirror image: it accepts a group/version pair containing exactly one slash and rejects a bare version, a lone slash, and an empty string. Each query prints a line with the quoted input and a 'processable=' boolean.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"version_processable\",\n                \"style\": \"core\",\n                \"group_version\": \"v1\",\n                \"kinds\": [\"Pod\", \"CronJob\"],\n                \"queries\": [\"v1\", \"app/v1\", \"/\", \"\"]\n            },\n            \"expected_output\": \"group='v1' processable=true\\ngroup='app/v1' processable=false\\ngroup='/' processable=false\\ngroup='' processable=false\\n\"\n        }\n    ]\n}\n```\n\n*9.2 Advertised Kinds by Version — return the kinds a catalog serves for a version.*\n\nReturn the set of resource kinds a catalog advertises for a queried API group/version. When the queried version matches the catalog's version, the advertised kinds are returned; when it does not match, the empty set is returned. Each query prints a `group=... kinds=...` line with the kinds in sorted, comma-separated order (empty when none).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_resources_by_version.json`\n\n```json\n{\n    \"description\": \"Returns the set of resource kinds a cluster catalog advertises for a queried API group/version. When the queried version matches the catalog's version, the advertised kinds are returned; when it does not match, the empty set is returned. Each query prints a 'group=... kinds=...' line with the kinds in sorted, comma-separated order (empty when none).\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"resources_by_version\",\n                \"style\": \"core\",\n                \"group_version\": \"v1\",\n                \"kinds\": [\"Pod\", \"CronJob\"],\n                \"queries\": [\"v1\", \"v2\"]\n            },\n            \"expected_output\": \"group=v1 kinds=CronJob,Pod\\ngroup=v2 kinds=\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 10: Resource Availability Validation\n\n**As a developer**, I want to confirm that every resource in a manifest is actually served by the target cluster before applying it, so unsupported kinds fail fast with a precise reason.\n\n**Expected Behavior / Usage:**\n\n*10.1 Kind Availability Across Catalogs — is a kind served for an apiVersion?*\n\nDetermine whether a specific kind is available for a given apiVersion across a collection of cluster catalogs, where each catalog advertises a fixed set of kinds for one version. A kind is available only when some catalog both handles that apiVersion's shape and lists that kind; a kind listed under a different version, or not listed at all, is unavailable. Each query prints an `api_version=... kind=... available=` line.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_available_kind.json`\n\n```json\n{\n    \"description\": \"Determines whether a specific kind is available for a given apiVersion across a collection of cluster catalogs, where each catalog advertises a fixed set of kinds for one version. A kind is available only when some catalog both handles that apiVersion's shape and lists that kind; a kind listed under a different version, or not listed at all, is unavailable. Each query prints an 'api_version=... kind=... available=' line.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"available_kind\",\n                \"catalogs\": [\n                    {\"style\": \"core\", \"group_version\": \"v1\", \"kinds\": [\"Pod\", \"CronJob\"]},\n                    {\"style\": \"regular\", \"group_version\": \"app/v1\", \"kinds\": [\"Deployment\", \"Service\"]}\n                ],\n                \"queries\": [\n                    {\"api_version\": \"v1\", \"kind\": \"Pod\"},\n                    {\"api_version\": \"app/v1\", \"kind\": \"Service\"},\n                    {\"api_version\": \"v1\", \"kind\": \"Deployment\"},\n                    {\"api_version\": \"app/v1\", \"kind\": \"CronJob\"}\n                ]\n            },\n            \"expected_output\": \"api_version=v1 kind=Pod available=true\\napi_version=app/v1 kind=Service available=true\\napi_version=v1 kind=Deployment available=false\\napi_version=app/v1 kind=CronJob available=false\\n\"\n        }\n    ]\n}\n```\n\n*10.2 Manifest Validation — accept a fully-served manifest, reject an unserved kind.*\n\nValidate every resource document in a manifest file against a collection of cluster catalogs, succeeding only when each document's kind is advertised for its apiVersion. A manifest whose document's apiVersion/kind is advertised prints `available=true`; a manifest whose apiVersion is unknown to all catalogs, or whose kind is listed only under a different version, is rejected with `error=resource_not_available` followed by `kind=` and `api_version=` lines naming the offending document.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_validate_manifest.json`\n\n```json\n{\n    \"description\": \"Validates every resource document in a manifest file against a collection of cluster catalogs, succeeding only when each document's kind is advertised for its apiVersion. A manifest whose single document's apiVersion/kind is advertised passes; a manifest whose apiVersion is unknown to all catalogs, or whose kind is listed only under a different version, is rejected with 'error=resource_not_available' together with the offending kind and apiVersion.\",\n    \"cases\": [\n        {\n            \"input\": {\n                \"op\": \"validate_manifest_availability\",\n                \"catalogs\": [\n                    {\"style\": \"core\", \"group_version\": \"v1\", \"kinds\": [\"Pod\", \"CronJob\"]},\n                    {\"style\": \"regular\", \"group_version\": \"app/v1\", \"kinds\": [\"Deployment\", \"Service\"]}\n                ],\n                \"manifest\": \"---\\napiVersion: app/v1\\nkind: Service\\nmetadata:\\n  name: my-service\\nspec:\\n  ports:\\n  - name: HTTP\\n    port: 80\\n    protocol: TCP\\n    targetPort: 80\\n  selector:\\n    app: my-app\\n  type: ClusterIP\\n\"\n            },\n            \"expected_output\": \"available=true\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the features above — configuration merging, placeholder resolution (env/file with strict mode and cycle detection), template rendering with filters/tags/globs, precedence-based connection settings, kind-name normalization, semantic-version deprecation logic, and pluggable catalog lookups for availability validation. The physical structure must align with the \"Scale-Driven Code Organization\" constraint and keep each responsibility in its own module.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core system. It reads one JSON command from stdin, dispatches on the command's `op`, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-leaf-feature contracts above — including normalizing any native error into the documented `error=<category>` lines. This adapter must be logically and physically separated from the core domain.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to choose the directory (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_dictionary_merge.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_dictionary_merge@000.txt`). Output is namespaced by `<cases-dir>` so different case directories never overwrite each other, and each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- resolve nested conflicts using the standard yamler pattern\n- examine the existing namespace propagation logic\n",
+  "oracle_data": {
+    "task_id": "2gis__k8s-handle-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "what is the strict error message",
+          "how do I see strict violations",
+          "remove strict mode fallback value"
+        ],
+        "oracle_response": "` (strict error)` with the variable name appended, or a clear legal prompt ` Nicht definiert` depending on locale, but the core string is a placeholder in the spec."
+      },
+      {
+        "constraint_id": "C029",
+        "trigger_keywords": [
+          "input for base64 filter",
+          "output of from_base64",
+          "what is the hex digest format"
+        ],
+        "oracle_response": "The spec uses vague placeholders like `BASE64_STRING` or `DECODED_STRING` instead of concrete examples, though C010 has better examples nearby."
+      },
+      {
+        "constraint_id": "C020",
+        "trigger_keywords": [
+          "what is the match true value",
+          "false case for tags",
+          "boolean return value for caching"
+        ],
+        "oracle_response": "The boolean result is just `true` or `false`."
+      },
+      {
+        "constraint_id": "TC_feature3_recursive_substitution",
+        "trigger_keywords": [
+          "test cases for feature3 recursive substitution",
+          "show me feature3 recursive substitution test cases",
+          "what are the feature3 recursive substitution inputs and outputs",
+          "give me the feature3_recursive_substitution test file",
+          "feature3 recursive substitution expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_recursive_substitution:\n{\n  \"description\": \"Walks an arbitrary nested structure (mappings, lists, and scalars) and substitutes string placeholders in place, leaving non-string leaves untouched. Each string is scanned for an env='<NAME>' placeholder that is replaced by the environment variable value (an unset variable expands to empty text in non-strict mode), and for a file='<path>' placeholder that is replaced by the parsed YAML content of the referenced file. Numbers, booleans, and list ordering are preserved exactly, and a bare scalar passed in alone is returned unchanged. Output is the transformed structure as sorted JSON.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"update_context\",\n        \"env\": {\n          \"CUSTOM_ENV\": \"My value\"\n        },\n        \"aux_files\": {\n          \"include.yaml\": \"---\\nha_ha: \\\"included_var\\\"\\n\"\n        },\n        \"context\": {\n          \"section1\": {\n            \"subsection1\": {\n              \"section1-key1\": \"value\",\n              \"section1-key2\": 1,\n              \"section1-key3\": 0.1,\n              \"section1-key4\": [\n                0,\n                1,\n                2,\n                3\n              ],\n              \"section1-key5\": \"{{ env='CUSTOM_ENV' }}\",\n              \"section1-key6\": \"{{ file='include.yaml' }}\",\n              \"section1-key7\": \"{{ env='CUSTOM_ENV'}} = {{ env='CUSTOM_ENV' }}\",\n              \"section1-key8\": \"{{ env='NULL_VAR' }}-{{ env='CUSTOM_ENV' }}\"\n            }\n          },\n          \"section2\": [\n            {},\n            \"var2\",\n            \"var3\",\n            \"{{ env='CUSTOM_ENV' }}\",\n            \"{{ env='CUSTOM_ENV' }} = {{ env='CUSTOM_ENV' }}\",\n            \"{{ env='NULL_VAR' }}-{{ env='CUSTOM_ENV' }}\"\n          ],\n          \"section3\": [\n            0,\n            1,\n            2,\n            3,\n            4\n          ]\n        }\n      },\n      \"expected_output\": \"{\\n  \\\"section1\\\": {\\n    \\\"subsection1\\\": {\\n      \\\"section1-key1\\\": \\\"value\\\",\\n      \\\"section1-key2\\\": 1,\\n      \\\"section1-key3\\\": 0.1,\\n      \\\"section1-key4\\\": [\\n        0,\\n        1,\\n        2,\\n        3\\n      ],\\n      \\\"section1-key5\\\": \\\"My value\\\",\\n      \\\"section1-key6\\\": {\\n        \\\"ha_ha\\\": \\\"included_var\\\"\\n      },\\n      \\\"section1-key7\\\": \\\"My value = My value\\\",\\n      \\\"section1-key8\\\": \\\"-My value\\\"\\n    }\\n  },\\n  \\\"section2\\\": [\\n    {},\\n    \\\"var2\\\",\\n    \\\"var3\\\",\\n    \\\"My value\\\",\\n    \\\"My value = My value\\\",\\n    \\\"-My value\\\"\\n  ],\\n  \\\"section3\\\": [\\n    0,\\n    1,\\n    2,\\n    3,\\n    4\\n  ]\\n}\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_filters",
+        "trigger_keywords": [
+          "test cases for feature4 filters",
+          "show me feature4 filters test cases",
+          "what are the feature4 filters inputs and outputs",
+          "give me the feature4_filters test file",
+          "feature4 filters expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_filters:\n{\n  \"description\": \"Renders templates that exercise the engine's value-transformation filters and a dashed key lookup. A base64-encode filter encodes its input string, a base64-decode filter decodes its input, a sha256 filter returns the hex digest of its input, and a to-yaml filter serializes a structure (a list of mappings) to inline YAML. A separate template indexes a mapping by a region key to select the matching value. Output is the rendered file content under a '# file:' header.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"render\",\n        \"section\": \"test_filters\",\n        \"templates_files\": {\n          \"filters.yaml.j2\": \"b64encode: {{ to_base64 | b64encode }}\\nb64decode: {{ from_base64 | b64decode }}\\nsha256: {{ to_sha256 | hash_sha256 }}\\naffinity: {{ affinity | to_yaml() }}\"\n        },\n        \"config\": \"common:\\n  k8s_namespace: namespace\\ntest_filters:\\n  to_base64: hello world\\n  from_base64: azhzLWhhbmRsZQ==\\n  to_sha256: k8s-hanle\\n  affinity:\\n    - key: \\\"dedicated\\\"\\n      operator: \\\"Equal\\\"\\n      value: \\\"monitoring\\\"\\n      effect: \\\"NoSchedule\\\"\\n    - key: \\\"dedicated\\\"\\n      operator: \\\"Equal\\\"\\n      value:\\n        hello: world\\n      effect: \\\"NoSchedule\\\"\\n  templates:\\n    - template: filters.yaml.j2\\n\"\n      },\n      \"expected_output\": \"# file: filters.yaml\\nb64encode: aGVsbG8gd29ybGQ=\\nb64decode: k8s-handle\\nsha256: 8fae6dd899aace000fd494fd6d795e26e2c85bf8e59d4262ef56b03dc91e924c\\naffinity: [{effect: NoSchedule, key: dedicated, operator: Equal, value: monitoring}, {effect: NoSchedule, key: dedicated, operator: Equal, value: {hello: world}}]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_evaluate_tags",
+        "trigger_keywords": [
+          "test cases for feature5 evaluate tags",
+          "show me feature5 evaluate tags test cases",
+          "what are the feature5 evaluate tags inputs and outputs",
+          "give me the feature5_evaluate_tags test file",
+          "feature5 evaluate tags expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_evaluate_tags:\n{\n  \"description\": \"Decides whether a template that carries a set of tags should be included given an optional allow-list ('only') and an optional skip-list ('skip'). A template is excluded when an allow-list is given and the template shares no tag with it, and excluded when a skip-list is given and the template shares any tag with it; otherwise it is included. When no lists are given the template is always included, and these rules also hold when the template has no tags at all. Each evaluation prints a 'match=true' or 'match=false' line in order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"eval_tags\",\n        \"evaluations\": [\n          {\n            \"tags\": [\n              \"tag1\",\n              \"tag2\",\n              \"tag3\"\n            ],\n            \"only\": [\n              \"tag1\"\n            ],\n            \"skip\": null\n          },\n          {\n            \"tags\": [\n              \"tag1\",\n              \"tag2\",\n              \"tag3\"\n            ],\n            \"only\": [\n              \"tag4\"\n            ],\n            \"skip\": null\n          },\n          {\n            \"tags\": [\n              \"tag1\",\n              \"tag2\",\n              \"tag3\"\n            ],\n            \"only\": [\n              \"tag1\"\n            ],\n            \"skip\": [\n              \"tag1\"\n            ]\n          },\n          {\n            \"tags\": [\n              \"tag1\",\n              \"tag2\",\n              \"tag3\"\n            ],\n            \"only\": null,\n            \"skip\": [\n              \"tag1\"\n            ]\n          },\n          {\n            \"tags\": [\n              \"tag1\",\n              \"tag2\",\n              \"tag3\"\n            ],\n            \"only\": null,\n            \"skip\": [\n              \"tag4\"\n            ]\n          },\n          {\n            \"tags\": [],\n            \"only\": [\n              \"tag4\"\n            ],\n            \"skip\": null\n          },\n          {\n            \"tags\": [],\n            \"only\": null,\n            \"skip\": [\n              \"tag4\"\n            ]\n          }\n        ]\n      },\n      \"expected_output\": \"match=true\\nmatch=false\\nmatch=false\\nmatch=false\\nmatch=true\\nmatch=false\\nmatch=true\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "resolve nested conflicts using the standard yamler pattern",
+        "actual_meaning": "The code defers to the behavior of the `tower` and `gocmp` libraries for recursive merging."
+      },
+      {
+        "vague_reference": "examine the existing namespace propagation logic",
+        "actual_meaning": "The spec references an unknown internal mechanism for falling back to kubeconfig namespacing, rather than just naming it explicitly."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_available_kind.json": {
+      "description": "Determines whether a specific kind is available for a given apiVersion across a collection of cluster catalogs, where each catalog advertises a fixed set of kinds for one version. A kind is available only when some catalog both handles that apiVersion's shape and lists that kind; a kind listed under a different version, or not listed at all, is unavailable. Each query prints an 'api_version=... kind=... available=' line.",
+      "cases": [
+        {
+          "input": {
+            "op": "available_kind",
+            "catalogs": [
+              {
+                "style": "core",
+                "group_version": "v1",
+                "kinds": [
+                  "Pod",
+                  "CronJob"
+                ]
+              },
+              {
+                "style": "regular",
+                "group_version": "app/v1",
+                "kinds": [
+                  "Deployment",
+                  "Service"
+                ]
+              }
+            ],
+            "queries": [
+              {
+                "api_version": "v1",
+                "kind": "Pod"
+              },
+              {
+                "api_version": "app/v1",
+                "kind": "Service"
+              },
+              {
+                "api_version": "v1",
+                "kind": "Deployment"
+              },
+              {
+                "api_version": "app/v1",
+                "kind": "CronJob"
+              }
+            ]
+          },
+          "expected_output": "api_version=v1 kind=Pod available=true\napi_version=app/v1 kind=Service available=true\napi_version=v1 kind=Deployment available=false\napi_version=app/v1 kind=CronJob available=false\n"
+        }
+      ]
+    },
+    "feature10_validate_manifest.json": {
+      "description": "Validates every resource document in a manifest file against a collection of cluster catalogs, succeeding only when each document's kind is advertised for its apiVersion. A manifest whose single document's apiVersion/kind is advertised passes; a manifest whose apiVersion is unknown to all catalogs, or whose kind is listed only under a different version, is rejected with 'error=resource_not_available' together with the offending kind and apiVersion.",
+      "cases": [
+        {
+          "input": {
+            "op": "validate_manifest_availability",
+            "catalogs": [
+              {
+                "style": "core",
+                "group_version": "v1",
+                "kinds": [
+                  "Pod",
+                  "CronJob"
+                ]
+              },
+              {
+                "style": "regular",
+                "group_version": "app/v1",
+                "kinds": [
+                  "Deployment",
+                  "Service"
+                ]
+              }
+            ],
+            "manifest": "---\napiVersion: app/v1\nkind: Service\nmetadata:\n  name: my-service\nspec:\n  ports:\n  - name: HTTP\n    port: 80\n    protocol: TCP\n    targetPort: 80\n  selector:\n    app: my-app\n  type: ClusterIP\n"
+          },
+          "expected_output": "available=true\n"
+        }
+      ]
+    },
+    "feature1_dictionary_merge.json": {
+      "description": "Deeply merges two configuration mappings into one. Keys present only in the override win; keys present in both are combined recursively when both values are mappings, otherwise the override value replaces the base value entirely (including replacing a mapping with a scalar, or replacing a list rather than concatenating it). The base input is never mutated.",
+      "cases": [
+        {
+          "input": {
+            "op": "merge",
+            "base": {
+              "name": "app",
+              "ports": [
+                80,
+                443
+              ],
+              "labels": {
+                "team": "core"
+              },
+              "replicas": {
+                "min": 1
+              }
+            },
+            "override": {
+              "name": "web",
+              "ports": [
+                8080
+              ],
+              "labels": {
+                "tier": "frontend"
+              },
+              "replicas": 3
+            }
+          },
+          "expected_output": "{\n  \"labels\": {\n    \"team\": \"core\",\n    \"tier\": \"frontend\"\n  },\n  \"name\": \"web\",\n  \"ports\": [\n    8080\n  ],\n  \"replicas\": 3\n}"
+        }
+      ]
+    },
+    "feature2_config_section_errors.json": {
+      "description": "Loads a named section from a YAML configuration document and reports structural errors as neutral categories instead of raising. The loader rejects a missing configuration file, a file whose parsed content is empty, a file that is not valid YAML, a request for a section name that does not exist, and a section that (after being merged with the shared 'common' section) declares neither a 'templates' nor a 'kubectl' list of items to deploy. It also rejects an empty section name, and the reserved shared section name that exists only to be inherited and is never deployed on its own. Each case prints a single 'error=<category>' line identifying which rule was violated.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve",
+            "section": "section",
+            "no_config": true
+          },
+          "expected_output": "error=config_not_found\n"
+        }
+      ]
+    },
+    "feature3_include_loop.json": {
+      "description": "Detects a cyclic file='<path>' include chain while resolving a section and aborts instead of recursing forever. A value that, directly or transitively through nested includes, references a file that has already been visited on the current include path is rejected. The case wires two include files that reference each other and prints 'error=include_loop'.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve",
+            "section": "section_3",
+            "aux_files": {
+              "incorrect_include.yaml": "\n---\nincluded_file: \"{{ file='incorrect_include2.yaml' }}\"\n",
+              "incorrect_include2.yaml": "\n---\nincluded_file: \"{{ file='incorrect_include.yaml' }}\"\n"
+            },
+            "config": "common:\n  k8s_namespace: namespace\nsection_3:\n  var: \"{{ file='incorrect_include.yaml' }}\"\n  templates:\n    - template: template1.yaml.j2\n"
+          },
+          "expected_output": "error=include_loop\n"
+        }
+      ]
+    },
+    "feature3_recursive_substitution.json": {
+      "description": "Walks an arbitrary nested structure (mappings, lists, and scalars) and substitutes string placeholders in place, leaving non-string leaves untouched. Each string is scanned for an env='<NAME>' placeholder that is replaced by the environment variable value (an unset variable expands to empty text in non-strict mode), and for a file='<path>' placeholder that is replaced by the parsed YAML content of the referenced file. Numbers, booleans, and list ordering are preserved exactly, and a bare scalar passed in alone is returned unchanged. Output is the transformed structure as sorted JSON.",
+      "cases": [
+        {
+          "input": {
+            "op": "update_context",
+            "env": {
+              "CUSTOM_ENV": "My value"
+            },
+            "aux_files": {
+              "include.yaml": "---\nha_ha: \"included_var\"\n"
+            },
+            "context": {
+              "section1": {
+                "subsection1": {
+                  "section1-key1": "value",
+                  "section1-key2": 1,
+                  "section1-key3": 0.1,
+                  "section1-key4": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ],
+                  "section1-key5": "{{ env='CUSTOM_ENV' }}",
+                  "section1-key6": "{{ file='include.yaml' }}",
+                  "section1-key7": "{{ env='CUSTOM_ENV'}} = {{ env='CUSTOM_ENV' }}",
+                  "section1-key8": "{{ env='NULL_VAR' }}-{{ env='CUSTOM_ENV' }}"
+                }
+              },
+              "section2": [
+                {},
+                "var2",
+                "var3",
+                "{{ env='CUSTOM_ENV' }}",
+                "{{ env='CUSTOM_ENV' }} = {{ env='CUSTOM_ENV' }}",
+                "{{ env='NULL_VAR' }}-{{ env='CUSTOM_ENV' }}"
+              ],
+              "section3": [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            }
+          },
+          "expected_output": "{\n  \"section1\": {\n    \"subsection1\": {\n      \"section1-key1\": \"value\",\n      \"section1-key2\": 1,\n      \"section1-key3\": 0.1,\n      \"section1-key4\": [\n        0,\n        1,\n        2,\n        3\n      ],\n      \"section1-key5\": \"My value\",\n      \"section1-key6\": {\n        \"ha_ha\": \"included_var\"\n      },\n      \"section1-key7\": \"My value = My value\",\n      \"section1-key8\": \"-My value\"\n    }\n  },\n  \"section2\": [\n    {},\n    \"var2\",\n    \"var3\",\n    \"My value\",\n    \"My value = My value\",\n    \"-My value\"\n  ],\n  \"section3\": [\n    0,\n    1,\n    2,\n    3,\n    4\n  ]\n}"
+        }
+      ]
+    },
+    "feature3_root_dashes.json": {
+      "description": "Validates that root-level variable names in a resolved section contain no dashes, because dashes are not legal identifiers for templating. Only top-level keys are checked; dashes nested inside mapping values are permitted. A section whose merged root keys include one or more dashed names is rejected with 'error=root_dashes' followed by the offending names in sorted order, while a section whose dashes appear only in nested values resolves successfully to a sorted JSON object.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve",
+            "section": "not_allowed",
+            "aux_files": {
+              "include.yaml": "---\nha_ha: \"included_var\"\n"
+            },
+            "config": "common:\n  my_file: \"{{ file='include.yaml' }}\"\n  k8s_namespace: namespace\n  templates:\n    - template: template1.yaml.j2\nnot_allowed:\n  my-var: my_value\n  my-var-with-dashes: not allowed\n"
+          },
+          "expected_output": "error=root_dashes\nvars=my-var, my-var-with-dashes\n"
+        }
+      ]
+    },
+    "feature3_strict_env_unset.json": {
+      "description": "When strict environment resolution is enabled, expanding a placeholder env='<NAME>' for an environment variable that is not set is treated as a hard error rather than substituting empty text. The rule applies to placeholders found directly in a section's values, in values pulled in through a file='<path>' include, and through chains of nested includes. Each case enables strict mode with the referenced variable unset and prints 'error=env_not_set' together with the offending variable name.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve",
+            "section": "section_1",
+            "strict": true,
+            "config": "common:\n  k8s_namespace: namespace\nsection_1:\n  var: \"{{ env='SECTION1' }}\"\n  templates:\n    - template: template1.yaml.j2\n"
+          },
+          "expected_output": "error=env_not_set\nvar=SECTION1\n"
+        }
+      ]
+    },
+    "feature3_variable_resolution.json": {
+      "description": "Resolves a configuration section by overlaying it on the shared 'common' section and expanding string placeholders. A placeholder of the form file='<path>' is replaced by the parsed YAML content of that file (yielding a nested mapping), and a placeholder of the form env='<NAME>' is replaced by the value of that environment variable; literal text surrounding an env placeholder is preserved so placeholders can be concatenated with prefixes/suffixes or with each other. Section values override common values, while mappings present in both are merged recursively. The output is the fully resolved section as a sorted JSON object.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve",
+            "section": "test_dirs",
+            "env": {
+              "CUSTOM_ENV": "My value"
+            },
+            "aux_files": {
+              "include.yaml": "---\nha_ha: \"included_var\"\n"
+            },
+            "config": "common:\n  my_var: my_value\n  my_file: \"{{ file='include.yaml' }}\"\n  my_env_var: \"{{ env='CUSTOM_ENV' }}\"\ntest_dirs:\n  dirs:\n    - dst: /tmp/test_directory1/\n  templates:\n    - template: template1.yaml.j2\n"
+          },
+          "expected_output": "{\n  \"dirs\": [\n    {\n      \"dst\": \"/tmp/test_directory1/\"\n    }\n  ],\n  \"my_env_var\": \"My value\",\n  \"my_file\": {\n    \"ha_ha\": \"included_var\"\n  },\n  \"my_var\": \"my_value\",\n  \"templates\": [\n    {\n      \"template\": \"template1.yaml.j2\"\n    }\n  ]\n}"
+        }
+      ]
+    },
+    "feature4_filters.json": {
+      "description": "Renders templates that exercise the engine's value-transformation filters and a dashed key lookup. A base64-encode filter encodes its input string, a base64-decode filter decodes its input, a sha256 filter returns the hex digest of its input, and a to-yaml filter serializes a structure (a list of mappings) to inline YAML. A separate template indexes a mapping by a region key to select the matching value. Output is the rendered file content under a '# file:' header.",
+      "cases": [
+        {
+          "input": {
+            "op": "render",
+            "section": "test_filters",
+            "templates_files": {
+              "filters.yaml.j2": "b64encode: {{ to_base64 | b64encode }}\nb64decode: {{ from_base64 | b64decode }}\nsha256: {{ to_sha256 | hash_sha256 }}\naffinity: {{ affinity | to_yaml() }}"
+            },
+            "config": "common:\n  k8s_namespace: namespace\ntest_filters:\n  to_base64: hello world\n  from_base64: azhzLWhhbmRsZQ==\n  to_sha256: k8s-hanle\n  affinity:\n    - key: \"dedicated\"\n      operator: \"Equal\"\n      value: \"monitoring\"\n      effect: \"NoSchedule\"\n    - key: \"dedicated\"\n      operator: \"Equal\"\n      value:\n        hello: world\n      effect: \"NoSchedule\"\n  templates:\n    - template: filters.yaml.j2\n"
+          },
+          "expected_output": "# file: filters.yaml\nb64encode: aGVsbG8gd29ybGQ=\nb64decode: k8s-handle\nsha256: 8fae6dd899aace000fd494fd6d795e26e2c85bf8e59d4262ef56b03dc91e924c\naffinity: [{effect: NoSchedule, key: dedicated, operator: Equal, value: monitoring}, {effect: NoSchedule, key: dedicated, operator: Equal, value: {hello: world}}]\n"
+        }
+      ]
+    },
+    "feature4_render_errors.json": {
+      "description": "Reports rendering failures as neutral error categories. Asking the engine to render from a null context is rejected with 'error=none_context'. A section that resolves with no usable template items prints 'error=no_template_items'. Referencing a template file that does not exist (including a name that is an unmatchable/invalid pattern, which is then treated as a literal name) prints 'error=template_not_found' with the missing template name. Rendering a template that references an undefined variable under strict-undefined semantics prints 'error=undefined_variable' with the variable name.",
+      "cases": [
+        {
+          "input": {
+            "op": "render",
+            "raw_context": null,
+            "templates_files": {
+              "template1.yaml.j2": "{{ x }}"
+            },
+            "config": "common: {}\n"
+          },
+          "expected_output": "error=none_context\n"
+        }
+      ]
+    },
+    "feature4_render_templates.json": {
+      "description": "Renders the templates declared by a resolved configuration section into output files, returning each produced file's relative path and rendered content. Template items may be listed under a 'templates' key or, equivalently, under a 'kubectl' key; items may be nested inside arbitrarily deep 'group' wrappers and are flattened; and a template name that is a regular expression is expanded to every available template file whose name it matches. Each context variable is available to the template engine, an include placeholder resolves to a nested mapping rendered with its native text form, a value piped through the base64-encode filter is encoded, a literal piped through the base64-decode filter is decoded, a static-file include global splices in the indented contents of matching files, and a list-files global yields the sorted base names of matching files. Output lists files in sorted path order, each introduced by a '# file:' header.",
+      "cases": [
+        {
+          "input": {
+            "op": "render",
+            "section": "test_dirs",
+            "env": {
+              "CUSTOM_ENV": "My value"
+            },
+            "aux_files": {
+              "include.yaml": "---\nha_ha: \"included_var\"\n",
+              "templates_tests/my_file.txt": "{{ hello world }}\nnew\nline\n",
+              "templates_tests/my_file1.txt": "{{ hello world1 }}",
+              "templates_tests/innerdir/template1.yaml.j2": "{{ my_file }}"
+            },
+            "templates_files": {
+              "template1.yaml.j2": "{{ my_file }}",
+              "template2.yaml.j2": "{{ my_env_var | b64encode }}\n",
+              "template3.yaml.j2": "{{ 'TXkgdmFsdWU=' | b64decode }}\n",
+              "template_include_file.yaml.j2": "test: |\n  {{ include_file('templates_tests/my_file*.txt') | indent(2) }}\n",
+              "innerdir/template1.yaml.j2": "{{ my_file }}",
+              "template_list_files.yaml.j2": "test: |\n  {% for f in list_files('templates_tests/innerdir') -%}\n  {{ f.split('/')[-1] }}:\n  {% endfor -%}\n  {% for f in list_files('templates_tests/my_file*.txt') -%}\n  {{ f.split('/')[-1] }}:\n  {% endfor -%}\n"
+            },
+            "config": "common:\n  my_var: my_value\n  my_file: \"{{ file='include.yaml' }}\"\n  my_env_var: \"{{ env='CUSTOM_ENV' }}\"\ntest_dirs:\n  dirs:\n    - dst: /tmp/test_directory1/\n  templates:\n    - template: template1.yaml.j2\n    - template: template2.yaml.j2\n    - template: template3.yaml.j2\n    - template: template_include_file.yaml.j2\n    - template: innerdir/template1.yaml.j2\n    - template: template_list_files.yaml.j2\n"
+          },
+          "expected_output": "# file: innerdir/template1.yaml\n{'ha_ha': 'included_var'}\n# file: template1.yaml\n{'ha_ha': 'included_var'}\n# file: template2.yaml\nTXkgdmFsdWU=\n# file: template3.yaml\nMy value\n# file: template_include_file.yaml\ntest: |\n  {{ hello world }}\n  new\n  line\n\n  {{ hello world1 }}\n# file: template_list_files.yaml\ntest: |\n  template1.yaml.j2:\n  my_file.txt:\n  my_file1.txt:\n  \n"
+        }
+      ]
+    },
+    "feature5_evaluate_tags.json": {
+      "description": "Decides whether a template that carries a set of tags should be included given an optional allow-list ('only') and an optional skip-list ('skip'). A template is excluded when an allow-list is given and the template shares no tag with it, and excluded when a skip-list is given and the template shares any tag with it; otherwise it is included. When no lists are given the template is always included, and these rules also hold when the template has no tags at all. Each evaluation prints a 'match=true' or 'match=false' line in order.",
+      "cases": [
+        {
+          "input": {
+            "op": "eval_tags",
+            "evaluations": [
+              {
+                "tags": [
+                  "tag1",
+                  "tag2",
+                  "tag3"
+                ],
+                "only": [
+                  "tag1"
+                ],
+                "skip": null
+              },
+              {
+                "tags": [
+                  "tag1",
+                  "tag2",
+                  "tag3"
+                ],
+                "only": [
+                  "tag4"
+                ],
+                "skip": null
+              },
+              {
+                "tags": [
+                  "tag1",
+                  "tag2",
+                  "tag3"
+                ],
+                "only": [
+                  "tag1"
+                ],
+                "skip": [
+                  "tag1"
+                ]
+              },
+              {
+                "tags": [
+                  "tag1",
+                  "tag2",
+                  "tag3"
+                ],
+                "only": null,
+                "skip": [
+                  "tag1"
+                ]
+              },
+              {
+                "tags": [
+                  "tag1",
+                  "tag2",
+                  "tag3"
+                ],
+                "only": null,
+                "skip": [
+                  "tag4"
+                ]
+              },
+              {
+                "tags": [],
+                "only": [
+                  "tag4"
+                ],
+                "skip": null
+              },
+              {
+                "tags": [],
+                "only": null,
+                "skip": [
+                  "tag4"
+                ]
+              }
+            ]
+          },
+          "expected_output": "match=true\nmatch=false\nmatch=false\nmatch=false\nmatch=true\nmatch=false\nmatch=true\n"
+        }
+      ]
+    },
+    "feature5_parse_tags.json": {
+      "description": "Normalizes the tags attached to a template item into a set. Tags provided as a list become the set of distinct entries, and tags provided as a single comma-separated string are split on commas into a set; a one-element list and a single bare string each yield a single-tag set. Supplying tags of any other type is rejected with 'error=unexpected_tags_type'. Each parsed result prints a 'tags=' line with the members in sorted order.",
+      "cases": [
+        {
+          "input": {
+            "op": "parse_tags",
+            "inputs": [
+              [
+                "tag1",
+                "tag2",
+                "tag3"
+              ],
+              "tag1,tag2,tag3",
+              [
+                "tag1"
+              ],
+              "tag1"
+            ]
+          },
+          "expected_output": "tags=tag1,tag2,tag3\ntags=tag1,tag2,tag3\ntags=tag1\ntags=tag1\n"
+        }
+      ]
+    },
+    "feature6_client_configuration.json": {
+      "description": "Assembles a Kubernetes client configuration from CLI, context, and environment inputs by precedence, requiring both a master URI and a token. A missing master URI is rejected with 'error=missing_master_uri' and a missing token with 'error=missing_token'. On success it reports the host (master URI), the bearer authorization header built from the token, whether debug is enabled (a debug flag supplied through the context as a truthy string turns it on), and the decoded certificate-authority text obtained by base64-decoding the supplied CA value.",
+      "cases": [
+        {
+          "input": {
+            "op": "client_configuration",
+            "cli": {
+              "k8s_ca_base64": "value_cli",
+              "k8s_token": "value_cli"
+            }
+          },
+          "expected_output": "error=missing_master_uri\n"
+        }
+      ]
+    },
+    "feature6_env_deprecated.json": {
+      "description": "Detects whether legacy/deprecated environment variables are present for supplying the cluster master URI or certificate authority. The check is true when either deprecated variable holds a non-empty value and false when both are absent or empty. Each environment set prints a 'deprecated=true' or 'deprecated=false' line.",
+      "cases": [
+        {
+          "input": {
+            "op": "env_deprecated",
+            "env_sets": [
+              {
+                "K8S_CA": "value_env_deprecated"
+              },
+              {
+                "K8S_HOST": "value_env_deprecated"
+              },
+              {
+                "K8S_CA": ""
+              },
+              {
+                "K8S_HOST": ""
+              }
+            ]
+          },
+          "expected_output": "deprecated=true\ndeprecated=true\ndeprecated=false\ndeprecated=false\n"
+        }
+      ]
+    },
+    "feature6_first_truthy.json": {
+      "description": "Picks the first 'truthy' value from an ordered argument list, modeling configuration precedence where higher-priority sources are listed first. Falsy values (none, false, zero, empty string, empty mapping, empty list) are skipped, and if every argument is falsy or there are no arguments the result is 'none'. Each argument set prints a 'first=' line with the selected value or 'none'.",
+      "cases": [
+        {
+          "input": {
+            "op": "first_truthy",
+            "arg_sets": [
+              [],
+              [
+                null
+              ],
+              [
+                null,
+                false,
+                0,
+                "",
+                {},
+                []
+              ],
+              [
+                "value_cli",
+                "value_env"
+              ],
+              [
+                "",
+                "value_env"
+              ]
+            ]
+          },
+          "expected_output": "first=none\nfirst=none\nfirst=none\nfirst=value_cli\nfirst=value_env\n"
+        }
+      ]
+    },
+    "feature6_namespace_default.json": {
+      "description": "Resolves the effective namespace by precedence: an explicit namespace from the configuration context wins over a namespace taken from a supplied kubeconfig default, which in turn wins over a namespace from the environment. When the context value is absent the kubeconfig default is used if provided, otherwise the environment value is used. Each scenario prints a 'namespace=' line with the resolved value or 'none'.",
+      "cases": [
+        {
+          "input": {
+            "op": "namespace_default",
+            "scenarios": [
+              {
+                "context": {
+                  "k8s_namespace": "value_context"
+                },
+                "env": {
+                  "K8S_NAMESPACE": "value_env"
+                }
+              },
+              {
+                "context": {
+                  "k8s_namespace": "value_context"
+                },
+                "env": {
+                  "K8S_NAMESPACE": "value_env"
+                },
+                "kubeconfig": "kubeconfig_namespace"
+              },
+              {
+                "context": {},
+                "env": {
+                  "K8S_NAMESPACE": "value_env"
+                }
+              },
+              {
+                "context": {},
+                "env": {
+                  "K8S_NAMESPACE": "value_env"
+                },
+                "kubeconfig": "kubeconfig_namespace"
+              }
+            ]
+          },
+          "expected_output": "namespace=value_context\nnamespace=value_context\nnamespace=value_env\nnamespace=kubeconfig_namespace\n"
+        }
+      ]
+    },
+    "feature7_normalize_kind.json": {
+      "description": "Converts a Kubernetes resource kind written in CamelCase into a lower-cased, underscore-separated identifier, splitting at each capital letter so that a single-word kind becomes one lowercase word and a multi-word kind becomes underscore-joined words. Each input kind prints a 'name=' line with its normalized form.",
+      "cases": [
+        {
+          "input": {
+            "op": "normalize_kind",
+            "kinds": [
+              "ConfigMap",
+              "Namespace",
+              "PodDisruptionBudget"
+            ]
+          },
+          "expected_output": "name=config_map\nname=namespace\nname=pod_disruption_budget\n"
+        }
+      ]
+    },
+    "feature8_deprecation.json": {
+      "description": "Decides whether a given apiVersion/kind pair is deprecated relative to a server version, using a deprecation table that maps each apiVersion and kind to a 'since' version and an optional 'until' version. The pair is not deprecated when the apiVersion or the kind is absent from the table, or when the server version is below 'since'. It is deprecated once the server version reaches or exceeds 'since', and also when an 'until' is set and the server version reaches or exceeds it (unsupported); an empty 'until' is ignored. Comparisons are semantic-version aware and boundary-inclusive. Each case prints the apiVersion, kind, server version, and a 'deprecated=' boolean.",
+      "cases": [
+        {
+          "input": {
+            "op": "check_deprecation",
+            "server_version": "1.9.7",
+            "api_version": "test/v2",
+            "kind": "Deployment",
+            "deprecations": {
+              "test/v1": {
+                "Deployment": {
+                  "since": "1.8.0",
+                  "until": "1.10.0"
+                }
+              }
+            }
+          },
+          "expected_output": "api_version=test/v2\nkind=Deployment\nserver_version=1.9.7\ndeprecated=false\n"
+        }
+      ]
+    },
+    "feature9_resources_by_version.json": {
+      "description": "Returns the set of resource kinds a cluster catalog advertises for a queried API group/version. When the queried version matches the catalog's version, the advertised kinds are returned; when it does not match, the empty set is returned. Each query prints a 'group=... kinds=...' line with the kinds in sorted, comma-separated order (empty when none).",
+      "cases": [
+        {
+          "input": {
+            "op": "resources_by_version",
+            "style": "core",
+            "group_version": "v1",
+            "kinds": [
+              "Pod",
+              "CronJob"
+            ],
+            "queries": [
+              "v1",
+              "v2"
+            ]
+          },
+          "expected_output": "group=v1 kinds=CronJob,Pod\ngroup=v2 kinds=\n"
+        }
+      ]
+    },
+    "feature9_version_processable.json": {
+      "description": "Classifies whether an API group identifier matches a getter's version shape. A core getter accepts a bare single-segment version with no slash and rejects a slashed group/version, a lone slash, and an empty string. A regular getter is the mirror image: it accepts a group/version pair containing exactly one slash and rejects a bare version, a lone slash, and an empty string. Each query prints a line with the quoted input and a 'processable=' boolean.",
+      "cases": [
+        {
+          "input": {
+            "op": "version_processable",
+            "style": "core",
+            "group_version": "v1",
+            "kinds": [
+              "Pod",
+              "CronJob"
+            ],
+            "queries": [
+              "v1",
+              "app/v1",
+              "/",
+              ""
+            ]
+          },
+          "expected_output": "group='v1' processable=true\ngroup='app/v1' processable=false\ngroup='/' processable=false\ngroup='' processable=false\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "merge",
+      "input_condition": "merge operation with 'base' and 'override' mappings",
+      "output_rule": "Deep merge recursively only when both values are mappings; otherwise override replaces base entirely. Base input is never mutated.",
+      "exact_values": [
+        "label: team/core + tier/frontend -> labels={team:core,tier:frontend}",
+        "port [80,443] + [8080] -> ports:[8080]",
+        "replicas {min:1} + 3 -> replicas:3"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "section_errors",
+      "input_condition": "no_config=true (missing file)",
+      "output_rule": "Reject with single line: error=config_not_found",
+      "exact_values": [
+        "error=config_not_found"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "section_errors",
+      "input_condition": "file parses to empty content",
+      "output_rule": "Reject with single line: error=empty_config",
+      "exact_values": [
+        "error=empty_config"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "section_errors",
+      "input_condition": "file is not valid YAML",
+      "output_rule": "Reject with single line: error=invalid_yaml",
+      "exact_values": [
+        "error=invalid_yaml"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "section_errors",
+      "input_condition": "section name not found in document",
+      "output_rule": "Reject with single line: error=section_not_found",
+      "exact_values": [
+        "error=section_not_found"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "section_errors",
+      "input_condition": "merged section ('common' overlayed) lacks 'templates' AND 'kubectl' lists",
+      "output_rule": "Reject with single line: error=missing_templates",
+      "exact_values": [
+        "error=missing_templates"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "section_errors",
+      "input_condition": "section name is empty string",
+      "output_rule": "Reject with single line: error=empty_section",
+      "exact_values": [
+        "error=empty_section"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "section_errors",
+      "input_condition": "section name is 'common' (reserved shared section)",
+      "output_rule": "Reject with single line: error=reserved_section",
+      "exact_values": [
+        "error=reserved_section"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "variable_resolution",
+      "input_condition": "Resolve a section with placeholders in strings",
+      "output_rule": "Overlay section on 'common' recursively. Expand 'file=<path>' to file content YAML. Expand 'env=<NAME>' to var value. Output sorted JSON.",
+      "exact_values": [
+        "file='include.yaml' -> nested mapping",
+        "env='CUSTOM_ENV' -> string var value",
+        "override values replace common unless mappings (recursive merge)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "recursive_substitution",
+      "input_condition": "Walk arbitrary nested structure (maps, lists, scalars)",
+      "output_rule": "Substitute 'env=' and 'file=' placeholders in-place in strings. Non-string leaves untouched. Output sorted JSON.",
+      "exact_values": [
+        "env='NULL_VAR' -> ' (non-strict)', ' (strict error) unless unsetSpec=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "root_dashes",
+      "input_condition": "Root-level keys in resolved section contain '-'",
+      "output_rule": "Reject with error=root_dashes followed by sorted offending names.",
+      "exact_values": [
+        "error=root_dashes\nvars=name1, name2-3 (sorted)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "include_loop",
+      "input_condition": "file include path references a file already visited in current include chain (direct or transitive)",
+      "output_rule": "Reject with error=include_loop",
+      "exact_values": [
+        "error=include_loop"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "strict_env_unset",
+      "input_condition": "strict=true and env var is empty/unset",
+      "output_rule": "Reject with error=env_not_set followed by the variable name.",
+      "exact_values": [
+        "error=env_not_set\nvar=NAME"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "available_kind",
+      "input_condition": "Query apiVersion/kind against catalog list",
+      "output_rule": "Kind available only if a catalog handles the apiVersion group AND lists the kind. Format: 'api_version=... kind=... available=true/false'",
+      "exact_values": [
+        "api_version=v1 kind=Pod available=true",
+        "api_version=v1 kind=Deployment available=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "validate_manifest",
+      "input_condition": "Validate manifest's single document apiVersion/kind against catalogs",
+      "output_rule": "Success: 'available=true'. Failure: 'error=resource_not_available' with kind and api_version.",
+      "exact_values": [
+        "available=true",
+        "error=resource_not_available"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "render",
+      "input_condition": "raw_context is null",
+      "output_rule": "Reject with 'error=none_context'",
+      "exact_values": [
+        "error=none_context"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "render",
+      "input_condition": "Resolved section has no usable template items",
+      "output_rule": "Reject with 'error=no_template_items'",
+      "exact_values": [
+        "error=no_template_items"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "render",
+      "input_condition": "Template file does not exist (including invalid patterns treated as literal names)",
+      "output_rule": "Reject with 'error=template_not_found' followed by the missing name.",
+      "exact_values": [
+        "error=template_not_found\ntemplate=missing.j2"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "render",
+      "input_condition": "Template references an undefined string variable (with strict-undefined semantics implied)",
+      "output_rule": "Reject with 'error=undefined_variable' followed by the name.",
+      "exact_values": [
+        "error=undefined_variable\nvar=x"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "evaluate_tags",
+      "input_condition": "only=<['tag1', ...] or skip=['tag1', ...]",
+      "output_rule": "Excluded if: only exists AND intersection(tags, only) is empty; OR skip exists AND intersection(tags, skip) is not empty. Else include. Case-insensitive/null handling applies.",
+      "exact_values": [
+        "match=true",
+        "match=false"
+      ],
+      "ambiguous": true
+    },
+    {
+      "id": "C021",
+      "feature": "parse_tags",
+      "input_condition": "Tags input is not a list or comma-separated string",
+      "output_rule": "Reject with 'error=unexpected_tags_type'",
+      "exact_values": [
+        "error=unexpected_tags_type"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "client_configuration",
+      "input_condition": "CLI or Context fails to provide 'master_uri'",
+      "output_rule": "Reject with 'error=missing_master_uri'",
+      "exact_values": [
+        "error=missing_master_uri"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "client_configuration",
+      "input_condition": "CLI or Context fails to provide 'token'",
+      "output_rule": "Reject with 'error=missing_token'",
+      "exact_values": [
+        "error=missing_token"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "first_truthy",
+      "input_condition": "Argument list contains only falsy values (null, false, 0, '', {}, [])",
+      "output_rule": "Return 'none'",
+      "exact_values": [
+        "first=none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "namespace_default",
+      "input_condition": "No source provides a namespace",
+      "output_rule": "Return 'none'",
+      "exact_values": [
+        "namespace=none"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "namespace_default",
+      "input_condition": "Explicit context namespace provided",
+      "output_rule": "Return context namespace (highest precedence)",
+      "exact_values": [
+        "namespace=value_context"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "namespace_default",
+      "input_condition": "Context missing, kubeconfig namespace present",
+      "output_rule": "Return kubeconfig namespace",
+      "exact_values": [
+        "namespace=kubeconfig_namespace"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "namespace_default",
+      "input_condition": "Context missing, kubeconfig missing, env namespace present",
+      "output_rule": "Return env namespace",
+      "exact_values": [
+        "namespace=value_env"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "filters",
+      "input_condition": "Template uses 'to_base64' or 'from_base64' or 'hash_sha256' or 'to_yaml'",
+      "output_rule": "Apply corresponding filter to context value or implicit string. Output must not violate sorted JSON key order if in context, but rendered text is specific.",
+      "exact_values": [
+        "b64encode: BASE64_STRING",
+        "from_base64: DECODED_STRING",
+        "to_sha256: HEX_DIGEST",
+        "to_yaml: INDENTED_YAML"
+      ],
+      "ambiguous": true
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C010",
+        "replacement": "a specific error message for unset variables in strict mode",
+        "exact_values_to_replace": [
+          "env='NULL_VAR' -> ' (non-strict)', ' (strict error) unless unsetSpec=true"
+        ],
+        "trigger_keywords": [
+          "what is the strict error message",
+          "how do I see strict violations",
+          "remove strict mode fallback value"
+        ],
+        "oracle_response": "` (strict error)` with the variable name appended, or a clear legal prompt ` Nicht definiert` depending on locale, but the core string is a placeholder in the spec."
+      },
+      {
+        "constraint_id": "C029",
+        "replacement": "a specific hint for base64 encoding input required by the filter",
+        "exact_values_to_replace": [
+          "b64encode: BASE64_STRING",
+          "from_base64: DECODED_STRING",
+          "to_sha256: HEX_DIGEST",
+          "to_yaml: INDENTED_YAML"
+        ],
+        "trigger_keywords": [
+          "input for base64 filter",
+          "output of from_base64",
+          "what is the hex digest format"
+        ],
+        "oracle_response": "The spec uses vague placeholders like `BASE64_STRING` or `DECODED_STRING` instead of concrete examples, though C010 has better examples nearby."
+      },
+      {
+        "constraint_id": "C020",
+        "replacement": "a specific boolean result for tag matching in exclude logic",
+        "exact_values_to_replace": [
+          "match=true",
+          "match=false"
+        ],
+        "trigger_keywords": [
+          "what is the match true value",
+          "false case for tags",
+          "boolean return value for caching"
+        ],
+        "oracle_response": "The boolean result is just `true` or `false`."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C001",
+        "vague_phrase": "resolve nested conflicts using the standard yamler pattern",
+        "actual_meaning": "The code defers to the behavior of the `tower` and `gocmp` libraries for recursive merging."
+      },
+      {
+        "constraint_id": "C027",
+        "vague_phrase": "examine the existing namespace propagation logic",
+        "actual_meaning": "The spec references an unknown internal mechanism for falling back to kubeconfig namespacing, rather than just naming it explicitly."
+      }
+    ]
+  }
+}

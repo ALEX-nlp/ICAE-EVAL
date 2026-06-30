@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need a small toolkit for our container auto-update agent. Basically the agent needs to figure out which containers to act on, how to talk to the registry, and how to load its own config. Right now every integration is doing this differently and we keep getting bugs where some containers get updated when they shouldn't, or credentials get handled wrong.
+
+For the container picking logic, we need something like what we did with the opt-in/opt-out stuff in the billing service — same idea where some containers say 'yes update me' and others say 'no skip me', and we need to handle both modes plus a name-based allowlist and grouping by scope. There's also a weird edge case with leading characters on container names that keeps biting us, similar to the path handling issue we fixed in the storage module.
+
+For registry auth, we need to encode credentials from environment variables into whatever token format the registry expects, and also figure out which server to talk to just from an image name.
+
+For config, secrets should be loadable either inline or from a file on disk (ops team keeps asking for this), and we need to translate our connection settings into the right env vars for the Docker client. Default socket path should just work out of the box with no config.
+
+The whole thing should be clean and composable — we want to wire these pieces together in different combinations depending on deployment mode.
+
+One quick follow-up from the questions that came in: for the name allow-list, we do want the match to succeed not just on the exact reported name, but also when the target matches that reported name with its very first character removed. This is specifically to tolerate cases where the runtime gives us something like '/test' and the target is 'test'. Same deal as the annoying leading separator issue we’ve seen before. Also, if there are no target names configured at all, the name selector should impose no restriction and just fall back to the admit-all base behavior. In other words, an empty allow-list should not reject everything.
+
+Also on the container predicates, the self check should only admit something when is_self_agent is explicitly true. If that flag is missing or just defaults to false, that candidate should not pass the self predicate.
+
+For the composed selector behavior, the ordering matters. The disabled_label check is always first, before name matching, before any enable_label requirement, and before scope. If something explicitly opts out, it’s out immediately. That means a container can still be rejected even if its name is in the allow-list. In particular, a container whose enable marker is present with value=false is immediately rejected without consulting any other layer. On the flip side, for enable_label mode, admission is purely about presence of the marker, not its boolean value. If the marker exists and value=false, it should still be admitted; if the marker is absent, it should be rejected. Related to that, in build mode, enable_label only becomes a layer when enable_label is false says it should be included, and scope only becomes a layer when scope is not an empty string. The only layers that are always there are the opt-out exclusion first and then the name allow-list.
+
+Just calling out too that this is meant to line up with Features 1.2 and 1.3 exactly: enable_label mode admits only when the marker is present and the value is irrelevant, while disabled_label mode rejects only when the marker is present and value is false. And for Feature 1.1 name matching, yes, we do want the comparison to succeed if the target matches the candidate name with its first character removed, so leading '/' on the reported name doesn’t break selection.

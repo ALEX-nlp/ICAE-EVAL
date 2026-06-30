@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the database client library work we've been discussing. The core ask is pretty straightforward — we need something that handles all the messy connection wiring so our app developers don't have to think about protocol-level stuff. Think of it like 'that connection manager abstraction we talked about in the Q2 planning doc' but actually shipped.
+
+Main pain points we keep hearing from devs: (1) They have to manually deal with connection strings in like 3 different formats and it's brittle, especially around SSL stuff and multi-server setups. (2) Error messages sometimes leak sensitive info (passwords) into logs, which compliance is flagging. (3) Running queries — both simple fire-and-forget ones and the parameterized kind — needs to be unified. Devs are copy-pasting protocol code everywhere. (4) Bulk data operations (loading CSVs, dumping tables) are completely un-abstracted right now. (5) Server-side notices and async messages just get silently dropped.
+
+The output format for our test harness reads commands from JSON and prints results as key=value lines — same pattern as the auth module we wired up before. Make sure errors surface clean codes, not raw exception dumps. Environment variable fallbacks (the PG* family) should work the same way our staging config loader does. Need this to cover the full lifecycle: parse → connect → query → copy → notifications.

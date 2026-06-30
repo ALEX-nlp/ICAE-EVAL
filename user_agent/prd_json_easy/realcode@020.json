@@ -1,0 +1,861 @@
+{
+  "fuzzy_prd": "# Portable Shell-Command Runner — A Cross-Platform CLI Wrapper for Common Shell Utilities\n\n## Project Goal\n\nBuild a single command-line program that exposes a curated set of common shell utilities (copy, remove, list, test, print working directory, echo, stream-substitute, pattern-search, change permissions, and more) behind one uniform front end, so developers can run the same portable commands on any operating system without depending on a platform-specific shell.\n\n---\n\n## Background & Problem\n\nBuild scripts and developer tooling frequently need to run small shell utilities, but the available utilities and their flags differ across platforms, and writing portable scripts by hand is tedious and error-prone. Without a unified runner, every project reinvents fragile shims around platform shells.\n\nWith this runner, a developer invokes one program with a command name and its arguments; the program validates the request, routes it to the matching utility, runs it, and reports results through a uniform contract: standard output for produced text, a non-zero exit status for failures, and clearly categorized errors for misuse. The runner also adds a few cross-cutting conveniences: a global flag to silence diagnostics, automatic consumption of piped input for the commands that accept it, an extensibility hook that loads optional plugins named in a working-directory configuration file, and a compatibility shim that lets stream-substitution use familiar `s/<pattern>/<replacement>/` syntax.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain. This runner has several distinct responsibilities (argument parsing, command routing and validation, the substitution-syntax shim, optional plugin loading, result formatting). It MUST NOT be a single \"god file\"; output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository. Do not over-engineer, but strictly avoid monolithic files.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core command-routing logic must remain completely decoupled from standard I/O and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic calls to the core.\n\n3. **Adherence to SOLID Design Principles:** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units (SRP); keep the routing engine open for new commands but closed for modification (OCP); model commands behind a uniform abstraction so they are interchangeable (LSP, ISP); and have high-level routing depend on abstractions rather than concrete I/O (DIP).\n\n4. **Robustness & Interface Design:** The public interface must be elegant and idiomatic to the target language. The system must handle edge cases gracefully and model errors properly (specific error types or a Result pattern) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Run A Named Command And Capture Its Output\n\n**As a developer**, I want to invoke a named utility with arguments and receive its produced text, so I can use portable commands uniformly.\n\n**Expected Behavior / Usage:**\n\nThe adapter reads one request describing a command line (`args`: the command name followed by its operands) and optional simulated piped input (`stdin`). It runs the command and renders, on standard output, the exit status as `exit_code=<n>`, then `stdout=<json-encoded text>`, then `stderr=<json-encoded text>`. Both text fields are JSON string literals so that newlines and special characters are represented unambiguously. The line-printing command joins its operands with single spaces and appends one trailing newline; with no operands it still emits a single newline. A successful run reports exit status zero.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_echo.json`\n\n```json\n{\n    \"description\": \"Run the line-printing command, which writes its space-joined operands followed by a single trailing newline to standard output and exits successfully. With no operands it still emits one newline.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"echo\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\\n\\\"\\nstderr=\\\"\\\"\\n\"},\n        {\"input\": {\"args\": [\"echo\", \"hello\", \"world\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"hello world\\\\n\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Side-Effecting Commands With No Textual Output\n\n**As a developer**, I want filesystem-mutating commands to run quietly, so a successful operation is signalled by its effect and a zero exit status rather than by chatter.\n\n**Expected Behavior / Usage:**\n\nA request may pre-populate the working directory via `files` (a map of path → content; a value may also be an object `{content, mode}` to set octal permission bits) and `dirs` (empty directories to create), and may request post-run inspection via `show_files` (render each file's contents as `file:<path>=<json text>`, or `file:<path>=null` when the file is absent). Commands that copy or remove files produce no standard output and no standard error and exit successfully; the effect is observable through the post-run file state — the copy destination now holds the source content, and a removed file is reported as absent.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_side_effect_no_output.json`\n\n```json\n{\n    \"description\": \"Commands that perform a filesystem side effect but yield no textual result write nothing to standard output or standard error and exit successfully; the effect is observable in the resulting filesystem state. Demonstrated by copying an existing file to a new name and by removing an existing file.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"cp\", \"a.txt\", \"b.txt\"], \"files\": {\"a.txt\": \"hello\\n\"}, \"show_files\": [\"b.txt\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\nfile:b.txt=\\\"hello\\\\n\\\"\\n\"},\n        {\"input\": {\"args\": [\"rm\", \"a.txt\"], \"files\": {\"a.txt\": \"x\"}, \"show_files\": [\"a.txt\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\nfile:a.txt=null\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Usage And Routing Errors\n\n**As a developer**, I want misuse of the runner itself to fail fast with a clear, categorized error and a dedicated status code, so mistakes are unambiguous and scriptable.\n\n**Expected Behavior / Usage:**\n\nWhen the request is malformed at the routing layer the run is rejected with the dedicated usage-error exit status `27` and a neutral `error=<category>` line (and, where relevant, the offending token). These usage errors are distinct from a command that ran but failed (Feature 5). Three categories exist.\n\n*3.1 Missing command name — no command was supplied.*\n\nWhen no command name is present, the runner reports `error=missing_command` with exit status `27`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_missing_command.json`\n\n```json\n{\n    \"description\": \"Invoking the runner with no command name reports a missing-command usage error and exits with the dedicated usage-error status.\",\n    \"cases\": [\n        {\"input\": {\"args\": []}, \"expected_output\": \"exit_code=27\\nerror=missing_command\\n\"}\n    ]\n}\n```\n\n*3.2 Unknown command name — the requested command is not recognized.*\n\nWhen the command name is not a known command, the runner reports `error=unknown_command` and echoes the offending token as `command=<json name>`, with exit status `27`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_unknown_command.json`\n\n```json\n{\n    \"description\": \"Requesting a command name that is not recognized reports an unknown-command error naming the offending token and exits with the usage-error status.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"foobar\"]}, \"expected_output\": \"exit_code=27\\nerror=unknown_command\\ncommand=\\\"foobar\\\"\\n\"}\n    ]\n}\n```\n\n*3.3 Unsupported command name — a known-but-disallowed command was requested.*\n\nA set of command names is explicitly unsupported (for example, ones that would change the runner's own process state). Requesting one reports `error=unsupported_command` with the name as `command=<json name>` and exit status `27`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_unsupported_command.json`\n\n```json\n{\n    \"description\": \"Some command names are explicitly unsupported by the runner; requesting one reports an unsupported-command error naming it and exits with the usage-error status.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"cd\", \"src\"]}, \"expected_output\": \"exit_code=27\\nerror=unsupported_command\\ncommand=\\\"cd\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Forwarding A Command's Own Failure\n\n**As a developer**, I want a command that runs but fails to surface its real exit status and diagnostic, so I can detect and diagnose runtime failures distinctly from misuse of the runner.\n\n**Expected Behavior / Usage:**\n\nWhen a routed command executes but fails (for example, listing a path that does not exist), the runner forwards the command's own non-zero exit status (not the usage status `27`) and renders the command's diagnostic message on `stderr`. The diagnostic is the utility's own message and appears in the JSON-encoded `stderr` field.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_command_failure.json`\n\n```json\n{\n    \"description\": \"When the underlying command fails (for example, listing a path that does not exist) the runner forwards the command's own non-zero exit status together with its diagnostic message on standard error.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"ls\", \"fakeFileName\"]}, \"expected_output\": \"exit_code=2\\nstdout=\\\"\\\"\\nstderr=\\\"ls: no such file or directory: fakeFileName\\\\n\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Silent Mode\n\n**As a developer**, I want a global flag that suppresses diagnostic output while preserving the exit status, so failures stay scriptable without noise.\n\n**Expected Behavior / Usage:**\n\nA global silent flag (`--silent`) prefixed before the command suppresses the failing command's diagnostic message: the run still forwards the same non-zero exit status, but `stderr` is empty. Without the flag, the identical failing command prints its diagnostic on `stderr`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_silent_mode.json`\n\n```json\n{\n    \"description\": \"A global silent flag suppresses diagnostic output: a failing command still returns its non-zero exit status, but its error message is withheld from standard error. Without the flag the same failure prints its message.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"--silent\", \"ls\", \"fakeFileName\"]}, \"expected_output\": \"exit_code=2\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\n\"},\n        {\"input\": {\"args\": [\"ls\", \"fakeFileName\"]}, \"expected_output\": \"exit_code=2\\nstdout=\\\"\\\"\\nstderr=\\\"ls: no such file or directory: fakeFileName\\\\n\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Boolean-Condition Commands\n\n**As a developer**, I want commands that answer a yes/no question to be silent and convey the answer purely through the exit status, so conditions compose cleanly in scripts.\n\n**Expected Behavior / Usage:**\n\nCommands whose result is a boolean condition print nothing on either stream; the answer is the exit status — zero when the condition holds, one when it does not. Demonstrated with a file-type test that succeeds for an existing regular file and fails for a path that is not a symbolic link.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_boolean_commands.json`\n\n```json\n{\n    \"description\": \"Commands whose result is a boolean condition print nothing; the outcome is conveyed solely through the exit status (zero when the condition holds, one when it does not). Demonstrated with a file-type test against an existing regular file and against a path that is not a symbolic link.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"test\", \"-f\", \"README.md\"], \"files\": {\"README.md\": \"x\"}}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\n\"},\n        {\"input\": {\"args\": [\"test\", \"-L\", \"somedir\"], \"dirs\": [\"somedir\"]}, \"expected_output\": \"exit_code=1\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 7: Built-In True And False Commands\n\n**As a developer**, I want always-available commands that unconditionally succeed or fail with no output, so I have portable primitives for control flow.\n\n**Expected Behavior / Usage:**\n\nTwo always-available commands report a fixed condition and produce no output: one always exits zero, the other always exits one. These are available without any configuration.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_true_false.json`\n\n```json\n{\n    \"description\": \"Two always-available commands report a fixed condition with no output: one always exits zero, the other always exits one.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"true\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\n\"},\n        {\"input\": {\"args\": [\"false\"]}, \"expected_output\": \"exit_code=1\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 8: Print Working Directory With Trailing Newline\n\n**As a developer**, I want the working-directory command to emit a newline-terminated path, so its output is easy to consume line-by-line.\n\n**Expected Behavior / Usage:**\n\nThe working-directory command prints the absolute path of the current directory followed by a trailing newline. The concrete absolute path is environment-specific; in the contract it is shown as the placeholder token `<cwd>`, and the salient, implementation-independent property is the trailing newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_pwd_newline.json`\n\n```json\n{\n    \"description\": \"The working-directory command prints the absolute path of the current directory followed by a trailing newline (the concrete path is shown here as a placeholder token).\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"pwd\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"<cwd>\\\\n\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 9: Consuming Piped Input\n\n**As a developer**, I want commands that accept standard input to read piped content, so I can compose the runner into pipelines.\n\n**Expected Behavior / Usage:**\n\nWhen piped input is supplied (the `stdin` field of the request), line-oriented commands consume it as their input. Demonstrated by filtering piped lines for those containing a literal substring; only matching lines are printed, each terminated by a newline.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_stdin_pipe.json`\n\n```json\n{\n    \"description\": \"When input is supplied on the pipe, line-filtering commands consume it as their input. Demonstrated by filtering piped lines for those containing a literal substring.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"grep\", \"foo\"], \"stdin\": \"foo\\nbar\\nfoobar\"}, \"expected_output\": \"exit_code=0\\nstdout=\\\"foo\\\\nfoobar\\\\n\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 10: Stream Substitution With `s/<pattern>/<replacement>/` Syntax\n\n**As a developer**, I want familiar substitution-expression syntax for stream editing, so I can transform text portably.\n\n**Expected Behavior / Usage:**\n\nA stream-substitution command accepts an expression of the form `s/<pattern>/<replacement>/` (optionally with a trailing `g` for global) followed by one file path; the transformed text is written to standard output. A global in-place flag (`-i`) additionally writes the result back to the source file.\n\n*10.1 Basic substitution — first match per line, source preserved.*\n\nWithout a global suffix, only the first match on each line is replaced. The source file is left unchanged (verified via `show_files`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_1_sed_basic.json`\n\n```json\n{\n    \"description\": \"Stream substitution accepts an expression of the form s/<pattern>/<replacement>/ followed by a file path. By default it replaces only the first match on each line, prints the transformed text to standard output, and leaves the source file unchanged.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"sed\", \"s/foo/bar/\", \"foo.txt\"], \"files\": {\"foo.txt\": \"foo\\nfoosomething\\nfoofoosomething\\n\"}, \"show_files\": [\"foo.txt\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"bar\\\\nbarsomething\\\\nbarfoosomething\\\\n\\\"\\nstderr=\\\"\\\"\\nfile:foo.txt=\\\"foo\\\\nfoosomething\\\\nfoofoosomething\\\\n\\\"\\n\"}\n    ]\n}\n```\n\n*10.2 Global and in-place — every match replaced and written back.*\n\nWith the global suffix, every match on each line is replaced; with the in-place flag, the transformed text is also written back to the source file (verified via `show_files`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_2_sed_global_inplace.json`\n\n```json\n{\n    \"description\": \"With the global suffix on the expression, every match on each line is replaced. With the in-place flag, the transformed text is additionally written back to the source file.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"sed\", \"-i\", \"s/foo/bar/g\", \"foo.txt\"], \"files\": {\"foo.txt\": \"foo\\nfoosomething\\nfoofoosomething\\n\"}, \"show_files\": [\"foo.txt\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"bar\\\\nbarsomething\\\\nbarbarsomething\\\\n\\\"\\nstderr=\\\"\\\"\\nfile:foo.txt=\\\"bar\\\\nbarsomething\\\\nbarbarsomething\\\\n\\\"\\n\"}\n    ]\n}\n```\n\n*10.3 Escaped forward slashes — literal slashes in pattern/replacement.*\n\nForward slashes inside the pattern or replacement may be escaped with a backslash so they are treated literally rather than as field delimiters.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_3_sed_escaped_slashes.json`\n\n```json\n{\n    \"description\": \"Forward slashes inside the pattern or replacement may be escaped with a backslash so they are treated literally rather than as field delimiters.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"sed\", \"s/http:\\\\/\\\\/www\\\\.google\\\\.com/https:\\\\/\\\\/www\\\\.facebook\\\\.com/\", \"urls.txt\"], \"files\": {\"urls.txt\": \"http://www.nochange.com\\nhttp://www.google.com\\n\"}}, \"expected_output\": \"exit_code=0\\nstdout=\\\"http://www.nochange.com\\\\nhttps://www.facebook.com\\\\n\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n*10.4 Escaped backslashes — convert backslashes to forward slashes.*\n\nAn escaped backslash in the pattern matches a literal backslash, enabling conversion of every backslash to a forward slash across the input.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_4_sed_backslash_to_slash.json`\n\n```json\n{\n    \"description\": \"An escaped backslash in the pattern matches a literal backslash, enabling conversion of every backslash to a forward slash across the input.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"sed\", \"s/\\\\\\\\/\\\\//g\", \"win.txt\"], \"files\": {\"win.txt\": \"C:\\\\Some\\\\Windows\\\\file\\\\path.txt\"}}, \"expected_output\": \"exit_code=0\\nstdout=\\\"C:/Some/Windows/file/path.txt\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n*10.5 Empty replacement — delete matched text.*\n\nAn empty replacement deletes matched text. With the global suffix every match on a line is removed; without it only the first match on each line is removed.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_5_sed_empty_replacement.json`\n\n```json\n{\n    \"description\": \"An empty replacement deletes matched text. With the global suffix every match on a line is removed; without it only the first match on each line is removed.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"sed\", \"s/foo//g\", \"foo.txt\"], \"files\": {\"foo.txt\": \"foo\\nfoosomething\\nfoofoosomething\\n\"}}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\\nsomething\\\\nsomething\\\\n\\\"\\nstderr=\\\"\\\"\\n\"},\n        {\"input\": {\"args\": [\"sed\", \"s/foo//\", \"foo.txt\"], \"files\": {\"foo.txt\": \"foo\\nfoosomething\\nfoofoosomething\\n\"}}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\\nsomething\\\\nfoosomething\\\\n\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n*10.6 Empty pattern — rejected.*\n\nAn empty search pattern is rejected: the runner raises an error (rendered as `error=empty_pattern`) rather than performing an unbounded substitution.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_6_sed_empty_pattern.json`\n\n```json\n{\n    \"description\": \"An empty search pattern is rejected: the runner raises an error rather than performing an unbounded substitution.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"sed\", \"s//foo/g\", \"foo.txt\"], \"files\": {\"foo.txt\": \"foo\\nfoosomething\\nfoofoosomething\\n\"}}, \"expected_output\": \"error=empty_pattern\\n\"}\n    ]\n}\n```\n\n*10.7 Expression vs. file disambiguation — only the first looks-like-an-expression operand is one.*\n\nOnly the first operand that looks like a substitution expression is treated as one; a later operand that merely resembles such an expression is treated as an ordinary file path.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_7_sed_filename_like_expression.json`\n\n```json\n{\n    \"description\": \"Only the first operand that looks like a substitution expression is treated as one; a later operand that merely resembles such an expression is treated as an ordinary file path.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"sed\", \"s/foo/bar/\", \"s/weirdfile\"], \"files\": {\"s/weirdfile\": \"foo\\nfoosomething\\nfoofoosomething\\n\"}}, \"expected_output\": \"exit_code=0\\nstdout=\\\"bar\\\\nbarsomething\\\\nbarfoosomething\\\\n\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 11: Pattern Search Over A File\n\n**As a developer**, I want to print lines of a file matching a regular expression, so I can search content portably.\n\n**Expected Behavior / Usage:**\n\nPattern search over a file prints every line that matches the given regular expression, each terminated by a newline; non-matching lines are omitted.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature13_grep_regex.json`\n\n```json\n{\n    \"description\": \"Pattern search over a file prints every line that matches the given regular expression.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"grep\", \"fo*\", \"file.txt\"], \"files\": {\"file.txt\": \"1st line\\nfoo\\nf\\ndoes not match\\nsomething foo\\n\"}}, \"expected_output\": \"exit_code=0\\nstdout=\\\"foo\\\\nf\\\\nsomething foo\\\\n\\\"\\nstderr=\\\"\\\"\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 12: Change File Permissions (Octal And Symbolic)\n\n**As a developer**, I want to change file permissions with either an absolute octal mode or a symbolic expression, so I can manage permissions portably.\n\n**Expected Behavior / Usage:**\n\nThe permission-change command accepts both absolute octal modes and symbolic mode expressions. An absolute octal mode (e.g. `644`, `755`) sets the permission bits directly. A symbolic expression adjusts the existing bits — `+x` adds execute for all classes, and a class prefix such as `u+x` restricts the adjustment to the owner. The resulting permission bits are observable via `show_modes`, rendered as a three-digit octal value `mode:<path>=<octal>`. (A file's starting permission bits can be set through the object form of a `files` entry.)\n\n**Test Cases:** `rcb_tests/public_test_cases/feature14_chmod_modes.json`\n\n```json\n{\n    \"description\": \"Changing file permissions accepts both absolute octal modes and symbolic mode expressions. An absolute octal mode sets the permission bits directly; a symbolic expression adjusts the existing bits, optionally restricted to a class such as the owner. The resulting permission bits are shown as a three-digit octal value.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"chmod\", \"644\", \"f.txt\"], \"files\": {\"f.txt\": \"x\"}, \"show_modes\": [\"f.txt\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\nmode:f.txt=644\\n\"},\n        {\"input\": {\"args\": [\"chmod\", \"+x\", \"f.txt\"], \"files\": {\"f.txt\": {\"content\": \"x\", \"mode\": \"644\"}}, \"show_modes\": [\"f.txt\"]}, \"expected_output\": \"exit_code=0\\nstdout=\\\"\\\"\\nstderr=\\\"\\\"\\nmode:f.txt=755\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 13: Loading Optional Plugins From A Configuration File\n\n**As a developer**, I want optional commands to be loadable from a working-directory configuration file, so I can extend the runner without modifying it.\n\n**Expected Behavior / Usage:**\n\nA configuration file named in the working directory may list plugins to load before routing. Two failure modes are categorized as neutral errors. The configuration content is supplied through a neutral `config` field on the request (the runner persists it under its own configuration-file name).\n\n*13.1 Missing plugin — a listed plugin cannot be found.*\n\nIf a listed plugin cannot be resolved, the runner raises a plugin-load error (`error=plugin_not_found`) identifying the missing plugin as `plugin=<json name>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature15_plugin_not_found.json`\n\n```json\n{\n    \"description\": \"A configuration file in the working directory may list plugins to load. If a listed plugin cannot be found, the runner raises a plugin-load error identifying the missing plugin.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"ls\"], \"config\": \"{\\\"plugins\\\":[\\\"missing-plugin-xyz\\\"]}\"}, \"expected_output\": \"error=plugin_not_found\\nplugin=\\\"missing-plugin-xyz\\\"\\n\"}\n    ]\n}\n```\n\n*13.2 Unreadable configuration — the file is not valid configuration.*\n\nIf the configuration file cannot be parsed as valid configuration, the runner raises a configuration error (`error=config_unreadable`) instead of executing its contents (it must never evaluate the file as code).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature16_config_unreadable.json`\n\n```json\n{\n    \"description\": \"If the configuration file in the working directory cannot be parsed as valid configuration, the runner raises a configuration error rather than executing its contents.\",\n    \"cases\": [\n        {\"input\": {\"args\": [\"ls\"], \"config\": \"this is not valid configuration\\n\"}, \"expected_output\": \"error=config_unreadable\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 14: Deciding Whether To Consume Piped Input\n\n**As a developer**, I want the runner to decide automatically whether to wait for piped input, so commands neither block unnecessarily nor miss available input.\n\n**Expected Behavior / Usage:**\n\nBefore running, the tool decides whether to consume piped input. Under the `stdin_decision` action it reports this decision (only) as `stdin_consumed=<true|false>` for a given command line (`args`) and whether the input is an interactive terminal (`tty`). It consumes piped input only when ALL of the following hold: input is actually piped (not an interactive terminal), the command is one that accepts standard input, and fewer file operands were supplied than the command requires (some commands such as the line-count-limited head/tail count a numeric option's value as consuming one of the expected operands). An interactive terminal, a command that does not accept standard input, or enough file operands each suppress reading.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature17_stdin_read_decision.json`\n\n```json\n{\n    \"description\": \"Before running, the tool decides whether to consume piped input. It consumes piped input only when all of the following hold: input is actually piped rather than an interactive terminal, the command is one that accepts standard input, and fewer file operands were supplied than the command requires. An interactive terminal, a command that does not accept standard input, or enough file operands each suppress reading. The decision is reported as a boolean.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"stdin_decision\", \"args\": [\"cat\"], \"tty\": false}, \"expected_output\": \"stdin_consumed=true\\n\"},\n        {\"input\": {\"action\": \"stdin_decision\", \"args\": [\"grep\", \"a.*z\"], \"tty\": false}, \"expected_output\": \"stdin_consumed=true\\n\"},\n        {\"input\": {\"action\": \"stdin_decision\", \"args\": [\"cat\"], \"tty\": true}, \"expected_output\": \"stdin_consumed=false\\n\"},\n        {\"input\": {\"action\": \"stdin_decision\", \"args\": [\"cat\", \"file.txt\"], \"tty\": false}, \"expected_output\": \"stdin_consumed=false\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the command runner described above (argument parsing, command routing and validation, the substitution-syntax shim, optional plugin loading from a working-directory configuration file, and result handling). Its physical structure MUST align with the \"Scale-Driven Code Organization\" constraint. The core routing logic must be decoupled from standard I/O and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program that acts as a client to your core system — logically (and ideally physically) separated from it. It reads a single JSON request from stdin and prints the result to stdout, matching the per-feature contracts above. The request's `action` selects behavior: the default action sets up a sandbox working directory from the optional `files`/`dirs`, runs the command line in `args` with optional piped `stdin`, and renders `exit_code=<n>` plus JSON-encoded `stdout`/`stderr` (and optional `file:<path>=...` / `mode:<path>=...` lines requested via `show_files`/`show_modes`); the `stdin_decision` action renders only the pipe-consumption decision. Native exceptions raised by the core (empty substitution pattern, unresolved plugin, unreadable configuration) MUST be translated by the adapter into the neutral `error=<category>` lines shown above — never by leaking host-language runtime details. Usage/routing failures use exit status `27`; a command that ran but failed forwards its own status. The absolute working-directory path is normalized to the token `<cwd>` in rendered output.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- matches the internal ruby path traversal logic\n- the G_FILE_PATTERN transformation rule\n",
+  "oracle_data": {
+    "task_id": "shelljs__shx-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "what does pwd output?",
+          "current directory behavior",
+          "pwd command stdout",
+          "absolute CWD string",
+          "pwd return value"
+        ],
+        "oracle_response": "The absolute path of the current working directory followed by a single newline character, with all other stdout and stderr empty and exit_code=0."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "cd command handling",
+          "forbidden cd error",
+          "unsupported cd output",
+          "cd specific exit status",
+          "cd error message format"
+        ],
+        "oracle_response": "Exit code 27, error category 'unsupported_command', with 'command' set to the string 'cd' and stderr containing the standard usage instruction."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "matches the internal ruby path traversal logic",
+        "actual_meaning": "The literal forward slash character, handled by the sed pattern engine's escaping rules."
+      },
+      {
+        "vague_reference": "the G_FILE_PATTERN transformation rule",
+        "actual_meaning": "Mapping of Windows backslash paths (\\\\) to forward slashes (/) during input processing."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_stdin_pipe.json": {
+      "description": "When input is supplied on the pipe, line-filtering commands consume it as their input. Demonstrated by filtering piped lines for those containing a literal substring.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "grep",
+              "foo"
+            ],
+            "stdin": "foo\nbar\nfoobar"
+          },
+          "expected_output": "exit_code=0\nstdout=\"foo\\nfoobar\\n\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature11_true_false.json": {
+      "description": "Two always-available commands report a fixed condition with no output: one always exits zero, the other always exits one.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "true"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"\"\nstderr=\"\"\n"
+        },
+        {
+          "input": {
+            "args": [
+              "false"
+            ]
+          },
+          "expected_output": "exit_code=1\nstdout=\"\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature12_1_sed_basic.json": {
+      "description": "Stream substitution accepts an expression of the form s/<pattern>/<replacement>/ followed by a file path. By default it replaces only the first match on each line, prints the transformed text to standard output, and leaves the source file unchanged.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "sed",
+              "s/foo/bar/",
+              "foo.txt"
+            ],
+            "files": {
+              "foo.txt": "foo\nfoosomething\nfoofoosomething\n"
+            },
+            "show_files": [
+              "foo.txt"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"bar\\nbarsomething\\nbarfoosomething\\n\"\nstderr=\"\"\nfile:foo.txt=\"foo\\nfoosomething\\nfoofoosomething\\n\"\n"
+        }
+      ]
+    },
+    "feature12_2_sed_global_inplace.json": {
+      "description": "With the global suffix on the expression, every match on each line is replaced. With the in-place flag, the transformed text is additionally written back to the source file.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "sed",
+              "-i",
+              "s/foo/bar/g",
+              "foo.txt"
+            ],
+            "files": {
+              "foo.txt": "foo\nfoosomething\nfoofoosomething\n"
+            },
+            "show_files": [
+              "foo.txt"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"bar\\nbarsomething\\nbarbarsomething\\n\"\nstderr=\"\"\nfile:foo.txt=\"bar\\nbarsomething\\nbarbarsomething\\n\"\n"
+        }
+      ]
+    },
+    "feature12_3_sed_escaped_slashes.json": {
+      "description": "Forward slashes inside the pattern or replacement may be escaped with a backslash so they are treated literally rather than as field delimiters.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "sed",
+              "s/http:\\/\\/www\\.google\\.com/https:\\/\\/www\\.facebook\\.com/",
+              "urls.txt"
+            ],
+            "files": {
+              "urls.txt": "http://www.nochange.com\nhttp://www.google.com\n"
+            }
+          },
+          "expected_output": "exit_code=0\nstdout=\"http://www.nochange.com\\nhttps://www.facebook.com\\n\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature12_4_sed_backslash_to_slash.json": {
+      "description": "An escaped backslash in the pattern matches a literal backslash, enabling conversion of every backslash to a forward slash across the input.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "sed",
+              "s/\\\\/\\//g",
+              "win.txt"
+            ],
+            "files": {
+              "win.txt": "C:\\Some\\Windows\\file\\path.txt"
+            }
+          },
+          "expected_output": "exit_code=0\nstdout=\"C:/Some/Windows/file/path.txt\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature12_5_sed_empty_replacement.json": {
+      "description": "An empty replacement deletes matched text. With the global suffix every match on a line is removed; without it only the first match on each line is removed.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "sed",
+              "s/foo//g",
+              "foo.txt"
+            ],
+            "files": {
+              "foo.txt": "foo\nfoosomething\nfoofoosomething\n"
+            }
+          },
+          "expected_output": "exit_code=0\nstdout=\"\\nsomething\\nsomething\\n\"\nstderr=\"\"\n"
+        },
+        {
+          "input": {
+            "args": [
+              "sed",
+              "s/foo//",
+              "foo.txt"
+            ],
+            "files": {
+              "foo.txt": "foo\nfoosomething\nfoofoosomething\n"
+            }
+          },
+          "expected_output": "exit_code=0\nstdout=\"\\nsomething\\nfoosomething\\n\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature12_6_sed_empty_pattern.json": {
+      "description": "An empty search pattern is rejected: the runner raises an error rather than performing an unbounded substitution.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "sed",
+              "s//foo/g",
+              "foo.txt"
+            ],
+            "files": {
+              "foo.txt": "foo\nfoosomething\nfoofoosomething\n"
+            }
+          },
+          "expected_output": "error=empty_pattern\n"
+        }
+      ]
+    },
+    "feature12_7_sed_filename_like_expression.json": {
+      "description": "Only the first operand that looks like a substitution expression is treated as one; a later operand that merely resembles such an expression is treated as an ordinary file path.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "sed",
+              "s/foo/bar/",
+              "s/weirdfile"
+            ],
+            "files": {
+              "s/weirdfile": "foo\nfoosomething\nfoofoosomething\n"
+            }
+          },
+          "expected_output": "exit_code=0\nstdout=\"bar\\nbarsomething\\nbarfoosomething\\n\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature13_grep_regex.json": {
+      "description": "Pattern search over a file prints every line that matches the given regular expression.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "grep",
+              "fo*",
+              "file.txt"
+            ],
+            "files": {
+              "file.txt": "1st line\nfoo\nf\ndoes not match\nsomething foo\n"
+            }
+          },
+          "expected_output": "exit_code=0\nstdout=\"foo\\nf\\nsomething foo\\n\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature14_chmod_modes.json": {
+      "description": "Changing file permissions accepts both absolute octal modes and symbolic mode expressions. An absolute octal mode sets the permission bits directly; a symbolic expression adjusts the existing bits, optionally restricted to a class such as the owner. The resulting permission bits are shown as a three-digit octal value.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "chmod",
+              "644",
+              "f.txt"
+            ],
+            "files": {
+              "f.txt": "x"
+            },
+            "show_modes": [
+              "f.txt"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"\"\nstderr=\"\"\nmode:f.txt=644\n"
+        },
+        {
+          "input": {
+            "args": [
+              "chmod",
+              "+x",
+              "f.txt"
+            ],
+            "files": {
+              "f.txt": {
+                "content": "x",
+                "mode": "644"
+              }
+            },
+            "show_modes": [
+              "f.txt"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"\"\nstderr=\"\"\nmode:f.txt=755\n"
+        }
+      ]
+    },
+    "feature15_plugin_not_found.json": {
+      "description": "A configuration file in the working directory may list plugins to load. If a listed plugin cannot be found, the runner raises a plugin-load error identifying the missing plugin.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "ls"
+            ],
+            "config": "{\"plugins\":[\"missing-plugin-xyz\"]}"
+          },
+          "expected_output": "error=plugin_not_found\nplugin=\"missing-plugin-xyz\"\n"
+        }
+      ]
+    },
+    "feature16_config_unreadable.json": {
+      "description": "If the configuration file in the working directory cannot be parsed as valid configuration, the runner raises a configuration error rather than executing its contents.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "ls"
+            ],
+            "config": "this is not valid configuration\n"
+          },
+          "expected_output": "error=config_unreadable\n"
+        }
+      ]
+    },
+    "feature17_stdin_read_decision.json": {
+      "description": "Before running, the tool decides whether to consume piped input. It consumes piped input only when all of the following hold: input is actually piped rather than an interactive terminal, the command is one that accepts standard input, and fewer file operands were supplied than the command requires. An interactive terminal, a command that does not accept standard input, or enough file operands each suppress reading. The decision is reported as a boolean.",
+      "cases": [
+        {
+          "input": {
+            "action": "stdin_decision",
+            "args": [
+              "cat"
+            ],
+            "tty": false
+          },
+          "expected_output": "stdin_consumed=true\n"
+        },
+        {
+          "input": {
+            "action": "stdin_decision",
+            "args": [
+              "grep",
+              "a.*z"
+            ],
+            "tty": false
+          },
+          "expected_output": "stdin_consumed=true\n"
+        },
+        {
+          "input": {
+            "action": "stdin_decision",
+            "args": [
+              "cat"
+            ],
+            "tty": true
+          },
+          "expected_output": "stdin_consumed=false\n"
+        },
+        {
+          "input": {
+            "action": "stdin_decision",
+            "args": [
+              "cat",
+              "file.txt"
+            ],
+            "tty": false
+          },
+          "expected_output": "stdin_consumed=false\n"
+        }
+      ]
+    },
+    "feature1_echo.json": {
+      "description": "Run the line-printing command, which writes its space-joined operands followed by a single trailing newline to standard output and exits successfully. With no operands it still emits one newline.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "echo"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"\\n\"\nstderr=\"\"\n"
+        },
+        {
+          "input": {
+            "args": [
+              "echo",
+              "hello",
+              "world"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"hello world\\n\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature2_side_effect_no_output.json": {
+      "description": "Commands that perform a filesystem side effect but yield no textual result write nothing to standard output or standard error and exit successfully; the effect is observable in the resulting filesystem state. Demonstrated by copying an existing file to a new name and by removing an existing file.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "cp",
+              "a.txt",
+              "b.txt"
+            ],
+            "files": {
+              "a.txt": "hello\n"
+            },
+            "show_files": [
+              "b.txt"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"\"\nstderr=\"\"\nfile:b.txt=\"hello\\n\"\n"
+        },
+        {
+          "input": {
+            "args": [
+              "rm",
+              "a.txt"
+            ],
+            "files": {
+              "a.txt": "x"
+            },
+            "show_files": [
+              "a.txt"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"\"\nstderr=\"\"\nfile:a.txt=null\n"
+        }
+      ]
+    },
+    "feature3_missing_command.json": {
+      "description": "Invoking the runner with no command name reports a missing-command usage error and exits with the dedicated usage-error status.",
+      "cases": [
+        {
+          "input": {
+            "args": []
+          },
+          "expected_output": "exit_code=27\nerror=missing_command\n"
+        }
+      ]
+    },
+    "feature4_unknown_command.json": {
+      "description": "Requesting a command name that is not recognized reports an unknown-command error naming the offending token and exits with the usage-error status.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "foobar"
+            ]
+          },
+          "expected_output": "exit_code=27\nerror=unknown_command\ncommand=\"foobar\"\n"
+        }
+      ]
+    },
+    "feature5_unsupported_command.json": {
+      "description": "Some command names are explicitly unsupported by the runner; requesting one reports an unsupported-command error naming it and exits with the usage-error status.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "cd",
+              "src"
+            ]
+          },
+          "expected_output": "exit_code=27\nerror=unsupported_command\ncommand=\"cd\"\n"
+        }
+      ]
+    },
+    "feature6_command_failure.json": {
+      "description": "When the underlying command fails (for example, listing a path that does not exist) the runner forwards the command's own non-zero exit status together with its diagnostic message on standard error.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "ls",
+              "fakeFileName"
+            ]
+          },
+          "expected_output": "exit_code=2\nstdout=\"\"\nstderr=\"ls: no such file or directory: fakeFileName\\n\"\n"
+        }
+      ]
+    },
+    "feature7_silent_mode.json": {
+      "description": "A global silent flag suppresses diagnostic output: a failing command still returns its non-zero exit status, but its error message is withheld from standard error. Without the flag the same failure prints its message.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "--silent",
+              "ls",
+              "fakeFileName"
+            ]
+          },
+          "expected_output": "exit_code=2\nstdout=\"\"\nstderr=\"\"\n"
+        },
+        {
+          "input": {
+            "args": [
+              "ls",
+              "fakeFileName"
+            ]
+          },
+          "expected_output": "exit_code=2\nstdout=\"\"\nstderr=\"ls: no such file or directory: fakeFileName\\n\"\n"
+        }
+      ]
+    },
+    "feature8_boolean_commands.json": {
+      "description": "Commands whose result is a boolean condition print nothing; the outcome is conveyed solely through the exit status (zero when the condition holds, one when it does not). Demonstrated with a file-type test against an existing regular file and against a path that is not a symbolic link.",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "test",
+              "-f",
+              "README.md"
+            ],
+            "files": {
+              "README.md": "x"
+            }
+          },
+          "expected_output": "exit_code=0\nstdout=\"\"\nstderr=\"\"\n"
+        },
+        {
+          "input": {
+            "args": [
+              "test",
+              "-L",
+              "somedir"
+            ],
+            "dirs": [
+              "somedir"
+            ]
+          },
+          "expected_output": "exit_code=1\nstdout=\"\"\nstderr=\"\"\n"
+        }
+      ]
+    },
+    "feature9_pwd_newline.json": {
+      "description": "The working-directory command prints the absolute path of the current directory followed by a trailing newline (the concrete path is shown here as a placeholder token).",
+      "cases": [
+        {
+          "input": {
+            "args": [
+              "pwd"
+            ]
+          },
+          "expected_output": "exit_code=0\nstdout=\"<cwd>\\n\"\nstderr=\"\"\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "run_echo",
+      "input_condition": "Command \"echo\" is invoked with any number of arguments",
+      "output_rule": "Returns exit_code=0. stdout is the arguments joined by single space followed by a single trailing newline. stderr is empty string.",
+      "exact_values": [
+        "exit_code=0",
+        "stderr=\"\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "run_side_effect",
+      "input_condition": "Command is a filesystem mutator (cp, rm) or a query command",
+      "output_rule": "Mutating commands return exit_code=0 with stdout=\"\" and stderr=\"\". The effect is in the resulting file system state checked by show_files.",
+      "exact_values": [
+        "exit_code=0",
+        "stdout=\"\"",
+        "stderr=\"\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "error_missing_command",
+      "input_condition": "The args array is empty",
+      "output_rule": "Returns usage status 27 with specific error message naming the missing component.",
+      "exact_values": [
+        "exit_code=27",
+        "error=missing_command"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "error_unknown_command",
+      "input_condition": "The first argument is not a known built-in or plugin command",
+      "output_rule": "Returns usage status 27 with error category unknown_command and echoes the offending token.",
+      "exact_values": [
+        "exit_code=27",
+        "error=unknown_command",
+        "command=unknown_string"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "error_unsupported_command",
+      "input_condition": "The first argument is a known command name but explicitly forbidden (e.g., cd)",
+      "output_rule": "Returns usage status 27 with error category unsupported_command.",
+      "exact_values": [
+        "exit_code=27",
+        "error=unsupported_command",
+        "command=\"cd\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "forward_command_failure",
+      "input_condition": "A valid command is invoked but fails execution (returns non-zero)",
+      "output_rule": "Returns the command's actual exit status. stdout is empty. stderr contains the command's diagnostic message, JSON-encoded.",
+      "exact_values": [
+        "exit_code!=0",
+        "stdout=\"\"",
+        "stderr=diagnostic_body"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "silent_mode",
+      "input_condition": "The first argument is \"--silent\" followed by a failing command invocation",
+      "output_rule": "Returns the command's non-zero exit status. stderr is empty (silenced).",
+      "exact_values": [
+        "exit_code!=0",
+        "stderr=\"\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "run_boolean_command",
+      "input_condition": "Command is a boolean tester like test",
+      "output_rule": "stdout and stderr are empty. Exit status 0 means condition true, 1 means condition false.",
+      "exact_values": [
+        "stdout=\"\"",
+        "stderr=\"\"",
+        "exit_code=[0,1]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "run_true_false",
+      "input_condition": "Command is \"true\" or \"false\"",
+      "output_rule": "\"true\" always exits 0 with empty streams. \"false\" always exits 1 with empty streams.",
+      "exact_values": [
+        "entry('').exit_code=0",
+        "entry('').stdout=\"\"",
+        "entry('').stderr=\"\"",
+        "entry('').exit_code=1",
+        "entry('false').stdout=\"\"",
+        "entry('false').stderr=\"\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "run_pwd",
+      "input_condition": "Command \"pwd\" is invoked",
+      "output_rule": "Returns exit_code=0. stdout is the absolute CWD followed by a single trailing newline. stderr is empty.",
+      "exact_values": [
+        "exit_code=0",
+        "stdout=<cwd>+\\n",
+        "stderr=\"\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "consume_piped_input",
+      "input_condition": "stdin field is provided AND not a TTY AND command accepts stdin < args.file_count",
+      "output_rule": "Command stdin is replaced with the provided input string.",
+      "exact_values": [
+        "cwd",
+        "<stdin_content>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "ced_syntax_basic",
+      "input_condition": "sed command has args s/<pattern>/<replacement>/ and a file path; no -g flag",
+      "output_rule": "Replaces pattern with replacement only on the first occurrence per line. Prints result to stdout. Preserves source file.",
+      "exact_values": [
+        "stdout=replaced_per_line"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "sed_syntax_global_inplace",
+      "input_condition": "sed command has s/<pattern>/<replacement>/g and -i flag",
+      "output_rule": "Replaces all occurrences per line. Prints to stdout. Writes result back to source file.",
+      "exact_values": [
+        "stdout=replaced_all",
+        "file:source=replaced_content"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "sed_escaped_slashes",
+      "input_condition": "sed pattern contains forward slash escaped as \\/",
+      "output_rule": "Matches literal forward slash. Escapes resolve to literal characters.",
+      "exact_values": [
+        "stdout=string_literal_with_slash"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "sed_escaped_backslash",
+      "input_condition": "sed pattern contains escaped backslash \\\\\\",
+      "output_rule": "Matches literal backslash. Converts backslash paths (\\\\) to forward slashes (/) across input.",
+      "exact_values": [
+        "stdout=C:/path/to/file"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "sed_empty_replacement",
+      "input_condition": "sed pattern matches text, replacement string is empty",
+      "output_rule": "Removes matches. 'g' suffix removes all; without 'suffix' removes first per line.",
+      "exact_values": [
+        "stdout=string_without_bang"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "sed_empty_pattern_error",
+      "input_condition": "sed command has empty pattern (s//)",
+      "output_rule": "Raises error=empty_pattern. Does not attempt execution.",
+      "exact_values": [
+        "error=empty_pattern"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "sed_filename_expression",
+      "input_condition": "sed command contains valid expr then a string resembling expr but acting as filename",
+      "output_rule": "Matches valid expr. Last operand is treated as literal filename argument.",
+      "exact_values": [
+        "operation=match_and_print_normally"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "run_grep",
+      "input_condition": "grep command invokes with regex and",
+      "output_rule": "Prints lines from file matching the regular expression to stdout. Exit 0 on success (lines found or no error), non-zero on no match found (per original echo/text).",
+      "exact_values": [
+        "stdout=matched_lines"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "run_chmod",
+      "input_condition": "chmod command inversed with octal mode",
+      "output_rule": "Sets file mode to octal. If show_modes requested, returns mode:file=octal_value.",
+      "exact_values": [
+        "mode:file=octal"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "error_plugin_not_found",
+      "input_condition": "config JSON lists a plugin that cannot be found",
+      "output_rule": "Raises plugin_load error identifying the missing plugin.",
+      "exact_values": [
+        "error=plugin_not_found",
+        "plugin=\"name\""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "error_config_unreadable",
+      "input_condition": "config file is not valid JSON/text configuration",
+      "output_rule": "Raises configuration error.",
+      "exact_values": [
+        "error=config_unreadable"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "stdin_decision_non_tty",
+      "input_condition": "WebDriver is invoked (e.g., grep, cat) where inputs are piped and TTY is false",
+      "output_rule": "stdin_consumed=true",
+      "exact_values": [
+        "entry('').stdin_consumed=true",
+        "entry('cat').stdin_consumed=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "stdin_decision_tty",
+      "input_condition": "WebDriver is invoked where TTY is true",
+      "output_rule": "stdin_consumed=false (terminal not piped)",
+      "exact_values": [
+        "entry('cat').stdin_consumed=false",
+        "entry('grep').stdin_consumed=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "stdin_decision_file_radix",
+      "input_condition": "Command requires files (radix) and argc > 0",
+      "output_rule": "stdin_consumed=false (radix resolves to args)",
+      "exact_values": [
+        "entry('cat f.txt').stdin_consumed=false"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C010",
+        "replacement": "current directory path as returned by OS",
+        "exact_values_to_replace": [
+          "stdout=<cwd>+\\n"
+        ],
+        "trigger_keywords": [
+          "what does pwd output?",
+          "current directory behavior",
+          "pwd command stdout",
+          "absolute CWD string",
+          "pwd return value"
+        ],
+        "oracle_response": "The absolute path of the current working directory followed by a single newline character, with all other stdout and stderr empty and exit_code=0."
+      },
+      {
+        "constraint_id": "C005",
+        "replacement": "a globally forbidden system command",
+        "exact_values_to_replace": [
+          "command=\"cd\""
+        ],
+        "trigger_keywords": [
+          "cd command handling",
+          "forbidden cd error",
+          "unsupported cd output",
+          "cd specific exit status",
+          "cd error message format"
+        ],
+        "oracle_response": "Exit code 27, error category 'unsupported_command', with 'command' set to the string 'cd' and stderr containing the standard usage instruction."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C014",
+        "vague_phrase": "matches the internal ruby path traversal logic",
+        "actual_meaning": "The literal forward slash character, handled by the sed pattern engine's escaping rules."
+      },
+      {
+        "constraint_id": "C015",
+        "vague_phrase": "the G_FILE_PATTERN transformation rule",
+        "actual_meaning": "Mapping of Windows backslash paths (\\\\) to forward slashes (/) during input processing."
+      }
+    ]
+  }
+}

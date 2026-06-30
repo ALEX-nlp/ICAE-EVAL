@@ -1,0 +1,482 @@
+{
+  "fuzzy_prd": "# Operational-Transform Core for Collaborative JSON Documents — Apply, Transform, and Validate Document Operations\n\n## Project Goal\n\nBuild the operational-transform (OT) core of a real-time collaboration backend: a small set of pure functions that validate operations, apply them to a versioned document snapshot, transform a pending operation against one that has already been applied, and keep cursor-like presence markers consistent. This lets multiple clients edit the same document concurrently and converge on the same result, without each application having to re-derive the tricky transform/apply rules itself.\n\n---\n\n## Background & Problem\n\nA collaborative document is represented as a *snapshot*: a monotonically increasing integer version, a document *type* (identified by a canonical string), and the document *content*. Clients submit *operations*; each operation is a small envelope that either creates the document, deletes it, carries an edit payload, or does nothing — and optionally carries its own version plus a source/sequence identity pair.\n\nBecause clients edit concurrently, two operations may be produced against the same base version. The server applies one, then must *transform* the other so it still makes sense afterwards; it must also reject combinations that cannot be reconciled (for example, editing a document that a concurrent operation just deleted). Doing this by hand in every application is error-prone, so this library centralizes the rules: structural validation of operations, version-guarded application, pairwise transformation, sequence application, and presence-marker transformation. All edit/transform semantics for the actual content are delegated to a registered *document type*; the core only orchestrates them and normalizes failures into a stable, language-neutral set of error categories.\n\nDocument types are looked up from a registry by either a short name or a canonical identifier. Two types are assumed to be registered for the scenarios below: a standard JSON OT type (short name `json0`, canonical identifier `http://sharejs.org/types/JSONv0`) whose edit payload is an array of JSON OT components (e.g. `{\"p\":[path...],\"si\":\"text\"}` inserts a string at a path, `{\"oi\":value}` inserts/sets an object member, `{\"li\":value}` inserts a list element), and a presence-capable string type (short name `presence-test-type`) used to demonstrate presence transformation.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\nThe execution adapter reads one JSON request from stdin. Every request has an `action` field that selects one of the operations below. On a domain error, the adapter prints a single normalized category line `error=<CATEGORY>` (and nothing else); the category names are the stable contract listed per feature. All output ends with a trailing newline.\n\n### Feature 1: Operation Validation\n\n**As a developer**, I want to check that an operation envelope is structurally well-formed before doing anything with it, so I can reject garbage early with a clear, stable reason.\n\n**Expected Behavior / Usage:**\n\nThe request (`action` = `checkOp`) carries an `op` field holding the envelope to validate (the field may also be absent, meaning \"no envelope\"). A well-formed envelope is a non-null map declaring exactly one intent: a `create` whose value is a map whose `type` names a registered document type; a `del` flag whose value is the literal boolean `true`; or an `op` edit payload. Optional `src` (string) and `seq` (number) identity fields, when present, must both be present and have those primitive shapes. The adapter prints `valid=true` when the envelope is well-formed. Otherwise it prints `valid=false` on the first line and `code=<CATEGORY>` on the second line, where the category is `[a specific error code for malformed operation structures — ask the PM for the exact string]` for any structural problem (not a map, missing/duplicate intent, a create missing its type, a non-object create payload, or a malformed src/seq pair) and `ERR_DOC_TYPE_NOT_RECOGNIZED` when a create names a type that is not registered.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_check_op.json`\n\n```json\n{\n    \"description\": \"Validate the structural well-formedness of a single operation envelope. A well-formed envelope is a non-null map that declares exactly one intent: a create whose payload is a map naming a registered document type, a deletion flag set to the literal boolean true, or an edit payload under the op field. Optional source and sequence identifiers, when present, must appear together with the correct primitive shapes (source a string, sequence a number). The check reports whether the envelope is well-formed, and on failure reports a normalized category distinguishing a malformed envelope from a reference to an unregistered type.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"checkOp\", \"op\": \"hi\"}, \"expected_output\": \"valid=false\\ncode=[a specific error code for malformed operation structures — ask the PM for the exact string]\\n\"},\n        {\"input\": {\"action\": \"checkOp\", \"op\": {\"create\": {\"type\": \"something that does not exist\"}}}, \"expected_output\": \"valid=false\\ncode=ERR_DOC_TYPE_NOT_RECOGNIZED\\n\"},\n        {\"input\": {\"action\": \"checkOp\", \"op\": {\"create\": {\"type\": \"json0\"}}}, \"expected_output\": \"valid=true\\n\"},\n        {\"input\": {\"action\": \"checkOp\", \"op\": {\"op\": [1, 2, 3]}}, \"expected_output\": \"valid=true\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Type Reference Normalization\n\n**As a developer**, I want to turn either a type's short name or its canonical identifier into the single canonical identifier, so downstream code can compare types unambiguously.\n\n**Expected Behavior / Usage:**\n\nThe request (`action` = `normalizeType`) carries a `typeName` reference. The adapter resolves it through the type registry and prints `uri=<canonical identifier>` when a registered type matches (whether the reference was the short name or the canonical identifier), and `uri=null` when no registered type matches.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_normalize_type.json`\n\n```json\n{\n    \"description\": \"Resolve a document-type reference, given either as a short type name or as its canonical identifier, to that type's canonical identifier string. A reference that names no registered type resolves to nothing.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"normalizeType\", \"typeName\": \"json0\"}, \"expected_output\": \"uri=http://sharejs.org/types/JSONv0\\n\"},\n        {\"input\": {\"action\": \"normalizeType\", \"typeName\": \"foo\"}, \"expected_output\": \"uri=null\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Apply One Operation To A Snapshot\n\n**As a developer**, I want to apply a single operation to a document snapshot in a version-safe way, so the snapshot reflects the change and advances its version, or fails with a precise reason.\n\n**Expected Behavior / Usage:**\n\nThe request (`action` = `apply`) carries a `snapshot` (a map with optional `v` version, optional `type`, optional `data` content) and an `op` envelope. On success the adapter prints the resulting snapshot as three lines in this fixed order: `v=<version>`, `type=<canonical identifier, short name, or null>`, and `data=<value>` where the value is the content rendered as canonical JSON (object keys sorted), or the literal token `absent` when the document has no content. On a domain error the adapter prints `error=<CATEGORY>` and the snapshot is left unchanged. The behavior splits into the version guard and the four operation intents below.\n\n*3.1 Version Guard — the precondition checked before any intent is processed*\n\nWhen both the snapshot and the operation declare a version, they must be equal; otherwise application is rejected with `ERR_APPLY_OP_VERSION_DOES_NOT_MATCH_SNAPSHOT`. When either side omits its version, the guard is skipped and the operation proceeds normally (updating the document and advancing the version).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_apply_version_guard.json`\n\n```json\n{\n    \"description\": \"Guard applied before mutating a snapshot: when both the snapshot and the operation carry a version they must be equal, otherwise application is rejected with a normalized version-mismatch category. When either side omits its version the guard is skipped and the operation is applied normally, updating the document and advancing its version.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 0}, \"op\": {\"v\": 1, \"create\": {\"type\": \"json0\"}}}, \"expected_output\": \"error=ERR_APPLY_OP_VERSION_DOES_NOT_MATCH_SNAPSHOT\\n\"},\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 5}, \"op\": {\"create\": {\"type\": \"json0\"}}}, \"expected_output\": \"v=6\\ntype=http://sharejs.org/types/JSONv0\\ndata=null\\n\"}\n    ]\n}\n```\n\n*3.2 Create — initialize a new document*\n\nApplying a `create` to a snapshot that has no type initializes the document: the snapshot adopts the named type's canonical identifier, the content becomes the supplied initial `data` (or the type's empty value — for the JSON type, `null` — when no data is supplied), and the version advances by one. Applying a `create` to a snapshot that already has a type is rejected with `ERR_DOC_ALREADY_CREATED` and the snapshot is untouched.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_apply_create.json`\n\n```json\n{\n    \"description\": \"Applying a create operation to an empty snapshot initializes the document: it adopts the named type's canonical identifier, sets its content to the supplied initial data (or the type's empty value when none is supplied), and advances the version by one. Creating over a snapshot that already has a type is rejected with a normalized already-exists category and leaves the snapshot untouched.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 5}, \"op\": {\"v\": 5, \"create\": {\"type\": \"json0\"}}}, \"expected_output\": \"v=6\\ntype=http://sharejs.org/types/JSONv0\\ndata=null\\n\"},\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 6, \"type\": \"http://sharejs.org/types/JSONv0\", \"data\": \"hi\"}, \"op\": {\"v\": 6, \"create\": {\"type\": \"json0\"}}}, \"expected_output\": \"error=ERR_DOC_ALREADY_CREATED\\n\"}\n    ]\n}\n```\n\n*3.3 Delete — clear a document*\n\nApplying a `del` operation clears the document: the content becomes absent and the type becomes `null`, and the version advances by one. This holds whether or not the document currently exists.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_apply_delete.json`\n\n```json\n{\n    \"description\": \"Applying a delete operation clears the document: its content becomes absent and its type becomes null, and the version advances by one. This holds whether or not the document currently exists.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 6, \"type\": \"json0\", \"data\": \"Hi there\"}, \"op\": {\"v\": 6, \"del\": true}}, \"expected_output\": \"v=7\\ntype=null\\ndata=absent\\n\"},\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 6}, \"op\": {\"v\": 6, \"del\": true}}, \"expected_output\": \"v=7\\ntype=null\\ndata=absent\\n\"}\n    ]\n}\n```\n\n*3.4 Edit — transform the content via the document type*\n\nApplying an `op` edit payload hands the payload to the snapshot's document type to transform the current content, then advances the version by one. Editing a document that does not exist (no type) is rejected with `ERR_DOC_DOES_NOT_EXIST`; editing when the snapshot references a type that is not registered is rejected with `ERR_DOC_TYPE_NOT_RECOGNIZED`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_4_apply_edit.json`\n\n```json\n{\n    \"description\": \"Applying an edit operation hands its payload to the document's type to transform the current content, advancing the version by one on success. Editing a document that does not exist is rejected with a normalized does-not-exist category; editing when the snapshot references an unregistered type is rejected with a normalized type-not-recognized category.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 6, \"type\": \"json0\", \"data\": \"Hi\"}, \"op\": {\"v\": 6, \"op\": [{\"p\": [2], \"si\": \" there\"}]}}, \"expected_output\": \"v=7\\ntype=json0\\ndata=\\\"Hi there\\\"\\n\"},\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 6}, \"op\": {\"v\": 6, \"op\": [1, 2, 3]}}, \"expected_output\": \"error=ERR_DOC_DOES_NOT_EXIST\\n\"}\n    ]\n}\n```\n\n*3.5 No-op — advance the version only*\n\nAn operation that carries none of `create`, `del`, or `op` leaves the content and type unchanged but still advances the version by one. This holds both for an existing document and for a snapshot that has no content yet (in which case the type renders as `null` and the content as `absent`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_5_apply_noop.json`\n\n```json\n{\n    \"description\": \"An operation that carries neither create, delete, nor edit intent leaves the document's content and type unchanged but still advances the version by one. This holds both for an existing document and for a snapshot that has no content yet.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 6, \"type\": \"json0\", \"data\": \"Hi\"}, \"op\": {\"v\": 6}}, \"expected_output\": \"v=7\\ntype=json0\\ndata=\\\"Hi\\\"\\n\"},\n        {\"input\": {\"action\": \"apply\", \"snapshot\": {\"v\": 0}, \"op\": {\"v\": 0}}, \"expected_output\": \"v=1\\ntype=null\\ndata=absent\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Transform A Pending Operation Against An Applied Operation\n\n**As a developer**, I want to transform a still-pending operation so it can be applied after a concurrent operation that was already applied at the same base version, so concurrent edits converge instead of corrupting the document.\n\n**Expected Behavior / Usage:**\n\nThe request (`action` = `transform`) carries a document `type` reference (or `null`), the pending `op`, and the already-applied `appliedOp`. The pending operation is transformed in place; on success the adapter prints `result=<canonical JSON of the transformed pending operation>` (object keys sorted) and, when the pending operation carried a version, that version has advanced by one. The outcome depends on the pair of intents on each side: a no-op pending operation is always returned unchanged; two edits are transformed against each other by the document type (the pending edit's positions shift to account for the applied edit); a pending delete survives unchanged (aside from its version) against an applied delete, edit, or no-op. Illegal combinations are rejected: a version that is declared on both sides but disagrees yields `ERR_OP_VERSION_MISMATCH_DURING_TRANSFORM`; a pending create or edit against an applied delete yields `ERR_DOC_WAS_DELETED`; and a pending operation against an applied create — or a pending create against an applied edit — yields `ERR_DOC_ALREADY_CREATED` because the document already exists remotely. A pending operation that omits its version is transformed without any version being assigned.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_transform.json`\n\n```json\n{\n    \"description\": \"Transform a pending operation so it can be applied after another operation that was already applied at the same base version, mutating the pending operation in place and advancing its version when it carries one. The outcome depends on the pair of intents on each side. A no-op pending operation is always left unchanged. Two edits are transformed against each other by the document type. Illegal combinations are rejected with normalized categories: a version disagreement between the two operations (version-mismatch); a pending create or edit against an applied delete (was-deleted); and a pending operation against an applied create or applied edit that implies the document already exists (already-created). A pending delete survives against an applied delete, edit, or no-op, and a pending operation that omits its version is transformed without a version being assigned.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"transform\", \"type\": \"json0\", \"op\": {\"v\": 6, \"op\": [{\"p\": [10], \"si\": \"hi\"}]}, \"appliedOp\": {\"v\": 6, \"op\": [{\"p\": [5], \"si\": \"abcde\"}]}}, \"expected_output\": \"result={\\\"op\\\":[{\\\"p\\\":[15],\\\"si\\\":\\\"hi\\\"}],\\\"v\\\":7}\\n\"},\n        {\"input\": {\"action\": \"transform\", \"type\": \"json0\", \"op\": {\"v\": 5, \"op\": [{\"p\": [10], \"si\": \"hi\"}]}, \"appliedOp\": {\"v\": 6, \"op\": [{\"p\": [5], \"si\": \"abcde\"}]}}, \"expected_output\": \"error=ERR_OP_VERSION_MISMATCH_DURING_TRANSFORM\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Transform A Presence Marker Against An Operation\n\n**As a developer**, I want to keep a cursor-like presence marker pointing at the right spot after an operation is applied, so collaborators' cursors stay sensible as the document changes.\n\n**Expected Behavior / Usage:**\n\nThe request (`action` = `transformPresence`) carries a `presence` marker (a map with a position `p`, a type reference `t`, and a version `v`), the `op` that is being applied, and an optional `isOwnOp` flag indicating whether the operation originated from the same author as the marker. The operation is first validated as in Feature 1; a malformed operation yields `[a specific error code for malformed operation structures — ask the PM for the exact string]`. The marker's type must be registered (`ERR_DOC_TYPE_NOT_RECOGNIZED` otherwise) and must be one that supports presence (`ERR_TYPE_DOES_NOT_SUPPORT_PRESENCE` otherwise). A create or delete operation discards the position (sets `p` to `null`) and advances the marker version. An edit operation asks the type to move the position, taking `isOwnOp` into account (a marker at the exact edit point shifts when the edit is the author's own, but stays put for someone else's edit at the same point). A marker whose position is already `null` is left `null`. On success the adapter prints `result=<canonical JSON of the transformed marker>` (object keys sorted), with the version advanced by one.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_transform_presence.json`\n\n```json\n{\n    \"description\": \"Transform a presence marker (a cursor-like position bound to a document type and version) so it stays consistent after an operation is applied, advancing the marker version. The marker's type must be registered and must support presence, otherwise a normalized category is returned (type-not-recognized or does-not-support-presence). A create or delete operation discards the marker position (sets it to null). An edit operation asks the type to move the marker, taking into account whether the operation came from the same author. A marker whose position is already null stays null. A malformed operation is rejected with the malformed-envelope category.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"transformPresence\", \"presence\": {\"p\": {\"index\": 5}, \"t\": \"presence-test-type\", \"v\": 1}, \"op\": {\"op\": {\"index\": 2, \"value\": \"foo\"}}}, \"expected_output\": \"result={\\\"p\\\":{\\\"index\\\":8},\\\"t\\\":\\\"presence-test-type\\\",\\\"v\\\":2}\\n\"},\n        {\"input\": {\"action\": \"transformPresence\", \"presence\": {\"p\": {\"index\": 5}, \"t\": \"json0\", \"v\": 1}, \"op\": {\"op\": {\"index\": 5, \"value\": \"foo\"}}}, \"expected_output\": \"error=ERR_TYPE_DOES_NOT_SUPPORT_PRESENCE\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Apply A Sequence Of Operations\n\n**As a developer**, I want to apply an ordered batch of operations to a snapshot, so a document can be rebuilt or fast-forwarded by replaying its history.\n\n**Expected Behavior / Usage:**\n\nThe request (`action` = `applyOps`) carries a `snapshot` and an ordered list `ops`. Each operation in turn sets the working version (to that operation's version) and is then applied as in Feature 3, so the document accumulates every change in order. On success the adapter prints the final snapshot in the same three-line form as Feature 3 (`v=`, `type=`, `data=`). The sequence short-circuits on the first error and prints `error=<CATEGORY>`: an unregistered snapshot type or an unregistered create type yields `ERR_DOC_TYPE_NOT_RECOGNIZED`, and an edit payload the type refuses to apply yields `ERR_OT_OP_NOT_APPLIED`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_apply_ops.json`\n\n```json\n{\n    \"description\": \"Apply an ordered sequence of operations to a snapshot, each operation establishing the working version before it is applied so the document accumulates every change in order. A single sequence may create, then edit, then further edit a document. Errors short-circuit the sequence and surface as normalized categories: an unregistered snapshot type or create type yields type-not-recognized, and a payload the type refuses to apply yields a normalized not-applied category.\",\n    \"cases\": [\n        {\"input\": {\"action\": \"applyOps\", \"snapshot\": {\"type\": \"json0\", \"data\": {\"title\": \"Wee Free Men\"}}, \"ops\": [{\"v\": 1, \"op\": [{\"p\": [\"title\", 0], \"si\": \"The \"}]}]}, \"expected_output\": \"v=2\\ntype=json0\\ndata={\\\"title\\\":\\\"The Wee Free Men\\\"}\\n\"},\n        {\"input\": {\"action\": \"applyOps\", \"snapshot\": {\"type\": \"json0\", \"data\": {\"title\": \"Wee Free Men\"}}, \"ops\": [{\"v\": 1, \"op\": [{\"p\": [\"title\", 0], \"si\": \"The \"}]}, {\"v\": 2, \"op\": [{\"p\": [\"author\"], \"oi\": \"Terry Pratchett\"}]}]}, \"expected_output\": \"v=3\\ntype=json0\\ndata={\\\"author\\\":\\\"Terry Pratchett\\\",\\\"title\\\":\\\"The Wee Free Men\\\"}\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the operation-validation, apply, transform, sequence-apply, and presence-transform behavior above, with the actual content edit/transform/presence math delegated to a pluggable document-type abstraction looked up from a type registry. Its physical structure MUST align with the \"Scale-Driven Code Organization\" constraint, and the core must be decoupled from standard I/O and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (entry point) that reads a single JSON request from stdin, selects behavior by its `action` field (`checkOp`, `normalizeType`, `apply`, `transform`, `transformPresence`, `applyOps`), invokes the core, and prints the result or a normalized `error=<CATEGORY>` line to stdout, matching the per-feature contracts above. The adapter is solely responsible for translating native failures into the language-neutral error categories and for rendering values as the line-oriented / canonical-JSON forms shown; the registry must have a standard JSON document type (`json0` / `http://sharejs.org/types/JSONv0`) and a presence-capable type (`presence-test-type`) registered.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the same error format as the validation envelope module\n",
+  "oracle_data": {
+    "task_id": "share__sharedb-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "What error should be triggered?",
+          "Which error category?",
+          "What value goes here?"
+        ],
+        "oracle_response": "ERR_OT_OP_BADLY_FORMED"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the same error format as the validation envelope module",
+        "actual_meaning": "The error code must match the prefix and suffix pattern used in other envelope-related validation errors."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_check_op.json": {
+      "description": "Validate the structural well-formedness of a single operation envelope. A well-formed envelope is a non-null map that declares exactly one intent: a create whose payload is a map naming a registered document type, a deletion flag set to the literal boolean true, or an edit payload under the op field. Optional source and sequence identifiers, when present, must appear together with the correct primitive shapes (source a string, sequence a number). The check reports whether the envelope is well-formed, and on failure reports a normalized category distinguishing a malformed envelope from a reference to an unregistered type.",
+      "cases": [
+        {
+          "input": {
+            "action": "checkOp",
+            "op": "hi"
+          },
+          "expected_output": "valid=false\ncode=ERR_OT_OP_BADLY_FORMED\n"
+        },
+        {
+          "input": {
+            "action": "checkOp",
+            "op": {
+              "create": {
+                "type": "something that does not exist"
+              }
+            }
+          },
+          "expected_output": "valid=false\ncode=ERR_DOC_TYPE_NOT_RECOGNIZED\n"
+        },
+        {
+          "input": {
+            "action": "checkOp",
+            "op": {
+              "create": {
+                "type": "json0"
+              }
+            }
+          },
+          "expected_output": "valid=true\n"
+        },
+        {
+          "input": {
+            "action": "checkOp",
+            "op": {
+              "op": [
+                1,
+                2,
+                3
+              ]
+            }
+          },
+          "expected_output": "valid=true\n"
+        }
+      ]
+    },
+    "feature2_normalize_type.json": {
+      "description": "Resolve a document-type reference, given either as a short type name or as its canonical identifier, to that type's canonical identifier string. A reference that names no registered type resolves to nothing.",
+      "cases": [
+        {
+          "input": {
+            "action": "normalizeType",
+            "typeName": "json0"
+          },
+          "expected_output": "uri=http://sharejs.org/types/JSONv0\n"
+        },
+        {
+          "input": {
+            "action": "normalizeType",
+            "typeName": "foo"
+          },
+          "expected_output": "uri=null\n"
+        }
+      ]
+    },
+    "feature3_1_apply_version_guard.json": {
+      "description": "Guard applied before mutating a snapshot: when both the snapshot and the operation carry a version they must be equal, otherwise application is rejected with a normalized version-mismatch category. When either side omits its version the guard is skipped and the operation is applied normally, updating the document and advancing its version.",
+      "cases": [
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 0
+            },
+            "op": {
+              "v": 1,
+              "create": {
+                "type": "json0"
+              }
+            }
+          },
+          "expected_output": "error=ERR_APPLY_OP_VERSION_DOES_NOT_MATCH_SNAPSHOT\n"
+        },
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 5
+            },
+            "op": {
+              "create": {
+                "type": "json0"
+              }
+            }
+          },
+          "expected_output": "v=6\ntype=http://sharejs.org/types/JSONv0\ndata=null\n"
+        }
+      ]
+    },
+    "feature3_2_apply_create.json": {
+      "description": "Applying a create operation to an empty snapshot initializes the document: it adopts the named type's canonical identifier, sets its content to the supplied initial data (or the type's empty value when none is supplied), and advances the version by one. Creating over a snapshot that already has a type is rejected with a normalized already-exists category and leaves the snapshot untouched.",
+      "cases": [
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 5
+            },
+            "op": {
+              "v": 5,
+              "create": {
+                "type": "json0"
+              }
+            }
+          },
+          "expected_output": "v=6\ntype=http://sharejs.org/types/JSONv0\ndata=null\n"
+        },
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 6,
+              "type": "http://sharejs.org/types/JSONv0",
+              "data": "hi"
+            },
+            "op": {
+              "v": 6,
+              "create": {
+                "type": "json0"
+              }
+            }
+          },
+          "expected_output": "error=ERR_DOC_ALREADY_CREATED\n"
+        }
+      ]
+    },
+    "feature3_3_apply_delete.json": {
+      "description": "Applying a delete operation clears the document: its content becomes absent and its type becomes null, and the version advances by one. This holds whether or not the document currently exists.",
+      "cases": [
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 6,
+              "type": "json0",
+              "data": "Hi there"
+            },
+            "op": {
+              "v": 6,
+              "del": true
+            }
+          },
+          "expected_output": "v=7\ntype=null\ndata=absent\n"
+        },
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 6
+            },
+            "op": {
+              "v": 6,
+              "del": true
+            }
+          },
+          "expected_output": "v=7\ntype=null\ndata=absent\n"
+        }
+      ]
+    },
+    "feature3_4_apply_edit.json": {
+      "description": "Applying an edit operation hands its payload to the document's type to transform the current content, advancing the version by one on success. Editing a document that does not exist is rejected with a normalized does-not-exist category; editing when the snapshot references an unregistered type is rejected with a normalized type-not-recognized category.",
+      "cases": [
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 6,
+              "type": "json0",
+              "data": "Hi"
+            },
+            "op": {
+              "v": 6,
+              "op": [
+                {
+                  "p": [
+                    2
+                  ],
+                  "si": " there"
+                }
+              ]
+            }
+          },
+          "expected_output": "v=7\ntype=json0\ndata=\"Hi there\"\n"
+        },
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 6
+            },
+            "op": {
+              "v": 6,
+              "op": [
+                1,
+                2,
+                3
+              ]
+            }
+          },
+          "expected_output": "error=ERR_DOC_DOES_NOT_EXIST\n"
+        }
+      ]
+    },
+    "feature3_5_apply_noop.json": {
+      "description": "An operation that carries neither create, delete, nor edit intent leaves the document's content and type unchanged but still advances the version by one. This holds both for an existing document and for a snapshot that has no content yet.",
+      "cases": [
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 6,
+              "type": "json0",
+              "data": "Hi"
+            },
+            "op": {
+              "v": 6
+            }
+          },
+          "expected_output": "v=7\ntype=json0\ndata=\"Hi\"\n"
+        },
+        {
+          "input": {
+            "action": "apply",
+            "snapshot": {
+              "v": 0
+            },
+            "op": {
+              "v": 0
+            }
+          },
+          "expected_output": "v=1\ntype=null\ndata=absent\n"
+        }
+      ]
+    },
+    "feature4_transform.json": {
+      "description": "Transform a pending operation so it can be applied after another operation that was already applied at the same base version, mutating the pending operation in place and advancing its version when it carries one. The outcome depends on the pair of intents on each side. A no-op pending operation is always left unchanged. Two edits are transformed against each other by the document type. Illegal combinations are rejected with normalized categories: a version disagreement between the two operations (version-mismatch); a pending create or edit against an applied delete (was-deleted); and a pending operation against an applied create or applied edit that implies the document already exists (already-created). A pending delete survives against an applied delete, edit, or no-op, and a pending operation that omits its version is transformed without a version being assigned.",
+      "cases": [
+        {
+          "input": {
+            "action": "transform",
+            "type": "json0",
+            "op": {
+              "v": 6,
+              "op": [
+                {
+                  "p": [
+                    10
+                  ],
+                  "si": "hi"
+                }
+              ]
+            },
+            "appliedOp": {
+              "v": 6,
+              "op": [
+                {
+                  "p": [
+                    5
+                  ],
+                  "si": "abcde"
+                }
+              ]
+            }
+          },
+          "expected_output": "result={\"op\":[{\"p\":[15],\"si\":\"hi\"}],\"v\":7}\n"
+        },
+        {
+          "input": {
+            "action": "transform",
+            "type": "json0",
+            "op": {
+              "v": 5,
+              "op": [
+                {
+                  "p": [
+                    10
+                  ],
+                  "si": "hi"
+                }
+              ]
+            },
+            "appliedOp": {
+              "v": 6,
+              "op": [
+                {
+                  "p": [
+                    5
+                  ],
+                  "si": "abcde"
+                }
+              ]
+            }
+          },
+          "expected_output": "error=ERR_OP_VERSION_MISMATCH_DURING_TRANSFORM\n"
+        }
+      ]
+    },
+    "feature5_transform_presence.json": {
+      "description": "Transform a presence marker (a cursor-like position bound to a document type and version) so it stays consistent after an operation is applied, advancing the marker version. The marker's type must be registered and must support presence, otherwise a normalized category is returned (type-not-recognized or does-not-support-presence). A create or delete operation discards the marker position (sets it to null). An edit operation asks the type to move the marker, taking into account whether the operation came from the same author. A marker whose position is already null stays null. A malformed operation is rejected with the malformed-envelope category.",
+      "cases": [
+        {
+          "input": {
+            "action": "transformPresence",
+            "presence": {
+              "p": {
+                "index": 5
+              },
+              "t": "presence-test-type",
+              "v": 1
+            },
+            "op": {
+              "op": {
+                "index": 2,
+                "value": "foo"
+              }
+            }
+          },
+          "expected_output": "result={\"p\":{\"index\":8},\"t\":\"presence-test-type\",\"v\":2}\n"
+        },
+        {
+          "input": {
+            "action": "transformPresence",
+            "presence": {
+              "p": {
+                "index": 5
+              },
+              "t": "json0",
+              "v": 1
+            },
+            "op": {
+              "op": {
+                "index": 5,
+                "value": "foo"
+              }
+            }
+          },
+          "expected_output": "error=ERR_TYPE_DOES_NOT_SUPPORT_PRESENCE\n"
+        }
+      ]
+    },
+    "feature6_apply_ops.json": {
+      "description": "Apply an ordered sequence of operations to a snapshot, each operation establishing the working version before it is applied so the document accumulates every change in order. A single sequence may create, then edit, then further edit a document. Errors short-circuit the sequence and surface as normalized categories: an unregistered snapshot type or create type yields type-not-recognized, and a payload the type refuses to apply yields a normalized not-applied category.",
+      "cases": [
+        {
+          "input": {
+            "action": "applyOps",
+            "snapshot": {
+              "type": "json0",
+              "data": {
+                "title": "Wee Free Men"
+              }
+            },
+            "ops": [
+              {
+                "v": 1,
+                "op": [
+                  {
+                    "p": [
+                      "title",
+                      0
+                    ],
+                    "si": "The "
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "v=2\ntype=json0\ndata={\"title\":\"The Wee Free Men\"}\n"
+        },
+        {
+          "input": {
+            "action": "applyOps",
+            "snapshot": {
+              "type": "json0",
+              "data": {
+                "title": "Wee Free Men"
+              }
+            },
+            "ops": [
+              {
+                "v": 1,
+                "op": [
+                  {
+                    "p": [
+                      "title",
+                      0
+                    ],
+                    "si": "The "
+                  }
+                ]
+              },
+              {
+                "v": 2,
+                "op": [
+                  {
+                    "p": [
+                      "author"
+                    ],
+                    "oi": "Terry Pratchett"
+                  }
+                ]
+              }
+            ]
+          },
+          "expected_output": "v=3\ntype=json0\ndata={\"author\":\"Terry Pratchett\",\"title\":\"The Wee Free Men\"}\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Operation Structure",
+      "input_condition": "Operation envelope must be a valid map",
+      "output_rule": "Malformed structs trigger ERR_OT_OP_BADLY_FORMED",
+      "exact_values": [
+        "ERR_OT_OP_BADLY_FORMED"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C001",
+        "replacement": "a specific error code for malformed operation structures — ask the PM for the exact string",
+        "exact_values_to_replace": [
+          "ERR_OT_OP_BADLY_FORMED"
+        ],
+        "trigger_keywords": [
+          "What error should be triggered?",
+          "Which error category?",
+          "What value goes here?"
+        ],
+        "oracle_response": "ERR_OT_OP_BADLY_FORMED"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C001",
+        "vague_phrase": "follow the same error format as the validation envelope module",
+        "actual_meaning": "The error code must match the prefix and suffix pattern used in other envelope-related validation errors."
+      }
+    ]
+  }
+}

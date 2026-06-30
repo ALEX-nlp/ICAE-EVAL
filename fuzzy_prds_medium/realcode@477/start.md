@@ -1,0 +1,17 @@
+## Product Requirement Document
+
+Hey team, we need a small request-builder thing for the search service. Basically we want something that takes a high-level 'count documents' instruction and turns it into a proper HTTP request — method, path, params, body, all that. The tricky part (and the reason this came up) is that our ops team noticed the service is getting hit with a bunch of empty `{}` payloads on simple count requests, and some of the upstream servers are behaving weirdly when they receive those. So we need to make sure the body is only included when it actually has something meaningful in it — same kind of logic we used in that index-routing module a while back, you know the one.
+
+Also some inputs are lightweight enough that they should just ride on the URL rather than going into a body. The structured stuff obviously needs to be serialized properly — for term-style queries, refer to how we nested things in the last search PR.
+
+The whole thing needs to be cleanly separated — don't just throw everything in one file. There should be a runnable adapter that reads from stdin and prints the wire request to stdout so we can test it. Tests should live under rcb_tests/ and run with a single bash command. If something goes in wrong, don't blow up with a stack trace — surface a clean generic error. Probably a two-day task, let me know if anything is unclear.
+
+Quick follow-up from the questions that came in: for count, `method=POST` every time, full stop. Even if the request is totally empty and there are no params and no body, it still needs to come out as `method=POST`. Path-wise, if there’s no `index` at all, use `/_count`. If `index` is provided as an array, the path is the comma-joined version plus `/_count`, so `["logs", "events"]` becomes `/logs,events/_count`.
+
+On the empty-payload issue, the rule is strict: include a body ONLY when the serialized request object has at least one property. If serialization ends up as `{}` because there wasn’t any structured query to put in there, then do not send a payload at all. In the adapter output that should show up as `body=absent`, not `body={}`. That stays true even if something like `q` is present, because `q` belongs on the query string and does not make the body count as present. More generally, the suppress-when-empty behavior should be its own reusable thing, decoupled from the endpoint-specific request building, same basic idea as keeping the `index` path handling generic instead of baking it into one special case.
+
+Also confirming `q`: it is a lightweight query-string param, so it must be emitted as `query.q=<value>` and not serialized into the JSON body. It should follow the same `query.<name>=<value>` output format as the other query-string params, and those lines should be sorted alphabetically. Its presence has no effect on whether the body is included or suppressed.
+
+For term queries, please transform the input shape instead of passing it through. The required body shape is `{"query":{"term":{"<field>":{"value":"<v>"}}}}`. So if field is `foo` and value is `bar`, the body is exactly `{"query":{"term":{"foo":{"value":"bar"}}}}`. The input shape `{"term": {"field": "foo", "value": "bar"}}` must be transformed — it is NOT passed through verbatim.
+
+A few exact details to be precise about: When no collection/index is specified, the path is `/_count`. When one or more collections are named via the `index` field (an array), the path becomes `/<comma-joined-names>/_count` — e.g., for `["logs", "events"]` the path would be `/logs,events/_count`.

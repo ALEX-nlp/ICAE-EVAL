@@ -1,0 +1,587 @@
+{
+  "fuzzy_prd": "# On-Device File Cache Toolkit — Cache Record Modeling, HTTP Fetch Metadata & Download Progress\n\n## Project Goal\n\nBuild the data-modeling and metadata layer of a generic file cache that downloads remote files, stores them on a device, and remembers when each file expires, so application developers can reuse cached files instead of re-downloading them and can reason about freshness without writing their own persistence and HTTP-parsing boilerplate.\n\n---\n\n## Background & Problem\n\nApplications that display or process remote files (images, documents, media) repeatedly fetch the same URLs over the network. Without a cache layer, every view costs bandwidth and latency, and developers hand-roll ad-hoc logic to track which file came from where, when it was last refreshed, and when it should be considered stale.\n\nThis toolkit provides the building blocks for such a cache: a record type that captures everything known about one cached file (its source URL, an optional lookup key, the on-disk relative path, an entity tag, a validity deadline, a stored byte length, and an internal id) together with the rules for persisting and copying that record; a metadata extractor that reads an HTTP response and decides the file extension, the entity tag, the byte length, and how long the response stays valid; and a progress calculator for streaming downloads. The features below define the externally observable input/output behavior of these pieces. They are pure data transformations: no real network or disk access is required to exercise them.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\n### Feature 1: Cache Record Modeling\n\n**As a developer**, I want a record type that captures everything known about one cached file and supports persistence and immutable copies, so I can store, reload, and update cache entries reliably.\n\n**Expected Behavior / Usage:**\n\nA cache record describes one cached file. Its fields are: the source `url`, a lookup `key`, the on-disk `relativePath`, an entity tag `eTag`, a validity deadline (`validTill`), a stored byte `length`, and an internal numeric `id`. Every output renders these as `name=value` lines; absent values render as the literal `null`. Timestamps are exchanged as epoch milliseconds. The sub-features below define construction, deserialization, serialization, and copy semantics.\n\n*1.1 Construct A Record (Key Defaulting) — Build a record from a URL with an optional explicit key*\n\nA record is created from a source URL. If no key is supplied, the key defaults to the URL itself; if an explicit key is supplied, it is retained exactly. The URL is always kept verbatim. The output reports the resulting `url` and `key`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_1_construct.json`\n\n```json\n{\n    \"description\": \"Constructing a cache record from a source URL, optionally with an explicit key. When no key is supplied the record's key defaults to the URL; when an explicit key is supplied it is kept verbatim. The URL is always retained as given.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"construct\", \"url\": \"baseflow.com/test.png\"},\n            \"expected_output\": \"url=baseflow.com/test.png\\nkey=baseflow.com/test.png\\n\"\n        },\n        {\n            \"input\": {\"action\": \"construct\", \"url\": \"baseflow.com/test.png\", \"key\": \"test key 1234\"},\n            \"expected_output\": \"url=baseflow.com/test.png\\nkey=test key 1234\\n\"\n        }\n    ]\n}\n```\n\n*1.2 Deserialize A Record — Rebuild a record from a persisted flat key/value record*\n\nA record is reconstructed from a stored flat map of columns: `_id` (numeric id), `url`, an optional `key`, `relativePath`, `eTag`, and `validTill` stored as epoch milliseconds. When the stored map omits the `key` column, the key falls back to the URL; when present it is used directly. A missing `length` column yields a null length. The output reports `id`, `url`, `key`, `relativePath`, `eTag`, `validTill_millis`, and `length`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_2_deserialize.json`\n\n```json\n{\n    \"description\": \"Reconstructing a cache record from a persisted flat key/value record loaded from storage. Recognised fields are the numeric id, the URL, an optional key, the relative file path, the entity tag, and the validity timestamp stored as epoch milliseconds. When the record omits the key field the key falls back to the URL; when present it is used directly. The validity timestamp is reported back as epoch milliseconds.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"deserialize\", \"record\": {\"_id\": 3, \"url\": \"baseflow.com/test.png\", \"relativePath\": \"test.png\", \"eTag\": \"test1\", \"validTill\": 1585301160000, \"touched\": 1585387560000}},\n            \"expected_output\": \"id=3\\nurl=baseflow.com/test.png\\nkey=baseflow.com/test.png\\nrelativePath=test.png\\neTag=test1\\nvalidTill_millis=1585301160000\\nlength=null\\n\"\n        },\n        {\n            \"input\": {\"action\": \"deserialize\", \"record\": {\"_id\": 3, \"url\": \"baseflow.com/test.png\", \"key\": \"testId1234\", \"relativePath\": \"test.png\", \"eTag\": \"test1\", \"validTill\": 1585301160000, \"touched\": 1585387560000}},\n            \"expected_output\": \"id=3\\nurl=baseflow.com/test.png\\nkey=testId1234\\nrelativePath=test.png\\neTag=test1\\nvalidTill_millis=1585301160000\\nlength=null\\n\"\n        }\n    ]\n}\n```\n\n*1.3 Serialize A Record — Flatten a record into a persistable key/value record*\n\nA record is serialized into a flat map for persistence. The validity deadline is written as epoch milliseconds, defaulting to `0` when absent. A `touched` timestamp is stamped from the current clock at the moment of serialization (supplied via `now_millis`). The `id` entry is emitted only when the record has an id. The fields `url`, `key`, `relativePath`, `eTag`, and `length` are written through unchanged. The output reports `url`, `key`, `relativePath`, `eTag`, `validTill`, `touched`, `length`, and `id`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_3_serialize.json`\n\n```json\n{\n    \"description\": \"Serialising a cache record into a flat key/value record suitable for persistence. The validity timestamp is written as epoch milliseconds (or 0 when absent) and a 'touched' timestamp is stamped from the current clock at serialisation time. The id is only emitted when the record has one; the remaining identifying fields (url, key, relative path, entity tag, length) are written through unchanged.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"serialize\", \"url\": \"baseflow.com/test.png\", \"key\": \"testKey1234\", \"relativePath\": \"test.png\", \"validTill_millis\": 1585301160000, \"eTag\": \"test1\", \"id\": 3, \"now_millis\": 1585387560000},\n            \"expected_output\": \"url=baseflow.com/test.png\\nkey=testKey1234\\nrelativePath=test.png\\neTag=test1\\nvalidTill=1585301160000\\ntouched=1585387560000\\nlength=null\\nid=3\\n\"\n        }\n    ]\n}\n```\n\n*1.4 Copy A Record With Overrides — Derive a modified record while preserving the key*\n\nA modified copy of a record is produced by overriding a single field while carrying over the rest. Any one of `url`, `id`, `relativePath`, `validTill` (as epoch milliseconds), `eTag`, or `length` may be replaced; fields not mentioned keep their original values. The `key` is always preserved from the original record and is never changed by a copy. The output reports all record fields. (The full case set in `rcb_tests/test_cases/` covers each overridable field individually; the examples below show overriding the id and the url.)\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_4_copy.json`\n\n```json\n{\n    \"description\": \"Producing a modified copy of a cache record by overriding a single field while leaving the others intact. Any one of url, id, relative path, validity timestamp, entity tag, or length may be replaced; fields not mentioned are carried over from the original. The key is always preserved from the original record and is never altered by a copy.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"copy\", \"base\": {\"url\": \"www.test.com/image\", \"key\": \"test123\", \"relativePath\": \"test.png\", \"validTill_millis\": 1585387560000, \"eTag\": \"test1\", \"length\": 200, \"id\": null}, \"changes\": {\"id\": 1}},\n            \"expected_output\": \"id=1\\nurl=www.test.com/image\\nkey=test123\\nrelativePath=test.png\\neTag=test1\\nvalidTill_millis=1585387560000\\nlength=200\\n\"\n        },\n        {\n            \"input\": {\"action\": \"copy\", \"base\": {\"url\": \"www.test.com/image\", \"key\": \"test123\", \"relativePath\": \"test.png\", \"validTill_millis\": 1585387560000, \"eTag\": \"test1\", \"length\": 200, \"id\": 1}, \"changes\": {\"url\": \"www.someotherurl.com\"}},\n            \"expected_output\": \"id=1\\nurl=www.someotherurl.com\\nkey=test123\\nrelativePath=test.png\\neTag=test1\\nvalidTill_millis=1585387560000\\nlength=200\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: HTTP Fetch Metadata Extraction\n\n**As a developer**, I want to derive cache metadata from an HTTP response to a file request, so I know what extension to save the file under, how to revalidate it later, and how long it stays fresh.\n\n**Expected Behavior / Usage:**\n\nGiven an HTTP response (described by a status code, an optional content length, a header map, and the reception time as `now_millis`), the extractor reports the `statusCode`, the `contentLength` (or `null`), the entity tag from the `etag` header (or `null` when absent), the file extension derived from the `content-type` header, and the validity deadline as epoch milliseconds. The validity deadline is the reception time plus a freshness window: a `cache-control: max-age=N` directive yields N seconds; when no cache directive is present the default window is one week (604800 seconds).\n\n*2.1 Full Response Metadata — Extract status, length, entity tag, extension and validity together*\n\nFor a successful response carrying an `etag`, a recognized `content-type`, and a `max-age` cache directive, all five metadata fields are reported. The validity deadline equals the reception time plus the max-age seconds.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_response_metadata.json`\n\n```json\n{\n    \"description\": \"Extracting cache metadata from an HTTP response to a file request. The reported metadata is the HTTP status code, the content length, the entity tag (from the response's etag header, or null when absent), the file extension derived from the content type, and the validity timestamp. When the response carries a 'max-age' cache directive the content is valid for that many seconds from the moment the response is received; the validity timestamp is reported as epoch milliseconds relative to the supplied reception time.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"http_response\", \"now_millis\": 1585387560000, \"status\": 200, \"content_length\": 16, \"headers\": {\"etag\": \"test\", \"content-type\": \"image/jpeg\", \"cache-control\": \"max-age=7200\"}},\n            \"expected_output\": \"statusCode=200\\ncontentLength=16\\neTag=test\\nfileExtension=.jpg\\nvalidTill_millis=1585394760000\\n\"\n        }\n    ]\n}\n```\n\n*2.2 File Extension From Content Type — Map media type to extension, falling back to the subtype*\n\nThe file extension is derived from the response `content-type`. A recognized media type maps to its conventional extension (for example `image/jpeg` to `.jpg`, `audio/mpeg` to `.mp3`). An unrecognized media type falls back to a dot followed by the content subtype (for example `unknown/cov` to `.cov`). Any parameters trailing the media type (such as a charset) are ignored when determining the extension. With no cache directive present, the validity deadline defaults to one week after the reception time.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_file_extension.json`\n\n```json\n{\n    \"description\": \"Deriving the on-disk file extension from an HTTP response's content type. A recognised media type maps to its conventional extension; an unrecognised media type falls back to a dot followed by the content subtype. Parameters after the media type (such as a charset) are ignored when determining the extension. With no cache directive present the content defaults to a one-week validity measured from the reception time.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"http_response\", \"now_millis\": 1585387560000, \"status\": 200, \"content_length\": 16, \"headers\": {\"content-type\": \"unknown/cov\"}},\n            \"expected_output\": \"statusCode=200\\ncontentLength=16\\neTag=null\\nfileExtension=.cov\\nvalidTill_millis=1585992360000\\n\"\n        },\n        {\n            \"input\": {\"action\": \"http_response\", \"now_millis\": 1585387560000, \"status\": 200, \"content_length\": 16, \"headers\": {\"content-type\": \"audio/mpeg;chartset=UTF-8\"}},\n            \"expected_output\": \"statusCode=200\\ncontentLength=16\\neTag=null\\nfileExtension=.mp3\\nvalidTill_millis=1585992360000\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Download Progress Calculation\n\n**As a developer**, I want to compute the fractional progress of a streaming download, so I can drive a progress indicator from the running byte count and the total expected size.\n\n**Expected Behavior / Usage:**\n\nGiven the total expected size and the number of bytes downloaded so far, progress is the ratio `downloaded / total`, a value between 0 and 1. The output reports the raw `totalSize`, the raw `downloaded` count, and the computed `progress`. The progress value is rendered as a decimal fraction (for example `0.16666666666666666`, and `1.0` when the download is complete).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_progress.json`\n\n```json\n{\n    \"description\": \"Computing fractional download progress from the total expected size and the number of bytes downloaded so far. Progress is reported as the ratio of downloaded bytes to total size (a value between 0 and 1), alongside the raw downloaded count and total size.\",\n    \"cases\": [\n        {\n            \"input\": {\"action\": \"progress\", \"total_size\": 6, \"downloaded\": 1},\n            \"expected_output\": \"totalSize=6\\ndownloaded=1\\nprogress=0.16666666666666666\\n\"\n        },\n        {\n            \"input\": {\"action\": \"progress\", \"total_size\": 6, \"downloaded\": 6},\n            \"expected_output\": \"totalSize=6\\ndownloaded=6\\nprogress=1.0\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the features described above (cache record modeling, HTTP fetch metadata extraction, and download progress calculation). Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request from stdin and prints the resulting `name=value` report to stdout, matching the per-feature contracts above. The request's `action` selects behavior: `construct`, `deserialize`, `serialize`, and `copy` exercise the cache record; `http_response` extracts response metadata; `progress` computes download progress. Timestamps are exchanged as epoch milliseconds; absent values render as the literal `null`.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- handle zero total size per the EdgeCase handling pattern used in the LegacyModule\n- exclude null ID lines following the spacing convention from the core serialization logic\n",
+  "oracle_data": {
+    "task_id": "Baseflow__flutter_cache_manager-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what exact value is used for the replaced id?",
+          "current offset for id replacement"
+        ],
+        "oracle_response": "1"
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "exact timestamp value for validTill",
+          "default stamp constant"
+        ],
+        "oracle_response": "1585301160000"
+      },
+      {
+        "constraint_id": "C024",
+        "trigger_keywords": [
+          "timestamp for no cache-control",
+          "validTill default from RGBY"
+        ],
+        "oracle_response": "1585992360000"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "handle zero total size per the EdgeCase handling pattern used in the LegacyModule",
+        "actual_meaning": "Input is 'progress' with 'total_size' == 0 must map to output field 'progress' with value 0 (or same aggressive error handling) to avoid division by zero, mirroring logic in LegacyModule."
+      },
+      {
+        "vague_reference": "exclude null ID lines following the spacing convention from the core serialization logic",
+        "actual_meaning": "When 'id' is null in input during serialize or copy, the 'id' line must be excluded from output, maintaining exactly one newline character after the last included line."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_1_construct.json": {
+      "description": "Constructing a cache record from a source URL, optionally with an explicit key. When no key is supplied the record's key defaults to the URL; when an explicit key is supplied it is kept verbatim. The URL is always retained as given.",
+      "cases": [
+        {
+          "input": {
+            "action": "construct",
+            "url": "baseflow.com/test.png"
+          },
+          "expected_output": "url=baseflow.com/test.png\nkey=baseflow.com/test.png\n"
+        },
+        {
+          "input": {
+            "action": "construct",
+            "url": "baseflow.com/test.png",
+            "key": "test key 1234"
+          },
+          "expected_output": "url=baseflow.com/test.png\nkey=test key 1234\n"
+        }
+      ]
+    },
+    "feature1_2_deserialize.json": {
+      "description": "Reconstructing a cache record from a persisted flat key/value record loaded from storage. Recognised fields are the numeric id, the URL, an optional key, the relative file path, the entity tag, and the validity timestamp stored as epoch milliseconds. When the record omits the key field the key falls back to the URL; when present it is used directly. The validity timestamp is reported back as epoch milliseconds.",
+      "cases": [
+        {
+          "input": {
+            "action": "deserialize",
+            "record": {
+              "_id": 3,
+              "url": "baseflow.com/test.png",
+              "relativePath": "test.png",
+              "eTag": "test1",
+              "validTill": 1585301160000,
+              "touched": 1585387560000
+            }
+          },
+          "expected_output": "id=3\nurl=baseflow.com/test.png\nkey=baseflow.com/test.png\nrelativePath=test.png\neTag=test1\nvalidTill_millis=1585301160000\nlength=null\n"
+        },
+        {
+          "input": {
+            "action": "deserialize",
+            "record": {
+              "_id": 3,
+              "url": "baseflow.com/test.png",
+              "key": "testId1234",
+              "relativePath": "test.png",
+              "eTag": "test1",
+              "validTill": 1585301160000,
+              "touched": 1585387560000
+            }
+          },
+          "expected_output": "id=3\nurl=baseflow.com/test.png\nkey=testId1234\nrelativePath=test.png\neTag=test1\nvalidTill_millis=1585301160000\nlength=null\n"
+        }
+      ]
+    },
+    "feature1_3_serialize.json": {
+      "description": "Serialising a cache record into a flat key/value record suitable for persistence. The validity timestamp is written as epoch milliseconds (or 0 when absent) and a 'touched' timestamp is stamped from the current clock at serialisation time. The id is only emitted when the record has one; the remaining identifying fields (url, key, relative path, entity tag, length) are written through unchanged.",
+      "cases": [
+        {
+          "input": {
+            "action": "serialize",
+            "url": "baseflow.com/test.png",
+            "key": "testKey1234",
+            "relativePath": "test.png",
+            "validTill_millis": 1585301160000,
+            "eTag": "test1",
+            "id": 3,
+            "now_millis": 1585387560000
+          },
+          "expected_output": "url=baseflow.com/test.png\nkey=testKey1234\nrelativePath=test.png\neTag=test1\nvalidTill=1585301160000\ntouched=1585387560000\nlength=null\nid=3\n"
+        }
+      ]
+    },
+    "feature1_4_copy.json": {
+      "description": "Producing a modified copy of a cache record by overriding a single field while leaving the others intact. Any one of url, id, relative path, validity timestamp, entity tag, or length may be replaced; fields not mentioned are carried over from the original. The key is always preserved from the original record and is never altered by a copy.",
+      "cases": [
+        {
+          "input": {
+            "action": "copy",
+            "base": {
+              "url": "www.test.com/image",
+              "key": "test123",
+              "relativePath": "test.png",
+              "validTill_millis": 1585387560000,
+              "eTag": "test1",
+              "length": 200,
+              "id": null
+            },
+            "changes": {
+              "id": 1
+            }
+          },
+          "expected_output": "id=1\nurl=www.test.com/image\nkey=test123\nrelativePath=test.png\neTag=test1\nvalidTill_millis=1585387560000\nlength=200\n"
+        },
+        {
+          "input": {
+            "action": "copy",
+            "base": {
+              "url": "www.test.com/image",
+              "key": "test123",
+              "relativePath": "test.png",
+              "validTill_millis": 1585387560000,
+              "eTag": "test1",
+              "length": 200,
+              "id": 1
+            },
+            "changes": {
+              "url": "www.someotherurl.com"
+            }
+          },
+          "expected_output": "id=1\nurl=www.someotherurl.com\nkey=test123\nrelativePath=test.png\neTag=test1\nvalidTill_millis=1585387560000\nlength=200\n"
+        }
+      ]
+    },
+    "feature2_1_response_metadata.json": {
+      "description": "Extracting cache metadata from an HTTP response to a file request. The reported metadata is the HTTP status code, the content length, the entity tag (from the response's etag header, or null when absent), the file extension derived from the content type, and the validity timestamp. When the response carries a 'max-age' cache directive the content is valid for that many seconds from the moment the response is received; the validity timestamp is reported as epoch milliseconds relative to the supplied reception time.",
+      "cases": [
+        {
+          "input": {
+            "action": "http_response",
+            "now_millis": 1585387560000,
+            "status": 200,
+            "content_length": 16,
+            "headers": {
+              "etag": "test",
+              "content-type": "image/jpeg",
+              "cache-control": "max-age=7200"
+            }
+          },
+          "expected_output": "statusCode=200\ncontentLength=16\neTag=test\nfileExtension=.jpg\nvalidTill_millis=1585394760000\n"
+        }
+      ]
+    },
+    "feature2_2_file_extension.json": {
+      "description": "Deriving the on-disk file extension from an HTTP response's content type. A recognised media type maps to its conventional extension; an unrecognised media type falls back to a dot followed by the content subtype. Parameters after the media type (such as a charset) are ignored when determining the extension. With no cache directive present the content defaults to a one-week validity measured from the reception time.",
+      "cases": [
+        {
+          "input": {
+            "action": "http_response",
+            "now_millis": 1585387560000,
+            "status": 200,
+            "content_length": 16,
+            "headers": {
+              "content-type": "unknown/cov"
+            }
+          },
+          "expected_output": "statusCode=200\ncontentLength=16\neTag=null\nfileExtension=.cov\nvalidTill_millis=1585992360000\n"
+        },
+        {
+          "input": {
+            "action": "http_response",
+            "now_millis": 1585387560000,
+            "status": 200,
+            "content_length": 16,
+            "headers": {
+              "content-type": "audio/mpeg;chartset=UTF-8"
+            }
+          },
+          "expected_output": "statusCode=200\ncontentLength=16\neTag=null\nfileExtension=.mp3\nvalidTill_millis=1585992360000\n"
+        }
+      ]
+    },
+    "feature3_progress.json": {
+      "description": "Computing fractional download progress from the total expected size and the number of bytes downloaded so far. Progress is reported as the ratio of downloaded bytes to total size (a value between 0 and 1), alongside the raw downloaded count and total size.",
+      "cases": [
+        {
+          "input": {
+            "action": "progress",
+            "total_size": 6,
+            "downloaded": 1
+          },
+          "expected_output": "totalSize=6\ndownloaded=1\nprogress=0.16666666666666666\n"
+        },
+        {
+          "input": {
+            "action": "progress",
+            "total_size": 6,
+            "downloaded": 6
+          },
+          "expected_output": "totalSize=6\ndownloaded=6\nprogress=1.0\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Cache Record: Construct",
+      "input_condition": "Action is 'construct' with 'url' provided",
+      "output_rule": "Output lines 'url=<url>' and 'key=<key>'",
+      "exact_values": [
+        "url",
+        "key"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Cache Record: Construct",
+      "input_condition": "Action is 'construct' without explicit 'key'",
+      "output_rule": "The output key defaults to the value of the input url",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Cache Record: Construct",
+      "input_condition": "Action is 'construct' with explicit 'key'",
+      "output_rule": "The output key is retained exactly as provided, overriding the default",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Cache Record: Construct",
+      "input_condition": "Input contains 'base' record and 'changes' map",
+      "output_rule": "Output includes all fields from 'base' with keys from 'base' (url, relativePath, etc.) that are not in 'changes'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Cache Record: Copy",
+      "input_condition": "Action is 'copy' where 'url' is in 'changes'",
+      "output_rule": "The output 'url' is replaced by the value in 'changes'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Cache Record: Copy",
+      "input_condition": "Action is 'copy' where 'id' is in 'changes'",
+      "output_rule": "The output 'id' is replaced by the value in 'changes'",
+      "exact_values": [
+        1
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Cache Record: Copy",
+      "input_condition": "Action is 'copy' (regardless of changes)",
+      "output_rule": "The output 'key' is always the same as the input 'base' key; it is never changed",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Cache Record: Copy",
+      "input_condition": "Action is 'copy'",
+      "output_rule": "Output fields are 'id', 'url', 'key', 'relativePath', 'eTag', 'validTill_millis', 'length'",
+      "exact_values": [
+        "id",
+        "url",
+        "key",
+        "relativePath",
+        "eTag",
+        "validTill_millis",
+        "length"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Cache Record: Deserialize",
+      "input_condition": "Input 'record' does not contain 'key'",
+      "output_rule": "The output 'key' defaults to the output 'url' (or input record 'url')",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Cache Record: Deserialize",
+      "input_condition": "Input 'record' contains 'key'",
+      "output_rule": "The output 'key' matches the input 'record' 'key'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Cache Record: Deserialize",
+      "input_condition": "Action is 'deserialize'",
+      "output_rule": "Output field 'id' equals input '_id'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Cache Record: Deserialize",
+      "input_condition": "Action is 'deserialize'",
+      "output_rule": "Output field 'url' equals input 'url'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Cache Record: Deserialize",
+      "input_condition": "Action is 'deserialize'",
+      "output_rule": "Output field 'relativePath' equals input 'relativePath'",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Cache Record: Deserialize",
+      "input_condition": "Action is 'deserialize'",
+      "output_rule": "Output field 'validTill_millis' equals input 'validTill'",
+      "exact_values": [
+        1585301160000
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Cache Record: Deserialize",
+      "input_condition": "Action is 'deserialize'",
+      "output_rule": "Output field 'length' is 'null'",
+      "exact_values": [
+        "null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Cache Record: Serialize",
+      "input_condition": "Action is 'serialize' with 'id'",
+      "output_rule": "Output includes 'id=<id>'",
+      "exact_values": [
+        "id"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Cache Record: Serialize",
+      "input_condition": "Action is 'serialize' without 'id'",
+      "output_rule": "Output omits the 'id' field entirely",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Cache Record: Serialize",
+      "input_condition": "Action is 'serialize'",
+      "output_rule": "Output includes 'touched=<now_millis>'",
+      "exact_values": [
+        "touched"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Cache Record: Serialize",
+      "input_condition": "Action is 'serialize' with 'validTill_millis'",
+      "output_rule": "Output includes 'validTill=<validTill_millis>'",
+      "exact_values": [
+        "validTill"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "HTTP Metadata: Response",
+      "input_condition": "Action is 'http_response' with 'cache-control' header",
+      "output_rule": "Output field 'validTill_millis' = (now_millis + max_age_seconds_in_seconds) converted to milliseconds",
+      "exact_values": [
+        1585394760000
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "HTTP Metadata: File Extension",
+      "input_condition": "Content-Type is 'image/jpeg'",
+      "output_rule": "Output field 'fileExtension' is '.jpg'",
+      "exact_values": [
+        ".jpg"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "HTTP Metadata: File Extension",
+      "input_condition": "Content-Type is 'audio/mpeg;chartset=UTF-8' (note typo in input)",
+      "output_rule": "Output field 'fileExtension' is '.mp3'",
+      "exact_values": [
+        ".mp3"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "HTTP Metadata: File Extension",
+      "input_condition": "Content-Type is 'unknown/cov'",
+      "output_rule": "Output field 'fileExtension' is '.cov'",
+      "exact_values": [
+        ".cov"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "HTTP Metadata: Validity Default",
+      "input_condition": "Action is 'http_response' without 'cache-control' containing max-age",
+      "output_rule": "Output field 'validTill_millis' = now_millis + (1 week in ms = 604800000)",
+      "exact_values": [
+        1585992360000
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "HTTP Metadata: ETag",
+      "input_condition": "'etag' header present in input",
+      "output_rule": "Output field 'eTag' equals the 'etag' header value",
+      "exact_values": null,
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "HTTP Metadata: ETag",
+      "input_condition": "'etag' header absent in input",
+      "output_rule": "Output field 'eTag' is 'null'",
+      "exact_values": [
+        "null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Progress: Calculation",
+      "input_condition": "Action is 'progress'",
+      "output_rule": "Output field 'progress' = downloaded * 100 / total_size",
+      "exact_values": [
+        0.16666666666666666,
+        1.0
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Output: Format",
+      "input_condition": "Any action in any feature",
+      "output_rule": "Output lines are strictly formatted as 'field_name=value'",
+      "exact_values": [
+        "name=",
+        "value="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "Output: Line Termination",
+      "input_condition": "Output contains data",
+      "output_rule": "Output lines are separated by newline characters '\\n'",
+      "exact_values": [
+        "\\n"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Timestamp: Format",
+      "input_condition": "Any timestamp field (validTill_millis, touched, now_millis, validity calculation result)",
+      "output_rule": "Timestamps must be integers representing epoch milliseconds",
+      "exact_values": [
+        1585387560000
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "Progress: Null Division",
+      "input_condition": "Input is 'progress' with 'total_size' == 0",
+      "output_rule": "Output field 'progress' must be handled as 0 or error (not specified in tests, but totalSize is provided)",
+      "exact_values": [
+        "totalSize=0"
+      ],
+      "ambiguous": true
+    },
+    {
+      "id": "C032",
+      "feature": "Record: ID Field",
+      "input_condition": "Input record has 'id': null",
+      "output_rule": "When serializing or copying with null id output, the 'id' line is excluded from output",
+      "exact_values": [
+        ".\\n"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C006",
+        "replacement": "a specific numeric ID offset found in the configuration system",
+        "exact_values_to_replace": [
+          "[1]"
+        ],
+        "trigger_keywords": [
+          "what exact value is used for the replaced id?",
+          "current offset for id replacement"
+        ],
+        "oracle_response": "1"
+      },
+      {
+        "constraint_id": "C014",
+        "replacement": "a specific legacy timestamp constant (1585301160000)",
+        "exact_values_to_replace": [
+          "[1585301160000]"
+        ],
+        "trigger_keywords": [
+          "exact timestamp value for validTill",
+          "default stamp constant"
+        ],
+        "oracle_response": "1585301160000"
+      },
+      {
+        "constraint_id": "C024",
+        "replacement": "a specific calculation result derived from RGBY scaling formula",
+        "exact_values_to_replace": [
+          "[1585992360000]"
+        ],
+        "trigger_keywords": [
+          "timestamp for no cache-control",
+          "validTill default from RGBY"
+        ],
+        "oracle_response": "1585992360000"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C031",
+        "vague_phrase": "handle zero total size per the EdgeCase handling pattern used in the LegacyModule",
+        "actual_meaning": "Input is 'progress' with 'total_size' == 0 must map to output field 'progress' with value 0 (or same aggressive error handling) to avoid division by zero, mirroring logic in LegacyModule."
+      },
+      {
+        "constraint_id": "C032",
+        "vague_phrase": "exclude null ID lines following the spacing convention from the core serialization logic",
+        "actual_meaning": "When 'id' is null in input during serialize or copy, the 'id' line must be excluded from output, maintaining exactly one newline character after the last included line."
+      }
+    ]
+  }
+}

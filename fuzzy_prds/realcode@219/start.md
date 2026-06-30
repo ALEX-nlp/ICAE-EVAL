@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to get the Sentry integration for our Laravel app properly wired up. Right now devs are complaining that when something breaks in prod they have no idea what was happening before the crash — no breadcrumbs for cache hits/misses, no DB query trail, nothing about what HTTP calls were going out. It's basically a black box. We talked about this a while back when we did the logging channel work, same idea applies here — we want all the usual framework activity to show up automatically without people having to sprinkle manual instrumentation everywhere.
+
+A few specific things that came up in the last retro: the transaction names on errors are basically useless right now (they show weird internal strings instead of actual route shapes), and the DSN/environment config isn't reliably picking up the right values at runtime. Also someone mentioned that filesystem operations should be observable both as traces AND as the other thing (you know, the lighter-weight diagnostic trail), depending on what's configured.
+
+We also need the SQL stuff to respect the privacy settings — sometimes we want bindings, sometimes we don't. Same pattern as the command breadcrumb feature we scoped out. Oh and for the lightweight router, the path params need to be replaced properly in the transaction name — there was a bug reported where repeated param values only get replaced once instead of twice. Please make sure edge cases like that are handled.

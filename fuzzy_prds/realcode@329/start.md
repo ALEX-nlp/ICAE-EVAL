@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that proxy config generation engine we talked about in the last planning session. Basically the idea is that each service instance sends us some metadata about itself (what it talks to, how it wants to receive traffic, health check stuff, etc.) and we need to spit out all the right config artifacts for it deterministically. Think of it like what we did for the login module's compatibility layer but for sidecar proxies.
+
+Right now operators are hand-writing all these route tables and cluster references and it's a total mess — every small policy change means touching dozens of files and there's no consistent way to tell proxies their config changed. We want a clean engine that takes instance metadata + server policy and derives everything: the routing labels, dependency descriptors, which traffic group an instance belongs to, the ingress/egress route configs, and some kind of versioning so connected proxies know when to reload.
+
+A few things I'm not 100% sure on: there's apparently some special handling needed when services request access to everything vs a specific list, and some tag combinations are allowed per-service but not globally. Also the versioning piece — I know we discussed stable labels so tests aren't brittle but I don't remember the exact scheme. The code should be organized sensibly across multiple files, not one giant blob. Errors should come out as clean category strings, never raw exceptions. Let's keep it extensible for new policy fields down the road.

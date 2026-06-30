@@ -1,0 +1,558 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out this load rate engine thing that the platform team has been asking about for a while. Basically, developers are frustrated because every time they write a load test they end up copy-pasting the same ugly timer loop boilerplate and it never quite works right — the request counts drift off target, ramps feel janky, and nobody wants to debug fractional accumulation math at 2am. The ask is to give them a clean way to describe traffic shapes (like 'ramp up, hold, ramp down', or that bell-curve pattern we use for the daily peak simulation) and have the engine just figure out exactly how many requests to fire each tick.\n\nThe config format should be readable enough that non-engineers can tweak it without help — similar to how we approached the scheduling layer on that campaign delivery system last quarter, just adapted for load testing. Make sure bad inputs don't blow up silently; they should get clear, categorized error messages.\n\nAlso important: the code shouldn't be one giant file. We've had reviews bounce back before for that. Split it up sensibly. The JSON test harness we already have should be treated as a black-box contract for the outer adapter layer only — the core logic shouldn't know anything about JSON or stdin. Ping me if the gaussian volume math needs clarification, that one always trips people up.",
+  "oracle_data": {
+    "task_id": "f1-load-rate-engine-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "how should durations be formatted in output",
+          "what is the string representation of a duration",
+          "how do I render a time span like 1 minute"
+        ],
+        "oracle_response": "Durations must be rendered as compact Go-style spans: seconds-only values appear as e.g. `0s`, `5s`, `10s`; values with minutes appear as e.g. `1m0s`, `2m30s`; values with hours appear as e.g. `1h0m0s`. The unit is always included down to seconds even when the sub-unit is zero (e.g. `1m0s` not `1m`, `1h0m0s` not `1h`)."
+      },
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "how does the regular distribution algorithm work",
+          "how are sub-tick counts calculated for even smoothing",
+          "what is the accumulator logic for spreading load across ticks"
+        ],
+        "oracle_response": "For regular (even) distribution across N sub-ticks (where N = interval / 100ms): maintain a floating-point accumulator initialised to 0. On each sub-tick, add `rate / N` to the accumulator. The integer part of the accumulator is emitted as that tick's count, and the fractional remainder is carried forward. This ensures the emitted integers over a full interval sum exactly to the requested rate. Example: rate=7, N=10 → add 0.7 each tick, emit floor each time: ticks produce 0,1,1,0,1,1,0,1,1,1."
+      },
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "what happens when the iteration interval is 100ms or less",
+          "does smoothing apply to small intervals",
+          "bypass condition for sub-tick distribution"
+        ],
+        "oracle_response": "When the requested `iteration_duration` is at or below 100ms, sub-tick smoothing is bypassed entirely. The effective sub-tick interval equals the original interval (not 100ms), and the full rate is returned as a single tick count. For intervals larger than 100ms, the effective sub-tick interval is always 100ms."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "how does random distribution handle the last tick",
+          "what ensures the random distribution sums to the correct total",
+          "final sub-tick budget in random mode"
+        ],
+        "oracle_response": "In random distribution mode, on each sub-tick except the last, the engine emits the supplied draw value clamped to the remaining budget and subtracts it. The final sub-tick always emits whatever budget remains, regardless of any draw value, guaranteeing the total over the interval equals exactly the requested rate. The `random_values` array provides one draw per non-final sub-tick; it does not need a value for the last tick."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "how is peak rate converted to total volume for gaussian profile",
+          "what is the integration formula for the bell curve volume",
+          "how does the gaussian volume calculation work over 24 hours"
+        ],
+        "oracle_response": "The engine integrates a normal distribution over a 24-hour window (86400 seconds). The peak rate (converted to requests-per-second) is the amplitude at the peak. The integral is computed as: `volume = round(peak_rate_per_second * stddev_seconds * sqrt(2*pi))` scaled by the fraction of the normal distribution that falls within the 24h window centred on the peak_time. The result is rounded to the nearest integer. stddev and peak_time are parsed as duration strings (e.g. `4h`, `14h`)."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "what rate string formats are valid",
+          "how do I write a rate like 100 per 10 seconds",
+          "what does a bare number mean in a rate string"
+        ],
+        "oracle_response": "Valid rate string formats are: `<count>/<unit>` where unit is a duration string (e.g. `1400/s`, `100/10s`, `1/h`, `5/m`), or a bare integer which is interpreted as per-second (e.g. `6` means `6/s`). A string that cannot be parsed into count + optional unit yields `invalid_rate`. A successfully parsed rate with a negative count yields `negative_rate`. Both error cases echo back the original rate string as `rate=<original>`."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "how does stage interpolation work at the boundaries",
+          "what rate is returned before the schedule starts or after it ends",
+          "what is the rate when no start_offset is provided"
+        ],
+        "oracle_response": "Stage interpolation uses linear ramping: each stage ramps from the previous stage's end target (the very first stage starts from 0) to its own end target over its duration. When `start_offset` is absent, elapsed time is 0, so the rate is 0 (start of first ramp). When elapsed time exceeds the total schedule duration, the rate is 0. The `start_offset` is a duration string; a negative value like `-2m` means the schedule started 2 minutes ago, so 2 minutes of elapsed time is applied."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "which config fields are required and which are optional",
+          "what validation errors can the config parser return",
+          "what does the config error output look like"
+        ],
+        "oracle_response": "Required global config fields: `scenario` (string), `limits.max-duration`, `limits.concurrency`, `limits.max-iterations`, `limits.ignore-dropped`. Missing `scenario` → `error=invalid_config\nreason=missing scenario\n`. At least one stage is required. Each stage needs a `mode`; missing mode → `error=invalid_config\nreason=missing stage mode at stage <N>\n`. Mode-specific required fields: `constant` needs `rate`; `ramp` needs `start-rate` and `end-rate`; `gaussian` needs `volume`, `repeat`, `iteration-frequency`, `peak`, `standard-deviation`. Missing mode field → `error=invalid_config\nreason=missing <field> at stage <N>\n`. Structurally invalid YAML → `error=invalid_config\nreason=malformed_yaml\n`."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "how does the config handle already elapsed stages",
+          "what does stage skipping based on now timestamp do",
+          "how is schedule.stage-start used to skip stages"
+        ],
+        "oracle_response": "When a stage has a `schedule.stage-start` timestamp, the engine compares it against the `now` timestamp provided in the operation input. Any stage whose entire duration would have completed before `now` is skipped and not included in the resolved output. Only the still-active tail of the schedule is returned. The `stages=` count in the output reflects only the non-skipped stages."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "what does the config output format look like",
+          "how are stage parameters printed",
+          "what is the output structure for a resolved config stage"
+        ],
+        "oracle_response": "Config output format (one line each, in order): `scenario=<name>`, `max_duration=<span>`, `concurrency=<n>`, `max_iterations=<n>`, `ignore_dropped=<true|false>`, `stages=<count>`, then for each stage: `stage=<N> duration=<span> iteration_duration=<span> users_concurrency=<n>`, then `params=<KEY=value KEY2=value2>` (sorted alphabetically by key), then (if samples>0) `rates=<space-separated integers>`. For `users` mode, `users_concurrency` is the configured concurrency value; for all other modes it is 0."
+      },
+      {
+        "constraint_id": "C011",
+        "trigger_keywords": [
+          "what is the architecture requirement for file organization",
+          "can all the code go in one file",
+          "how should the project be structured across files"
+        ],
+        "oracle_response": "The project must NOT be a single file. It requires a multi-file directory structure separating: (1) core domain modules — rate-string parsing, stage interpolation, distribution smoothing, gaussian volume calculation, config parsing/validation each in distinct units; (2) a thin JSON adapter layer solely responsible for reading JSON commands from stdin, calling core APIs, and writing text output; (3) tests. The core engine must have zero dependency on stdin/stdout or JSON. The JSON test cases are a black-box contract for the adapter only."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid op field values",
+          "what values can op take",
+          "list all supported op values",
+          "what actions does the dispatcher handle",
+          "which op strings does the adapter support",
+          "what are the possible op inputs",
+          "tell me all the op names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'op' field. Valid values are: 'parse_schedule', 'staged_rate', 'distribute_load', 'peak_to_volume', 'config_schedule'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature1_schedule_parsing",
+        "trigger_keywords": [
+          "test cases for feature1 schedule parsing",
+          "show me feature1 schedule parsing test cases",
+          "what are the feature1 schedule parsing test inputs",
+          "give me the feature1_schedule_parsing test file",
+          "test cases for feature 1",
+          "feature1 schedule parsing expected output",
+          "what does feature1 schedule parsing expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_schedule_parsing:\n{\n  \"description\": \"Parse a comma-separated load schedule string of <stage_duration>:<target> segments into an ordered list of stages, each carrying its normalized duration and target concurrency; malformed segments are rejected with a normalized error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"parse_schedule\",\n        \"stages\": \"0s:1,10s:1,20s:20,1m:50,1h:200\"\n      },\n      \"expected_output\": \"stage=0 duration=0s target=1\\nstage=1 duration=10s target=1\\nstage=2 duration=20s target=20\\nstage=3 duration=1m0s target=50\\nstage=4 duration=1h0m0s target=200\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"parse_schedule\",\n        \"stages\": \"1s:BB\"\n      },\n      \"expected_output\": \"error=invalid_target\\nstages=1s:BB\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_staged_rate",
+        "trigger_keywords": [
+          "test cases for feature2 staged rate",
+          "show me feature2 staged rate test cases",
+          "what are the feature2 staged rate test inputs",
+          "give me the feature2_staged_rate test file",
+          "test cases for feature 2",
+          "feature2 staged rate expected output",
+          "what does feature2 staged rate expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_staged_rate:\n{\n  \"description\": \"Compute the instantaneous target rate for a multi-stage schedule given an elapsed-time offset, linearly interpolating within the active stage; before the schedule starts the rate is zero, and past the final stage the rate is zero.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"staged_rate\",\n        \"schedule\": [\n          {\n            \"end\": 10,\n            \"duration\": \"1m\"\n          },\n          {\n            \"end\": 10,\n            \"duration\": \"10m\"\n          }\n        ],\n        \"start_offset\": \"-2m\"\n      },\n      \"expected_output\": \"rate=10\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"staged_rate\",\n        \"schedule\": [\n          {\n            \"end\": 1,\n            \"duration\": \"1m\"\n          },\n          {\n            \"end\": 10,\n            \"duration\": \"10m\"\n          }\n        ]\n      },\n      \"expected_output\": \"rate=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_regular_distribution",
+        "trigger_keywords": [
+          "test cases for feature3 1 regular distribution",
+          "show me feature3 1 regular distribution test cases",
+          "what are the feature3 1 regular distribution test inputs",
+          "give me the feature3_1_regular_distribution test file",
+          "test cases for feature 3",
+          "feature3 1 regular distribution expected output",
+          "what does feature3 1 regular distribution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_regular_distribution:\n{\n  \"description\": \"Smooth a per-interval target rate evenly across fixed 100ms sub-ticks so the integer counts emitted over each interval sum to the requested rate; when the interval is at or below the sub-tick size the rate passes through unchanged. A sequence of per-interval rates is consumed one value per full interval.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"distribute_load\",\n        \"distribution\": \"regular\",\n        \"iteration_duration\": \"1s\",\n        \"rate\": 7,\n        \"ticks\": 10\n      },\n      \"expected_output\": \"iteration_duration=100ms\\nrates=0 1 1 0 1 1 0 1 1 1\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"distribute_load\",\n        \"distribution\": \"regular\",\n        \"iteration_duration\": \"1s\",\n        \"rate\": 15,\n        \"ticks\": 10\n      },\n      \"expected_output\": \"iteration_duration=100ms\\nrates=1 2 1 2 1 2 1 2 1 2\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"distribute_load\",\n        \"distribution\": \"regular\",\n        \"iteration_duration\": \"10ms\",\n        \"rate\": 10000,\n        \"ticks\": 1\n      },\n      \"expected_output\": \"iteration_duration=10ms\\nrates=10000\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_random_distribution",
+        "trigger_keywords": [
+          "test cases for feature3 2 random distribution",
+          "show me feature3 2 random distribution test cases",
+          "what are the feature3 2 random distribution test inputs",
+          "give me the feature3_2_random_distribution test file",
+          "test cases for feature 3",
+          "feature3 2 random distribution expected output",
+          "what does feature3 2 random distribution expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_random_distribution:\n{\n  \"description\": \"Smooth a per-interval target rate across fixed 100ms sub-ticks by randomly drawing how many to emit on each sub-tick from the remaining budget, with the final sub-tick receiving whatever remains so the interval total is exactly the requested rate. The draw sequence is supplied deterministically.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"distribute_load\",\n        \"distribution\": \"random\",\n        \"iteration_duration\": \"1s\",\n        \"rate\": 28,\n        \"random_values\": [\n          0,\n          1,\n          0,\n          0,\n          1,\n          0,\n          0,\n          0,\n          7\n        ],\n        \"ticks\": 10\n      },\n      \"expected_output\": \"iteration_duration=100ms\\nrates=0 1 0 0 1 0 0 0 7 19\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"distribute_load\",\n        \"distribution\": \"random\",\n        \"iteration_duration\": \"1s\",\n        \"rate\": 1,\n        \"random_values\": [\n          1\n        ],\n        \"ticks\": 10\n      },\n      \"expected_output\": \"iteration_duration=100ms\\nrates=1 0 0 0 0 0 0 0 0 0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_peak_volume",
+        "trigger_keywords": [
+          "test cases for feature4 peak volume",
+          "show me feature4 peak volume test cases",
+          "what are the feature4 peak volume test inputs",
+          "give me the feature4_peak_volume test file",
+          "test cases for feature 4",
+          "feature4 peak volume expected output",
+          "what does feature4 peak volume expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_peak_volume:\n{\n  \"description\": \"Convert a desired peak rate (requests per time unit) at a given peak offset, together with a standard deviation, into the total volume of a Gaussian load profile over a 24h window; unparseable or negative rates are rejected with a normalized error category.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"peak_to_volume\",\n        \"peak_rate\": \"1400/s\",\n        \"peak_time\": \"14h\",\n        \"stddev\": \"4h\"\n      },\n      \"expected_output\": \"volume=50208044\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"peak_to_volume\",\n        \"peak_rate\": \"100/10s\",\n        \"peak_time\": \"14h\",\n        \"stddev\": \"4h\"\n      },\n      \"expected_output\": \"volume=358629\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"peak_to_volume\",\n        \"peak_rate\": \"1/h\",\n        \"peak_time\": \"14h\",\n        \"stddev\": \"4h\"\n      },\n      \"expected_output\": \"volume=10\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"peak_to_volume\",\n        \"peak_rate\": \"ms\",\n        \"peak_time\": \"14h\",\n        \"stddev\": \"4h\"\n      },\n      \"expected_output\": \"error=invalid_rate\\nrate=ms\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"peak_to_volume\",\n        \"peak_rate\": \"-10/s\",\n        \"peak_time\": \"14h\",\n        \"stddev\": \"4h\"\n      },\n      \"expected_output\": \"error=negative_rate\\nrate=-10/s\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_config_modes",
+        "trigger_keywords": [
+          "test cases for feature5 1 config modes",
+          "show me feature5 1 config modes test cases",
+          "what are the feature5 1 config modes test inputs",
+          "give me the feature5_1_config_modes test file",
+          "test cases for feature 5",
+          "feature5 1 config modes expected output",
+          "what does feature5 1 config modes expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_config_modes:\n{\n  \"description\": \"Parse a YAML load-test config into a runnable schedule, exposing global limits (scenario, max-duration, concurrency, max-iterations, ignore-dropped), the resolved per-stage duration/iteration window/user concurrency/parameters, and the sampled per-interval rate series for each supported stage mode (constant, ramp, staged, gaussian, users), including default-value inheritance and skipping of already-elapsed scheduled stages.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"config_schedule\",\n        \"now\": \"2020-12-10T10:00:00+00:00\",\n        \"samples\": 6,\n        \"content\": \"\\nscenario: template\\nlimits:\\n  max-duration: 1m\\n  concurrency: 50\\n  max-iterations: 100\\n  ignore-dropped: true\\nstages:\\n- duration: 5s\\n  mode: constant\\n  rate: 6/s\\n  jitter: 0\\n  distribution: none\\n  parameters:\\n    FOO: bar\\n\"\n      },\n      \"expected_output\": \"scenario=template\\nmax_duration=1m0s\\nconcurrency=50\\nmax_iterations=100\\nignore_dropped=true\\nstages=1\\nstage=0 duration=5s iteration_duration=1s users_concurrency=0\\nparams=FOO=bar\\nrates=6 6 6 6 6 6\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"config_schedule\",\n        \"now\": \"2020-12-10T10:00:00+00:00\",\n        \"samples\": 10,\n        \"content\": \"\\nscenario: template\\nlimits:\\n  max-duration: 1m\\n  concurrency: 50\\n  max-iterations: 100\\n  ignore-dropped: true\\nstages:\\n- duration: 10s\\n  mode: ramp\\n  start-rate: 0/s\\n  end-rate: 10/s\\n  jitter: 0\\n  distribution: none\\n  parameters:\\n    FOO: bar\\n\"\n      },\n      \"expected_output\": \"scenario=template\\nmax_duration=1m0s\\nconcurrency=50\\nmax_iterations=100\\nignore_dropped=true\\nstages=1\\nstage=0 duration=10s iteration_duration=1s users_concurrency=0\\nparams=FOO=bar\\nrates=0 1 2 3 4 5 6 7 8 9\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"config_schedule\",\n        \"now\": \"2020-12-10T10:00:00+00:00\",\n        \"samples\": 60,\n        \"content\": \"\\nscenario: template\\nlimits:\\n  max-duration: 1m\\n  concurrency: 50\\n  max-iterations: 100\\n  ignore-dropped: true\\nstages:\\n- duration: 10s\\n  mode: gaussian\\n  volume: 100\\n  repeat: 20s\\n  iteration-frequency: 1s\\n  peak: 10s\\n  weights: \\\"1.0,1.0\\\"\\n  standard-deviation: 3s\\n  jitter: 0\\n  distribution: none\\n  parameters:\\n    FOO: bar\\n\"\n      },\n      \"expected_output\": \"scenario=template\\nmax_duration=1m0s\\nconcurrency=50\\nmax_iterations=100\\nignore_dropped=true\\nstages=1\\nstage=0 duration=10s iteration_duration=1s users_concurrency=0\\nparams=FOO=bar\\nrates=0 0 1 2 3 6 8 10 13 13 13 10 9 5 3 2 1 0 1 0 0 0 1 2 3 6 8 10 13 13 13 11 8 5 3 2 1 0 1 0 0 0 1 2 3 6 8 10 13 13 13 11 8 5 3 2 1 1 0 0\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"config_schedule\",\n        \"now\": \"2020-12-10T10:00:00+00:00\",\n        \"samples\": 0,\n        \"content\": \"\\nscenario: template\\nlimits:\\n  max-duration: 1m\\n  concurrency: 50\\n  max-iterations: 100\\n  ignore-dropped: true\\nstages:\\n- duration: 10s\\n  mode: users\\n  concurrency: 100\\n  parameters:\\n    FOO: bar\\n\"\n      },\n      \"expected_output\": \"scenario=template\\nmax_duration=1m0s\\nconcurrency=50\\nmax_iterations=100\\nignore_dropped=true\\nstages=1\\nstage=0 duration=10s iteration_duration=0s users_concurrency=100\\nparams=FOO=bar\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_config_errors",
+        "trigger_keywords": [
+          "test cases for feature5 2 config errors",
+          "show me feature5 2 config errors test cases",
+          "what are the feature5 2 config errors test inputs",
+          "give me the feature5_2_config_errors test file",
+          "test cases for feature 5",
+          "feature5 2 config errors expected output",
+          "what does feature5 2 config errors expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_config_errors:\n{\n  \"description\": \"Reject invalid YAML load-test configs with a normalized error category and a domain reason: missing required global fields, missing mode-specific fields per stage, missing stage mode, and structurally malformed YAML.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"config_schedule\",\n        \"now\": \"2020-12-10T10:00:00+00:00\",\n        \"content\": \"limits:\\n  max-duration: 1m\\n  concurrency: 50\\n  max-iterations: 100\\n  ignore-dropped: true\\n\"\n      },\n      \"expected_output\": \"error=invalid_config\\nreason=missing scenario\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"config_schedule\",\n        \"now\": \"2020-12-10T10:00:00+00:00\",\n        \"content\": \"scenario: template\\nlimits:\\n  max-duration: 1m\\n  concurrency: 50\\n  max-iterations: 100\\n  ignore-dropped: true\\nstages:\\n- duration: 1h\\n  mode: constant\\n\"\n      },\n      \"expected_output\": \"error=invalid_config\\nreason=missing rate at stage 0\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"config_schedule\",\n        \"now\": \"2020-12-10T10:00:00+00:00\",\n        \"content\": \"scenario: template\\nlimits:\\n  max-duration: 1m\\n  concurrency: 50\\n  max-iterations: 100\\n  ignore-dropped: true\\nstages:\\n- duration: 10s\\n\"\n      },\n      \"expected_output\": \"error=invalid_config\\nreason=missing stage mode at stage 0\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"config_schedule\",\n        \"now\": \"2020-12-10T10:00:00+00:00\",\n        \"content\": \"\\ninvalid file content\\n\"\n      },\n      \"expected_output\": \"error=invalid_config\\nreason=malformed_yaml\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "similar to how we approached the scheduling layer on that campaign delivery system last quarter",
+        "actual_meaning": "Refers to the Feature 5 config-file load schedule (feature5_1_config_modes.json and feature5_2_config_errors.json): a YAML config with a `limits` block, a `stages` list, `default` inheritance, and stage modes (constant, ramp, staged, gaussian, users) parsed and validated by the engine."
+      },
+      {
+        "vague_reference": "that bell-curve pattern we use for the daily peak simulation",
+        "actual_meaning": "Refers to Feature 4 (peak_to_volume) and the gaussian stage mode in Feature 5: a Gaussian/normal distribution profile over a 24-hour window, parameterised by peak_rate, peak_time, and stddev, integrating to a total volume."
+      },
+      {
+        "vague_reference": "Ping me if the gaussian volume math needs clarification, that one always trips people up",
+        "actual_meaning": "Refers to the specific integration formula: volume = round(peak_rate_per_second * stddev_seconds * sqrt(2*pi)) adjusted for the fraction of the normal distribution within the 24h window, as verified by the test cases in feature4_peak_volume.json (e.g. 1400/s, peak=14h, stddev=4h → 50208044)."
+      },
+      {
+        "vague_reference": "The JSON test harness we already have should be treated as a black-box contract for the outer adapter layer only",
+        "actual_meaning": "Refers to the rcb_tests/public_test_cases/*.json files and the architectural constraint in NFR #2: the JSON input/output format is exclusively the contract of the thin I/O adapter; the core engine must be expressed in idiomatic typed structures (durations, rate functions, value objects) with no JSON awareness."
+      }
+    ],
+    "fallback_response": "I don't have specific details on that aspect handy — could you check the test case files under rcb_tests/public_test_cases/ or the start.md PRD for the exact expected behavior? Those should be the ground truth. If something still seems ambiguous after checking those, flag it and we can dig in together."
+  },
+  "public_test_cases": {
+    "feature1_schedule_parsing.json": {
+      "description": "Parse a comma-separated load schedule string of <stage_duration>:<target> segments into an ordered list of stages, each carrying its normalized duration and target concurrency; malformed segments are rejected with a normalized error category.",
+      "cases": [
+        {
+          "input": {
+            "op": "parse_schedule",
+            "stages": "0s:1,10s:1,20s:20,1m:50,1h:200"
+          },
+          "expected_output": "stage=0 duration=0s target=1\nstage=1 duration=10s target=1\nstage=2 duration=20s target=20\nstage=3 duration=1m0s target=50\nstage=4 duration=1h0m0s target=200\n"
+        },
+        {
+          "input": {
+            "op": "parse_schedule",
+            "stages": "1s:BB"
+          },
+          "expected_output": "error=invalid_target\nstages=1s:BB\n"
+        }
+      ]
+    },
+    "feature2_staged_rate.json": {
+      "description": "Compute the instantaneous target rate for a multi-stage schedule given an elapsed-time offset, linearly interpolating within the active stage; before the schedule starts the rate is zero, and past the final stage the rate is zero.",
+      "cases": [
+        {
+          "input": {
+            "op": "staged_rate",
+            "schedule": [
+              {
+                "end": 10,
+                "duration": "1m"
+              },
+              {
+                "end": 10,
+                "duration": "10m"
+              }
+            ],
+            "start_offset": "-2m"
+          },
+          "expected_output": "rate=10\n"
+        },
+        {
+          "input": {
+            "op": "staged_rate",
+            "schedule": [
+              {
+                "end": 1,
+                "duration": "1m"
+              },
+              {
+                "end": 10,
+                "duration": "10m"
+              }
+            ]
+          },
+          "expected_output": "rate=0\n"
+        }
+      ]
+    },
+    "feature3_1_regular_distribution.json": {
+      "description": "Smooth a per-interval target rate evenly across fixed 100ms sub-ticks so the integer counts emitted over each interval sum to the requested rate; when the interval is at or below the sub-tick size the rate passes through unchanged. A sequence of per-interval rates is consumed one value per full interval.",
+      "cases": [
+        {
+          "input": {
+            "op": "distribute_load",
+            "distribution": "regular",
+            "iteration_duration": "1s",
+            "rate": 7,
+            "ticks": 10
+          },
+          "expected_output": "iteration_duration=100ms\nrates=0 1 1 0 1 1 0 1 1 1\n"
+        },
+        {
+          "input": {
+            "op": "distribute_load",
+            "distribution": "regular",
+            "iteration_duration": "1s",
+            "rate": 15,
+            "ticks": 10
+          },
+          "expected_output": "iteration_duration=100ms\nrates=1 2 1 2 1 2 1 2 1 2\n"
+        },
+        {
+          "input": {
+            "op": "distribute_load",
+            "distribution": "regular",
+            "iteration_duration": "10ms",
+            "rate": 10000,
+            "ticks": 1
+          },
+          "expected_output": "iteration_duration=10ms\nrates=10000\n"
+        }
+      ]
+    },
+    "feature3_2_random_distribution.json": {
+      "description": "Smooth a per-interval target rate across fixed 100ms sub-ticks by randomly drawing how many to emit on each sub-tick from the remaining budget, with the final sub-tick receiving whatever remains so the interval total is exactly the requested rate. The draw sequence is supplied deterministically.",
+      "cases": [
+        {
+          "input": {
+            "op": "distribute_load",
+            "distribution": "random",
+            "iteration_duration": "1s",
+            "rate": 28,
+            "random_values": [
+              0,
+              1,
+              0,
+              0,
+              1,
+              0,
+              0,
+              0,
+              7
+            ],
+            "ticks": 10
+          },
+          "expected_output": "iteration_duration=100ms\nrates=0 1 0 0 1 0 0 0 7 19\n"
+        },
+        {
+          "input": {
+            "op": "distribute_load",
+            "distribution": "random",
+            "iteration_duration": "1s",
+            "rate": 1,
+            "random_values": [
+              1
+            ],
+            "ticks": 10
+          },
+          "expected_output": "iteration_duration=100ms\nrates=1 0 0 0 0 0 0 0 0 0\n"
+        }
+      ]
+    },
+    "feature4_peak_volume.json": {
+      "description": "Convert a desired peak rate (requests per time unit) at a given peak offset, together with a standard deviation, into the total volume of a Gaussian load profile over a 24h window; unparseable or negative rates are rejected with a normalized error category.",
+      "cases": [
+        {
+          "input": {
+            "op": "peak_to_volume",
+            "peak_rate": "1400/s",
+            "peak_time": "14h",
+            "stddev": "4h"
+          },
+          "expected_output": "volume=50208044\n"
+        },
+        {
+          "input": {
+            "op": "peak_to_volume",
+            "peak_rate": "100/10s",
+            "peak_time": "14h",
+            "stddev": "4h"
+          },
+          "expected_output": "volume=358629\n"
+        },
+        {
+          "input": {
+            "op": "peak_to_volume",
+            "peak_rate": "1/h",
+            "peak_time": "14h",
+            "stddev": "4h"
+          },
+          "expected_output": "volume=10\n"
+        },
+        {
+          "input": {
+            "op": "peak_to_volume",
+            "peak_rate": "ms",
+            "peak_time": "14h",
+            "stddev": "4h"
+          },
+          "expected_output": "error=invalid_rate\nrate=ms\n"
+        },
+        {
+          "input": {
+            "op": "peak_to_volume",
+            "peak_rate": "-10/s",
+            "peak_time": "14h",
+            "stddev": "4h"
+          },
+          "expected_output": "error=negative_rate\nrate=-10/s\n"
+        }
+      ]
+    },
+    "feature5_1_config_modes.json": {
+      "description": "Parse a YAML load-test config into a runnable schedule, exposing global limits (scenario, max-duration, concurrency, max-iterations, ignore-dropped), the resolved per-stage duration/iteration window/user concurrency/parameters, and the sampled per-interval rate series for each supported stage mode (constant, ramp, staged, gaussian, users), including default-value inheritance and skipping of already-elapsed scheduled stages.",
+      "cases": [
+        {
+          "input": {
+            "op": "config_schedule",
+            "now": "2020-12-10T10:00:00+00:00",
+            "samples": 6,
+            "content": "\nscenario: template\nlimits:\n  max-duration: 1m\n  concurrency: 50\n  max-iterations: 100\n  ignore-dropped: true\nstages:\n- duration: 5s\n  mode: constant\n  rate: 6/s\n  jitter: 0\n  distribution: none\n  parameters:\n    FOO: bar\n"
+          },
+          "expected_output": "scenario=template\nmax_duration=1m0s\nconcurrency=50\nmax_iterations=100\nignore_dropped=true\nstages=1\nstage=0 duration=5s iteration_duration=1s users_concurrency=0\nparams=FOO=bar\nrates=6 6 6 6 6 6\n"
+        },
+        {
+          "input": {
+            "op": "config_schedule",
+            "now": "2020-12-10T10:00:00+00:00",
+            "samples": 10,
+            "content": "\nscenario: template\nlimits:\n  max-duration: 1m\n  concurrency: 50\n  max-iterations: 100\n  ignore-dropped: true\nstages:\n- duration: 10s\n  mode: ramp\n  start-rate: 0/s\n  end-rate: 10/s\n  jitter: 0\n  distribution: none\n  parameters:\n    FOO: bar\n"
+          },
+          "expected_output": "scenario=template\nmax_duration=1m0s\nconcurrency=50\nmax_iterations=100\nignore_dropped=true\nstages=1\nstage=0 duration=10s iteration_duration=1s users_concurrency=0\nparams=FOO=bar\nrates=0 1 2 3 4 5 6 7 8 9\n"
+        },
+        {
+          "input": {
+            "op": "config_schedule",
+            "now": "2020-12-10T10:00:00+00:00",
+            "samples": 60,
+            "content": "\nscenario: template\nlimits:\n  max-duration: 1m\n  concurrency: 50\n  max-iterations: 100\n  ignore-dropped: true\nstages:\n- duration: 10s\n  mode: gaussian\n  volume: 100\n  repeat: 20s\n  iteration-frequency: 1s\n  peak: 10s\n  weights: \"1.0,1.0\"\n  standard-deviation: 3s\n  jitter: 0\n  distribution: none\n  parameters:\n    FOO: bar\n"
+          },
+          "expected_output": "scenario=template\nmax_duration=1m0s\nconcurrency=50\nmax_iterations=100\nignore_dropped=true\nstages=1\nstage=0 duration=10s iteration_duration=1s users_concurrency=0\nparams=FOO=bar\nrates=0 0 1 2 3 6 8 10 13 13 13 10 9 5 3 2 1 0 1 0 0 0 1 2 3 6 8 10 13 13 13 11 8 5 3 2 1 0 1 0 0 0 1 2 3 6 8 10 13 13 13 11 8 5 3 2 1 1 0 0\n"
+        },
+        {
+          "input": {
+            "op": "config_schedule",
+            "now": "2020-12-10T10:00:00+00:00",
+            "samples": 0,
+            "content": "\nscenario: template\nlimits:\n  max-duration: 1m\n  concurrency: 50\n  max-iterations: 100\n  ignore-dropped: true\nstages:\n- duration: 10s\n  mode: users\n  concurrency: 100\n  parameters:\n    FOO: bar\n"
+          },
+          "expected_output": "scenario=template\nmax_duration=1m0s\nconcurrency=50\nmax_iterations=100\nignore_dropped=true\nstages=1\nstage=0 duration=10s iteration_duration=0s users_concurrency=100\nparams=FOO=bar\n"
+        }
+      ]
+    },
+    "feature5_2_config_errors.json": {
+      "description": "Reject invalid YAML load-test configs with a normalized error category and a domain reason: missing required global fields, missing mode-specific fields per stage, missing stage mode, and structurally malformed YAML.",
+      "cases": [
+        {
+          "input": {
+            "op": "config_schedule",
+            "now": "2020-12-10T10:00:00+00:00",
+            "content": "limits:\n  max-duration: 1m\n  concurrency: 50\n  max-iterations: 100\n  ignore-dropped: true\n"
+          },
+          "expected_output": "error=invalid_config\nreason=missing scenario\n"
+        },
+        {
+          "input": {
+            "op": "config_schedule",
+            "now": "2020-12-10T10:00:00+00:00",
+            "content": "scenario: template\nlimits:\n  max-duration: 1m\n  concurrency: 50\n  max-iterations: 100\n  ignore-dropped: true\nstages:\n- duration: 1h\n  mode: constant\n"
+          },
+          "expected_output": "error=invalid_config\nreason=missing rate at stage 0\n"
+        },
+        {
+          "input": {
+            "op": "config_schedule",
+            "now": "2020-12-10T10:00:00+00:00",
+            "content": "scenario: template\nlimits:\n  max-duration: 1m\n  concurrency: 50\n  max-iterations: 100\n  ignore-dropped: true\nstages:\n- duration: 10s\n"
+          },
+          "expected_output": "error=invalid_config\nreason=missing stage mode at stage 0\n"
+        },
+        {
+          "input": {
+            "op": "config_schedule",
+            "now": "2020-12-10T10:00:00+00:00",
+            "content": "\ninvalid file content\n"
+          },
+          "expected_output": "error=invalid_config\nreason=malformed_yaml\n"
+        }
+      ]
+    }
+  }
+}

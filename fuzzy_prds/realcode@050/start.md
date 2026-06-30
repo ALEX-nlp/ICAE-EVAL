@@ -1,0 +1,9 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from a few backend devs that their Django apps are hammering the database way too hard on repeated reads — stuff that should obviously be the same query is hitting the DB every single time. We talked about doing something similar to what we did with the login session layer (you know the one, where we wrapped the read path and tracked origin state), and the consensus is we should build something proper here rather than everyone writing their own ad-hoc solution.
+
+Basically we need a caching layer that sits on top of Django's ORM so that repeated reads just work without devs having to think about keys or invalidation. The big pain points are: stale data showing up after a record gets updated (especially when a related child or parent record changes), pages not refreshing after a save even when the user can clearly see the data changed in the admin, and template fragments being re-rendered on every request even when nothing changed.
+
+There's also a reported issue where switching languages mid-session causes some users to see wrong cached content — apparently the cache doesn't know about locale context. And some teams are using multiple database connections and seeing data bleed between them.
+
+We also want devs to be able to opt out of caching per-query when needed, and handle edge cases like empty result sets and methods on model instances. Should support Jinja templates too. Needs proper test coverage. Refer to how the parameterized query identity stuff was handled in the raw query path for the key uniqueness approach.

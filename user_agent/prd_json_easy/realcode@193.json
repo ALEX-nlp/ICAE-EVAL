@@ -1,0 +1,716 @@
+{
+  "fuzzy_prd": "# Distributed Tracing Instrumentation for a Microservice Application Framework\n\n## Project Goal\n\nBuild an auto-activating tracing instrumentation layer for a conventional\nmicroservice application framework. When the host application performs common\nruntime activities — serving inbound HTTP requests, calling other services,\nrouting traffic through an edge gateway, talking to a database, running work in\nthe background, scheduling jobs, executing circuit-breaker commands, or passing\nmessages through a publish/subscribe channel — the layer must automatically\nproduce tracing **spans** that describe each activity and correctly correlate\nthem into traces, without the application author writing any tracing code.\n\nThe layer binds to a pluggable tracer abstraction. For the purposes of this\ncontract, an in-memory tracer records every finished span so that the observable\nresult of an activity can be inspected: the span's operation name, its\ncomponent and kind, selected attributes (such as HTTP status, route host, or\ndatabase statement), whether it recorded an error, and which span is its parent.\n\n## Background & Problem\n\nIn a distributed system a single logical action fans out across many technical\nlayers and threads. Operators need an end-to-end picture of where time is spent\nand where failures originate, but manually adding tracing calls to every entry\npoint, client, executor and message handler is error-prone, repetitive and\nquickly drifts out of date.\n\nThe problem this project solves is to make tracing **ambient**: by being present\non the application's classpath and detecting a configured tracer, the layer\ntransparently wraps the framework's extension points so that activities are\ntraced consistently. Two properties matter most:\n\n1. **Faithful observation** — each activity yields a span with the right\n   operation name, component label, kind, status/attributes and error flag.\n2. **Correct correlation** — spans produced within one logical action share a\n   single trace, and each span points at the correct parent, even across thread\n   boundaries, asynchronous hand-offs and remote message carriers.\n\n## Architecture & Engineering Constraints\n\n- **Ambient activation.** The instrumentation activates only when a tracer is\n  available, and otherwise stays inert. It must not require changes to business\n  code beyond ordinary framework configuration.\n- **Pluggable tracer.** All spans are created through a tracer abstraction.\n  Instrumentation never depends on a concrete backend.\n- **Context propagation.** The currently active span is treated as the parent of\n  any span started while it is active. Context must survive executor hand-offs,\n  asynchronous results and serialization into/out of message carriers.\n- **Language-neutral observable contract.** The externally-checkable result of an\n  activity is a deterministic textual rendering of the finished spans. It must\n  not contain random identifiers, host-language exception types, or\n  backend-specific formatting. Failures are surfaced as a neutral error flag and\n  a neutral error event on the relevant span.\n- **Determinism.** Renderings are stable across runs: span/trace identifiers are\n  never printed; parent links are rendered by the parent's operation name; span\n  lines are emitted in a stable, sorted order; the number of distinct traces is\n  reported instead of raw trace identifiers.\n\n### Observable rendering format\n\nMost features render a finished-span set as:\n\n```\nspans=<total number of finished spans>\ndistinct_traces=<number of distinct traces; 0 when there are no spans>\n<one sorted line per span>\n```\n\nEach per-span line has the shape:\n\n```\nop=<operation name> component=<component|-> span.kind=<kind|-> http.status=<status|-> attrs=[k=v;...sorted] error=<true|false> error_log=<event|-> parent=<parent operation|root|external>\n```\n\nwhere `component`, `span.kind`, `http.status` and the error flag are surfaced as\ndedicated fields; all remaining tags appear in the sorted `attrs` list; `parent`\nis `root` for a span with no parent and `external` for a parent that is not part\nof the recorded set. The gateway and message-channel features use a small,\npurpose-specific rendering described in their respective sections.\n\nEvery program invocation reads a single JSON command object from standard input\n(the `feature` field selects the activity to exercise; the remaining fields are\nparameters) and writes only the rendered observation to standard output.\n\n## Core Features\n\n### Feature 1: HTTP request/response tracing\n\nServing an inbound HTTP request produces a **server** span tagged with the HTTP\nmethod, URL and resulting status. Making an outbound call through an instrumented\nHTTP client (synchronous or asynchronous) produces a **client** span and\npropagates context so the downstream server span becomes its child. A configured\nskip pattern suppresses the **server** span for matching paths, while outbound\nclient spans are still produced. An external, non-instrumented client produces no\nclient span (only the server side may be traced).\n\nParameters: `caller` (`browser` = external non-instrumented client,\n`rest_client` = instrumented synchronous client, `async_rest_client` =\ninstrumented asynchronous client); `path` (`/hello` is traced, `/notTraced`\nmatches the skip pattern).\n\n```json\n{\n  \"cases\": [\n    {\n      \"name\": \"instrumented_client_creates_client_and_server_spans\",\n      \"input\": {\"feature\": \"http_request\", \"caller\": \"rest_client\", \"path\": \"/hello\"},\n      \"expected_output\": \"spans=2\\ndistinct_traces=1\\nop=GET component=java-spring-rest-template span.kind=client http.status=200 attrs=[http.method=GET;http.url=http://localhost/hello] error=false error_log=- parent=root\\nop=hello component=java-web-servlet span.kind=server http.status=200 attrs=[http.method=GET;http.url=http://localhost/hello] error=false error_log=- parent=GET\\n\"\n    },\n    {\n      \"name\": \"skip_pattern_suppresses_server_span_only\",\n      \"input\": {\"feature\": \"http_request\", \"caller\": \"rest_client\", \"path\": \"/notTraced\"},\n      \"expected_output\": \"spans=1\\ndistinct_traces=1\\nop=GET component=java-spring-rest-template span.kind=client http.status=200 attrs=[http.method=GET;http.url=http://localhost/notTraced] error=false error_log=- parent=root\\n\"\n    }\n  ]\n}\n```\n\n### Feature 2: Edge-gateway routing tracing\n\nA request that matches a configured gateway route is proxied to a backend and\ntraced as a single gateway span named after the HTTP method, tagged with the\ngateway component, the resolved route host and the resulting downstream HTTP\nstatus. A failure reaching the backend is recorded as an error on the gateway\nspan. A request handled directly by the application (no matching route) produces\nonly the inbound server span(s) and no gateway span.\n\nThis feature renders a purpose-specific summary: the total span count, the number\nof distinct traces, the per-component span counts (sorted), and — when a gateway\nspan exists — its operation, HTTP status, route host and error flag.\n\nParameters: `path` (`/test` routes to a healthy backend, `/wrong` routes to a\nmissing backend path, `/wrong-port` routes to an unreachable backend, `/hello` is\nserved directly).\n\n```json\n{\n  \"cases\": [\n    {\n      \"name\": \"successful_route_records_status_and_route_host\",\n      \"input\": {\"feature\": \"gateway_route\", \"path\": \"/test\"},\n      \"expected_output\": \"spans=3\\ndistinct_traces=1\\ncomponent.java-web-servlet=2\\ncomponent.zuul=1\\ngateway.op=GET\\ngateway.http.status=200\\ngateway.route.host=http://localhost:53751/hello\\ngateway.error=false\\n\"\n    },\n    {\n      \"name\": \"unreachable_downstream_records_500_and_error\",\n      \"input\": {\"feature\": \"gateway_route\", \"path\": \"/wrong-port\"},\n      \"expected_output\": \"spans=2\\ndistinct_traces=1\\ncomponent.java-web-servlet=1\\ncomponent.zuul=1\\ngateway.op=GET\\ngateway.[the standard 500 representation for gateway fallback errors]\\ngateway.route.host=http://localhost:53752/wrong-port\\ngateway.error=true\\n\"\n    }\n  ]\n}\n```\n\n### Feature 3: Database call tracing\n\nAcquiring a connection from a data source and executing a statement — whether via\na raw connection or via a higher-level template helper — produces a **client**\nspan for the database component, carrying the statement text, database type and\ndatabase user as attributes. When the call happens within an active caller span,\nthe database span is correlated as its child.\n\nParameters: `executor` (`connection` or `jdbc_template`); `statement`; optional\n`parent` (operation name of a surrounding active span).\n\n```json\n{\n  \"cases\": [\n    {\n      \"name\": \"raw_connection_statement_is_traced\",\n      \"input\": {\"feature\": \"database_call\", \"executor\": \"connection\", \"statement\": \"select 1\"},\n      \"expected_output\": \"spans=1\\ndistinct_traces=1\\nop=Execute component=java-jdbc span.kind=client http.status=- attrs=[db.statement=select 1;db.type=h2;db.user=SA] error=false error_log=- parent=root\\n\"\n    },\n    {\n      \"name\": \"statement_span_is_child_of_active_caller\",\n      \"input\": {\"feature\": \"database_call\", \"executor\": \"connection\", \"statement\": \"select 1\", \"parent\": \"caller\"},\n      \"expected_output\": \"spans=2\\ndistinct_traces=1\\nop=Execute component=java-jdbc span.kind=client http.status=- attrs=[db.statement=select 1;db.type=h2;db.user=SA] error=false error_log=- parent=caller\\nop=caller component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\\n\"\n    }\n  ]\n}\n```\n\n### Feature 4: Background method tracing\n\nInvoking a method marked to run asynchronously produces a span tagged with the\noriginating type and method names, correlated with the caller's active span. If\nthe background method throws, its span is marked as an error and carries a neutral\nerror event.\n\nParameters: `outcome` (`success` or `error`).\n\n```json\n{\n  \"cases\": [\n    {\n      \"name\": \"async_method_span_correlated_with_caller\",\n      \"input\": {\"feature\": \"background_method\", \"outcome\": \"success\"},\n      \"expected_output\": \"spans=3\\ndistinct_traces=1\\nop=bar component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\\nop=inner-work component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=bar\\nop=runJob component=async span.kind=- http.status=- attrs=[class=BackgroundJobs;method=runJob] error=false error_log=- parent=bar\\n\"\n    },\n    {\n      \"name\": \"async_method_failure_recorded_as_error\",\n      \"input\": {\"feature\": \"background_method\", \"outcome\": \"error\"},\n      \"expected_output\": \"spans=1\\ndistinct_traces=1\\nop=failingJob component=async span.kind=- http.status=- attrs=[class=BackgroundJobs;method=failingJob] error=true error_log=error parent=root\\n\"\n    }\n  ]\n}\n```\n\n### Feature 5: Managed-executor context propagation\n\nWork submitted to a managed executor must keep the caller's active trace context.\nA span created inside the worker therefore shares the caller's trace and is\ncorrelated as the caller's child. This holds for both a pooled executor and a\nsimple per-task executor.\n\nParameters: `executor` (`thread_pool` or `simple`).\n\n```json\n{\n  \"cases\": [\n    {\n      \"name\": \"thread_pool_executor_propagates_context\",\n      \"input\": {\"feature\": \"executor_submit\", \"executor\": \"thread_pool\"},\n      \"expected_output\": \"spans=2\\ndistinct_traces=1\\nop=caller component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\\nop=worker component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=caller\\n\"\n    }\n  ]\n}\n```\n\n### Feature 6: Circuit-breaker command tracing\n\nCommands executed on a circuit-breaker's worker threads keep the caller's trace\ncontext, so spans created inside a command share the caller's trace. When a\ncommand fails and a fallback runs, the fallback's work is recorded too. A traced\ncommand wrapper additionally tags the command's identifying metadata (its group,\nkey and pool).\n\nParameters: `scenario` (`command`, `fallback`, or `traced_command`); for\n`traced_command` also `command_group` and `command_key`.\n\n```json\n{\n  \"cases\": [\n    {\n      \"name\": \"command_runs_in_caller_trace\",\n      \"input\": {\"feature\": \"circuit_breaker\", \"scenario\": \"command\"},\n      \"expected_output\": \"spans=2\\ndistinct_traces=1\\nop=caller component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\\nop=sayHello component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=caller\\n\"\n    },\n    {\n      \"name\": \"fallback_invocation_is_recorded\",\n      \"input\": {\"feature\": \"circuit_breaker\", \"scenario\": \"fallback\"},\n      \"expected_output\": \"spans=3\\ndistinct_traces=1\\nop=alwaysFail component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=caller\\nop=caller component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\\nop=defaultGreeting component=- span.kind=- http.status=- attrs=[fallback=yes] error=false error_log=- parent=caller\\n\"\n    }\n  ]\n}\n```\n\n### Feature 7: Scheduled-task tracing\n\nA method invoked by the scheduler is automatically wrapped in a span tagged with\nthe originating type and method. Any span created inside the scheduled task is\ncorrelated as its child.\n\nThis feature takes no parameters beyond the activity selector.\n\n```json\n{\n  \"cases\": [\n    {\n      \"name\": \"scheduled_invocation_traced_and_correlates_child\",\n      \"input\": {\"feature\": \"scheduled_task\"},\n      \"expected_output\": \"spans=2\\ndistinct_traces=1\\nop=child component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=reportMetrics\\nop=reportMetrics component=scheduled span.kind=- http.status=- attrs=[class=ScheduledJob;method=reportMetrics] error=false error_log=- parent=root\\n\"\n    }\n  ]\n}\n```\n\n### Feature 8: Message-channel tracing\n\nWhen a message flows through a publish/subscribe channel, a span named after the\nmessage destination is created and tagged with the channel component and the span\nkind. On the inbound (server) side the span links to a remote parent extracted\nfrom the message carrier; on the outbound (client) side it links to the local\nactive span and injects its own context into the carrier so downstream consumers\ncan continue the trace.\n\nThis feature renders a purpose-specific summary: the destination operation name,\ncomponent, kind, whether the span linked to its expected parent, whether it shares\nthe parent's trace, and (for the outbound case) whether context was propagated\ninto the carrier.\n\nParameters: `span_kind` (`server` or `client`); `destination`.\n\n```json\n{\n  \"cases\": [\n    {\n      \"name\": \"inbound_message_links_remote_parent\",\n      \"input\": {\"feature\": \"message_channel\", \"span_kind\": \"server\", \"destination\": \"/app/test\"},\n      \"expected_output\": \"op=/app/test\\ncomponent=websocket\\nspan.kind=server\\nparent_linked=true\\nsame_trace_as_parent=true\\n\"\n    },\n    {\n      \"name\": \"outbound_message_links_active_parent_and_propagates_context\",\n      \"input\": {\"feature\": \"message_channel\", \"span_kind\": \"client\", \"destination\": \"/topic/greetings\"},\n      \"expected_output\": \"op=/topic/greetings\\ncomponent=websocket\\nspan.kind=client\\nparent_linked=true\\nsame_trace_as_parent=true\\ncontext_propagated=true\\n\"\n    }\n  ]\n}\n```\n\n## Deliverables\n\n- An ambient tracing instrumentation layer that activates when a tracer is\n  present and transparently traces the eight activities above.\n- A single command-line entry point that accepts one JSON command on standard\n  input, exercises the selected activity against the instrumentation, and writes\n  the deterministic, language-neutral observation to standard output.\n- A test harness (`rcb_tests/test.sh`) with a single entry point and a\n  `--cases-dir <subdir>` option (default `test_cases`) that runs every case in the\n  chosen directory, writing each invocation's raw standard output to\n  `rcb_tests/stdout/<cases-dir>/<file-stem>@<NNN>.txt` (where `NNN` is the\n  three-digit case index) and reporting a pass/total summary.\n- Machine-checkable case suites: `rcb_tests/test_cases/` (full contract suite) and\n  `rcb_tests/public_test_cases/` (the representative cases embedded in this\n  document).\n\n\n---\n**Implementation notes:**\n- follow the same summary line format used for internal components\n- matches the correlation method used for river events\n",
+  "oracle_data": {
+    "task_id": "opentracing-contrib__java-spring-cloud-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C027",
+        "trigger_keywords": [
+          "What is the fallback parent when a circuit breaker action is triggered?",
+          "How should background spans link to an alwaysFail span?",
+          "What is the default name for a fallback span in this circuit breaker scenario?"
+        ],
+        "oracle_response": "The exact strings 'alwaysFail' and 'defaultGreeting' must be used to link the fallback span to the failed command span."
+      },
+      {
+        "constraint_id": "C017",
+        "trigger_keywords": [
+          "What value should the HTTP status be when the downstream gateway fails?",
+          "Which error code indicates a missing backend path or unreachable port?",
+          "How is a gateway error status defined in the constraint?"
+        ],
+        "oracle_response": "The exact string '500' must be used for the http.status field when a downstream failure occurs."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "What is the value for the error_log when an exception occurs?",
+          "How should error events be represented in the output?",
+          "What is the neutral log placeholder for exceptions?"
+        ],
+        "oracle_response": "The exact string 'error' must be used for the error_log field when an explicit error or exception occurs."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the same summary line format used for internal components",
+        "actual_meaning": "The output must use the 'component.java-something=number' format if multiple components are involved, rather than the 'spans' or 'distinct_traces' summary lines used for isolated internal traces."
+      },
+      {
+        "vague_reference": "matches the correlation method used for river events",
+        "actual_meaning": "The parent field must be set to the HTTP method (e.g., 'GET') to link the server span to the client span, mirroring the correlation logic already established for river events in the codebase."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_http_request.json": {
+      "feature": "http_request",
+      "description": "HTTP server and client span instrumentation, including skip-pattern handling.",
+      "cases": [
+        {
+          "name": "instrumented_client_creates_client_and_server_spans",
+          "input": {
+            "feature": "http_request",
+            "caller": "rest_client",
+            "path": "/hello"
+          },
+          "expected_output": "spans=2\ndistinct_traces=1\nop=GET component=java-spring-rest-template span.kind=client http.status=200 attrs=[http.method=GET;http.url=http://localhost/hello] error=false error_log=- parent=root\nop=hello component=java-web-servlet span.kind=server http.status=200 attrs=[http.method=GET;http.url=http://localhost/hello] error=false error_log=- parent=GET\n"
+        },
+        {
+          "name": "skip_pattern_suppresses_server_span_only",
+          "input": {
+            "feature": "http_request",
+            "caller": "rest_client",
+            "path": "/notTraced"
+          },
+          "expected_output": "spans=1\ndistinct_traces=1\nop=GET component=java-spring-rest-template span.kind=client http.status=200 attrs=[http.method=GET;http.url=http://localhost/notTraced] error=false error_log=- parent=root\n"
+        }
+      ]
+    },
+    "feature2_gateway_route.json": {
+      "feature": "gateway_route",
+      "description": "Edge-gateway (reverse proxy) routing spans: route host, downstream status, error recording, and non-routed pass-through.",
+      "cases": [
+        {
+          "name": "successful_route_records_status_and_route_host",
+          "input": {
+            "feature": "gateway_route",
+            "path": "/test"
+          },
+          "expected_output": "spans=3\ndistinct_traces=1\ncomponent.java-web-servlet=2\ncomponent.zuul=1\ngateway.op=GET\ngateway.http.status=200\ngateway.route.host=http://localhost:53751/hello\ngateway.error=false\n"
+        },
+        {
+          "name": "unreachable_downstream_records_500_and_error",
+          "input": {
+            "feature": "gateway_route",
+            "path": "/wrong-port"
+          },
+          "expected_output": "spans=2\ndistinct_traces=1\ncomponent.java-web-servlet=1\ncomponent.zuul=1\ngateway.op=GET\ngateway.http.status=500\ngateway.route.host=http://localhost:53752/wrong-port\ngateway.error=true\n"
+        }
+      ]
+    },
+    "feature3_database_call.json": {
+      "feature": "database_call",
+      "description": "Database call instrumentation: acquiring a connection and executing a statement is traced; the span correlates with the active caller span when present.",
+      "cases": [
+        {
+          "name": "raw_connection_statement_is_traced",
+          "input": {
+            "feature": "database_call",
+            "executor": "connection",
+            "statement": "select 1"
+          },
+          "expected_output": "spans=1\ndistinct_traces=1\nop=Execute component=java-jdbc span.kind=client http.status=- attrs=[db.statement=select 1;db.type=h2;db.user=SA] error=false error_log=- parent=root\n"
+        },
+        {
+          "name": "statement_span_is_child_of_active_caller",
+          "input": {
+            "feature": "database_call",
+            "executor": "connection",
+            "statement": "select 1",
+            "parent": "caller"
+          },
+          "expected_output": "spans=2\ndistinct_traces=1\nop=Execute component=java-jdbc span.kind=client http.status=- attrs=[db.statement=select 1;db.type=h2;db.user=SA] error=false error_log=- parent=caller\nop=caller component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\n"
+        }
+      ]
+    },
+    "feature4_background_method.json": {
+      "feature": "background_method",
+      "description": "Background (asynchronous) method instrumentation: invocation produces a span tagged with the originating type and method; failures are recorded as an error.",
+      "cases": [
+        {
+          "name": "async_method_span_correlated_with_caller",
+          "input": {
+            "feature": "background_method",
+            "outcome": "success"
+          },
+          "expected_output": "spans=3\ndistinct_traces=1\nop=bar component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\nop=inner-work component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=bar\nop=runJob component=async span.kind=- http.status=- attrs=[class=BackgroundJobs;method=runJob] error=false error_log=- parent=bar\n"
+        },
+        {
+          "name": "async_method_failure_recorded_as_error",
+          "input": {
+            "feature": "background_method",
+            "outcome": "error"
+          },
+          "expected_output": "spans=1\ndistinct_traces=1\nop=failingJob component=async span.kind=- http.status=- attrs=[class=BackgroundJobs;method=failingJob] error=true error_log=error parent=root\n"
+        }
+      ]
+    },
+    "feature5_executor_submit.json": {
+      "feature": "executor_submit",
+      "description": "Managed-executor instrumentation: work submitted to an executor keeps the caller's active trace context, so a span created inside the worker is correlated with the caller's span.",
+      "cases": [
+        {
+          "name": "thread_pool_executor_propagates_context",
+          "input": {
+            "feature": "executor_submit",
+            "executor": "thread_pool"
+          },
+          "expected_output": "spans=2\ndistinct_traces=1\nop=caller component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\nop=worker component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=caller\n"
+        }
+      ]
+    },
+    "feature6_circuit_breaker.json": {
+      "feature": "circuit_breaker",
+      "description": "Circuit-breaker instrumentation: commands run on breaker worker threads keep the caller's trace context, fallback invocations are recorded, and a traced command wrapper tags the command's identifying metadata.",
+      "cases": [
+        {
+          "name": "command_runs_in_caller_trace",
+          "input": {
+            "feature": "circuit_breaker",
+            "scenario": "command"
+          },
+          "expected_output": "spans=2\ndistinct_traces=1\nop=caller component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\nop=sayHello component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=caller\n"
+        },
+        {
+          "name": "fallback_invocation_is_recorded",
+          "input": {
+            "feature": "circuit_breaker",
+            "scenario": "fallback"
+          },
+          "expected_output": "spans=3\ndistinct_traces=1\nop=alwaysFail component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=caller\nop=caller component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=root\nop=defaultGreeting component=- span.kind=- http.status=- attrs=[fallback=yes] error=false error_log=- parent=caller\n"
+        }
+      ]
+    },
+    "feature7_scheduled_task.json": {
+      "feature": "scheduled_task",
+      "description": "Scheduled-task instrumentation: a method invoked by the scheduler is wrapped in a span tagged with the originating type and method, and any span created inside the task is correlated as its child.",
+      "cases": [
+        {
+          "name": "scheduled_invocation_traced_and_correlates_child",
+          "input": {
+            "feature": "scheduled_task"
+          },
+          "expected_output": "spans=2\ndistinct_traces=1\nop=child component=- span.kind=- http.status=- attrs=[] error=false error_log=- parent=reportMetrics\nop=reportMetrics component=scheduled span.kind=- http.status=- attrs=[class=ScheduledJob;method=reportMetrics] error=false error_log=- parent=root\n"
+        }
+      ]
+    },
+    "feature8_message_channel.json": {
+      "feature": "message_channel",
+      "description": "Message-channel instrumentation for a publish/subscribe broker: a message flowing through the channel creates a span named after the destination, tagged with the channel component and span kind, linked to the surrounding trace (remote parent on server side, active span on client side, with context propagated onward).",
+      "cases": [
+        {
+          "name": "inbound_message_links_remote_parent",
+          "input": {
+            "feature": "message_channel",
+            "span_kind": "server",
+            "destination": "/app/test"
+          },
+          "expected_output": "op=/app/test\ncomponent=websocket\nspan.kind=server\nparent_linked=true\nsame_trace_as_parent=true\n"
+        },
+        {
+          "name": "outbound_message_links_active_parent_and_propagates_context",
+          "input": {
+            "feature": "message_channel",
+            "span_kind": "client",
+            "destination": "/topic/greetings"
+          },
+          "expected_output": "op=/topic/greetings\ncomponent=websocket\nspan.kind=client\nparent_linked=true\nsame_trace_as_parent=true\ncontext_propagated=true\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "global_activation",
+      "input_condition": "Any JSON input dispatched via CLI entry point",
+      "output_rule": "If no tracer is available, instrumentation remains inert and produces no output/output matches null artigianal span rendering.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "output_format_numbering",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Every program invocation starts with a summary line containing the total number of finished spans.",
+      "exact_values": [
+        "spans=<number>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "output_format_tre_counting",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Immediately follows the span count line a line containing the number of distinct traces (0 if no spans).",
+      "exact_values": [
+        "distinct_traces=<number>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "output_format_span_list",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Followed by exactly one sorted line per finished span.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "output_field_oper",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Each span line must begin with the operation name.",
+      "exact_values": [
+        "op="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "output_field_component",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Immediately after operation name comes the component label.",
+      "exact_values": [
+        "component="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "output_field_spankind",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Follows component field; reflects candidate component or root server side.",
+      "exact_values": [
+        "span.kind="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "output_field_httpstatus",
+      "input_condition": "External JSON inputs",
+      "output_rule": "Follows span kind field; HTTP status or - for non-HTTP activity.",
+      "exact_values": [
+        "http.status="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "output_field_error_flag_default",
+      "input_condition": "No explicit error in activity",
+      "output_rule": "Error flag asserts false, with neutral error event log.",
+      "exact_values": [
+        "error=false",
+        "error_log=-"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "output_field_error_flag_exception",
+      "input_condition": "Explicit error in activity",
+      "output_rule": "Error flag asserts true, with neutral error log.",
+      "exact_values": [
+        "error=true",
+        "error_log=<event>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "output_field_attrs",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Attributes appear as k=v pairs within brackets, sorted alphabetically by key.",
+      "exact_values": [
+        "attrs=[k=v;...]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "output_field_parent",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Parent field indicates relation: root for span with no parent; external for parent not in recorded set; parent=<op> for active call.",
+      "exact_values": [
+        "parent=root",
+        "parent=external",
+        "parent=<op_name>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "http_request_skip_pattern",
+      "input_condition": "Feature http_request with path matching skip pattern (e.g. /notTraced)",
+      "output_rule": "Server span suppressed; client span produced for rest client or async rest client; client operation name remains unchanged.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "http_request_caller_type",
+      "input_condition": "Feature http_request with caller field == browser",
+      "output_rule": "Only parent/client spans generated, outer span suppression applies if outbound is non-instrumented.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "http_request_correlation",
+      "input_condition": "Feature http_request with rest client or async rest client (caller in rest_client/async_rest_client)",
+      "output_rule": "Server span linked to client span as child via parent=GET field.",
+      "exact_values": [
+        "parent=GET"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "gateway_route_span_type",
+      "input_condition": "Feature gateway_route with matching route",
+      "output_rule": "Produces single gateway span named with HTTP method (e.g. GET) as op field.",
+      "exact_values": [
+        "op=GET",
+        "op=POST",
+        "op=PUT",
+        "op=DELETE"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "gateway_route_error",
+      "input_condition": "Feature gateway_route where downstream fails (missing backend path, unreachable port)",
+      "output_rule": "Record 500 status; error=true on gateway span.",
+      "exact_values": [
+        "http.status=500",
+        "error=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "gateway_route_non_route",
+      "input_condition": "Feature gateway_route where path does not match any gateway route",
+      "output_rule": "No gateway span produced; only inbound server spans recorded.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "database_call_component",
+      "input_condition": "Feature database_call with connection or jdbc_template executor",
+      "output_rule": "Produces span named Execute with component=java-jdbc.",
+      "exact_values": [
+        "op=Execute",
+        "component=java-jdbc"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "database_call_attrs",
+      "input_condition": "Feature database_call",
+      "output_rule": "Attributes include db.statement, db.type, db.user, sorted.",
+      "exact_values": [
+        "db.statement=",
+        "db.type=",
+        "db.user="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "database_call_correlation",
+      "input_condition": "Feature database_call within active caller",
+      "output_rule": "Database span parent becomes caller operation name.",
+      "exact_values": [
+        "parent=caller"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "background_method_success",
+      "input_condition": "Feature background_method with outcome=success",
+      "output_rule": "Produces success span; error=false; error_log=-.",
+      "exact_values": [
+        "error=false",
+        "error_log=-"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "background_method_error",
+      "input_condition": "Feature background_method with outcome=error",
+      "output_rule": "Produces span with error=true and error_log=error.",
+      "exact_values": [
+        "error=true",
+        "error_log=error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "background_method_parent",
+      "input_condition": "Feature background_method invoked within caller",
+      "output_rule": "Background span linked to caller via parent=caller.",
+      "exact_values": [
+        "parent=caller"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "executor_submit_propagation",
+      "input_condition": "Feature executor_submit with executor=thread_pool or simple",
+      "output_rule": "Child span created inside worker must be linked to parent caller via parent=caller.",
+      "exact_values": [
+        "parent=caller"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "circuit_breaker_command",
+      "input_condition": "Feature circuit_breaker with scenario=command",
+      "output_rule": "Command spans recorded in caller's trace (child of caller), if no fallback triggered.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "circuit_breaker_fallback",
+      "input_condition": "Feature circuit_breaker with scenario=fallback",
+      "output_rule": "Record alwaysFail span; record fallback span with fallback=yes in attrs; parent on fallback is the failed command (alwaysFail).",
+      "exact_values": [
+        "fallback=yes",
+        "parent=alwaysFail",
+        "parent=defaultGreeting"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "circuit_breaker_traced_wrapper",
+      "input_condition": "Feature circuit_breaker with scenario=traced_command",
+      "output_rule": "Observed tags identity group, key, pool on span.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "scheduled_task_parent",
+      "input_condition": "Feature scheduled_task",
+      "output_rule": "Child task span linked to parent via parent=reportMetrics.",
+      "exact_values": [
+        "parent=reportMetrics"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "cs_buy_method_tag",
+      "input_condition": "Feature scheduled_task",
+      "output_rule": "Operation name is reportMetrics, component is scheduled.",
+      "exact_values": [
+        "op=reportMetrics",
+        "component=scheduled"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "span_kind_server_link",
+      "input_condition": "Feature message_channel with span_kind=server",
+      "output_rule": "Links structured parent extracted from message carrier; ensures same_trace_as_parent=true.",
+      "exact_values": [
+        "same_trace_as_parent=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "span_kind_client_link",
+      "input_condition": "Feature message_channel with span_kind=client",
+      "output_rule": "Links structured parent; ensures same_trace_as_parent=true; ensures context_propagated=true.",
+      "exact_values": [
+        "same_trace_as_parent=true",
+        "context_propagated=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "message_channel_parent_linked",
+      "input_condition": "Feature message_channel",
+      "output_rule": "Both server and client spans must produce parent_linked=true.",
+      "exact_values": [
+        "parent_linked=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "span_list_sorting",
+      "input_condition": "Any JSON input",
+      "output_rule": "Span lines emitted in a stable, sorted order (likely by operation name, or deterministic logical order based on test case)."
+    },
+    {
+      "id": "C035",
+      "feature": "trace_id_exclusion",
+      "input_condition": "Any JSON input",
+      "output_rule": "Span/trace identifiers must never be printed or rendered.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "execution_context_preservation",
+      "input_condition": "Multiple features (executors, circuit breakers, message carrier)",
+      "output_rule": "Context must survive executor hand-offs, asynchronous results, and serialization into message carriers; parent link must reflect the active thread/timer context correctly.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "global_activation",
+      "input_condition": "Any JSON input",
+      "output_rule": "No business code changes required beyond framework configuration.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C038",
+      "feature": "output_format_gatewayspecific",
+      "input_condition": "Feature gateway_route",
+      "output_rule": "Produces component count lines (e.g. component.java-web-servlet=2) if multiple components involved, or uses the span summary lines (spans, distinct_traces) if only internal components (message channel).",
+      "exact_values": [],
+      "ambiguous": true
+    },
+    {
+      "id": "C039",
+      "feature": "output_format_message_channelspecific",
+      "input_condition": "Feature message_channel",
+      "output_rule": "Produces per-field summary: op, component, span.kind, parent_linked, same_trace_as_parent, context_propagated.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C040",
+      "feature": "attributes_sorting",
+      "input_condition": "All JSON inputs",
+      "output_rule": "attrs array items sorted alphabetically by key.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C041",
+      "feature": "http_request_client_span_kind",
+      "input_condition": "Feature http_request with caller rests_client",
+      "output_rule": "Client span span.kind=client.",
+      "exact_values": [
+        "span.kind=client"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C042",
+      "feature": "database_call_span_kind",
+      "input_condition": "Feature database_call",
+      "output_rule": "Database span span.kind=client.",
+      "exact_values": [
+        "span.kind=client"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C043",
+      "feature": "message_channel_server_span_kind",
+      "input_condition": "Feature message_channel with span_kind=server",
+      "output_rule": "Span.kind=server.",
+      "exact_values": [
+        "span.kind=server"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C044",
+      "feature": "message_channel_client_span_kind",
+      "input_condition": "Feature message_channel with span_kind=client",
+      "output_rule": "Span.kind=client.",
+      "exact_values": [
+        "span.kind=client"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C045",
+      "feature": "output_field_detracing",
+      "input_condition": "All JSON inputs",
+      "output_rule": "Failures are surfaced as neutral error flag and neutral error event; no language-specific exception types.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C046",
+      "feature": "circuit_breaker_ea_wrapped",
+      "input_condition": "Feature circuit_breaker with scenario=traced_command",
+      "output_rule": "Must tag command's group and key.",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C027",
+        "replacement": "a specific magic constant string defined in circuit breaker fallback logic",
+        "exact_values_to_replace": [
+          "parent=alwaysFail",
+          "parent=defaultGreeting"
+        ],
+        "trigger_keywords": [
+          "What is the fallback parent when a circuit breaker action is triggered?",
+          "How should background spans link to an alwaysFail span?",
+          "What is the default name for a fallback span in this circuit breaker scenario?"
+        ],
+        "oracle_response": "The exact strings 'alwaysFail' and 'defaultGreeting' must be used to link the fallback span to the failed command span."
+      },
+      {
+        "constraint_id": "C017",
+        "replacement": "the standard 500 representation for gateway fallback errors",
+        "exact_values_to_replace": [
+          "http.status=500"
+        ],
+        "trigger_keywords": [
+          "What value should the HTTP status be when the downstream gateway fails?",
+          "Which error code indicates a missing backend path or unreachable port?",
+          "How is a gateway error status defined in the constraint?"
+        ],
+        "oracle_response": "The exact string '500' must be used for the http.status field when a downstream failure occurs."
+      },
+      {
+        "constraint_id": "C010",
+        "replacement": "the standard string for clean error events",
+        "exact_values_to_replace": [
+          "<event>"
+        ],
+        "trigger_keywords": [
+          "What is the value for the error_log when an exception occurs?",
+          "How should error events be represented in the output?",
+          "What is the neutral log placeholder for exceptions?"
+        ],
+        "oracle_response": "The exact string 'error' must be used for the error_log field when an explicit error or exception occurs."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C038",
+        "vague_phrase": "follow the same summary line format used for internal components",
+        "actual_meaning": "The output must use the 'component.java-something=number' format if multiple components are involved, rather than the 'spans' or 'distinct_traces' summary lines used for isolated internal traces."
+      },
+      {
+        "constraint_id": "C015",
+        "vague_phrase": "matches the correlation method used for river events",
+        "actual_meaning": "The parent field must be set to the HTTP method (e.g., 'GET') to link the server span to the client span, mirroring the correlation logic already established for river events in the codebase."
+      }
+    ]
+  }
+}

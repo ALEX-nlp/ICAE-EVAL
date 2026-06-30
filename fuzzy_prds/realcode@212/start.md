@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to get the wallet primitives library shipped. Users have been complaining that integrating with our blockchain SDK is way too painful — they keep running into silent failures when they try to move funds or build transactions, and nobody can tell if it's a bad address, a wrong key, or something in the transaction structure itself. We want a clean library that handles all the low-level stuff: reading and writing those human-readable address strings, recovering wallets from seed phrases, doing the key tree thing so you can get keys for any account slot, and packaging up transactions into the wire format the network expects.
+
+The encoding/decoding stuff should work like the login module we shipped last quarter — same idea where you accept sloppy casing on input but always emit clean lowercase hex. The transaction serializer is the big one; it needs to handle the case where you have a payment output AND a leftover change output going back to the sender, with the fees and expiry baked in.
+
+Also important: the whole thing needs to be split up properly — no giant single files, keep the address logic away from the key derivation away from the serialization. The JSON adapter layer should be totally separate from the real business logic. Error messages should never leak internal runtime garbage to callers. Ship it clean.

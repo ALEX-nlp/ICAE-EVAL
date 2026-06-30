@@ -1,0 +1,535 @@
+{
+  "fuzzy_prd": "Hey team, we need to get this auth gateway thing wrapped up. Basically it's a reverse proxy that sits in front of our internal apps and handles all the 'who are you and can you come in' stuff uniformly. Right now every team is rolling their own and it's a mess — some check email case-sensitively, some don't sign cookies at all, etc.\n\nThe core pieces are: (1) a way to decide if an email address is allowed in, based on domain rules or an explicit list — similar to how we handled the login module last time; (2) checking username/password against a static file using that hashing approach we standardized on; (3) packing session info into a cookie string that can survive a round-trip without leaking tokens; (4) the actual HTTP front door that challenges unauthenticated users and has a couple of fixed public endpoints; and (5) a config validator that catches ALL the problems at once instead of exploding on the first one.\n\nA few things I'm fuzzy on: how exactly the cookie encryption works when someone uses the wrong key to decode — does it blow up or gracefully degrade? Also not sure about the exact rules for when config validation considers the secret 'long enough' for certain features. And what happens with the sign-in page redirect when someone hits the sign-in path directly vs a protected path? Can someone clarify these before we hand this to the dev team?\n\nQuick follow-up after the questions that came in: for the email/domain allow logic, treat it as fully case-insensitive across the board. The configured domains, the allow-list entries, and the queried address all get folded to lower case before any comparison, both for matching the host part against domains and for exact allow-list membership checks. This is the same Feature 1 (Email/Domain Authorization) behavior in start.md. Also, if the configured domain set contains just '*', then every non-empty address is authorized no matter what the host part is and whether it appears in the allow-list or not. But an empty address is never authorized, even with '*'. And if both the domain set and the allow-list are empty, then nothing is authorized at all and every queried address comes back 'denied'. Those empty-address and empty-config outcomes are absolute.\n\nOn config validation, yes, we want ALL problems back in one shot, not fail-fast. The four required settings are at least one upstream target, a cookie-secret, a client-id, and a client-secret, and each missing one should show up as its own 'missing_setting' error with the setting name. Same idea for skip_auth_regex: every bad pattern gets its own 'invalid_regex' error, and everything is reported together. For upstreams, parse the URL into scheme, host, path, and if the path is missing normalize it to '/'. In the validated output, report each upstream as 'scheme|host|path'. If there’s an optional redirect URL, report that the same way as 'scheme|host|path'.\n\nAlso on the secret-length question: if token pass-through or cookie refresh is turned on, the cookie secret has to be one of the AES key sizes, so 16, 24, or 32 bytes. A random short secret is still fine for basic operation, so something like 'foobar' which is 6 bytes is acceptable unless one of those features is enabled. And cookie refresh has one more rule: the refresh interval must be strictly less than the expiry interval.\n\nFor the static credentials piece, each entry is 'username:{SHA}' followed immediately by the Base64 encoding of the SHA-1 digest of the password. A login only passes if the username exists in the store and the Base64-encoded SHA-1 digest of the supplied password exactly matches the stored digest. If the stored secret does not start with '{SHA}', it should never be accepted. That’s the same '{SHA}' prefix marker scheme called out in Feature 2 (Static Credential Verification), and the stored format is '{SHA}' followed by the Base64-encoded SHA-1 digest of the password.",
+  "oracle_data": {
+    "task_id": "bitly__oauth2_proxy__auth_gateway_core",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "wrong key decryption",
+          "different secret decode",
+          "mismatched key cookie",
+          "graceful degradation wrong key"
+        ],
+        "oracle_response": "When a session cookie is decoded with a different secret than was used to encode it, the system does NOT throw an error. The clear fields (identity address, derived username, expiry instant) are still recovered correctly because they are stored in the clear. However, the encrypted fields (access token, refresh token) do not recover to their original values — they should be treated as not-recovered (represented as '<not-recovered>' in output). The session object is still returned, just with unrecoverable token values."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "session cookie fields",
+          "serialized session structure",
+          "cookie field count",
+          "delimiter separated session"
+        ],
+        "oracle_response": "The encrypted session serialization produces exactly four delimiter-separated fields: (1) identity address stored in the clear, (2) expiry instant stored in the clear, (3) access token encrypted, (4) refresh token encrypted. The field count when deserialized must equal 4. The derived username is not a stored field — it is computed from the identity address by taking the local part before the at-sign."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "session without cipher",
+          "no encryption key session",
+          "identity only serialization",
+          "session encode no secret"
+        ],
+        "oracle_response": "When no cipher is available (no encryption key configured), only the session identity is persisted and the tokens are dropped entirely. The identity stored is the email address when one is present and non-empty; otherwise the bare username is used. When decoding, if the identity string contains an at-sign it is treated as an email address and the local part before the at-sign becomes the derived username; otherwise the identity string itself is the username and the email is empty."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "session expiry no timestamp",
+          "null expiry behavior",
+          "missing expiry field",
+          "session never expires"
+        ],
+        "oracle_response": "A session that carries no expiry instant at all (the expiry field is absent/null) is never considered expired — it has infinite lifetime. The output for such a session reports has_expiry=false and expired=false. A session with an expiry instant in the past reports has_expiry=true and expired=true; one with an expiry in the future reports has_expiry=true and expired=false."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "ciphertext must differ",
+          "encryption not identity",
+          "plaintext not stored",
+          "value encryption requirement"
+        ],
+        "oracle_response": "The encryption scheme must guarantee that the ciphertext is never identical to the plaintext — the value is never stored verbatim. After encrypting and then decrypting with the same key, the original value must be recovered exactly. The output must report ciphertext_differs=true, confirming the ciphertext differed from the plaintext."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "robots.txt endpoint",
+          "crawler exclusion",
+          "unauthenticated public endpoint",
+          "disallow all crawling response"
+        ],
+        "oracle_response": "A request to /robots.txt is served without any authentication check and returns HTTP 200. The response body must be exactly 'User-agent: *\\nDisallow: /\\n' — disallowing all crawlers from all paths. This endpoint bypasses the authentication gateway entirely."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "sign-in page redirect target",
+          "post sign-in redirect",
+          "challenge page embedded redirect",
+          "unauthenticated protected path response"
+        ],
+        "oracle_response": "When an unauthenticated visitor requests any protected path (not the sign-in path itself), the gateway returns HTTP 403 and renders a sign-in challenge page. The challenge page embeds the originally requested path as the post-sign-in redirect target. When the request directly targets the dedicated sign-in path (/oauth2/sign_in), the response status is HTTP 200 and the embedded redirect target collapses to '/' (site root) rather than '/oauth2/sign_in'."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid action field values",
+          "what values can action take",
+          "list all supported action values",
+          "what actions does the dispatcher handle",
+          "which action strings does the adapter support",
+          "what are the possible action inputs",
+          "tell me all the action names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'action' field. Valid values are: 'validate_email', 'check_credential', 'session_encrypted_roundtrip', 'session_identity', 'session_expiry', 'encrypt_roundtrip', 'http_request', 'validate_config'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature1_email_authorization",
+        "trigger_keywords": [
+          "test cases for feature1 email authorization",
+          "show me feature1 email authorization test cases",
+          "what are the feature1 email authorization test inputs",
+          "give me the feature1_email_authorization test file",
+          "test cases for feature 1",
+          "feature1 email authorization expected output",
+          "what does feature1 email authorization expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_email_authorization:\n{\n  \"description\": \"Decide whether a login identity is authorized, given a set of permitted address suffixes (domains) and an allow-list file of exact addresses. An address is authorized when its host part matches one of the configured domains, or when the whole address appears in the allow-list. When the configured domain set contains the wildcard everything is authorized. Matching is case-insensitive on both sides. An empty address is never authorized; when both the domain set and the allow-list are empty nothing is authorized. For each queried address the verdict is reported on its own line.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"validate_email\",\n        \"domains\": [\n          \"example.com\"\n        ],\n        \"allowlist\": [],\n        \"queries\": [\n          \"foo.bar@example.com\",\n          \"baz.quux@example.com\"\n        ]\n      },\n      \"expected_output\": \"foo.bar@example.com=allowed\\nbaz.quux@example.com=allowed\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"validate_email\",\n        \"domains\": [\n          \"example0.com\",\n          \"example1.com\"\n        ],\n        \"allowlist\": [\n          \"xyzzy@example.com\",\n          \"plugh@example.com\"\n        ],\n        \"queries\": [\n          \"foo.bar@example0.com\",\n          \"baz.quux@example1.com\",\n          \"xyzzy@example.com\",\n          \"plugh@example.com\",\n          \"xyzzy.plugh@example.com\"\n        ]\n      },\n      \"expected_output\": \"foo.bar@example0.com=allowed\\nbaz.quux@example1.com=allowed\\nxyzzy@example.com=allowed\\nplugh@example.com=allowed\\nxyzzy.plugh@example.com=denied\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_basic_credential",
+        "trigger_keywords": [
+          "test cases for feature2 basic credential",
+          "show me feature2 basic credential test cases",
+          "what are the feature2 basic credential test inputs",
+          "give me the feature2_basic_credential test file",
+          "test cases for feature 2",
+          "feature2 basic credential expected output",
+          "what does feature2 basic credential expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_basic_credential:\n{\n  \"description\": \"Verify a username/password pair against a credential store whose entries each pair a username with a salted hash marker followed by the Base64 of the SHA-1 digest of the password. A pair is accepted only when the username exists in the store and the SHA-1 digest of the supplied password, Base64-encoded, equals the stored digest. The checked username and the boolean verdict are reported.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"check_credential\",\n        \"entries\": [\n          \"testuser:{SHA}PaVBVZkYqAjCQCu6UBL2xgsnZhw=\"\n        ],\n        \"user\": \"testuser\",\n        \"password\": \"asdf\"\n      },\n      \"expected_output\": \"user=testuser\\nauthenticated=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_session_encrypted_roundtrip",
+        "trigger_keywords": [
+          "test cases for feature3 1 session encrypted roundtrip",
+          "show me feature3 1 session encrypted roundtrip test cases",
+          "what are the feature3 1 session encrypted roundtrip test inputs",
+          "give me the feature3_1_session_encrypted_roundtrip test file",
+          "test cases for feature 3",
+          "feature3 1 session encrypted roundtrip expected output",
+          "what does feature3 1 session encrypted roundtrip expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_session_encrypted_roundtrip:\n{\n  \"description\": \"Serialize a session (identity address, access token, refresh token, and an absolute expiry instant) into a single delimited string using a symmetric cipher keyed by a secret, then deserialize it back. The serialized form has four delimiter-separated fields; the access and refresh tokens are encrypted while the identity and expiry are stored in the clear. When the same secret is used to decode, every field round-trips exactly. When a different secret is used to decode, the clear fields (identity, derived user, expiry) still round-trip but the encrypted tokens do not recover to their originals. The reported output gives the field count, the recovered identity and user, the recovered expiry as an absolute number, and either the recovered token value or a not-recovered marker for each token.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"session_encrypted_roundtrip\",\n        \"secret\": \"0123456789abcdefghijklmnopqrstuv\",\n        \"email\": \"user@domain.com\",\n        \"access_token\": \"token1234\",\n        \"refresh_token\": \"refresh4321\",\n        \"expires_unix\": 4102444800\n      },\n      \"expected_output\": \"field_count=4\\nemail=user@domain.com\\nuser=user\\nexpires_unix=4102444800\\naccess_token=token1234\\nrefresh_token=refresh4321\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"session_encrypted_roundtrip\",\n        \"secret\": \"0123456789abcdefghijklmnopqrstuv\",\n        \"decode_secret\": \"0000000000abcdefghijklmnopqrstuv\",\n        \"email\": \"user@domain.com\",\n        \"access_token\": \"token1234\",\n        \"refresh_token\": \"refresh4321\",\n        \"expires_unix\": 4102444800\n      },\n      \"expected_output\": \"field_count=4\\nemail=user@domain.com\\nuser=user\\nexpires_unix=4102444800\\naccess_token=<not-recovered>\\nrefresh_token=<not-recovered>\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_2_session_identity",
+        "trigger_keywords": [
+          "test cases for feature3 2 session identity",
+          "show me feature3 2 session identity test cases",
+          "what are the feature3 2 session identity test inputs",
+          "give me the feature3_2_session_identity test file",
+          "test cases for feature 3",
+          "feature3 2 session identity expected output",
+          "what does feature3 2 session identity expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_2_session_identity:\n{\n  \"description\": \"Serialize a session WITHOUT a cipher. With no encryption key available, only the session identity is persisted: the address is preferred when present, otherwise the bare username is used. Deserializing the result yields the same identity, and when the identity is an email-style address the local part (before the at-sign) is also exposed as the username. The reported output shows the persisted identity string plus the recovered address and username.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"session_identity\",\n        \"email\": \"user@domain.com\",\n        \"user\": \"just-user\"\n      },\n      \"expected_output\": \"identity=user@domain.com\\nemail=user@domain.com\\nuser=user\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"session_identity\",\n        \"email\": \"\",\n        \"user\": \"just-user\"\n      },\n      \"expected_output\": \"identity=just-user\\nemail=\\nuser=just-user\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_3_session_expiry",
+        "trigger_keywords": [
+          "test cases for feature3 3 session expiry",
+          "show me feature3 3 session expiry test cases",
+          "what are the feature3 3 session expiry test inputs",
+          "give me the feature3_3_session_expiry test file",
+          "test cases for feature 3",
+          "feature3 3 session expiry expected output",
+          "what does feature3 3 session expiry expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_3_session_expiry:\n{\n  \"description\": \"Report whether a session is expired relative to the current moment, given its expiry instant. A session with an expiry instant in the past is expired; one with an expiry in the future is not. A session that carries no expiry instant at all is never considered expired. The output reports whether an expiry was set and the resulting expired verdict.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"session_expiry\",\n        \"expires_unix\": 1000000000\n      },\n      \"expected_output\": \"has_expiry=true\\nexpired=true\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"session_expiry\"\n      },\n      \"expected_output\": \"has_expiry=false\\nexpired=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_value_encryption",
+        "trigger_keywords": [
+          "test cases for feature4 value encryption",
+          "show me feature4 value encryption test cases",
+          "what are the feature4 value encryption test inputs",
+          "give me the feature4_value_encryption test file",
+          "test cases for feature 4",
+          "feature4 value encryption expected output",
+          "what does feature4 value encryption expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_value_encryption:\n{\n  \"description\": \"Encrypt an opaque string value with a symmetric cipher keyed by a secret, then decrypt it with the same secret. The decrypted result must equal the original value, and the ciphertext must differ from the plaintext (the value is not stored in the clear). The output reports the decrypted value and whether the ciphertext differed from the plaintext.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"encrypt_roundtrip\",\n        \"secret\": \"0123456789abcdefghijklmnopqrstuv\",\n        \"value\": \"my access token\"\n      },\n      \"expected_output\": \"decrypted=my access token\\nciphertext_differs=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_1_robots",
+        "trigger_keywords": [
+          "test cases for feature5 1 robots",
+          "show me feature5 1 robots test cases",
+          "what are the feature5 1 robots test inputs",
+          "give me the feature5_1_robots test file",
+          "test cases for feature 5",
+          "feature5 1 robots expected output",
+          "what does feature5 1 robots expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_1_robots:\n{\n  \"description\": \"A fixed unauthenticated endpoint serves a crawler-exclusion document without requiring any authentication. A request to the well-known robots path returns a success status and a body that disallows all crawling. The output reports the HTTP status code and the response body.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"http_request\",\n        \"path\": \"/robots.txt\",\n        \"extract\": \"body\"\n      },\n      \"expected_output\": \"status=200\\nbody=User-agent: *\\nDisallow: /\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_2_signin_challenge",
+        "trigger_keywords": [
+          "test cases for feature5 2 signin challenge",
+          "show me feature5 2 signin challenge test cases",
+          "what are the feature5 2 signin challenge test inputs",
+          "give me the feature5_2_signin_challenge test file",
+          "test cases for feature 5",
+          "feature5 2 signin challenge expected output",
+          "what does feature5 2 signin challenge expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_2_signin_challenge:\n{\n  \"description\": \"When an unauthenticated visitor reaches a protected resource, the gateway answers with a sign-in challenge page instead of proxying. For a request to an arbitrary protected path the response status is forbidden and the rendered challenge embeds, as its post-sign-in redirect target, the exact path that was originally requested. For a request that directly targets the dedicated sign-in path, the response status is success and the embedded redirect target collapses to the site root. The output reports the HTTP status code and the embedded redirect target extracted from the rendered page.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"http_request\",\n        \"path\": \"/some/random/endpoint\",\n        \"extract\": \"redirect\"\n      },\n      \"expected_output\": \"status=403\\nredirect=/some/random/endpoint\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"http_request\",\n        \"path\": \"/oauth2/sign_in\",\n        \"extract\": \"redirect\"\n      },\n      \"expected_output\": \"status=200\\nredirect=/\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_config_validation",
+        "trigger_keywords": [
+          "test cases for feature6 config validation",
+          "show me feature6 config validation test cases",
+          "what are the feature6 config validation test inputs",
+          "give me the feature6_config_validation test file",
+          "test cases for feature 6",
+          "feature6 config validation expected output",
+          "what does feature6 config validation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_config_validation:\n{\n  \"description\": \"Validate a gateway configuration and report the outcome. Validation aggregates every problem found rather than stopping at the first. Required settings (at least one upstream target, a cookie secret, a client id, and a client secret) must be present. Upstream targets are parsed into structured URLs and a missing path is normalized to the root path. An optional redirect URL is parsed into a structured URL. Optional skip-authentication patterns are compiled as regular expressions; an invalid pattern is a validation error. When token pass-through or cookie refresh is enabled the cookie secret length must be one of the accepted cipher key sizes. The cookie refresh interval must be strictly less than the cookie expiry interval. If group restriction is requested, the administrator address and the service-account credentials file must be present and the file must exist. On success the output reports valid plus the parsed redirect, upstreams, and compiled patterns; on failure it reports invalid plus one neutral error category per problem.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"validate_config\",\n        \"config\": {\n          \"email_domains\": [\n            \"*\"\n          ]\n        }\n      },\n      \"expected_output\": \"valid=false\\nerror=missing_setting setting=upstream\\nerror=missing_setting setting=cookie-secret\\nerror=missing_setting setting=client-id\\nerror=missing_setting setting=client-secret\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"validate_config\",\n        \"config\": {\n          \"upstreams\": [\n            \"http://127.0.0.1:8080/\"\n          ],\n          \"cookie_secret\": \"foobar\",\n          \"client_id\": \"bazquux\",\n          \"client_secret\": \"xyzzyplugh\",\n          \"email_domains\": [\n            \"*\"\n          ],\n          \"redirect_url\": \"https://myhost.com/oauth2/callback\"\n        }\n      },\n      \"expected_output\": \"valid=true\\nredirect=https|myhost.com|/oauth2/callback\\nupstream=http|127.0.0.1:8080|/\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"validate_config\",\n        \"config\": {\n          \"upstreams\": [\n            \"http://127.0.0.1:8080/\"\n          ],\n          \"cookie_secret\": \"foobar\",\n          \"client_id\": \"bazquux\",\n          \"client_secret\": \"xyzzyplugh\",\n          \"email_domains\": [\n            \"*\"\n          ],\n          \"skip_auth_regex\": [\n            \"(foobaz\",\n            \"barquux)\"\n          ]\n        }\n      },\n      \"expected_output\": \"valid=false\\nerror=invalid_regex\\nerror=invalid_regex\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "how exactly the cookie encryption works when someone uses the wrong key to decode",
+        "actual_meaning": "Refers to the graceful degradation behavior in Feature 3.1 (Session Encrypted Roundtrip): clear fields (identity, expiry) are still recovered but encrypted token fields return '<not-recovered>', as tested in feature3_1_session_encrypted_roundtrip.json second test case."
+      },
+      {
+        "vague_reference": "exact rules for when config validation considers the secret long enough for certain features",
+        "actual_meaning": "Refers to Feature 6 config validation constraint: when token pass-through or cookie refresh is enabled, cookie_secret length must be one of the AES key sizes (16, 24, or 32 bytes), documented in feature6_config_validation.json and start.md Feature 6 description."
+      }
+    ],
+    "fallback_response": "I don't have more specific details on that aspect — you'll need to check the existing codebase or the test cases in rcb_tests/public_test_cases/ for the exact expected behavior. The test JSON files are the source of truth for input/output contracts."
+  },
+  "public_test_cases": {
+    "feature1_email_authorization.json": {
+      "description": "Decide whether a login identity is authorized, given a set of permitted address suffixes (domains) and an allow-list file of exact addresses. An address is authorized when its host part matches one of the configured domains, or when the whole address appears in the allow-list. When the configured domain set contains the wildcard everything is authorized. Matching is case-insensitive on both sides. An empty address is never authorized; when both the domain set and the allow-list are empty nothing is authorized. For each queried address the verdict is reported on its own line.",
+      "cases": [
+        {
+          "input": {
+            "action": "validate_email",
+            "domains": [
+              "example.com"
+            ],
+            "allowlist": [],
+            "queries": [
+              "foo.bar@example.com",
+              "baz.quux@example.com"
+            ]
+          },
+          "expected_output": "foo.bar@example.com=allowed\nbaz.quux@example.com=allowed\n"
+        },
+        {
+          "input": {
+            "action": "validate_email",
+            "domains": [
+              "example0.com",
+              "example1.com"
+            ],
+            "allowlist": [
+              "xyzzy@example.com",
+              "plugh@example.com"
+            ],
+            "queries": [
+              "foo.bar@example0.com",
+              "baz.quux@example1.com",
+              "xyzzy@example.com",
+              "plugh@example.com",
+              "xyzzy.plugh@example.com"
+            ]
+          },
+          "expected_output": "foo.bar@example0.com=allowed\nbaz.quux@example1.com=allowed\nxyzzy@example.com=allowed\nplugh@example.com=allowed\nxyzzy.plugh@example.com=denied\n"
+        }
+      ]
+    },
+    "feature2_basic_credential.json": {
+      "description": "Verify a username/password pair against a credential store whose entries each pair a username with a salted hash marker followed by the Base64 of the SHA-1 digest of the password. A pair is accepted only when the username exists in the store and the SHA-1 digest of the supplied password, Base64-encoded, equals the stored digest. The checked username and the boolean verdict are reported.",
+      "cases": [
+        {
+          "input": {
+            "action": "check_credential",
+            "entries": [
+              "testuser:{SHA}PaVBVZkYqAjCQCu6UBL2xgsnZhw="
+            ],
+            "user": "testuser",
+            "password": "asdf"
+          },
+          "expected_output": "user=testuser\nauthenticated=true\n"
+        }
+      ]
+    },
+    "feature3_1_session_encrypted_roundtrip.json": {
+      "description": "Serialize a session (identity address, access token, refresh token, and an absolute expiry instant) into a single delimited string using a symmetric cipher keyed by a secret, then deserialize it back. The serialized form has four delimiter-separated fields; the access and refresh tokens are encrypted while the identity and expiry are stored in the clear. When the same secret is used to decode, every field round-trips exactly. When a different secret is used to decode, the clear fields (identity, derived user, expiry) still round-trip but the encrypted tokens do not recover to their originals. The reported output gives the field count, the recovered identity and user, the recovered expiry as an absolute number, and either the recovered token value or a not-recovered marker for each token.",
+      "cases": [
+        {
+          "input": {
+            "action": "session_encrypted_roundtrip",
+            "secret": "0123456789abcdefghijklmnopqrstuv",
+            "email": "user@domain.com",
+            "access_token": "token1234",
+            "refresh_token": "refresh4321",
+            "expires_unix": 4102444800
+          },
+          "expected_output": "field_count=4\nemail=user@domain.com\nuser=user\nexpires_unix=4102444800\naccess_token=token1234\nrefresh_token=refresh4321\n"
+        },
+        {
+          "input": {
+            "action": "session_encrypted_roundtrip",
+            "secret": "0123456789abcdefghijklmnopqrstuv",
+            "decode_secret": "0000000000abcdefghijklmnopqrstuv",
+            "email": "user@domain.com",
+            "access_token": "token1234",
+            "refresh_token": "refresh4321",
+            "expires_unix": 4102444800
+          },
+          "expected_output": "field_count=4\nemail=user@domain.com\nuser=user\nexpires_unix=4102444800\naccess_token=<not-recovered>\nrefresh_token=<not-recovered>\n"
+        }
+      ]
+    },
+    "feature3_2_session_identity.json": {
+      "description": "Serialize a session WITHOUT a cipher. With no encryption key available, only the session identity is persisted: the address is preferred when present, otherwise the bare username is used. Deserializing the result yields the same identity, and when the identity is an email-style address the local part (before the at-sign) is also exposed as the username. The reported output shows the persisted identity string plus the recovered address and username.",
+      "cases": [
+        {
+          "input": {
+            "action": "session_identity",
+            "email": "user@domain.com",
+            "user": "just-user"
+          },
+          "expected_output": "identity=user@domain.com\nemail=user@domain.com\nuser=user\n"
+        },
+        {
+          "input": {
+            "action": "session_identity",
+            "email": "",
+            "user": "just-user"
+          },
+          "expected_output": "identity=just-user\nemail=\nuser=just-user\n"
+        }
+      ]
+    },
+    "feature3_3_session_expiry.json": {
+      "description": "Report whether a session is expired relative to the current moment, given its expiry instant. A session with an expiry instant in the past is expired; one with an expiry in the future is not. A session that carries no expiry instant at all is never considered expired. The output reports whether an expiry was set and the resulting expired verdict.",
+      "cases": [
+        {
+          "input": {
+            "action": "session_expiry",
+            "expires_unix": 1000000000
+          },
+          "expected_output": "has_expiry=true\nexpired=true\n"
+        },
+        {
+          "input": {
+            "action": "session_expiry"
+          },
+          "expected_output": "has_expiry=false\nexpired=false\n"
+        }
+      ]
+    },
+    "feature4_value_encryption.json": {
+      "description": "Encrypt an opaque string value with a symmetric cipher keyed by a secret, then decrypt it with the same secret. The decrypted result must equal the original value, and the ciphertext must differ from the plaintext (the value is not stored in the clear). The output reports the decrypted value and whether the ciphertext differed from the plaintext.",
+      "cases": [
+        {
+          "input": {
+            "action": "encrypt_roundtrip",
+            "secret": "0123456789abcdefghijklmnopqrstuv",
+            "value": "my access token"
+          },
+          "expected_output": "decrypted=my access token\nciphertext_differs=true\n"
+        }
+      ]
+    },
+    "feature5_1_robots.json": {
+      "description": "A fixed unauthenticated endpoint serves a crawler-exclusion document without requiring any authentication. A request to the well-known robots path returns a success status and a body that disallows all crawling. The output reports the HTTP status code and the response body.",
+      "cases": [
+        {
+          "input": {
+            "action": "http_request",
+            "path": "/robots.txt",
+            "extract": "body"
+          },
+          "expected_output": "status=200\nbody=User-agent: *\nDisallow: /\n"
+        }
+      ]
+    },
+    "feature5_2_signin_challenge.json": {
+      "description": "When an unauthenticated visitor reaches a protected resource, the gateway answers with a sign-in challenge page instead of proxying. For a request to an arbitrary protected path the response status is forbidden and the rendered challenge embeds, as its post-sign-in redirect target, the exact path that was originally requested. For a request that directly targets the dedicated sign-in path, the response status is success and the embedded redirect target collapses to the site root. The output reports the HTTP status code and the embedded redirect target extracted from the rendered page.",
+      "cases": [
+        {
+          "input": {
+            "action": "http_request",
+            "path": "/some/random/endpoint",
+            "extract": "redirect"
+          },
+          "expected_output": "status=403\nredirect=/some/random/endpoint\n"
+        },
+        {
+          "input": {
+            "action": "http_request",
+            "path": "/oauth2/sign_in",
+            "extract": "redirect"
+          },
+          "expected_output": "status=200\nredirect=/\n"
+        }
+      ]
+    },
+    "feature6_config_validation.json": {
+      "description": "Validate a gateway configuration and report the outcome. Validation aggregates every problem found rather than stopping at the first. Required settings (at least one upstream target, a cookie secret, a client id, and a client secret) must be present. Upstream targets are parsed into structured URLs and a missing path is normalized to the root path. An optional redirect URL is parsed into a structured URL. Optional skip-authentication patterns are compiled as regular expressions; an invalid pattern is a validation error. When token pass-through or cookie refresh is enabled the cookie secret length must be one of the accepted cipher key sizes. The cookie refresh interval must be strictly less than the cookie expiry interval. If group restriction is requested, the administrator address and the service-account credentials file must be present and the file must exist. On success the output reports valid plus the parsed redirect, upstreams, and compiled patterns; on failure it reports invalid plus one neutral error category per problem.",
+      "cases": [
+        {
+          "input": {
+            "action": "validate_config",
+            "config": {
+              "email_domains": [
+                "*"
+              ]
+            }
+          },
+          "expected_output": "valid=false\nerror=missing_setting setting=upstream\nerror=missing_setting setting=cookie-secret\nerror=missing_setting setting=client-id\nerror=missing_setting setting=client-secret\n"
+        },
+        {
+          "input": {
+            "action": "validate_config",
+            "config": {
+              "upstreams": [
+                "http://127.0.0.1:8080/"
+              ],
+              "cookie_secret": "foobar",
+              "client_id": "bazquux",
+              "client_secret": "xyzzyplugh",
+              "email_domains": [
+                "*"
+              ],
+              "redirect_url": "https://myhost.com/oauth2/callback"
+            }
+          },
+          "expected_output": "valid=true\nredirect=https|myhost.com|/oauth2/callback\nupstream=http|127.0.0.1:8080|/\n"
+        },
+        {
+          "input": {
+            "action": "validate_config",
+            "config": {
+              "upstreams": [
+                "http://127.0.0.1:8080/"
+              ],
+              "cookie_secret": "foobar",
+              "client_id": "bazquux",
+              "client_secret": "xyzzyplugh",
+              "email_domains": [
+                "*"
+              ],
+              "skip_auth_regex": [
+                "(foobaz",
+                "barquux)"
+              ]
+            }
+          },
+          "expected_output": "valid=false\nerror=invalid_regex\nerror=invalid_regex\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C014",
+      "C003"
+    ],
+    "kept_c": [
+      "C004",
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

@@ -1,0 +1,782 @@
+{
+  "fuzzy_prd": "# HTTP Message & Middleware Composition Toolkit - A Library for Modeling Web Requests, Responses, Routing and Composable Handlers\n\n## Project Goal\n\nBuild a library that models HTTP requests and responses as immutable, inspectable message objects and lets developers compose request handling out of small, reusable pieces (handlers, middleware, cascades) without re-implementing header parsing, body buffering, content negotiation, routing arithmetic, or transfer-coding by hand. The library exposes a uniform message abstraction (shared by both requests and responses) plus composition primitives so that an application's request/response flow can be assembled declaratively and reasoned about as data.\n\n---\n\n## Background & Problem\n\nWithout such a library, developers writing web servers must repeatedly hand-roll the same low-level machinery: normalizing case-insensitive headers, reconciling single-valued and multi-valued header views, computing a body's content length from its bytes vs. its headers, decoding a body using the right character set, splitting a requested URI into \"the part this handler owns\" vs. \"the part still to be routed\", and wiring cross-cutting concerns (logging, error handling, redirects) around a core handler. This leads to repetitive, error-prone boilerplate, inconsistent edge-case handling, and tangled control flow that is hard to test.\n\nWith this library, a message is an immutable value object you can construct, inspect, and copy-with-changes; a handler is just a function from a request to a response; and middleware, cascades, and transfer-coding wrappers are composable adapters that turn handlers into bigger handlers. Application code declares *what* should happen at each layer and the library guarantees consistent, well-specified behavior for headers, bodies, routing, status semantics, and streaming.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility domain (message model, header normalization, body buffering/encoding, request routing math, response semantics, and handler composition). It MUST NOT be a single \"god file\". Output a clear, multi-file directory tree that separates the message/body model, the request and response types, and the composition primitives (cascade, pipeline/middleware, transfer-coding wrapper). Do not over-engineer, but reflect a production-grade repository structure.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below define a **black-box testing contract** for an execution adapter, NOT the internal data model of the core system. The core library must remain completely decoupled from stdin/stdout and JSON parsing. A thin execution adapter is solely responsible for translating each JSON command into idiomatic calls on the core types and rendering the observable result.\n\n3. **Adherence to SOLID Design Principles:** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units. The core composition engine must be open for extension (new handlers/middleware) but closed for modification. A request and a response must both be substitutable wherever the shared message abstraction is expected. Keep interfaces small and cohesive; high-level composition must depend on the handler abstraction, not on any I/O implementation.\n\n4. **Robustness & Interface Design:** The public interface must be elegant and idiomatic to the target language, hiding internal complexity. The system must handle edge cases gracefully and model errors properly: invalid arguments, illegal state (such as reading a body twice), and malformed input must surface as distinct, well-typed error conditions rather than generic faults.\n\n---\n\n## I/O Contract for the Execution Adapter\n\nThe execution adapter reads exactly **one JSON object** from stdin describing an `action` plus its parameters, performs the corresponding operation against the core library, and writes a deterministic, line-oriented report to stdout. Conventions used throughout:\n\n- Output is a sequence of `key=value` lines, each terminated by `\\n`. Where a feature emits a map view, keys are emitted in ascending sorted order.\n- A header map in the input is an object whose values are either a string (single value) or an array of strings (multiple values). Header names are case-insensitive.\n- A body spec in the input is one of: `null` (no body); a string; an array of integers (raw bytes); `{\"type\":\"bytes\",\"value\":[...]}`; `{\"type\":\"string\",\"value\":\"...\"}`; `{\"type\":\"stream\",\"chunks\":[[...],...]}` (a stream of byte chunks, length unknown); or `{\"type\":\"empty_stream\"}` (an empty stream, length unknown).\n- An `encoding` field names a character set (`utf8`, `latin1`/`iso-8859-1`, `ascii`).\n- **Errors are normalized to a language-neutral contract.** An invalid argument emits `error=invalid_argument` plus, when available, a `field=<argument name>` line and a `message=<domain message>` line. An illegal-state condition emits `error=invalid_state` with a `message=` line. A malformed value emits `error=format`. Any other failure emits `error=failure`. No host-language exception class names or runtime-specific text appear in stdout.\n\n---\n\n## Core Features\n\n### Feature 1: Header Model — Single vs. Multi-Valued Views\n\n**As a developer**, I want to construct a message from a header map and inspect both a single-valued and a multi-valued view of its headers, so I can read headers conveniently regardless of how many values a name carries.\n\n**Expected Behavior / Usage:**\n\nA message is built from a header map whose values are each a string or a list of strings. The single-valued view maps every header name to its values joined by `,`; the multi-valued view maps every name to the list of its values. Header names are case-insensitive. A message constructed with no body and no explicit headers still reports a `content-length` of `0`. The output emits the single-valued view (`headers[name]=joined`) followed by the multi-valued view (`headersAll[name]=[json array]`), each with names in sorted order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_header_model.json`\n\n```json\n{\n  \"description\": \"Construct an HTTP message from a header map whose values may be a single string or a list of strings, then inspect both header views. The single-valued view maps each name to its values joined by commas; the multi-valued view preserves the list per name. Header names are case-insensitive. A message built with no body and no explicit headers carries a default content-length of 0.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"msg_headers\",\n        \"headers\": {\n          \"a\": \"A\",\n          \"b\": [\n            \"B1\",\n            \"B2\"\n          ]\n        }\n      },\n      \"expected_output\": \"headers[a]=A\\nheaders[b]=B1,B2\\nheaders[content-length]=0\\nheadersAll[a]=[\\\"A\\\"]\\nheadersAll[b]=[\\\"B1\\\",\\\"B2\\\"]\\nheadersAll[content-length]=[\\\"0\\\"]\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 2: Content Length Determination\n\n**As a developer**, I want the content length of a message to be derived consistently from its body and headers, so I can rely on a single rule for known vs. unknown body sizes.\n\n**Expected Behavior / Usage:**\n\nA string or byte body yields the byte length of the encoded body, and this computed length always takes precedence over any `content-length` header. A body whose size cannot be determined ahead of time (a stream) yields no length unless a `content-length` header supplies one. A non-identity `transfer-encoding` suppresses any computed length (yielding none), whereas an `identity` transfer-encoding does not. The output is a single line `contentLength=<n>` or `contentLength=null`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_content_length.json`\n\n```json\n{\n  \"description\": \"Determine the content length of a message from its body and headers. A string or byte body yields the byte length of the encoded body and always takes precedence over any content-length header. A body whose length cannot be determined (a stream) yields no length unless a content-length header supplies one. A non-identity transfer-encoding suppresses the computed length; an identity transfer-encoding does not.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"msg_content_length\",\n        \"body\": [\n          1,\n          2,\n          3\n        ]\n      },\n      \"expected_output\": \"contentLength=3\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"msg_content_length\",\n        \"body\": {\n          \"type\": \"empty_stream\"\n        }\n      },\n      \"expected_output\": \"contentLength=null\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 3: Content Negotiation — MIME Type & Encoding\n\n**As a developer**, I want to read a message's MIME type and character encoding from its content-type header, and have an explicit body encoding rewrite that header, so I can negotiate content consistently.\n\n**Expected Behavior / Usage:**\n\nThe MIME type is the bare media type with no parameters. The encoding is taken from the `charset` parameter and is absent when there is no charset or the charset is unknown. When an explicit body encoding is supplied, the content-type's charset is set to match it; if no content-type header was present, the media type defaults to `application/octet-stream`. The output emits `mimeType=...`, `encoding=...` (the charset name, or `null`), then the single-valued header view in sorted order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_content_negotiation.json`\n\n```json\n{\n  \"description\": \"Derive the MIME type and character encoding of a message from its content-type header, and observe how supplying an explicit body encoding rewrites that header. The MIME type is the bare media type without parameters. The encoding comes from the charset parameter and is absent when there is no charset or the charset is unknown. When an explicit encoding is given, the charset of the content-type is set accordingly, defaulting the media type to application/octet-stream when no content-type was present.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"msg_content_type\",\n        \"headers\": {\n          \"content-type\": \"text/plain; charset=iso-8859-1\"\n        }\n      },\n      \"expected_output\": \"mimeType=text/plain\\nencoding=iso-8859-1\\nheaders[content-length]=0\\nheaders[content-type]=text/plain; charset=iso-8859-1\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"msg_content_type\",\n        \"body\": \"è\",\n        \"encoding\": \"latin1\"\n      },\n      \"expected_output\": \"mimeType=application/octet-stream\\nencoding=iso-8859-1\\nheaders[content-length]=1\\nheaders[content-type]=application/octet-stream; charset=iso-8859-1\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 4: Body Reading — Text, Bytes, and Read-Once\n\n**As a developer**, I want to read a message body once, either as decoded text or as raw bytes, so I can consume the payload while being protected against accidental double reads.\n\n**Expected Behavior / Usage:**\n\nReading as text decodes the bytes using, in order of precedence, an explicit encoding argument, then the content-type charset, then UTF-8. Reading as raw bytes returns the body unchanged. A string body is encoded to bytes using the message's encoding. The body may be read only once; a second read fails with a neutral illegal-state error. For text mode the output is `body=<text>`; the read-once case emits `first=read` then the normalized error lines `error=invalid_state` and `message=<domain message>`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_body_read.json`\n\n```json\n{\n  \"description\": \"Read the body of a message. Reading as text decodes the bytes using, in order of precedence, an explicit encoding argument, the content-type charset, then UTF-8. Reading as raw bytes returns the body unchanged. A string body is encoded to bytes using the message encoding. The body may be read only once; a second read fails with a neutral state error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"msg_read\",\n        \"mode\": \"string\",\n        \"body\": {\n          \"type\": \"bytes\",\n          \"value\": [\n            195,\n            168\n          ]\n        }\n      },\n      \"expected_output\": \"body=è\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"msg_read\",\n        \"mode\": \"twice\"\n      },\n      \"expected_output\": \"first=read\\nerror=invalid_state\\nmessage=The 'read' method can only be called once on a shelf.Request/shelf.Response object.\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 5: Copy-With-Changes (Headers, Context, Body)\n\n**As a developer**, I want to derive a modified copy of a message by applying targeted header/context changes and an optional new body, so I can transform messages immutably as they flow through layers.\n\n**Expected Behavior / Usage:**\n\nA change set maps names to new values. An entry set to `null` removes that name; an entry set to an empty list removes it; an entry set to a string or list replaces it; a name not present in the original is added. Passing an empty change set returns a copy that shares the same underlying header and context instances as the original (observable via identity flags). The body may also be replaced. The output emits the copy's single- and multi-valued header views and context (sorted), then `headersSame=<bool>` and `contextSame=<bool>` reporting whether the copy reused the originals' instances.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_message_change.json`\n\n```json\n{\n  \"description\": \"Create a copy of a message applying targeted changes. A header or context entry set to null is removed; set to an empty list is removed; set to a string or list replaces the value. New entries are added. Passing an empty change set returns the same underlying header and context instances. The body can be replaced with a new value.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"change\",\n        \"kind\": \"request\",\n        \"base\": {\n          \"headers\": {\n            \"header1\": \"header value 1\"\n          }\n        },\n        \"change\": {\n          \"headers\": {\n            \"header1\": null\n          },\n          \"context\": {\n            \"context1\": null\n          }\n        }\n      },\n      \"expected_output\": \"headers[content-length]=0\\nheadersAll[content-length]=[\\\"0\\\"]\\nheadersSame=false\\ncontextSame=true\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"change\",\n        \"kind\": \"request\",\n        \"base\": {\n          \"headers\": {\n            \"header1\": \"header value 1\"\n          }\n        },\n        \"change\": {\n          \"headers\": {\n            \"header1\": \"new header value\"\n          }\n        }\n      },\n      \"expected_output\": \"headers[content-length]=0\\nheaders[header1]=new header value\\nheadersAll[content-length]=[\\\"0\\\"]\\nheadersAll[header1]=[\\\"new header value\\\"]\\nheadersSame=false\\ncontextSame=true\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 6: Request Routing Fields (url / handlerPath)\n\n**As a developer**, I want a request to expose the path relative to the current handler and the root-relative path to that handler, so I can mount handlers at sub-paths and route correctly.\n\n**Expected Behavior / Usage:**\n\nA request is built from a method and an absolute requested URI. `url` is the resource path relative to the current handler (plus the original query string); `handlerPath` is the root-relative path leading to the current handler. The two can be inferred from one another, with a trailing slash appended to a non-empty handler path. Changing the path moves a leading segment from `url` into `handlerPath`. The protocol version defaults to `1.1`. A requested URI that is not absolute, and other malformed combinations, are reported via the neutral error contract (`error=invalid_argument`, `field=...`, `message=...`). The successful output emits `method=`, `protocolVersion=`, `url=`, `handlerPath=`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_request_routing.json`\n\n```json\n{\n  \"description\": \"Construct an HTTP request from a method and an absolute requested URI, and observe the routing fields. The url is the resource path relative to the current handler (plus the original query); handlerPath is the root-relative path to the current handler. They can be inferred from one another, with a trailing slash added to a non-empty handler path. Changing the path moves a leading segment from url into handlerPath. Invalid combinations and malformed arguments are reported as neutral errors. The protocol version defaults to 1.1.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"request\",\n        \"uri\": \"http://localhost/foo/bar?q=1\"\n      },\n      \"expected_output\": \"method=GET\\nprotocolVersion=1.1\\nurl=foo/bar?q=1\\nhandlerPath=/\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"request\",\n        \"uri\": \"/path\"\n      },\n      \"expected_output\": \"error=invalid_argument\\nfield=requestedUri\\nmessage=must be an absolute URL.\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 7: Response Semantics & Factories\n\n**As a developer**, I want semantic response constructors for success, arbitrary status, redirects, errors, and not-modified, so I can produce correct status codes, default bodies, and key headers without manual bookkeeping.\n\n**Expected Behavior / Usage:**\n\nSuccess and arbitrary-status responses carry the supplied body. Redirect responses set a `location` header and the matching 3xx status. Error responses default their body text and set a `text/plain` content-type when no body is supplied, while preserving any existing content-type parameters. A not-modified response uses status `304`, carries a date header, and has an empty body. A status code below `100` is rejected via the neutral error contract. The successful output emits `status=`, `contentType=` (or `null`), `location=` (or `null`), `hasDate=<bool>`, and `body=`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_responses.json`\n\n```json\n{\n  \"description\": \"Construct responses using their semantic factories and observe the resulting status code, body and key headers. Success and arbitrary-status responses carry the supplied body. Redirect responses set a location header and the corresponding 3xx status. Error responses default their body and set a text/plain content-type when no body is supplied, preserving any existing content-type parameters. A not-modified response uses status 304, carries a date header and an empty body. A status code below 100 is rejected as a neutral error.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"response\",\n        \"kind\": \"internalServerError\"\n      },\n      \"expected_output\": \"status=500\\ncontentType=text/plain\\nlocation=null\\nhasDate=false\\nbody=Internal Server Error\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"response\",\n        \"kind\": \"found\",\n        \"location\": \"/foo\"\n      },\n      \"expected_output\": \"status=302\\ncontentType=null\\nlocation=/foo\\nhasDate=false\\nbody=\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 8: Conditional Date Headers\n\n**As a developer**, I want conditional date headers parsed into timestamps, so I can implement caching/conditional logic without manual date parsing.\n\n**Expected Behavior / Usage:**\n\nA request exposes its `if-modified-since` header as a parsed UTC timestamp. A response exposes its `expires` and `last-modified` headers likewise. When the corresponding header is absent the value is `null`. Timestamps are rendered in ISO-8601 UTC form. The request case emits `ifModifiedSince=...`; the response case emits `expires=...` and `lastModified=...`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_date_headers.json`\n\n```json\n{\n  \"description\": \"Parse conditional date headers into timestamps. A request exposes its if-modified-since header as a parsed UTC timestamp; a response exposes its expires and last-modified headers likewise. When the corresponding header is absent the value is null.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"dates\",\n        \"kind\": \"request\",\n        \"headers\": {\n          \"if-modified-since\": \"Sun, 06 Nov 1994 08:49:37 GMT\"\n        }\n      },\n      \"expected_output\": \"ifModifiedSince=1994-11-06T08:49:37.000Z\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"dates\",\n        \"kind\": \"response\",\n        \"headers\": {\n          \"expires\": \"Sun, 06 Nov 1994 08:49:37 GMT\"\n        }\n      },\n      \"expected_output\": \"expires=1994-11-06T08:49:37.000Z\\nlastModified=null\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 9: Cascade — First Acceptable Response\n\n**As a developer**, I want to compose several handlers into a cascade that returns the first acceptable response, so I can try fallbacks in order.\n\n**Expected Behavior / Usage:**\n\nHandlers are tried in registration order. By default a response is unacceptable (causing the cascade to try the next handler) when its status is `404` or `405`; any other status is returned immediately. If every handler is unacceptable, the final handler's response is returned. The set of cascading statuses can be replaced either by an explicit list of status codes or by a predicate over the status code. An empty cascade, and supplying both a status list and a predicate at once, are reported via the neutral error contract. The output emits `status=` and `body=` of the chosen response.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_cascade.json`\n\n```json\n{\n  \"description\": \"Compose several handlers into a cascade that returns the first acceptable response. By default a response is unacceptable (causing the cascade to try the next handler) when its status is 404 or 405; otherwise it is returned immediately. If all handlers are unacceptable the final response is returned. The set of cascading statuses can be replaced by an explicit list or by a predicate over the status code. An empty cascade and the simultaneous use of both a status list and a predicate are reported as neutral errors.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"cascade\",\n        \"handlers\": [\n          {\n            \"type\": \"toggle\",\n            \"header\": \"one\",\n            \"body\": \"handler 1\"\n          },\n          {\n            \"type\": \"toggle\",\n            \"header\": \"two\",\n            \"body\": \"handler 2\"\n          },\n          {\n            \"type\": \"toggle\",\n            \"header\": \"three\",\n            \"body\": \"handler 3\"\n          }\n        ],\n        \"requestHeaders\": {\n          \"one\": \"false\"\n        }\n      },\n      \"expected_output\": \"status=200\\nbody=handler 2\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"cascade\",\n        \"statusCodes\": [\n          302,\n          403\n        ],\n        \"handlers\": [\n          {\n            \"type\": \"found\",\n            \"location\": \"/\"\n          },\n          {\n            \"type\": \"forbidden\",\n            \"body\": \"handler 2\"\n          },\n          {\n            \"type\": \"notfound\",\n            \"body\": \"handler 3\"\n          },\n          {\n            \"type\": \"ok\",\n            \"body\": \"handler 4\"\n          }\n        ]\n      },\n      \"expected_output\": \"status=404\\nbody=handler 3\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 10: Pipeline & Middleware Composition\n\n**As a developer**, I want to wrap an inner handler with a pipeline of middleware that can inspect/short-circuit requests, transform responses, and handle errors, so I can layer cross-cutting concerns cleanly.\n\n**Expected Behavior / Usage:**\n\nEach middleware may run a request phase before the inner handler and a response phase after it. Request phases run outermost-first; response phases run innermost-first. A middleware's request phase may short-circuit by returning a response, in which case the inner handler and all response phases are skipped. A response phase may replace the response. If the inner handler throws, the error is offered to a middleware error phase, which may produce a replacement response or rethrow; errors thrown from request or response phases bypass the error phase. A hijack signal always propagates untouched. The output traces phase execution (e.g. `request:A`, `handler`, `response:A`) followed by `status=`, optional surfaced headers, and `body=`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_pipeline_middleware.json`\n\n```json\n{\n  \"description\": \"Compose middleware around an inner handler with a pipeline. Each middleware may inspect the request before the inner handler runs and the response afterwards; request processing runs outermost-first and response processing runs innermost-first. A middleware request phase may short-circuit by returning a response, in which case the inner handler and response phase are skipped. A response phase may replace the response. An error thrown by the inner handler is offered to a middleware error phase, which may produce a replacement response or rethrow; errors from the request or response phases bypass the error phase. A hijack signal always propagates untouched.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"pipeline\",\n        \"middlewares\": [\n          {\n            \"name\": \"A\",\n            \"request\": \"pass\",\n            \"response\": \"pass\"\n          },\n          {\n            \"name\": \"B\",\n            \"request\": \"pass\",\n            \"response\": \"pass\"\n          }\n        ],\n        \"handler\": {\n          \"type\": \"trace\",\n          \"body\": \"ok\"\n        }\n      },\n      \"expected_output\": \"request:A\\nrequest:B\\nhandler\\nresponse:B\\nresponse:A\\nstatus=200\\nbody=ok\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"pipeline\",\n        \"middlewares\": [\n          {\n            \"name\": \"A\",\n            \"request\": {\n              \"respond\": {\n                \"status\": 200,\n                \"headers\": {\n                  \"from\": \"middleware\"\n                },\n                \"body\": \"middleware content\"\n              }\n            },\n            \"response\": \"pass\"\n          }\n        ],\n        \"handler\": {\n          \"type\": \"fail\"\n        }\n      },\n      \"expected_output\": \"request:A\\nstatus=200\\nfrom=middleware\\nbody=middleware content\\n\"\n    }\n  ]\n}\n```\n\n---\n\n### Feature 11: Chunked Transfer Coding\n\n**As a developer**, I want middleware that applies chunked transfer coding to streamed responses only when appropriate, so streaming bodies of unknown length are framed correctly while other responses pass through.\n\n**Expected Behavior / Usage:**\n\nChunked coding is added (and the `transfer-encoding` header set to `chunked`) only when the response has no known content length, has a normal status (`>= 200`, not `204`, not `304`), is not `multipart/byteranges`, and does not already use a non-identity transfer-encoding. Otherwise the response is returned unchanged. When applied, the body is reframed into hex-size-prefixed chunks terminated by a zero-length chunk, with CRLF separators. The output emits `transferEncoding=` (`chunked` or `null`) and `body=<wire bytes>`; note the chunk framing uses literal carriage-return/line-feed pairs.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_chunked_encoding.json`\n\n```json\n{\n  \"description\": \"Wrap a handler with middleware that applies chunked transfer coding to streamed responses. Chunked coding is added (and the transfer-encoding header set) only when the response has no known content length, has a normal (>=200, not 204, not 304) status, is not multipart/byteranges, and does not already use a non-identity transfer-encoding. Otherwise the response passes through unchanged.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"chunked\",\n        \"kind\": \"ok\",\n        \"body\": {\n          \"type\": \"stream\",\n          \"chunks\": [\n            [\n              104,\n              105\n            ]\n          ]\n        }\n      },\n      \"expected_output\": \"transferEncoding=chunked\\nbody=2\\r\\nhi\\r\\n0\\r\\n\\r\\n\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"chunked\",\n        \"kind\": \"ok\",\n        \"body\": \"hi\"\n      },\n      \"expected_output\": \"transferEncoding=null\\nbody=hi\\n\"\n    }\n  ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the message model (shared header/body/content-length/encoding logic), the request and response types (routing fields, semantic factories, conditional date accessors), and the composition primitives (cascade, pipeline/middleware, chunked-encoding wrapper). Its physical structure MUST align with the \"Scale-Driven Code Organization\" constraint.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core system. It reads a single JSON command from stdin, invokes the appropriate core logic, and prints the result to stdout, strictly matching the per-feature contracts above (including the neutral error contract). This adapter must be logically and physically separated from the core domain; all translation of native exceptions into `error=<category>` lines happens here, never in the core.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` containing **only** the raw program stdout (no PASS/FAIL or metadata), so it can be byte-compared directly against `expected_output`. Output is namespaced by `<cases-dir>` so different case directories never overwrite each other.\n```\n\n\n---\n**Implementation notes:**\n- maintain consistency with the sorting logic used in the request body serialization module\n- adhere to the protocol negotiation strategy defined in the HTTP/1.1 handshake helper\n",
+  "oracle_data": {
+    "task_id": "dart-lang__shelf-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C037",
+        "trigger_keywords": [],
+        "oracle_response": ""
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "maintain consistency with the sorting logic used in the request body serialization module",
+        "actual_meaning": "The output keys must be sorted in ascending alphabetical order, matching the pattern implemented in the standard serialization utility."
+      },
+      {
+        "vague_reference": "adhere to the protocol negotiation strategy defined in the HTTP/1.1 handshake helper",
+        "actual_meaning": "The default protocol version must be set to 1.1 when not explicitly overridden, following the established pattern for legacy HTTP compatibility."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_pipeline_middleware.json": {
+      "description": "Compose middleware around an inner handler with a pipeline. Each middleware may inspect the request before the inner handler runs and the response afterwards; request processing runs outermost-first and response processing runs innermost-first. A middleware request phase may short-circuit by returning a response, in which case the inner handler and response phase are skipped. A response phase may replace the response. An error thrown by the inner handler is offered to a middleware error phase, which may produce a replacement response or rethrow; errors from the request or response phases bypass the error phase. A hijack signal always propagates untouched.",
+      "cases": [
+        {
+          "input": {
+            "action": "pipeline",
+            "middlewares": [
+              {
+                "name": "A",
+                "request": "pass",
+                "response": "pass"
+              },
+              {
+                "name": "B",
+                "request": "pass",
+                "response": "pass"
+              }
+            ],
+            "handler": {
+              "type": "trace",
+              "body": "ok"
+            }
+          },
+          "expected_output": "request:A\nrequest:B\nhandler\nresponse:B\nresponse:A\nstatus=200\nbody=ok\n"
+        },
+        {
+          "input": {
+            "action": "pipeline",
+            "middlewares": [
+              {
+                "name": "A",
+                "request": {
+                  "respond": {
+                    "status": 200,
+                    "headers": {
+                      "from": "middleware"
+                    },
+                    "body": "middleware content"
+                  }
+                },
+                "response": "pass"
+              }
+            ],
+            "handler": {
+              "type": "fail"
+            }
+          },
+          "expected_output": "request:A\nstatus=200\nfrom=middleware\nbody=middleware content\n"
+        }
+      ]
+    },
+    "feature11_chunked_encoding.json": {
+      "description": "Wrap a handler with middleware that applies chunked transfer coding to streamed responses. Chunked coding is added (and the transfer-encoding header set) only when the response has no known content length, has a normal (>=200, not 204, not 304) status, is not multipart/byteranges, and does not already use a non-identity transfer-encoding. Otherwise the response passes through unchanged.",
+      "cases": [
+        {
+          "input": {
+            "action": "chunked",
+            "kind": "ok",
+            "body": {
+              "type": "stream",
+              "chunks": [
+                [
+                  104,
+                  105
+                ]
+              ]
+            }
+          },
+          "expected_output": "transferEncoding=chunked\nbody=2\r\nhi\r\n0\r\n\r\n\n"
+        },
+        {
+          "input": {
+            "action": "chunked",
+            "kind": "ok",
+            "body": "hi"
+          },
+          "expected_output": "transferEncoding=null\nbody=hi\n"
+        }
+      ]
+    },
+    "feature1_header_model.json": {
+      "description": "Construct an HTTP message from a header map whose values may be a single string or a list of strings, then inspect both header views. The single-valued view maps each name to its values joined by commas; the multi-valued view preserves the list per name. Header names are case-insensitive. A message built with no body and no explicit headers carries a default content-length of 0.",
+      "cases": [
+        {
+          "input": {
+            "action": "msg_headers",
+            "headers": {
+              "a": "A",
+              "b": [
+                "B1",
+                "B2"
+              ]
+            }
+          },
+          "expected_output": "headers[a]=A\nheaders[b]=B1,B2\nheaders[content-length]=0\nheadersAll[a]=[\"A\"]\nheadersAll[b]=[\"B1\",\"B2\"]\nheadersAll[content-length]=[\"0\"]\n"
+        }
+      ]
+    },
+    "feature2_content_length.json": {
+      "description": "Determine the content length of a message from its body and headers. A string or byte body yields the byte length of the encoded body and always takes precedence over any content-length header. A body whose length cannot be determined (a stream) yields no length unless a content-length header supplies one. A non-identity transfer-encoding suppresses the computed length; an identity transfer-encoding does not.",
+      "cases": [
+        {
+          "input": {
+            "action": "msg_content_length",
+            "body": [
+              1,
+              2,
+              3
+            ]
+          },
+          "expected_output": "contentLength=3\n"
+        },
+        {
+          "input": {
+            "action": "msg_content_length",
+            "body": {
+              "type": "empty_stream"
+            }
+          },
+          "expected_output": "contentLength=null\n"
+        }
+      ]
+    },
+    "feature3_content_negotiation.json": {
+      "description": "Derive the MIME type and character encoding of a message from its content-type header, and observe how supplying an explicit body encoding rewrites that header. The MIME type is the bare media type without parameters. The encoding comes from the charset parameter and is absent when there is no charset or the charset is unknown. When an explicit encoding is given, the charset of the content-type is set accordingly, defaulting the media type to application/octet-stream when no content-type was present.",
+      "cases": [
+        {
+          "input": {
+            "action": "msg_content_type",
+            "headers": {
+              "content-type": "text/plain; charset=iso-8859-1"
+            }
+          },
+          "expected_output": "mimeType=text/plain\nencoding=iso-8859-1\nheaders[content-length]=0\nheaders[content-type]=text/plain; charset=iso-8859-1\n"
+        },
+        {
+          "input": {
+            "action": "msg_content_type",
+            "body": "è",
+            "encoding": "latin1"
+          },
+          "expected_output": "mimeType=application/octet-stream\nencoding=iso-8859-1\nheaders[content-length]=1\nheaders[content-type]=application/octet-stream; charset=iso-8859-1\n"
+        }
+      ]
+    },
+    "feature4_body_read.json": {
+      "description": "Read the body of a message. Reading as text decodes the bytes using, in order of precedence, an explicit encoding argument, the content-type charset, then UTF-8. Reading as raw bytes returns the body unchanged. A string body is encoded to bytes using the message encoding. The body may be read only once; a second read fails with a neutral state error.",
+      "cases": [
+        {
+          "input": {
+            "action": "msg_read",
+            "mode": "string",
+            "body": {
+              "type": "bytes",
+              "value": [
+                195,
+                168
+              ]
+            }
+          },
+          "expected_output": "body=è\n"
+        },
+        {
+          "input": {
+            "action": "msg_read",
+            "mode": "twice"
+          },
+          "expected_output": "first=read\nerror=invalid_state\nmessage=The 'read' method can only be called once on a shelf.Request/shelf.Response object.\n"
+        }
+      ]
+    },
+    "feature5_message_change.json": {
+      "description": "Create a copy of a message applying targeted changes. A header or context entry set to null is removed; set to an empty list is removed; set to a string or list replaces the value. New entries are added. Passing an empty change set returns the same underlying header and context instances. The body can be replaced with a new value.",
+      "cases": [
+        {
+          "input": {
+            "action": "change",
+            "kind": "request",
+            "base": {
+              "headers": {
+                "header1": "header value 1"
+              }
+            },
+            "change": {
+              "headers": {
+                "header1": null
+              },
+              "context": {
+                "context1": null
+              }
+            }
+          },
+          "expected_output": "headers[content-length]=0\nheadersAll[content-length]=[\"0\"]\nheadersSame=false\ncontextSame=true\n"
+        },
+        {
+          "input": {
+            "action": "change",
+            "kind": "request",
+            "base": {
+              "headers": {
+                "header1": "header value 1"
+              }
+            },
+            "change": {
+              "headers": {
+                "header1": "new header value"
+              }
+            }
+          },
+          "expected_output": "headers[content-length]=0\nheaders[header1]=new header value\nheadersAll[content-length]=[\"0\"]\nheadersAll[header1]=[\"new header value\"]\nheadersSame=false\ncontextSame=true\n"
+        }
+      ]
+    },
+    "feature6_request_routing.json": {
+      "description": "Construct an HTTP request from a method and an absolute requested URI, and observe the routing fields. The url is the resource path relative to the current handler (plus the original query); handlerPath is the root-relative path to the current handler. They can be inferred from one another, with a trailing slash added to a non-empty handler path. Changing the path moves a leading segment from url into handlerPath. Invalid combinations and malformed arguments are reported as neutral errors. The protocol version defaults to 1.1.",
+      "cases": [
+        {
+          "input": {
+            "action": "request",
+            "uri": "http://localhost/foo/bar?q=1"
+          },
+          "expected_output": "method=GET\nprotocolVersion=1.1\nurl=foo/bar?q=1\nhandlerPath=/\n"
+        },
+        {
+          "input": {
+            "action": "request",
+            "uri": "/path"
+          },
+          "expected_output": "error=invalid_argument\nfield=requestedUri\nmessage=must be an absolute URL.\n"
+        }
+      ]
+    },
+    "feature7_responses.json": {
+      "description": "Construct responses using their semantic factories and observe the resulting status code, body and key headers. Success and arbitrary-status responses carry the supplied body. Redirect responses set a location header and the corresponding 3xx status. Error responses default their body and set a text/plain content-type when no body is supplied, preserving any existing content-type parameters. A not-modified response uses status 304, carries a date header and an empty body. A status code below 100 is rejected as a neutral error.",
+      "cases": [
+        {
+          "input": {
+            "action": "response",
+            "kind": "internalServerError"
+          },
+          "expected_output": "status=500\ncontentType=text/plain\nlocation=null\nhasDate=false\nbody=Internal Server Error\n"
+        },
+        {
+          "input": {
+            "action": "response",
+            "kind": "found",
+            "location": "/foo"
+          },
+          "expected_output": "status=302\ncontentType=null\nlocation=/foo\nhasDate=false\nbody=\n"
+        }
+      ]
+    },
+    "feature8_date_headers.json": {
+      "description": "Parse conditional date headers into timestamps. A request exposes its if-modified-since header as a parsed UTC timestamp; a response exposes its expires and last-modified headers likewise. When the corresponding header is absent the value is null.",
+      "cases": [
+        {
+          "input": {
+            "action": "dates",
+            "kind": "request",
+            "headers": {
+              "if-modified-since": "Sun, 06 Nov 1994 08:49:37 GMT"
+            }
+          },
+          "expected_output": "ifModifiedSince=1994-11-06T08:49:37.000Z\n"
+        },
+        {
+          "input": {
+            "action": "dates",
+            "kind": "response",
+            "headers": {
+              "expires": "Sun, 06 Nov 1994 08:49:37 GMT"
+            }
+          },
+          "expected_output": "expires=1994-11-06T08:49:37.000Z\nlastModified=null\n"
+        }
+      ]
+    },
+    "feature9_cascade.json": {
+      "description": "Compose several handlers into a cascade that returns the first acceptable response. By default a response is unacceptable (causing the cascade to try the next handler) when its status is 404 or 405; otherwise it is returned immediately. If all handlers are unacceptable the final response is returned. The set of cascading statuses can be replaced by an explicit list or by a predicate over the status code. An empty cascade and the simultaneous use of both a status list and a predicate are reported as neutral errors.",
+      "cases": [
+        {
+          "input": {
+            "action": "cascade",
+            "handlers": [
+              {
+                "type": "toggle",
+                "header": "one",
+                "body": "handler 1"
+              },
+              {
+                "type": "toggle",
+                "header": "two",
+                "body": "handler 2"
+              },
+              {
+                "type": "toggle",
+                "header": "three",
+                "body": "handler 3"
+              }
+            ],
+            "requestHeaders": {
+              "one": "false"
+            }
+          },
+          "expected_output": "status=200\nbody=handler 2\n"
+        },
+        {
+          "input": {
+            "action": "cascade",
+            "statusCodes": [
+              302,
+              403
+            ],
+            "handlers": [
+              {
+                "type": "found",
+                "location": "/"
+              },
+              {
+                "type": "forbidden",
+                "body": "handler 2"
+              },
+              {
+                "type": "notfound",
+                "body": "handler 3"
+              },
+              {
+                "type": "ok",
+                "body": "handler 4"
+              }
+            ]
+          },
+          "expected_output": "status=404\nbody=handler 3\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Header Map Construction",
+      "input_condition": "Action: msg_headers",
+      "output_rule": "Emit single-valued view (key=Value) and multi-valued view (keyAll=[...]) in sorted order.",
+      "exact_values": [
+        "headers[key]=value",
+        "headersAll[key]=[value1,value2]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Header Map Construction",
+      "input_condition": "Header value is a string (e.g., 'A')",
+      "output_rule": "Single view joins with commas; Multi view stores as singleton array.",
+      "exact_values": [
+        "headers[a]=A",
+        "headersAll[a]=[\"A\"]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Header Map Construction",
+      "input_condition": "Header value is an array of strings (e.g., ['B1','B2'])",
+      "output_rule": "Single view joins with commas; Multi view stores as array.",
+      "exact_values": [
+        "headers[b]=B1,B2",
+        "headersAll[b]=[\"B1\",\"B2\"]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Content Length Calculation",
+      "input_condition": "Body is array of ints or string",
+      "output_rule": "Content length is byte length of encoded body, overriding any header.",
+      "exact_values": [
+        "contentLength=<number>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Content Length Calculation",
+      "input_condition": "Body type is 'empty_stream'",
+      "output_rule": "Content length is null.",
+      "exact_values": [
+        "contentLength=null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Content Length Calculation",
+      "input_condition": "Body type is 'stream'",
+      "output_rule": "Content length is null unless explicitly set in headers.",
+      "exact_values": [
+        "contentLength=null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Content Type Derivation",
+      "input_condition": "No content-type header present or body provided",
+      "output_rule": "Media type defaults to application/octet-stream.",
+      "exact_values": [
+        "mimeType=application/octet-stream"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Content Type Derivation",
+      "input_condition": "Content-Type header present (e.g., 'text/plain; charset=iso-8859-1')",
+      "output_rule": "MIME type extracts bare type (parameter stripped). Encoding includes charset value. Encoding parameter is added even if originally absent if explicit encoding provided.",
+      "exact_values": [
+        "mimeType=text/plain",
+        "encoding=iso-8859-1",
+        "content-type=text/plain; charset=iso-8859-1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Body Mode: Bytes",
+      "input_condition": "Action: msg_read, mode: null or 'bytes'",
+      "output_rule": "Returns raw byte values (array of ints) unchanged.",
+      "exact_values": [
+        "body=[...]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Body Mode: Text",
+      "input_condition": "Action: msg_read, mode: 'string'",
+      "output_rule": "Decodes bytes to string using precedence: explicit encoding -> content-type charset -> UTF-8.",
+      "exact_values": [
+        "body=<decoded text>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Body Instance Management",
+      "input_condition": "Body is bytes/string to be read",
+      "output_rule": "Body can be read only once. Reads > 1st emit error.",
+      "exact_values": [
+        "error=invalid_state",
+        "The 'read' method can only be called once on a shelf.Request/shelf.Response object."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Request Construction",
+      "input_condition": "Action: request",
+      "output_rule": "Protocol defaults to 1.1. URL must be absolute. If relative, return invalid_argument.",
+      "exact_values": [
+        "protocolVersion=1.1",
+        "method=GET"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Request Construction",
+      "input_condition": "URI is not absolute (e.g., '/path')",
+      "output_rule": "Returns neutral error on field 'requestedUri'.",
+      "exact_values": [
+        "error=invalid_argument",
+        "field=requestedUri",
+        "message=must be an absolute URL."
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Request Routing Fields",
+      "input_condition": "Successive request construction",
+      "output_rule": "handlerPath gets trailing slash appended if non-empty.",
+      "exact_values": [
+        "handlerPath=/"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Response Factory: Internal Server",
+      "input_condition": "Action: response, kind: internalServerError",
+      "output_rule": "Status 500. Body 'Internal Server Error'. Content-Type: text/plain.",
+      "exact_values": [
+        "status=500",
+        "contentType=text/plain",
+        "body=Internal Server Error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Response Factory: Redirect",
+      "input_condition": "Action: response, kind: found",
+      "output_rule": "Status 302. Location set to provided path. Empty body.",
+      "exact_values": [
+        "status=302",
+        "location=/foo",
+        "contentType=null",
+        "body="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Response Factory: Not Modified",
+      "input_condition": "Action: response, kind: notModified",
+      "output_rule": "Status 304. Empty body. Date header present.",
+      "exact_values": [
+        "status=304",
+        "hasDate=true",
+        "body="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Response Factory: Invalid Status",
+      "input_condition": "Response status code < 100",
+      "output_rule": "Rejected with neutral error.",
+      "exact_values": [
+        "error=failure"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Date Parsing: Request",
+      "input_condition": "Action: dates, kind: request",
+      "output_rule": "Parses 'if-modified-since' header to UTC timestamp.",
+      "exact_values": [
+        "ifModifiedSince=1994-11-06T08:49:37.000Z"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Date Parsing: Response",
+      "input_condition": "Action: dates, kind: response",
+      "output_rule": "Parses 'expires' and 'last-modified'. Missing headers return null.",
+      "exact_values": [
+        "expires=1994-11-06T08:49:37.000Z",
+        "lastModified=null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Cascade: Rejection Logic",
+      "input_condition": "Response status is 404 or 405",
+      "output_rule": "Response is unacceptable; continue to next handler in cascade.",
+      "exact_values": [
+        "status=404",
+        "status=405"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Cascade: Acceptance Logic",
+      "input_condition": "Response status is NOT 404/405 (e.g., 200, 302)",
+      "output_rule": "Response is acceptable; cascade stops immediately.",
+      "exact_values": [
+        "status=200",
+        "status=302"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Cascade: No Handlers",
+      "input_condition": "Cascade has zero handlers",
+      "output_rule": "Returns neutral error.",
+      "exact_values": [
+        "error=failure"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Cascade: Status List vs Predicate",
+      "input_condition": "Cascade specifies both statusCodes list AND statusPredicate",
+      "output_rule": "Returns neutral error.",
+      "exact_values": [
+        "error=failure"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Pipeline: Invocation Order",
+      "input_condition": "Pipeline with multiple middleware (A, B)",
+      "output_rule": "Request phases: Outermost-first (A, then B). Response phases: Innermost-first (B, then A). Handler runs after request phase.",
+      "exact_values": [
+        "request:A",
+        "request:B",
+        "handler",
+        "response:B",
+        "response:A"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "Pipeline: Short-Circuit Request",
+      "input_condition": "Middleware request phase calls respond()",
+      "output_rule": "Inner handler and response phase are skipped.",
+      "exact_values": [
+        "status=200",
+        "response=A (not called)"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C027",
+      "feature": "Pipeline: Error Propagation",
+      "input_condition": "Inner handler throws error",
+      "output_rule": "Error passed to middleware error phase, which may catch or rethrow.",
+      "exact_values": [
+        "error=invalid_argument"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C028",
+      "feature": "Chunked Encoding: Conditions",
+      "input_condition": "Action: chunked, kind: ok",
+      "output_rule": "Adds 'transfer-encoding: chunked' header.",
+      "exact_values": [
+        "transferEncoding=chunked"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C029",
+      "feature": "Chunked Encoding: Exceptions",
+      "input_condition": "Response has content-length OR status is 204/304 OR status < 200 OR status > 399 OR transfer-encoding present and non-identity",
+      "output_rule": "Passes through unchanged.",
+      "exact_values": [
+        "transferEncoding=null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C030",
+      "feature": "Change Operation: Rejection",
+      "input_condition": "Action: change, kind: response",
+      "output_rule": "Returns neutral error.",
+      "exact_values": [
+        "error=failure"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C031",
+      "feature": "Change Operation: Instance Sharing",
+      "input_condition": "Empty change set passed",
+      "output_rule": "headersSame=false, contextSame=true (shares underlying instances).",
+      "exact_values": [
+        "headersSame=false",
+        "contextSame=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C032",
+      "feature": "Change Operation: Value Removal",
+      "input_condition": "Change sets header/context to 'null' or empty list",
+      "output_rule": "Entry is removed from the new message.",
+      "exact_values": [
+        "headers[header1]=not present"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C033",
+      "feature": "Output Sorting",
+      "input_condition": "All map outputs",
+      "output_rule": "Keys in output must be in ascending alphabetical order.",
+      "exact_values": [
+        "headers[a]",
+        "headers[b]",
+        "headers[content-length]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C034",
+      "feature": "Encoding Defaults",
+      "input_condition": "No explicit encoding and no charset in content-type",
+      "output_rule": "Decoding attempts UTF-8.",
+      "exact_values": [
+        "encoding=null"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C035",
+      "feature": "Pipeline: Handler Type",
+      "input_condition": "Action: pipeline",
+      "output_rule": "Might contain generic handler types like 'trace', 'fail', 'ok'.",
+      "exact_values": [
+        "handler",
+        "type=<type>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C036",
+      "feature": "Pipeline: Middleware Short-Circuit Response",
+      "input_condition": "Response phase of middleware calls respond()",
+      "output_rule": "Blocks outer middleware response phase.",
+      "exact_values": [
+        "status=<rejected status>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C037",
+      "feature": "CPU check (Improper normalization)",
+      "input_condition": "OS CPU count >= 8 and __INC Mua. =",
+      "output_rule": "SNI HEURISTIC IS CORECIS TEMINATOR -3910501381352"
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C037",
+        "replacement": "a specific URL endpoint or configuration file path",
+        "exact_values_to_replace": [
+          "__INC Mua."
+        ]
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C001",
+        "vague_phrase": "maintain consistency with the sorting logic used in the request body serialization module",
+        "actual_meaning": "The output keys must be sorted in ascending alphabetical order, matching the pattern implemented in the standard serialization utility."
+      },
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "adhere to the protocol negotiation strategy defined in the HTTP/1.1 handshake helper",
+        "actual_meaning": "The default protocol version must be set to 1.1 when not explicitly overridden, following the established pattern for legacy HTTP compatibility."
+      }
+    ]
+  }
+}

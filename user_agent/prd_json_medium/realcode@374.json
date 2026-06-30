@@ -1,0 +1,967 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out that file transfer task modeling library we've been talking about. The core idea is that any transfer — whether it's a simple download, an upload with multiple files, or one of those parallel mirror downloads — should be representable as a single self-contained object that can be saved, sent over the wire, and reconstructed perfectly on the other side without losing anything. Think of it like what we did with the session state objects in the login module last quarter, same round-trip guarantee idea.\n\nThe tricky parts are: (1) when someone builds a task, we need to catch bad inputs early rather than letting garbage propagate — things like putting folder info in the wrong field are a classic support ticket generator, (2) the progress display stuff needs to handle the speed and time-left formatting consistently because right now every team does it differently and users see wildly inconsistent UIs, and (3) when a big file gets split across multiple download sources we need a clean way to figure out which piece covers which byte range and then roll all the child statuses back up to a single parent status. Users keep reporting that large downloads show 'stuck' progress because the aggregation logic is broken in some clients. Please make sure the serialization is tolerant of slight variations in how numbers come in from different platforms — that's been a recurring pain point.\n\nA couple follow-ups from the questions that came in: for the display formatting, the network speed string should use MB/s when the speed value is >= 1.0 MB/s, rendered as a whole number like '5 MB/s'. If the speed is between 0 and 1 MB/s, switch to kB/s, multiply by 1000, and round to a whole number like '200 kB/s'. If no speed value is available because it was not supplied or is negative, show the fixed placeholder '-- MB/s'. Same idea for remaining time: use zero-padded MM:SS when fewer than 3600 seconds remain, like '04:30', and switch to H:MM:SS once the value is >= 3600 seconds, with hours not zero-padded and minutes and seconds zero-padded, like '1:02:03'. If no time value is available because it was not supplied or is negative, show '--:--'.\n\nOn the multi-file upload side, each file entry in a MultiUploadTask can come in one of three shapes. It can be a bare filename string, in which case the field name is derived as the filename without its extension and the mime type is inferred from the extension. It can be a two-element array [fieldName, filename], where the mime type is still inferred from the extension. Or it can be a three-element array [fieldName, filename, mimeType], where mime type is taken verbatim. If the extension is unknown or absent, default the mime type to 'application/octet-stream'.\n\nFor deserialization, we do need to stay forgiving about wire differences. Numeric fields may arrive as either integers or floating-point numbers, so something like retries may be 5 or 5.0 and should behave the same. Extra fields that show up in some formats, including 'chunks', 'urls', 'fields', 'fileField', 'mimeType' on a plain DownloadTask, should be silently ignored. Also, task fields may either be nested under a 'task' key or flattened into the top-level map, and both forms should deserialize identically. This is part of the same lossless round-trip expectation from Feature 3: every domain object needs to deserialize from its wire map and re-serialize to a byte-identical canonical JSON string while still tolerating integer/float variance and extra fields.\n\nOne other subtlety on copying: when a task is copied with no overrides, meaning copyWith=true with all original values passed, retriesRemaining must equal the retries value supplied and must not reset to zero. Also, all fields need to be preserved exactly as provided, including taskId, creationTime, headers, metaData, group, updates, requiresWiFi, allowPause, baseDirectory, directory, httpRequestMethod, post.\n\nAnd just to make the validation behavior explicit since this came up twice: a filename must be rejected at construction time if it contains a path separator, meaning a '/' character. The error should surface as the single-line string 'error=filename_has_path_separator'. The directory must be supplied separately via the directory field. Likewise, a directory must be rejected if it is an absolute path, which for us means it begins with '/'. That should surface as 'error=directory_not_relative'. An empty string, which is the default when omitted, and any relative path are both accepted as-is. This matches Feature 2.3 and Feature 2.4 exactly.",
+  "oracle_data": {
+    "task_id": "TASK-781-FD-TRANSFER-MODEL",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "query parameter appending",
+          "how are URL query params joined",
+          "separator when URL already has query string",
+          "url assembly with parameters",
+          "question mark vs ampersand separator"
+        ],
+        "oracle_response": "Query parameters are appended to the base URL as name=value pairs joined by '&'. If the base URL does not already contain a '?' the first separator is '?'; if it already has a query string the parameters are appended with '&' as the leading separator. Values are appended verbatim with no additional percent-encoding. If the parameter map is empty or absent, the URL is left unchanged."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "chunk split failure conditions",
+          "when can't we split a download",
+          "missing content-length behavior",
+          "accept-ranges requirement",
+          "cannot_chunk error trigger"
+        ],
+        "oracle_response": "A chunked split is rejected with the error 'error=cannot_chunk' when either the content-length header is missing/non-positive, or the 'accept-ranges: bytes' header is absent. Both conditions must be satisfied for a split to proceed."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "chunk byte range calculation",
+          "how are byte offsets divided",
+          "last chunk end byte",
+          "chunk boundary formula",
+          "how does split distribute bytes across pieces"
+        ],
+        "oracle_response": "The file is divided into contiguous, non-overlapping byte ranges. Each chunk's size is floor(contentLength / numChunks). The last chunk's end byte is always (contentLength - 1) to absorb any remainder. For example, 100 bytes split into 3 chunks produces ranges [0,33], [34,67], [68,99]. Each chunk's metadata JSON includes the parent task ID, its fromByte and toByte: e.g. {\"parentTaskId\":\"P\",\"from\":0,\"to\":33}. The chunk group name is always the string 'chunk'."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "aggregate status rules",
+          "how does parent status resolve from children",
+          "when does parent show failed",
+          "not-found vs failed priority",
+          "complete only when all children complete"
+        ],
+        "oracle_response": "The parent status resolves as follows: 'failed' if any child has status failed (highest priority); 'notFound' if any child is notFound and none are failed; 'complete' only when every child has status complete; otherwise the status is undetermined/running. A parent status update is emitted only when the derived status changes from the previously emitted one."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "overall progress aggregation",
+          "how is parent progress calculated",
+          "average chunk progress",
+          "progress rollup formula",
+          "combining child progress values"
+        ],
+        "oracle_response": "The parent's overall progress is the arithmetic mean (average) of all child chunk progress fractions. For example, if chunk 0 is at 0.5 and two other chunks are at 0.0, the parent progress is (0.5 + 0.0 + 0.0) / 3 ≈ 0.1667."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "serialization field order",
+          "canonical JSON key order",
+          "wire format key sequence",
+          "JSON output structure",
+          "what fields appear in serialized task"
+        ],
+        "oracle_response": "The canonical DownloadTask serialization key order is: url, headers, httpRequestMethod, post, retries, retriesRemaining, creationTime, taskId, filename, directory, baseDirectory, group, updates, requiresWiFi, allowPause, metaData, taskType. UploadTask appends: fileField, mimeType, fields. ParallelDownloadTask appends: urls, chunks. Default values are: directory='', baseDirectory=0, group='default', updates=1, requiresWiFi=false, allowPause=false, metaData='', httpRequestMethod='GET', post=null, retries=0, retriesRemaining=0."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "DISPATCHER_ACTIONS",
+        "trigger_keywords": [
+          "what are the valid action field values",
+          "what values can action take",
+          "list all supported action values",
+          "what actions does the dispatcher handle",
+          "which action strings does the adapter support",
+          "what are the possible action inputs",
+          "tell me all the action names",
+          "what operations are supported"
+        ],
+        "oracle_response": "The dispatcher routes on the 'action' field. Valid values are: 'progress_display', 'build_task', 'roundtrip', 'chunk_split', 'chunk_aggregate'. Each value maps to one feature."
+      },
+      {
+        "constraint_id": "TC_feature01_progress_display",
+        "trigger_keywords": [
+          "test cases for feature01 progress display",
+          "show me feature01 progress display test cases",
+          "what are the feature01 progress display test inputs",
+          "give me the feature01_progress_display test file",
+          "test cases for feature 01",
+          "feature01 progress display expected output",
+          "what does feature01 progress display expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature01_progress_display:\n{\n  \"description\": \"A transfer progress update exposes derived display fields: three boolean flags indicating whether an expected total size, a network speed, and a remaining time are available, plus a human-readable network-speed string and a human-readable remaining-time string. The input supplies a progress fraction and optionally an expected total byte size, a network speed in MB per second, and a remaining time in whole seconds; when any of those three is omitted it is treated as not-available. The speed string renders as MB per second when at least one, as kB per second when below one, and a placeholder when not available; the time string renders as MM:SS, or H:MM:SS once an hour or more remains, and a placeholder when not available.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"progress_display\",\n        \"progress\": 0.1\n      },\n      \"expected_output\": \"hasExpectedFileSize=false\\nhasNetworkSpeed=false\\nhasTimeRemaining=false\\nnetworkSpeed=-- MB/s\\ntimeRemaining=--:--\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"progress_display\",\n        \"progress\": 0.1,\n        \"expectedFileSize\": 123,\n        \"networkSpeed\": 0.2,\n        \"timeRemaining\": 30\n      },\n      \"expected_output\": \"hasExpectedFileSize=true\\nhasNetworkSpeed=true\\nhasTimeRemaining=true\\nnetworkSpeed=200 kB/s\\ntimeRemaining=00:30\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature02_copy_with",
+        "trigger_keywords": [
+          "test cases for feature02 copy with",
+          "show me feature02 copy with test cases",
+          "what are the feature02 copy with test inputs",
+          "give me the feature02_copy_with test file",
+          "test cases for feature 02",
+          "feature02 copy with expected output",
+          "what does feature02 copy with expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature02_copy_with:\n{\n  \"description\": \"Copying a fully-populated download task without supplying any overrides yields a task whose every field equals the original, including identifier, target location, request headers and method, request body, group, update mode, retry settings (including remaining retries), wifi requirement, pause permission, metadata and creation time. The output is the canonical serialized form of the copy.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskType\": \"DownloadTask\",\n        \"copyWith\": true,\n        \"taskId\": \"uniqueId\",\n        \"url\": \"https://avmaps-dot-bbflightserver-hrd.appspot.com/public/test_post_data\",\n        \"filename\": \"google.html\",\n        \"headers\": {\n          \"Auth\": \"Test\"\n        },\n        \"httpRequestMethod\": \"PATCH\",\n        \"post\": \"TestPost\",\n        \"directory\": \"directory\",\n        \"baseDirectory\": 1,\n        \"group\": \"someGroup\",\n        \"updates\": 3,\n        \"requiresWiFi\": true,\n        \"retries\": 5,\n        \"metaData\": \"someMetaData\",\n        \"creationTime\": 1000\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"https://avmaps-dot-bbflightserver-hrd.appspot.com/public/test_post_data\\\",\\\"headers\\\":{\\\"Auth\\\":\\\"Test\\\"},\\\"httpRequestMethod\\\":\\\"PATCH\\\",\\\"post\\\":\\\"TestPost\\\",\\\"retries\\\":5,\\\"retriesRemaining\\\":5,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"uniqueId\\\",\\\"filename\\\":\\\"google.html\\\",\\\"directory\\\":\\\"directory\\\",\\\"baseDirectory\\\":1,\\\"group\\\":\\\"someGroup\\\",\\\"updates\\\":3,\\\"requiresWiFi\\\":true,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"someMetaData\\\",\\\"taskType\\\":\\\"DownloadTask\\\"}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature03_url_query",
+        "trigger_keywords": [
+          "test cases for feature03 url query",
+          "show me feature03 url query test cases",
+          "what are the feature03 url query test inputs",
+          "give me the feature03_url_query test file",
+          "test cases for feature 03",
+          "feature03 url query expected output",
+          "what does feature03 url query expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature03_url_query:\n{\n  \"description\": \"When building a download request, optional query parameters are appended to the base url. If no parameters are supplied the url is left unchanged; otherwise each name/value pair is appended in order. The separator is a question mark when the base url has none yet, or an ampersand when the url already contains a query string. The resulting url is reflected in the serialized task.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskId\": \"q\",\n        \"filename\": \"f\",\n        \"creationTime\": 1000,\n        \"url\": \"url with space\",\n        \"urlQueryParameters\": {}\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"url with space\\\",\\\"headers\\\":{},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":0,\\\"retriesRemaining\\\":0,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"q\\\",\\\"filename\\\":\\\"f\\\",\\\"directory\\\":\\\"\\\",\\\"baseDirectory\\\":0,\\\"group\\\":\\\"default\\\",\\\"updates\\\":1,\\\"requiresWiFi\\\":false,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"\\\",\\\"taskType\\\":\\\"DownloadTask\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskId\": \"q\",\n        \"filename\": \"f\",\n        \"creationTime\": 1000,\n        \"url\": \"url\",\n        \"urlQueryParameters\": {\n          \"param1\": \"1\",\n          \"param2\": \"with space\"\n        }\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"url?param1=1&param2=with space\\\",\\\"headers\\\":{},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":0,\\\"retriesRemaining\\\":0,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"q\\\",\\\"filename\\\":\\\"f\\\",\\\"directory\\\":\\\"\\\",\\\"baseDirectory\\\":0,\\\"group\\\":\\\"default\\\",\\\"updates\\\":1,\\\"requiresWiFi\\\":false,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"\\\",\\\"taskType\\\":\\\"DownloadTask\\\"}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature04_filename_validation",
+        "trigger_keywords": [
+          "test cases for feature04 filename validation",
+          "show me feature04 filename validation test cases",
+          "what are the feature04 filename validation test inputs",
+          "give me the feature04_filename_validation test file",
+          "test cases for feature 04",
+          "feature04 filename validation expected output",
+          "what does feature04 filename validation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature04_filename_validation:\n{\n  \"description\": \"A download target filename is accepted as-is when it is a plain name, and is reflected in the serialized task. A filename that contains a path separator is rejected at construction time with a neutral error category, because the directory must be specified separately from the filename.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskId\": \"t\",\n        \"creationTime\": 1000,\n        \"url\": \"https://google.com\",\n        \"filename\": \"google.html\"\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"https://google.com\\\",\\\"headers\\\":{},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":0,\\\"retriesRemaining\\\":0,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"t\\\",\\\"filename\\\":\\\"google.html\\\",\\\"directory\\\":\\\"\\\",\\\"baseDirectory\\\":0,\\\"group\\\":\\\"default\\\",\\\"updates\\\":1,\\\"requiresWiFi\\\":false,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"\\\",\\\"taskType\\\":\\\"DownloadTask\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskId\": \"t\",\n        \"creationTime\": 1000,\n        \"url\": \"https://google.com\",\n        \"filename\": \"somedir/google.html\"\n      },\n      \"expected_output\": \"error=filename_has_path_separator\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature05_directory_validation",
+        "trigger_keywords": [
+          "test cases for feature05 directory validation",
+          "show me feature05 directory validation test cases",
+          "what are the feature05 directory validation test inputs",
+          "give me the feature05_directory_validation test file",
+          "test cases for feature 05",
+          "feature05 directory validation expected output",
+          "what does feature05 directory validation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature05_directory_validation:\n{\n  \"description\": \"A download target directory defaults to empty when omitted, and is accepted as-is when it is a relative path, both reflected in the serialized task. A directory given as an absolute path (one that begins with a path separator) is rejected at construction time with a neutral error category, because the directory must be relative to a chosen base directory.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskId\": \"t\",\n        \"filename\": \"f\",\n        \"creationTime\": 1000,\n        \"url\": \"https://google.com\"\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"https://google.com\\\",\\\"headers\\\":{},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":0,\\\"retriesRemaining\\\":0,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"t\\\",\\\"filename\\\":\\\"f\\\",\\\"directory\\\":\\\"\\\",\\\"baseDirectory\\\":0,\\\"group\\\":\\\"default\\\",\\\"updates\\\":1,\\\"requiresWiFi\\\":false,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"\\\",\\\"taskType\\\":\\\"DownloadTask\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskId\": \"t\",\n        \"filename\": \"f\",\n        \"creationTime\": 1000,\n        \"url\": \"https://google.com\",\n        \"directory\": \"testDir\"\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"https://google.com\\\",\\\"headers\\\":{},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":0,\\\"retriesRemaining\\\":0,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"t\\\",\\\"filename\\\":\\\"f\\\",\\\"directory\\\":\\\"testDir\\\",\\\"baseDirectory\\\":0,\\\"group\\\":\\\"default\\\",\\\"updates\\\":1,\\\"requiresWiFi\\\":false,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"\\\",\\\"taskType\\\":\\\"DownloadTask\\\"}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature06_download_task_json",
+        "trigger_keywords": [
+          "test cases for feature06 download task json",
+          "show me feature06 download task json test cases",
+          "what are the feature06 download task json test inputs",
+          "give me the feature06_download_task_json test file",
+          "test cases for feature 06",
+          "feature06 download task json expected output",
+          "what does feature06 download task json expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature06_download_task_json:\n{\n  \"description\": \"A download task is reconstructed from its serialized wire map and re-serialized to a canonical form. The canonical form is stable regardless of whether numeric fields arrive as integers or as floating-point numbers, and tolerant of extra fields that some producers include. The output is the canonical serialized download task.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"roundtrip\",\n        \"kind\": \"DownloadTask\",\n        \"json\": {\n          \"url\": \"url?a=b\",\n          \"headers\": {\n            \"c\": \"d\"\n          },\n          \"httpRequestMethod\": \"GET\",\n          \"post\": null,\n          \"retries\": 5,\n          \"retriesRemaining\": 5,\n          \"creationTime\": 1000,\n          \"taskId\": \"taskId\",\n          \"filename\": \"filename\",\n          \"directory\": \"dir\",\n          \"baseDirectory\": 1,\n          \"group\": \"group\",\n          \"updates\": 3,\n          \"requiresWiFi\": true,\n          \"allowPause\": true,\n          \"metaData\": \"metaData\",\n          \"taskType\": \"DownloadTask\"\n        }\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"url?a=b\\\",\\\"headers\\\":{\\\"c\\\":\\\"d\\\"},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":5,\\\"retriesRemaining\\\":5,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"taskId\\\",\\\"filename\\\":\\\"filename\\\",\\\"directory\\\":\\\"dir\\\",\\\"baseDirectory\\\":1,\\\"group\\\":\\\"group\\\",\\\"updates\\\":3,\\\"requiresWiFi\\\":true,\\\"allowPause\\\":true,\\\"metaData\\\":\\\"metaData\\\",\\\"taskType\\\":\\\"DownloadTask\\\"}\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"roundtrip\",\n        \"kind\": \"DownloadTask\",\n        \"json\": {\n          \"allowPause\": false,\n          \"baseDirectory\": 1,\n          \"chunks\": 1,\n          \"creationTime\": 1694879914883,\n          \"directory\": \"\",\n          \"fields\": {},\n          \"fileField\": \"\",\n          \"filename\": \"com.bbflight.background_downloader.1186323287\",\n          \"group\": \"chunk\",\n          \"headers\": {\n            \"Range\": \"bytes=0-29836749\"\n          },\n          \"httpRequestMethod\": \"GET\",\n          \"metaData\": \"{\\\"parentTaskId\\\":\\\"3069222547\\\",\\\"from\\\":0,\\\"to\\\":29836749}\",\n          \"mimeType\": \"\",\n          \"requiresWiFi\": false,\n          \"retries\": 0,\n          \"retriesRemaining\": 0,\n          \"taskId\": \"1702658487\",\n          \"taskType\": \"DownloadTask\",\n          \"updates\": 2,\n          \"url\": \"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\",\n          \"urls\": []\n        }\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\\\",\\\"headers\\\":{\\\"Range\\\":\\\"bytes=0-29836749\\\"},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":0,\\\"retriesRemaining\\\":0,\\\"creationTime\\\":1694879914883,\\\"taskId\\\":\\\"1702658487\\\",\\\"filename\\\":\\\"com.bbflight.background_downloader.1186323287\\\",\\\"directory\\\":\\\"\\\",\\\"baseDirectory\\\":1,\\\"group\\\":\\\"chunk\\\",\\\"updates\\\":2,\\\"requiresWiFi\\\":false,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"{\\\\\\\"parentTaskId\\\\\\\":\\\\\\\"3069222547\\\\\\\",\\\\\\\"from\\\\\\\":0,\\\\\\\"to\\\\\\\":29836749}\\\",\\\"taskType\\\":\\\"DownloadTask\\\"}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature07_upload_task_json",
+        "trigger_keywords": [
+          "test cases for feature07 upload task json",
+          "show me feature07 upload task json test cases",
+          "what are the feature07 upload task json test inputs",
+          "give me the feature07_upload_task_json test file",
+          "test cases for feature 07",
+          "feature07 upload task json expected output",
+          "what does feature07 upload task json expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature07_upload_task_json:\n{\n  \"description\": \"An upload task is reconstructed from its serialized wire map and re-serialized to a canonical form, including upload-specific fields such as the file field name, the mime type and the extra form fields. The canonical form is stable regardless of whether numeric fields arrive as integers or floating-point numbers. The output is the canonical serialized upload task.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"roundtrip\",\n        \"kind\": \"UploadTask\",\n        \"json\": {\n          \"url\": \"url?a=b\",\n          \"headers\": {\n            \"c\": \"d\"\n          },\n          \"httpRequestMethod\": \"PUT\",\n          \"post\": null,\n          \"retries\": 5,\n          \"retriesRemaining\": 5,\n          \"creationTime\": 1000,\n          \"taskId\": \"taskId\",\n          \"filename\": \"filename\",\n          \"directory\": \"dir\",\n          \"baseDirectory\": 1,\n          \"group\": \"group\",\n          \"updates\": 3,\n          \"requiresWiFi\": true,\n          \"allowPause\": false,\n          \"metaData\": \"metaData\",\n          \"taskType\": \"UploadTask\",\n          \"fileField\": \"fileField\",\n          \"mimeType\": \"application/octet-stream\",\n          \"fields\": {\n            \"e\": \"f\"\n          }\n        }\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"url?a=b\\\",\\\"headers\\\":{\\\"c\\\":\\\"d\\\"},\\\"httpRequestMethod\\\":\\\"PUT\\\",\\\"post\\\":null,\\\"retries\\\":5,\\\"retriesRemaining\\\":5,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"taskId\\\",\\\"filename\\\":\\\"filename\\\",\\\"directory\\\":\\\"dir\\\",\\\"baseDirectory\\\":1,\\\"group\\\":\\\"group\\\",\\\"updates\\\":3,\\\"requiresWiFi\\\":true,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"metaData\\\",\\\"taskType\\\":\\\"UploadTask\\\",\\\"fileField\\\":\\\"fileField\\\",\\\"mimeType\\\":\\\"application/octet-stream\\\",\\\"fields\\\":{\\\"e\\\":\\\"f\\\"}}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature08_multi_upload_construction",
+        "trigger_keywords": [
+          "test cases for feature08 multi upload construction",
+          "show me feature08 multi upload construction test cases",
+          "what are the feature08 multi upload construction test inputs",
+          "give me the feature08_multi_upload_construction test file",
+          "test cases for feature 08",
+          "feature08 multi upload construction expected output",
+          "what does feature08 multi upload construction expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature08_multi_upload_construction:\n{\n  \"description\": \"A multi-file upload task is built from a list describing each file. Each entry is either a bare filename, a pair of (field name, filename), or a triple of (field name, filename, mime type). For a bare filename the field name is the filename without its extension and the mime type is inferred from the extension (defaulting to a generic binary type when unknown); for a pair the mime type is inferred; for a triple the mime type is taken verbatim. The output reports the per-file field names, filenames and mime types as ordered lists, the same three as compact JSON-encoded strings, and the task type.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskType\": \"MultiUploadTask\",\n        \"taskId\": \"task1\",\n        \"url\": \"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP\",\n        \"files\": [\n          \"f1.txt\",\n          \"f2.txt\"\n        ]\n      },\n      \"expected_output\": \"fileFields=[\\\"f1\\\",\\\"f2\\\"]\\nfilenames=[\\\"f1.txt\\\",\\\"f2.txt\\\"]\\nmimeTypes=[\\\"text/plain\\\",\\\"text/plain\\\"]\\nfileField=[\\\"f1\\\",\\\"f2\\\"]\\nfilename=[\\\"f1.txt\\\",\\\"f2.txt\\\"]\\nmimeType=[\\\"text/plain\\\",\\\"text/plain\\\"]\\ntaskType=MultiUploadTask\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskType\": \"MultiUploadTask\",\n        \"taskId\": \"task2\",\n        \"url\": \"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP\",\n        \"files\": [\n          [\n            \"file1\",\n            \"f1.txt\"\n          ],\n          [\n            \"file2\",\n            \"f2.txt\"\n          ]\n        ]\n      },\n      \"expected_output\": \"fileFields=[\\\"file1\\\",\\\"file2\\\"]\\nfilenames=[\\\"f1.txt\\\",\\\"f2.txt\\\"]\\nmimeTypes=[\\\"text/plain\\\",\\\"text/plain\\\"]\\nfileField=[\\\"file1\\\",\\\"file2\\\"]\\nfilename=[\\\"f1.txt\\\",\\\"f2.txt\\\"]\\nmimeType=[\\\"text/plain\\\",\\\"text/plain\\\"]\\ntaskType=MultiUploadTask\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature09_parallel_construction",
+        "trigger_keywords": [
+          "test cases for feature09 parallel construction",
+          "show me feature09 parallel construction test cases",
+          "what are the feature09 parallel construction test inputs",
+          "give me the feature09_parallel_construction test file",
+          "test cases for feature 09",
+          "feature09 parallel construction expected output",
+          "what does feature09 parallel construction expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature09_parallel_construction:\n{\n  \"description\": \"A parallel download task is built from a single url or a list of urls, each providing the same file, plus a chunk count. Optional query parameters are applied to every url. The serialized task exposes the full list of resolved urls and the chunk count, and its primary url is the first resolved url. The output is the canonical serialized parallel download task.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskType\": \"ParallelDownloadTask\",\n        \"taskId\": \"p1\",\n        \"filename\": \"f\",\n        \"creationTime\": 1000,\n        \"url\": \"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\"\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\\\",\\\"headers\\\":{},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":0,\\\"retriesRemaining\\\":0,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"p1\\\",\\\"filename\\\":\\\"f\\\",\\\"directory\\\":\\\"\\\",\\\"baseDirectory\\\":0,\\\"group\\\":\\\"default\\\",\\\"updates\\\":1,\\\"requiresWiFi\\\":false,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"\\\",\\\"taskType\\\":\\\"ParallelDownloadTask\\\",\\\"urls\\\":[\\\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\\\"],\\\"chunks\\\":1}\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"build_task\",\n        \"taskType\": \"ParallelDownloadTask\",\n        \"taskId\": \"p2\",\n        \"filename\": \"f\",\n        \"creationTime\": 1000,\n        \"url\": [\n          \"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\",\n          \"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP\"\n        ],\n        \"urlQueryParameters\": {\n          \"a\": \"b\"\n        },\n        \"chunks\": 5\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP?a=b\\\",\\\"headers\\\":{},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":0,\\\"retriesRemaining\\\":0,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"p2\\\",\\\"filename\\\":\\\"f\\\",\\\"directory\\\":\\\"\\\",\\\"baseDirectory\\\":0,\\\"group\\\":\\\"default\\\",\\\"updates\\\":1,\\\"requiresWiFi\\\":false,\\\"allowPause\\\":false,\\\"metaData\\\":\\\"\\\",\\\"taskType\\\":\\\"ParallelDownloadTask\\\",\\\"urls\\\":[\\\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP?a=b\\\",\\\"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP?a=b\\\"],\\\"chunks\\\":5}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature10_status_update_json",
+        "trigger_keywords": [
+          "test cases for feature10 status update json",
+          "show me feature10 status update json test cases",
+          "what are the feature10 status update json test inputs",
+          "give me the feature10_status_update_json test file",
+          "test cases for feature 10",
+          "feature10 status update json expected output",
+          "what does feature10 status update json expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature10_status_update_json:\n{\n  \"description\": \"A status update carries its task, a status code, an optional failure exception (with a domain exception type name and description), and an optional response body. It is reconstructed from its wire map (whether the task fields are nested or flattened, and whether numbers are integers or floating-point) and re-serialized to a canonical form. The output is the canonical serialized status update.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"roundtrip\",\n        \"kind\": \"TaskStatusUpdate\",\n        \"json\": {\n          \"task\": {\n            \"url\": \"url?a=b\",\n            \"headers\": {\n              \"c\": \"d\"\n            },\n            \"httpRequestMethod\": \"GET\",\n            \"post\": null,\n            \"retries\": 5,\n            \"retriesRemaining\": 5,\n            \"creationTime\": 1000,\n            \"taskId\": \"taskId\",\n            \"filename\": \"filename\",\n            \"directory\": \"dir\",\n            \"baseDirectory\": 1,\n            \"group\": \"group\",\n            \"updates\": 3,\n            \"requiresWiFi\": true,\n            \"allowPause\": true,\n            \"metaData\": \"metaData\",\n            \"taskType\": \"DownloadTask\"\n          },\n          \"taskStatus\": 4,\n          \"exception\": {\n            \"type\": \"TaskConnectionException\",\n            \"description\": \"test\"\n          },\n          \"responseBody\": null\n        }\n      },\n      \"expected_output\": \"{\\\"task\\\":{\\\"url\\\":\\\"url?a=b\\\",\\\"headers\\\":{\\\"c\\\":\\\"d\\\"},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":5,\\\"retriesRemaining\\\":5,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"taskId\\\",\\\"filename\\\":\\\"filename\\\",\\\"directory\\\":\\\"dir\\\",\\\"baseDirectory\\\":1,\\\"group\\\":\\\"group\\\",\\\"updates\\\":3,\\\"requiresWiFi\\\":true,\\\"allowPause\\\":true,\\\"metaData\\\":\\\"metaData\\\",\\\"taskType\\\":\\\"DownloadTask\\\"},\\\"taskStatus\\\":4,\\\"exception\\\":{\\\"type\\\":\\\"TaskConnectionException\\\",\\\"description\\\":\\\"test\\\"},\\\"responseBody\\\":null}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature11_progress_update_json",
+        "trigger_keywords": [
+          "test cases for feature11 progress update json",
+          "show me feature11 progress update json test cases",
+          "what are the feature11 progress update json test inputs",
+          "give me the feature11_progress_update_json test file",
+          "test cases for feature 11",
+          "feature11 progress update json expected output",
+          "what does feature11 progress update json expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_progress_update_json:\n{\n  \"description\": \"A progress update carries its task, a progress fraction, an expected total byte size, a network speed and a remaining time. It is reconstructed from its wire map (task fields nested or flattened, numbers integer or floating-point) and re-serialized to a canonical form in which unset speed and time appear as their not-available sentinels. The output is the canonical serialized progress update.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"roundtrip\",\n        \"kind\": \"TaskProgressUpdate\",\n        \"json\": {\n          \"task\": {\n            \"url\": \"url?a=b\",\n            \"headers\": {\n              \"c\": \"d\"\n            },\n            \"httpRequestMethod\": \"GET\",\n            \"post\": null,\n            \"retries\": 5,\n            \"retriesRemaining\": 5,\n            \"creationTime\": 1000,\n            \"taskId\": \"taskId\",\n            \"filename\": \"filename\",\n            \"directory\": \"dir\",\n            \"baseDirectory\": 1,\n            \"group\": \"group\",\n            \"updates\": 3,\n            \"requiresWiFi\": true,\n            \"allowPause\": true,\n            \"metaData\": \"metaData\",\n            \"taskType\": \"DownloadTask\"\n          },\n          \"progress\": 1.0,\n          \"expectedFileSize\": 123,\n          \"networkSpeed\": -1.0,\n          \"timeRemaining\": -1\n        }\n      },\n      \"expected_output\": \"{\\\"task\\\":{\\\"url\\\":\\\"url?a=b\\\",\\\"headers\\\":{\\\"c\\\":\\\"d\\\"},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":5,\\\"retriesRemaining\\\":5,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"taskId\\\",\\\"filename\\\":\\\"filename\\\",\\\"directory\\\":\\\"dir\\\",\\\"baseDirectory\\\":1,\\\"group\\\":\\\"group\\\",\\\"updates\\\":3,\\\"requiresWiFi\\\":true,\\\"allowPause\\\":true,\\\"metaData\\\":\\\"metaData\\\",\\\"taskType\\\":\\\"DownloadTask\\\"},\\\"progress\\\":1.0,\\\"expectedFileSize\\\":123,\\\"networkSpeed\\\":-1.0,\\\"timeRemaining\\\":-1}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature12_task_record_json",
+        "trigger_keywords": [
+          "test cases for feature12 task record json",
+          "show me feature12 task record json test cases",
+          "what are the feature12 task record json test inputs",
+          "give me the feature12_task_record_json test file",
+          "test cases for feature 12",
+          "feature12 task record json expected output",
+          "what does feature12 task record json expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature12_task_record_json:\n{\n  \"description\": \"A task record merges a task with its tracked status, progress fraction, expected total byte size and optional failure exception into a single flat serialized map. It is reconstructed from its wire map (numbers integer or floating-point) and re-serialized to a canonical form. The output is the canonical serialized task record.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"roundtrip\",\n        \"kind\": \"TaskRecord\",\n        \"json\": {\n          \"url\": \"url?a=b\",\n          \"headers\": {\n            \"c\": \"d\"\n          },\n          \"httpRequestMethod\": \"GET\",\n          \"post\": null,\n          \"retries\": 5,\n          \"retriesRemaining\": 5,\n          \"creationTime\": 1000,\n          \"taskId\": \"taskId\",\n          \"filename\": \"filename\",\n          \"directory\": \"dir\",\n          \"baseDirectory\": 1,\n          \"group\": \"group\",\n          \"updates\": 3,\n          \"requiresWiFi\": true,\n          \"allowPause\": true,\n          \"metaData\": \"metaData\",\n          \"taskType\": \"DownloadTask\",\n          \"status\": 4,\n          \"progress\": 1.0,\n          \"expectedFileSize\": 123,\n          \"exception\": {\n            \"type\": \"TaskUrlException\",\n            \"description\": \"test\"\n          }\n        }\n      },\n      \"expected_output\": \"{\\\"url\\\":\\\"url?a=b\\\",\\\"headers\\\":{\\\"c\\\":\\\"d\\\"},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":5,\\\"retriesRemaining\\\":5,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"taskId\\\",\\\"filename\\\":\\\"filename\\\",\\\"directory\\\":\\\"dir\\\",\\\"baseDirectory\\\":1,\\\"group\\\":\\\"group\\\",\\\"updates\\\":3,\\\"requiresWiFi\\\":true,\\\"allowPause\\\":true,\\\"metaData\\\":\\\"metaData\\\",\\\"taskType\\\":\\\"DownloadTask\\\",\\\"status\\\":4,\\\"progress\\\":1.0,\\\"expectedFileSize\\\":123,\\\"exception\\\":{\\\"type\\\":\\\"TaskUrlException\\\",\\\"description\\\":\\\"test\\\"}}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature13_resume_data_json",
+        "trigger_keywords": [
+          "test cases for feature13 resume data json",
+          "show me feature13 resume data json test cases",
+          "what are the feature13 resume data json test inputs",
+          "give me the feature13_resume_data_json test file",
+          "test cases for feature 13",
+          "feature13 resume data json expected output",
+          "what does feature13 resume data json expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature13_resume_data_json:\n{\n  \"description\": \"Resume data pairs a task with an opaque resume payload, a required start byte and an optional entity tag. It is reconstructed from its wire map and re-serialized to a canonical form; a missing entity tag is preserved as a null. The output is the canonical serialized resume data.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"roundtrip\",\n        \"kind\": \"ResumeData\",\n        \"json\": {\n          \"task\": {\n            \"url\": \"url?a=b\",\n            \"headers\": {\n              \"c\": \"d\"\n            },\n            \"httpRequestMethod\": \"GET\",\n            \"post\": null,\n            \"retries\": 5,\n            \"retriesRemaining\": 5,\n            \"creationTime\": 1000,\n            \"taskId\": \"taskId\",\n            \"filename\": \"filename\",\n            \"directory\": \"dir\",\n            \"baseDirectory\": 1,\n            \"group\": \"group\",\n            \"updates\": 3,\n            \"requiresWiFi\": true,\n            \"allowPause\": true,\n            \"metaData\": \"metaData\",\n            \"taskType\": \"DownloadTask\"\n          },\n          \"data\": \"data\",\n          \"requiredStartByte\": 123,\n          \"eTag\": \"tag\"\n        }\n      },\n      \"expected_output\": \"{\\\"task\\\":{\\\"url\\\":\\\"url?a=b\\\",\\\"headers\\\":{\\\"c\\\":\\\"d\\\"},\\\"httpRequestMethod\\\":\\\"GET\\\",\\\"post\\\":null,\\\"retries\\\":5,\\\"retriesRemaining\\\":5,\\\"creationTime\\\":1000,\\\"taskId\\\":\\\"taskId\\\",\\\"filename\\\":\\\"filename\\\",\\\"directory\\\":\\\"dir\\\",\\\"baseDirectory\\\":1,\\\"group\\\":\\\"group\\\",\\\"updates\\\":3,\\\"requiresWiFi\\\":true,\\\"allowPause\\\":true,\\\"metaData\\\":\\\"metaData\\\",\\\"taskType\\\":\\\"DownloadTask\\\"},\\\"data\\\":\\\"data\\\",\\\"requiredStartByte\\\":123,\\\"eTag\\\":\\\"tag\\\"}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature14_chunk_split",
+        "trigger_keywords": [
+          "test cases for feature14 chunk split",
+          "show me feature14 chunk split test cases",
+          "what are the feature14 chunk split test inputs",
+          "give me the feature14_chunk_split test file",
+          "test cases for feature 14",
+          "feature14 chunk split expected output",
+          "what does feature14 chunk split expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature14_chunk_split:\n{\n  \"description\": \"Given a ranged download split across one or more urls and a number of chunks per url, the file is divided into contiguous byte ranges. The total number of pieces is the number of urls times the chunks per url. Each piece records its source url, its inclusive start and end byte offsets (the last piece ending at the final byte of the content), the chunk group it belongs to, and metadata linking it to its parent transfer with its byte range. If the content length is missing or non-positive, or the server does not advertise range support, the split is rejected with a neutral error category. The output lists the piece count followed by one line per piece.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"chunk_split\",\n        \"taskId\": \"P\",\n        \"url\": \"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP\",\n        \"chunks\": 1,\n        \"headers\": {\n          \"content-length\": \"100\",\n          \"accept-ranges\": \"bytes\"\n        }\n      },\n      \"expected_output\": \"count=1\\nurl=https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP fromByte=0 toByte=99 group=chunk metaData={\\\"parentTaskId\\\":\\\"P\\\",\\\"from\\\":0,\\\"to\\\":99}\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"chunk_split\",\n        \"taskId\": \"P\",\n        \"url\": \"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP\",\n        \"chunks\": 3,\n        \"headers\": {\n          \"content-length\": \"100\",\n          \"accept-ranges\": \"bytes\"\n        }\n      },\n      \"expected_output\": \"count=3\\nurl=https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP fromByte=0 toByte=33 group=chunk metaData={\\\"parentTaskId\\\":\\\"P\\\",\\\"from\\\":0,\\\"to\\\":33}\\nurl=https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP fromByte=34 toByte=67 group=chunk metaData={\\\"parentTaskId\\\":\\\"P\\\",\\\"from\\\":34,\\\"to\\\":67}\\nurl=https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP fromByte=68 toByte=99 group=chunk metaData={\\\"parentTaskId\\\":\\\"P\\\",\\\"from\\\":68,\\\"to\\\":99}\\n\"\n    },\n    {\n      \"input\": {\n        \"action\": \"chunk_split\",\n        \"taskId\": \"P\",\n        \"url\": \"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP\",\n        \"chunks\": 1,\n        \"headers\": {}\n      },\n      \"expected_output\": \"error=cannot_chunk\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature15_chunk_aggregation",
+        "trigger_keywords": [
+          "test cases for feature15 chunk aggregation",
+          "show me feature15 chunk aggregation test cases",
+          "what are the feature15 chunk aggregation test inputs",
+          "give me the feature15_chunk_aggregation test file",
+          "test cases for feature 15",
+          "feature15 chunk aggregation expected output",
+          "what does feature15 chunk aggregation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature15_chunk_aggregation:\n{\n  \"description\": \"A parent transfer derives its overall progress and overall status from its child chunks. Overall progress is the average of the child progress fractions. Overall status resolves to failed if any child failed, to not-found if any child reports not-found (and none failed), to complete only once every child has completed, and is otherwise undetermined. A per-chunk status event reports the newly-derived parent status only when it changes from the previously reported one. Events drive the chunks one at a time and the output records the derived value after each event.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"action\": \"chunk_aggregate\",\n        \"taskId\": \"PA\",\n        \"url\": \"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP\",\n        \"chunks\": 3,\n        \"contentLength\": 6207471,\n        \"events\": [\n          {\n            \"type\": \"parentProgress\"\n          },\n          {\n            \"type\": \"progress\",\n            \"chunk\": 0,\n            \"value\": 0.5\n          },\n          {\n            \"type\": \"parentStatus\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 0,\n            \"value\": \"complete\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 2,\n            \"value\": \"complete\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 1,\n            \"value\": \"complete\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 0,\n            \"value\": \"failed\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 1,\n            \"value\": \"failed\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 2,\n            \"value\": \"failed\"\n          },\n          {\n            \"type\": \"parentStatus\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 0,\n            \"value\": \"notFound\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 1,\n            \"value\": \"notFound\"\n          },\n          {\n            \"type\": \"status\",\n            \"chunk\": 2,\n            \"value\": \"notFound\"\n          },\n          {\n            \"type\": \"parentStatus\"\n          }\n        ]\n      },\n      \"expected_output\": \"parent_progress=0.0\\nparent_progress=0.16666666666666666\\nparent_status=none\\nstatus_change=none\\nstatus_change=none\\nstatus_change=complete\\nstatus_change=failed\\nstatus_change=none\\nstatus_change=none\\nparent_status=failed\\nstatus_change=none\\nstatus_change=none\\nstatus_change=notFound\\nparent_status=notFound\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "large downloads show 'stuck' progress because the aggregation logic is broken",
+        "actual_meaning": "Feature 3 chunk aggregation (feature15_chunk_aggregation): parent progress is the average of child fractions, and parent status resolves via priority rules (failed > notFound > complete > undetermined), emitting a new status event only on change."
+      },
+      {
+        "vague_reference": "serialization is tolerant of slight variations in how numbers come in from different platforms",
+        "actual_meaning": "Round-trip deserialization (features 06–13) must accept both integer and floating-point JSON numbers for all numeric fields (retries, retriesRemaining, creationTime, progress, expectedFileSize, networkSpeed, timeRemaining, baseDirectory, updates, requiredStartByte)."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that specific point — you'll need to look at the existing behavior in the codebase or the test cases to determine the exact rule. If it's about formatting, validation, or status logic, check the relevant feature test JSON files for examples of expected inputs and outputs."
+  },
+  "public_test_cases": {
+    "feature01_progress_display.json": {
+      "description": "A transfer progress update exposes derived display fields: three boolean flags indicating whether an expected total size, a network speed, and a remaining time are available, plus a human-readable network-speed string and a human-readable remaining-time string. The input supplies a progress fraction and optionally an expected total byte size, a network speed in MB per second, and a remaining time in whole seconds; when any of those three is omitted it is treated as not-available. The speed string renders as MB per second when at least one, as kB per second when below one, and a placeholder when not available; the time string renders as MM:SS, or H:MM:SS once an hour or more remains, and a placeholder when not available.",
+      "cases": [
+        {
+          "input": {
+            "action": "progress_display",
+            "progress": 0.1
+          },
+          "expected_output": "hasExpectedFileSize=false\nhasNetworkSpeed=false\nhasTimeRemaining=false\nnetworkSpeed=-- MB/s\ntimeRemaining=--:--\n"
+        },
+        {
+          "input": {
+            "action": "progress_display",
+            "progress": 0.1,
+            "expectedFileSize": 123,
+            "networkSpeed": 0.2,
+            "timeRemaining": 30
+          },
+          "expected_output": "hasExpectedFileSize=true\nhasNetworkSpeed=true\nhasTimeRemaining=true\nnetworkSpeed=200 kB/s\ntimeRemaining=00:30\n"
+        }
+      ]
+    },
+    "feature02_copy_with.json": {
+      "description": "Copying a fully-populated download task without supplying any overrides yields a task whose every field equals the original, including identifier, target location, request headers and method, request body, group, update mode, retry settings (including remaining retries), wifi requirement, pause permission, metadata and creation time. The output is the canonical serialized form of the copy.",
+      "cases": [
+        {
+          "input": {
+            "action": "build_task",
+            "taskType": "DownloadTask",
+            "copyWith": true,
+            "taskId": "uniqueId",
+            "url": "https://avmaps-dot-bbflightserver-hrd.appspot.com/public/test_post_data",
+            "filename": "google.html",
+            "headers": {
+              "Auth": "Test"
+            },
+            "httpRequestMethod": "PATCH",
+            "post": "TestPost",
+            "directory": "directory",
+            "baseDirectory": 1,
+            "group": "someGroup",
+            "updates": 3,
+            "requiresWiFi": true,
+            "retries": 5,
+            "metaData": "someMetaData",
+            "creationTime": 1000
+          },
+          "expected_output": "{\"url\":\"https://avmaps-dot-bbflightserver-hrd.appspot.com/public/test_post_data\",\"headers\":{\"Auth\":\"Test\"},\"httpRequestMethod\":\"PATCH\",\"post\":\"TestPost\",\"retries\":5,\"retriesRemaining\":5,\"creationTime\":1000,\"taskId\":\"uniqueId\",\"filename\":\"google.html\",\"directory\":\"directory\",\"baseDirectory\":1,\"group\":\"someGroup\",\"updates\":3,\"requiresWiFi\":true,\"allowPause\":false,\"metaData\":\"someMetaData\",\"taskType\":\"DownloadTask\"}\n"
+        }
+      ]
+    },
+    "feature03_url_query.json": {
+      "description": "When building a download request, optional query parameters are appended to the base url. If no parameters are supplied the url is left unchanged; otherwise each name/value pair is appended in order. The separator is a question mark when the base url has none yet, or an ampersand when the url already contains a query string. The resulting url is reflected in the serialized task.",
+      "cases": [
+        {
+          "input": {
+            "action": "build_task",
+            "taskId": "q",
+            "filename": "f",
+            "creationTime": 1000,
+            "url": "url with space",
+            "urlQueryParameters": {}
+          },
+          "expected_output": "{\"url\":\"url with space\",\"headers\":{},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":0,\"retriesRemaining\":0,\"creationTime\":1000,\"taskId\":\"q\",\"filename\":\"f\",\"directory\":\"\",\"baseDirectory\":0,\"group\":\"default\",\"updates\":1,\"requiresWiFi\":false,\"allowPause\":false,\"metaData\":\"\",\"taskType\":\"DownloadTask\"}\n"
+        },
+        {
+          "input": {
+            "action": "build_task",
+            "taskId": "q",
+            "filename": "f",
+            "creationTime": 1000,
+            "url": "url",
+            "urlQueryParameters": {
+              "param1": "1",
+              "param2": "with space"
+            }
+          },
+          "expected_output": "{\"url\":\"url?param1=1&param2=with space\",\"headers\":{},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":0,\"retriesRemaining\":0,\"creationTime\":1000,\"taskId\":\"q\",\"filename\":\"f\",\"directory\":\"\",\"baseDirectory\":0,\"group\":\"default\",\"updates\":1,\"requiresWiFi\":false,\"allowPause\":false,\"metaData\":\"\",\"taskType\":\"DownloadTask\"}\n"
+        }
+      ]
+    },
+    "feature04_filename_validation.json": {
+      "description": "A download target filename is accepted as-is when it is a plain name, and is reflected in the serialized task. A filename that contains a path separator is rejected at construction time with a neutral error category, because the directory must be specified separately from the filename.",
+      "cases": [
+        {
+          "input": {
+            "action": "build_task",
+            "taskId": "t",
+            "creationTime": 1000,
+            "url": "https://google.com",
+            "filename": "google.html"
+          },
+          "expected_output": "{\"url\":\"https://google.com\",\"headers\":{},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":0,\"retriesRemaining\":0,\"creationTime\":1000,\"taskId\":\"t\",\"filename\":\"google.html\",\"directory\":\"\",\"baseDirectory\":0,\"group\":\"default\",\"updates\":1,\"requiresWiFi\":false,\"allowPause\":false,\"metaData\":\"\",\"taskType\":\"DownloadTask\"}\n"
+        },
+        {
+          "input": {
+            "action": "build_task",
+            "taskId": "t",
+            "creationTime": 1000,
+            "url": "https://google.com",
+            "filename": "somedir/google.html"
+          },
+          "expected_output": "error=filename_has_path_separator\n"
+        }
+      ]
+    },
+    "feature05_directory_validation.json": {
+      "description": "A download target directory defaults to empty when omitted, and is accepted as-is when it is a relative path, both reflected in the serialized task. A directory given as an absolute path (one that begins with a path separator) is rejected at construction time with a neutral error category, because the directory must be relative to a chosen base directory.",
+      "cases": [
+        {
+          "input": {
+            "action": "build_task",
+            "taskId": "t",
+            "filename": "f",
+            "creationTime": 1000,
+            "url": "https://google.com"
+          },
+          "expected_output": "{\"url\":\"https://google.com\",\"headers\":{},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":0,\"retriesRemaining\":0,\"creationTime\":1000,\"taskId\":\"t\",\"filename\":\"f\",\"directory\":\"\",\"baseDirectory\":0,\"group\":\"default\",\"updates\":1,\"requiresWiFi\":false,\"allowPause\":false,\"metaData\":\"\",\"taskType\":\"DownloadTask\"}\n"
+        },
+        {
+          "input": {
+            "action": "build_task",
+            "taskId": "t",
+            "filename": "f",
+            "creationTime": 1000,
+            "url": "https://google.com",
+            "directory": "testDir"
+          },
+          "expected_output": "{\"url\":\"https://google.com\",\"headers\":{},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":0,\"retriesRemaining\":0,\"creationTime\":1000,\"taskId\":\"t\",\"filename\":\"f\",\"directory\":\"testDir\",\"baseDirectory\":0,\"group\":\"default\",\"updates\":1,\"requiresWiFi\":false,\"allowPause\":false,\"metaData\":\"\",\"taskType\":\"DownloadTask\"}\n"
+        }
+      ]
+    },
+    "feature06_download_task_json.json": {
+      "description": "A download task is reconstructed from its serialized wire map and re-serialized to a canonical form. The canonical form is stable regardless of whether numeric fields arrive as integers or as floating-point numbers, and tolerant of extra fields that some producers include. The output is the canonical serialized download task.",
+      "cases": [
+        {
+          "input": {
+            "action": "roundtrip",
+            "kind": "DownloadTask",
+            "json": {
+              "url": "url?a=b",
+              "headers": {
+                "c": "d"
+              },
+              "httpRequestMethod": "GET",
+              "post": null,
+              "retries": 5,
+              "retriesRemaining": 5,
+              "creationTime": 1000,
+              "taskId": "taskId",
+              "filename": "filename",
+              "directory": "dir",
+              "baseDirectory": 1,
+              "group": "group",
+              "updates": 3,
+              "requiresWiFi": true,
+              "allowPause": true,
+              "metaData": "metaData",
+              "taskType": "DownloadTask"
+            }
+          },
+          "expected_output": "{\"url\":\"url?a=b\",\"headers\":{\"c\":\"d\"},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":5,\"retriesRemaining\":5,\"creationTime\":1000,\"taskId\":\"taskId\",\"filename\":\"filename\",\"directory\":\"dir\",\"baseDirectory\":1,\"group\":\"group\",\"updates\":3,\"requiresWiFi\":true,\"allowPause\":true,\"metaData\":\"metaData\",\"taskType\":\"DownloadTask\"}\n"
+        },
+        {
+          "input": {
+            "action": "roundtrip",
+            "kind": "DownloadTask",
+            "json": {
+              "allowPause": false,
+              "baseDirectory": 1,
+              "chunks": 1,
+              "creationTime": 1694879914883,
+              "directory": "",
+              "fields": {},
+              "fileField": "",
+              "filename": "com.bbflight.background_downloader.1186323287",
+              "group": "chunk",
+              "headers": {
+                "Range": "bytes=0-29836749"
+              },
+              "httpRequestMethod": "GET",
+              "metaData": "{\"parentTaskId\":\"3069222547\",\"from\":0,\"to\":29836749}",
+              "mimeType": "",
+              "requiresWiFi": false,
+              "retries": 0,
+              "retriesRemaining": 0,
+              "taskId": "1702658487",
+              "taskType": "DownloadTask",
+              "updates": 2,
+              "url": "https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP",
+              "urls": []
+            }
+          },
+          "expected_output": "{\"url\":\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\",\"headers\":{\"Range\":\"bytes=0-29836749\"},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":0,\"retriesRemaining\":0,\"creationTime\":1694879914883,\"taskId\":\"1702658487\",\"filename\":\"com.bbflight.background_downloader.1186323287\",\"directory\":\"\",\"baseDirectory\":1,\"group\":\"chunk\",\"updates\":2,\"requiresWiFi\":false,\"allowPause\":false,\"metaData\":\"{\\\"parentTaskId\\\":\\\"3069222547\\\",\\\"from\\\":0,\\\"to\\\":29836749}\",\"taskType\":\"DownloadTask\"}\n"
+        }
+      ]
+    },
+    "feature07_upload_task_json.json": {
+      "description": "An upload task is reconstructed from its serialized wire map and re-serialized to a canonical form, including upload-specific fields such as the file field name, the mime type and the extra form fields. The canonical form is stable regardless of whether numeric fields arrive as integers or floating-point numbers. The output is the canonical serialized upload task.",
+      "cases": [
+        {
+          "input": {
+            "action": "roundtrip",
+            "kind": "UploadTask",
+            "json": {
+              "url": "url?a=b",
+              "headers": {
+                "c": "d"
+              },
+              "httpRequestMethod": "PUT",
+              "post": null,
+              "retries": 5,
+              "retriesRemaining": 5,
+              "creationTime": 1000,
+              "taskId": "taskId",
+              "filename": "filename",
+              "directory": "dir",
+              "baseDirectory": 1,
+              "group": "group",
+              "updates": 3,
+              "requiresWiFi": true,
+              "allowPause": false,
+              "metaData": "metaData",
+              "taskType": "UploadTask",
+              "fileField": "fileField",
+              "mimeType": "application/octet-stream",
+              "fields": {
+                "e": "f"
+              }
+            }
+          },
+          "expected_output": "{\"url\":\"url?a=b\",\"headers\":{\"c\":\"d\"},\"httpRequestMethod\":\"PUT\",\"post\":null,\"retries\":5,\"retriesRemaining\":5,\"creationTime\":1000,\"taskId\":\"taskId\",\"filename\":\"filename\",\"directory\":\"dir\",\"baseDirectory\":1,\"group\":\"group\",\"updates\":3,\"requiresWiFi\":true,\"allowPause\":false,\"metaData\":\"metaData\",\"taskType\":\"UploadTask\",\"fileField\":\"fileField\",\"mimeType\":\"application/octet-stream\",\"fields\":{\"e\":\"f\"}}\n"
+        }
+      ]
+    },
+    "feature08_multi_upload_construction.json": {
+      "description": "A multi-file upload task is built from a list describing each file. Each entry is either a bare filename, a pair of (field name, filename), or a triple of (field name, filename, mime type). For a bare filename the field name is the filename without its extension and the mime type is inferred from the extension (defaulting to a generic binary type when unknown); for a pair the mime type is inferred; for a triple the mime type is taken verbatim. The output reports the per-file field names, filenames and mime types as ordered lists, the same three as compact JSON-encoded strings, and the task type.",
+      "cases": [
+        {
+          "input": {
+            "action": "build_task",
+            "taskType": "MultiUploadTask",
+            "taskId": "task1",
+            "url": "https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP",
+            "files": [
+              "f1.txt",
+              "f2.txt"
+            ]
+          },
+          "expected_output": "fileFields=[\"f1\",\"f2\"]\nfilenames=[\"f1.txt\",\"f2.txt\"]\nmimeTypes=[\"text/plain\",\"text/plain\"]\nfileField=[\"f1\",\"f2\"]\nfilename=[\"f1.txt\",\"f2.txt\"]\nmimeType=[\"text/plain\",\"text/plain\"]\ntaskType=MultiUploadTask\n"
+        },
+        {
+          "input": {
+            "action": "build_task",
+            "taskType": "MultiUploadTask",
+            "taskId": "task2",
+            "url": "https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP",
+            "files": [
+              [
+                "file1",
+                "f1.txt"
+              ],
+              [
+                "file2",
+                "f2.txt"
+              ]
+            ]
+          },
+          "expected_output": "fileFields=[\"file1\",\"file2\"]\nfilenames=[\"f1.txt\",\"f2.txt\"]\nmimeTypes=[\"text/plain\",\"text/plain\"]\nfileField=[\"file1\",\"file2\"]\nfilename=[\"f1.txt\",\"f2.txt\"]\nmimeType=[\"text/plain\",\"text/plain\"]\ntaskType=MultiUploadTask\n"
+        }
+      ]
+    },
+    "feature09_parallel_construction.json": {
+      "description": "A parallel download task is built from a single url or a list of urls, each providing the same file, plus a chunk count. Optional query parameters are applied to every url. The serialized task exposes the full list of resolved urls and the chunk count, and its primary url is the first resolved url. The output is the canonical serialized parallel download task.",
+      "cases": [
+        {
+          "input": {
+            "action": "build_task",
+            "taskType": "ParallelDownloadTask",
+            "taskId": "p1",
+            "filename": "f",
+            "creationTime": 1000,
+            "url": "https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP"
+          },
+          "expected_output": "{\"url\":\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\",\"headers\":{},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":0,\"retriesRemaining\":0,\"creationTime\":1000,\"taskId\":\"p1\",\"filename\":\"f\",\"directory\":\"\",\"baseDirectory\":0,\"group\":\"default\",\"updates\":1,\"requiresWiFi\":false,\"allowPause\":false,\"metaData\":\"\",\"taskType\":\"ParallelDownloadTask\",\"urls\":[\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP\"],\"chunks\":1}\n"
+        },
+        {
+          "input": {
+            "action": "build_task",
+            "taskType": "ParallelDownloadTask",
+            "taskId": "p2",
+            "filename": "f",
+            "creationTime": 1000,
+            "url": [
+              "https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP",
+              "https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP"
+            ],
+            "urlQueryParameters": {
+              "a": "b"
+            },
+            "chunks": 5
+          },
+          "expected_output": "{\"url\":\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP?a=b\",\"headers\":{},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":0,\"retriesRemaining\":0,\"creationTime\":1000,\"taskId\":\"p2\",\"filename\":\"f\",\"directory\":\"\",\"baseDirectory\":0,\"group\":\"default\",\"updates\":1,\"requiresWiFi\":false,\"allowPause\":false,\"metaData\":\"\",\"taskType\":\"ParallelDownloadTask\",\"urls\":[\"https://storage.googleapis.com/approachcharts/test/57MB-test.ZIP?a=b\",\"https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP?a=b\"],\"chunks\":5}\n"
+        }
+      ]
+    },
+    "feature10_status_update_json.json": {
+      "description": "A status update carries its task, a status code, an optional failure exception (with a domain exception type name and description), and an optional response body. It is reconstructed from its wire map (whether the task fields are nested or flattened, and whether numbers are integers or floating-point) and re-serialized to a canonical form. The output is the canonical serialized status update.",
+      "cases": [
+        {
+          "input": {
+            "action": "roundtrip",
+            "kind": "TaskStatusUpdate",
+            "json": {
+              "task": {
+                "url": "url?a=b",
+                "headers": {
+                  "c": "d"
+                },
+                "httpRequestMethod": "GET",
+                "post": null,
+                "retries": 5,
+                "retriesRemaining": 5,
+                "creationTime": 1000,
+                "taskId": "taskId",
+                "filename": "filename",
+                "directory": "dir",
+                "baseDirectory": 1,
+                "group": "group",
+                "updates": 3,
+                "requiresWiFi": true,
+                "allowPause": true,
+                "metaData": "metaData",
+                "taskType": "DownloadTask"
+              },
+              "taskStatus": 4,
+              "exception": {
+                "type": "TaskConnectionException",
+                "description": "test"
+              },
+              "responseBody": null
+            }
+          },
+          "expected_output": "{\"task\":{\"url\":\"url?a=b\",\"headers\":{\"c\":\"d\"},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":5,\"retriesRemaining\":5,\"creationTime\":1000,\"taskId\":\"taskId\",\"filename\":\"filename\",\"directory\":\"dir\",\"baseDirectory\":1,\"group\":\"group\",\"updates\":3,\"requiresWiFi\":true,\"allowPause\":true,\"metaData\":\"metaData\",\"taskType\":\"DownloadTask\"},\"taskStatus\":4,\"exception\":{\"type\":\"TaskConnectionException\",\"description\":\"test\"},\"responseBody\":null}\n"
+        }
+      ]
+    },
+    "feature11_progress_update_json.json": {
+      "description": "A progress update carries its task, a progress fraction, an expected total byte size, a network speed and a remaining time. It is reconstructed from its wire map (task fields nested or flattened, numbers integer or floating-point) and re-serialized to a canonical form in which unset speed and time appear as their not-available sentinels. The output is the canonical serialized progress update.",
+      "cases": [
+        {
+          "input": {
+            "action": "roundtrip",
+            "kind": "TaskProgressUpdate",
+            "json": {
+              "task": {
+                "url": "url?a=b",
+                "headers": {
+                  "c": "d"
+                },
+                "httpRequestMethod": "GET",
+                "post": null,
+                "retries": 5,
+                "retriesRemaining": 5,
+                "creationTime": 1000,
+                "taskId": "taskId",
+                "filename": "filename",
+                "directory": "dir",
+                "baseDirectory": 1,
+                "group": "group",
+                "updates": 3,
+                "requiresWiFi": true,
+                "allowPause": true,
+                "metaData": "metaData",
+                "taskType": "DownloadTask"
+              },
+              "progress": 1.0,
+              "expectedFileSize": 123,
+              "networkSpeed": -1.0,
+              "timeRemaining": -1
+            }
+          },
+          "expected_output": "{\"task\":{\"url\":\"url?a=b\",\"headers\":{\"c\":\"d\"},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":5,\"retriesRemaining\":5,\"creationTime\":1000,\"taskId\":\"taskId\",\"filename\":\"filename\",\"directory\":\"dir\",\"baseDirectory\":1,\"group\":\"group\",\"updates\":3,\"requiresWiFi\":true,\"allowPause\":true,\"metaData\":\"metaData\",\"taskType\":\"DownloadTask\"},\"progress\":1.0,\"expectedFileSize\":123,\"networkSpeed\":-1.0,\"timeRemaining\":-1}\n"
+        }
+      ]
+    },
+    "feature12_task_record_json.json": {
+      "description": "A task record merges a task with its tracked status, progress fraction, expected total byte size and optional failure exception into a single flat serialized map. It is reconstructed from its wire map (numbers integer or floating-point) and re-serialized to a canonical form. The output is the canonical serialized task record.",
+      "cases": [
+        {
+          "input": {
+            "action": "roundtrip",
+            "kind": "TaskRecord",
+            "json": {
+              "url": "url?a=b",
+              "headers": {
+                "c": "d"
+              },
+              "httpRequestMethod": "GET",
+              "post": null,
+              "retries": 5,
+              "retriesRemaining": 5,
+              "creationTime": 1000,
+              "taskId": "taskId",
+              "filename": "filename",
+              "directory": "dir",
+              "baseDirectory": 1,
+              "group": "group",
+              "updates": 3,
+              "requiresWiFi": true,
+              "allowPause": true,
+              "metaData": "metaData",
+              "taskType": "DownloadTask",
+              "status": 4,
+              "progress": 1.0,
+              "expectedFileSize": 123,
+              "exception": {
+                "type": "TaskUrlException",
+                "description": "test"
+              }
+            }
+          },
+          "expected_output": "{\"url\":\"url?a=b\",\"headers\":{\"c\":\"d\"},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":5,\"retriesRemaining\":5,\"creationTime\":1000,\"taskId\":\"taskId\",\"filename\":\"filename\",\"directory\":\"dir\",\"baseDirectory\":1,\"group\":\"group\",\"updates\":3,\"requiresWiFi\":true,\"allowPause\":true,\"metaData\":\"metaData\",\"taskType\":\"DownloadTask\",\"status\":4,\"progress\":1.0,\"expectedFileSize\":123,\"exception\":{\"type\":\"TaskUrlException\",\"description\":\"test\"}}\n"
+        }
+      ]
+    },
+    "feature13_resume_data_json.json": {
+      "description": "Resume data pairs a task with an opaque resume payload, a required start byte and an optional entity tag. It is reconstructed from its wire map and re-serialized to a canonical form; a missing entity tag is preserved as a null. The output is the canonical serialized resume data.",
+      "cases": [
+        {
+          "input": {
+            "action": "roundtrip",
+            "kind": "ResumeData",
+            "json": {
+              "task": {
+                "url": "url?a=b",
+                "headers": {
+                  "c": "d"
+                },
+                "httpRequestMethod": "GET",
+                "post": null,
+                "retries": 5,
+                "retriesRemaining": 5,
+                "creationTime": 1000,
+                "taskId": "taskId",
+                "filename": "filename",
+                "directory": "dir",
+                "baseDirectory": 1,
+                "group": "group",
+                "updates": 3,
+                "requiresWiFi": true,
+                "allowPause": true,
+                "metaData": "metaData",
+                "taskType": "DownloadTask"
+              },
+              "data": "data",
+              "requiredStartByte": 123,
+              "eTag": "tag"
+            }
+          },
+          "expected_output": "{\"task\":{\"url\":\"url?a=b\",\"headers\":{\"c\":\"d\"},\"httpRequestMethod\":\"GET\",\"post\":null,\"retries\":5,\"retriesRemaining\":5,\"creationTime\":1000,\"taskId\":\"taskId\",\"filename\":\"filename\",\"directory\":\"dir\",\"baseDirectory\":1,\"group\":\"group\",\"updates\":3,\"requiresWiFi\":true,\"allowPause\":true,\"metaData\":\"metaData\",\"taskType\":\"DownloadTask\"},\"data\":\"data\",\"requiredStartByte\":123,\"eTag\":\"tag\"}\n"
+        }
+      ]
+    },
+    "feature14_chunk_split.json": {
+      "description": "Given a ranged download split across one or more urls and a number of chunks per url, the file is divided into contiguous byte ranges. The total number of pieces is the number of urls times the chunks per url. Each piece records its source url, its inclusive start and end byte offsets (the last piece ending at the final byte of the content), the chunk group it belongs to, and metadata linking it to its parent transfer with its byte range. If the content length is missing or non-positive, or the server does not advertise range support, the split is rejected with a neutral error category. The output lists the piece count followed by one line per piece.",
+      "cases": [
+        {
+          "input": {
+            "action": "chunk_split",
+            "taskId": "P",
+            "url": "https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP",
+            "chunks": 1,
+            "headers": {
+              "content-length": "100",
+              "accept-ranges": "bytes"
+            }
+          },
+          "expected_output": "count=1\nurl=https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP fromByte=0 toByte=99 group=chunk metaData={\"parentTaskId\":\"P\",\"from\":0,\"to\":99}\n"
+        },
+        {
+          "input": {
+            "action": "chunk_split",
+            "taskId": "P",
+            "url": "https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP",
+            "chunks": 3,
+            "headers": {
+              "content-length": "100",
+              "accept-ranges": "bytes"
+            }
+          },
+          "expected_output": "count=3\nurl=https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP fromByte=0 toByte=33 group=chunk metaData={\"parentTaskId\":\"P\",\"from\":0,\"to\":33}\nurl=https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP fromByte=34 toByte=67 group=chunk metaData={\"parentTaskId\":\"P\",\"from\":34,\"to\":67}\nurl=https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP fromByte=68 toByte=99 group=chunk metaData={\"parentTaskId\":\"P\",\"from\":68,\"to\":99}\n"
+        },
+        {
+          "input": {
+            "action": "chunk_split",
+            "taskId": "P",
+            "url": "https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP",
+            "chunks": 1,
+            "headers": {}
+          },
+          "expected_output": "error=cannot_chunk\n"
+        }
+      ]
+    },
+    "feature15_chunk_aggregation.json": {
+      "description": "A parent transfer derives its overall progress and overall status from its child chunks. Overall progress is the average of the child progress fractions. Overall status resolves to failed if any child failed, to not-found if any child reports not-found (and none failed), to complete only once every child has completed, and is otherwise undetermined. A per-chunk status event reports the newly-derived parent status only when it changes from the previously reported one. Events drive the chunks one at a time and the output records the derived value after each event.",
+      "cases": [
+        {
+          "input": {
+            "action": "chunk_aggregate",
+            "taskId": "PA",
+            "url": "https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP",
+            "chunks": 3,
+            "contentLength": 6207471,
+            "events": [
+              {
+                "type": "parentProgress"
+              },
+              {
+                "type": "progress",
+                "chunk": 0,
+                "value": 0.5
+              },
+              {
+                "type": "parentStatus"
+              },
+              {
+                "type": "status",
+                "chunk": 0,
+                "value": "complete"
+              },
+              {
+                "type": "status",
+                "chunk": 2,
+                "value": "complete"
+              },
+              {
+                "type": "status",
+                "chunk": 1,
+                "value": "complete"
+              },
+              {
+                "type": "status",
+                "chunk": 0,
+                "value": "failed"
+              },
+              {
+                "type": "status",
+                "chunk": 1,
+                "value": "failed"
+              },
+              {
+                "type": "status",
+                "chunk": 2,
+                "value": "failed"
+              },
+              {
+                "type": "parentStatus"
+              },
+              {
+                "type": "status",
+                "chunk": 0,
+                "value": "notFound"
+              },
+              {
+                "type": "status",
+                "chunk": 1,
+                "value": "notFound"
+              },
+              {
+                "type": "status",
+                "chunk": 2,
+                "value": "notFound"
+              },
+              {
+                "type": "parentStatus"
+              }
+            ]
+          },
+          "expected_output": "parent_progress=0.0\nparent_progress=0.16666666666666666\nparent_status=none\nstatus_change=none\nstatus_change=none\nstatus_change=complete\nstatus_change=failed\nstatus_change=none\nstatus_change=none\nparent_status=failed\nstatus_change=none\nstatus_change=none\nstatus_change=notFound\nparent_status=notFound\n"
+        }
+      ]
+    }
+  },
+  "_medium_meta": {
+    "revealed_c": [
+      "C001",
+      "C002",
+      "C011",
+      "C012",
+      "C013",
+      "C003",
+      "C004"
+    ],
+    "kept_c": [
+      "C005",
+      "C006",
+      "C007",
+      "C008",
+      "C009",
+      "C010"
+    ],
+    "revealed_cp": 2,
+    "kept_cp": 2
+  }
+}

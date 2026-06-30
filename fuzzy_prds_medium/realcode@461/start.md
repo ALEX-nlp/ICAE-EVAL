@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we need a small library/tool that helps developers fill out a 'create service' form and spits out a properly shaped deployment request for our container hosting platform. Right now people are hand-rolling these request payloads and keep getting it wrong — wrong fields, extra slashes in URLs, flags set when they shouldn't be, that sort of thing. The thing needs to handle a few different deployment flavors (private registry image, public registry image, deploying from a source repo), and each one has slightly different rules about what goes in the payload. Some fields just shouldn't exist at all in certain modes, not just be empty or zero.
+
+Also there's some normalization stuff — like the URL cleanup logic we did for the login module a while back, same idea, trim it up and drop trailing separators. Start commands that are blank should be treated like they were never entered.
+
+The code should NOT be one big file — split it up sensibly by responsibility. There should be a thin adapter layer that reads a JSON command and calls into the core logic, don't mix those two things together.
+
+Also needs a test runner script at rcb_tests/test.sh that loops over the JSON case files and writes per-case output files so we can diff them. Make sure it supports pointing at a different cases subdirectory.
+
+A couple follow-ups from the questions that came in. For public container image deploys, the automatic deployment setting needs to stay genuinely unset and come through as the literal `null`, not `false` and not any other boolean. Same general idea as before: if it doesn’t apply, it shouldn’t be sent at all. Public image sources don’t support a managed redeployment policy, so that field should be absent in the actual request rather than included with a falsy value. Along the same lines, `auto_deployments` must be genuinely absent (null) for public image deployments, the inline code-configuration block must be genuinely absent for file-based repository deployments, and `access_role_arn` must not appear outside private image deployments.
+
+On the private image side, we do need to resolve the one available instance access role and attach it in the auth section. The resolved value is `arn::access-role` and the field name is `access_role_arn`. That should only show up for private image deploys, never for public image or repo-based requests. For repository-style deploys, we also need to resolve the source connection from the available picker and attach it as `connection_arn` with the value `arn::source-connection`, and that needs to be there for both `api` and `file` repo_config variants.
+
+A few implementation-shape details too. The codebase really should be split across multiple files so responsibilities stay clean: the form model with field normalization, picker/selection resolution for the asynchronously-loaded pickers for access role and source connection, and then the per-deployment-style request assembly. The adapter should stay thin and just translate JSON stdin commands into calls on the core logic. The core must not be coupled to stdin/stdout or JSON parsing.
+
+For the `container_uri` action, it just seeds the form with a pre-supplied container image reference. The URI is stored unchanged in the form’s container image field and echoed as `container_uri=<value>`, so an external trigger can pre-populate the image to deploy without us “helpfully” rewriting it.
+
+On output formatting, the adapter should print one field per line in alphabetically sorted order as `key=value`. If a field is genuinely absent, leave it out entirely rather than printing it empty, except in the few places where the spec explicitly wants `null`, which are `auto_deployments` for public image and `start_command` when blank. If the value is intentionally an empty string, keep the key and print the empty value, like `image_identifier=` and `service_name=`.
+
+And one more small normalization note: repository URLs should have surrounding whitespace trimmed and a single trailing slash removed, and that belongs in the form model normalization layer, same behavior called out in feature 4.2 / feature5_2_repository_url_normalization.json.
+
+For the test harness, the entry point is `bash rcb_tests/test.sh`. It takes an optional `--cases-dir <subdir>` and defaults to `public_test_cases`. For each case it writes output to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`, and that file should contain only the raw program output so it can be compared directly against `expected_output`.

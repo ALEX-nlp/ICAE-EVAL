@@ -1,0 +1,23 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from devs using our HTTP client generator that they keep running into silent misconfigurations and cryptic runtime failures when setting up API clients. Like someone spent half a day debugging why their requests were hitting the wrong endpoint just because of a trailing slash issue on the base address — that kind of thing should blow up immediately with a clear message, not silently misbehave.
+
+We also need to make sure the tool rejects nonsensical declarations at build time rather than producing broken clients. For example, using the wrong annotation combo on a single method, or putting a body on a verb that doesn't support it — those should be caught early.
+
+Also, there's been feedback that the interface validation isn't strict enough. Remember how we handled the compatibility checks in the interface-shape validation logic last time? We need something similar here — foreign language interfaces, unpackaged interfaces, generic interfaces should all be rejected cleanly.
+
+The adapter output format needs to be consistent too — headers sorted, fields sorted, errors sorted when multiple apply. And the whole thing should be modular, not one giant file — separate the generator bits from the runtime bits from the adapter.
+
+Can someone scope this out? I think the test cases in the rcb_tests folder cover most of the scenarios we care about. Let's make sure all the error categories are neutral and language-agnostic.
+
+Quick follow-up from the questions that came in: for the base address checks, we do want this to be strict up front during client construction, before any request is issued. The base address has to be present (non-null/non-empty), it has to end with a '/' path separator, and it has to use a recognised URL scheme (http or https). If not, the failure should be explicit as error=base_url_required, error=base_url_must_end_with_slash, or error=base_url_invalid_scheme. This is the same thing we were calling out around Feature 3 (feature03_base_url_validation.json): fail early, don’t let a bad setup turn into weird request behavior later.
+
+A couple more generation-time validations to make explicit: if someone puts more than one HTTP verb annotation on the same interface method, like GET and POST together, that should be rejected with error=multiple_http_methods. One verb per method, full stop. Same idea for URL declarations: if the verb's static path is empty AND no dynamic full-URL parameter (kind=url) is present on the method, reject it with error=missing_url. And if someone declares more than one url-kind parameter on the same method, that should produce error=multiple_url_annotations.
+
+On the parameter side, a field parameter (kind=field or kind=fieldMap) is only valid on a method that declares form encoding. If it shows up on a method without the form encoding declaration, reject it at generation time with error=field_without_form_encoding. Also, for conversion, if a parameter requires type conversion (op=convert or requestType declared) but no registered converter supports the requested from→to type pair, the call fails with error=no_request_converter. The important bit there is that a converter must be explicitly registered in the converter registry, and the runtime depends on an abstraction, not a concrete converter.
+
+For the interface validation questions, yes, this is specifically the host-language (Kotlin) interface requirement. A foreign-language interface (lang=java) is rejected with error=java_interface_unsupported. An interface without a package is rejected with error=interface_must_have_package. An interface carrying a type parameter (generic=true) is rejected with error=interface_must_not_be_generic. That’s the same set of rules referenced in Feature 14 (feature14_interface_validation.json), matching what’s described in start.md under Feature 14.
+
+Also wanted to be precise about output ordering since that came up. The adapter output should be strictly ordered as method, url, body, text (if body=text), field lines sorted by name (if body=form), header lines sorted by name (static Accept/Accept-Charset excluded), converted/type for op=convert. If multiple errors apply, all error=<category> lines are sorted alphabetically and printed together with no other output.
+
+And on structure, yes, we really do want this split cleanly: a generator for compile-time validation + code emission, a runtime for request building + dispatch, and an execution adapter for JSON stdin/stdout translation. The core generator and runtime should be completely decoupled from stdin/stdout and JSON parsing. The adapter is the sole component that reads JSON input and writes key=value output.

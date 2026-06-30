@@ -1,0 +1,414 @@
+{
+  "fuzzy_prd": "# Reactive Key-Value Preference — Observable Persisted Values Backed by a Key-Value Store\n\n## Project Goal\n\nBuild a reusable abstraction that represents a single persisted value identified by a key and exposes it as an observable stream, so developers can both read/write the value and react to its changes over time without manually wiring up polling, change notifications, or default-value handling.\n\n---\n\n## Background & Problem\n\nApplication settings and similar small pieces of state are usually persisted in a simple key-value store. Reading such a value gives only a one-time snapshot; to keep a UI or other consumer in sync, developers end up re-reading the store on every suspected change, hand-rolling change notifications, and repeatedly substituting a fallback whenever the value is absent. This is repetitive and error-prone.\n\nWith this abstraction, a value is wrapped together with its key, its fallback (default) value, and a backing key-value store. Writing the value persists it and notifies observers; removing it deletes it from the store and reverts observers to the default; and observing the value yields the current contents immediately and then every distinct subsequent change. The wrapper deduplicates consecutive identical values and fans out every change to all active observers.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\nThe execution adapter reads a single JSON request describing one scenario and replays a short sequence of operations against one persisted value, emitting a plain-text event log. The request fields are: `key` (the identifier the value is stored under; may be `null` to model a value with no key), `default` (the fallback value emitted whenever the stored value is absent), and `ops` (an ordered list of operations to perform). Each operation is an object with an `op` field; the supported operations are `observe` (attach a new observer to the value), `put` (set/persist a new value, supplied in `value`), `remove` (delete the stored value), and `preset` (a side-channel write that seeds the backing store directly **without** notifying existing observers).\n\nThe event log uses these line forms, written in execution order: `[a specific value suffix pattern — ask the PM for the exact format]` when observer number `<i>` (numbered from 0 in attachment order) receives a value; `store write key=<k> value=<v>` and `store remove key=<k>` when an operation delegates to the backing store; `put ok=<bool>` / `remove ok=<bool>` reporting whether the operation's persistence call reported success; and `error=<category> op=<op> reason=<reason>` for a rejected operation. When an observer is attached it immediately receives the value currently held in the store, or the default value when none is stored.\n\n### Feature 1: Persist A Value And Notify Observers\n\n**As a developer**, I want setting the value to write it to the backing store and push the new value to anyone observing it, so persisted state and live consumers stay in sync.\n\n**Expected Behavior / Usage:**\n\nA `put` operation persists the supplied `value` under the value's `key`. It delegates exactly one write to the backing store (observable as a `store write key=<k> value=<v>` line carrying the key and value, in operation order) and reports the persistence result as `put ok=true`. After the write, every active observer is notified and re-reads the now-current value, emitting it. An observer attached before any write first receives the default value (because the store is initially empty). Performing several `put` operations in sequence yields one store-write line and one emission per operation, in order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_set_value_and_notify.json`\n\n```json\n{\n    \"description\": \"Persisting a sequence of values through the value-setting operation. The store starts empty and one observer is attached, so it first receives the configured default value. Each set operation delegates the write to the backing key-value store (recording the key and the value written, in call order) and reports whether the write succeeded, and then notifies the active observer which re-reads the freshly stored value. The observer therefore sees each newly persisted value in turn.\",\n    \"cases\": [\n        {\n            \"input\": {\"key\": \"key\", \"default\": \"default value\", \"ops\": [\n                {\"op\": \"observe\"},\n                {\"op\": \"put\", \"value\": \"value1\"},\n                {\"op\": \"put\", \"value\": \"value2\"},\n                {\"op\": \"put\", \"value\": \"value3\"}\n            ]},\n            \"expected_output\": \"emit[0] default value\\nstore write key=key value=value1\\nput ok=true\\nemit[0] value1\\nstore write key=key value=value2\\nput ok=true\\nemit[0] value2\\nstore write key=key value=value3\\nput ok=true\\nemit[0] value3\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Remove A Value And Revert To Default\n\n**As a developer**, I want removing the value to delete it from the backing store and have observers fall back to the default, so clearing a setting behaves predictably.\n\n**Expected Behavior / Usage:**\n\nA `remove` operation deletes the value's `key` from the backing store. It delegates exactly one removal (observable as a `store remove key=<k>` line) and reports the result as `remove ok=true`. Because the stored value is now absent, every active observer is notified and re-reads, emitting the default value. In a scenario where the store is preset with a value and an observer is attached, the observer first emits the preset value and then, after the removal, emits the default value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_clear_value.json`\n\n```json\n{\n    \"description\": \"Removing the stored value. The store is preset with an existing value and an observer is attached, so the observer first sees the preset value. The removal operation delegates a deletion of the key to the backing store (recorded as a remove call) and reports whether it succeeded; because the value associated with the key is now absent, the observer is notified and re-reads, seeing the configured default value.\",\n    \"cases\": [\n        {\n            \"input\": {\"key\": \"key\", \"default\": \"default value\", \"ops\": [\n                {\"op\": \"preset\", \"value\": \"stored value\"},\n                {\"op\": \"observe\"},\n                {\"op\": \"remove\"}\n            ]},\n            \"expected_output\": \"emit[0] stored value\\nstore remove key=key\\nremove ok=true\\nemit[0] default value\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Reject Mutations On A Value With No Key\n\n**As a developer**, I want set and remove to fail cleanly when the value has no key, so a value that cannot be persisted does not silently corrupt the store.\n\n**Expected Behavior / Usage:**\n\nWhen the value is constructed with a `null` key, both `put` and `remove` are unsupported. Each such operation fails without touching the backing store (no store line is produced) and instead emits a normalized error line `[a specific error format string — ask the PM for the exact text]`, where `<op>` is `put` or `remove`. The error is language-neutral: it names the operation category and reason rather than exposing any host runtime exception.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_null_key_guard.json`\n\n```json\n{\n    \"description\": \"Guarding mutating operations on a value that has no key. When the value is constructed without a key, both the set operation and the removal operation are unsupported and must fail instead of touching the store. Each attempt produces a normalized error line naming the attempted operation and the reason, and no store mutation is recorded.\",\n    \"cases\": [\n        {\n            \"input\": {\"key\": null, \"default\": \"\", \"ops\": [\n                {\"op\": \"put\", \"value\": \"\"},\n                {\"op\": \"remove\"}\n            ]},\n            \"expected_output\": \"error=unsupported_operation op=put reason=null_key\\nerror=unsupported_operation op=remove reason=null_key\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: A New Observer Starts With The Latest Value\n\n**As a developer**, I want each observer to immediately receive the value that is current at the moment it starts observing, so consumers never begin from a stale or empty state.\n\n**Expected Behavior / Usage:**\n\nAttaching an observer (`observe`) causes that observer to immediately emit the value currently held in the backing store (or the default when none is stored). A `preset` operation writes directly to the store as a side channel and does **not** notify any already-attached observer. Therefore, when the store is preset to one value then an observer is attached, then preset to a second value and another observer attached, and so on, each newly attached observer emits exactly the value present when it began observing — and earlier observers are not disturbed by later presets.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_starts_with_latest.json`\n\n```json\n{\n    \"description\": \"A freshly attached observer immediately receives the value currently held in the backing store. Between attachments the store is updated through a side channel that does NOT notify existing observers, so each newly attached observer (and only it) emits the value present at the moment it begins observing.\",\n    \"cases\": [\n        {\n            \"input\": {\"key\": \"key\", \"default\": \"default value\", \"ops\": [\n                {\"op\": \"preset\", \"value\": \"1\"},\n                {\"op\": \"observe\"},\n                {\"op\": \"preset\", \"value\": \"2\"},\n                {\"op\": \"observe\"},\n                {\"op\": \"preset\", \"value\": \"3\"},\n                {\"op\": \"observe\"}\n            ]},\n            \"expected_output\": \"emit[0] 1\\nemit[1] 2\\nemit[2] 3\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Suppress Consecutive Duplicate Values Per Observer\n\n**As a developer**, I want an observer to be notified only when the value actually changes, so consumers are not woken up by writes that leave the value unchanged.\n\n**Expected Behavior / Usage:**\n\nFor a single observer, after its initial emission, a `put` triggers an emission only when the freshly re-read value differs from the last value that observer emitted. Every `put` still delegates its write to the store (each producing a `store write` line and a `put ok=true` line), but writing the same value as the current one produces no new emission. Distinct new values are each emitted once. Thus repeating the same write after the value already equals it yields one emission for the first transition and none for the following identical ones; subsequent genuinely different values are emitted one by one.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_no_duplicate_consecutive.json`\n\n```json\n{\n    \"description\": \"A single observer never receives the same value twice in a row. After the initial default emission, repeated set operations that write the same value still delegate every write to the store, but the observer only emits when the re-read value actually differs from the last value it emitted; consecutive identical writes produce no new emission, while each genuinely changed value is emitted once.\",\n    \"cases\": [\n        {\n            \"input\": {\"key\": \"key\", \"default\": \"default value\", \"ops\": [\n                {\"op\": \"observe\"},\n                {\"op\": \"put\", \"value\": \"new value\"},\n                {\"op\": \"put\", \"value\": \"new value\"},\n                {\"op\": \"put\", \"value\": \"new value\"},\n                {\"op\": \"put\", \"value\": \"another value 1\"},\n                {\"op\": \"put\", \"value\": \"another value 2\"},\n                {\"op\": \"put\", \"value\": \"another value 3\"}\n            ]},\n            \"expected_output\": \"emit[0] default value\\nstore write key=key value=new value\\nput ok=true\\nemit[0] new value\\nstore write key=key value=new value\\nput ok=true\\nstore write key=key value=new value\\nput ok=true\\nstore write key=key value=another value 1\\nput ok=true\\nemit[0] another value 1\\nstore write key=key value=another value 2\\nput ok=true\\nemit[0] another value 2\\nstore write key=key value=another value 3\\nput ok=true\\nemit[0] another value 3\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Broadcast Every Change To All Observers\n\n**As a developer**, I want every active observer to receive each value change, so multiple consumers of the same value stay consistent.\n\n**Expected Behavior / Usage:**\n\nMultiple observers may observe the same value concurrently. Each one independently emits the current value when it attaches (here, the default value). A single `put` delegates exactly one store write and then notifies all active observers, so each emits the same new value; the emissions appear in observer-attachment order (observer 0, then 1, then 2). Successive changes are likewise delivered to every observer.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_broadcasts_to_all_listeners.json`\n\n```json\n{\n    \"description\": \"Every value change is delivered to all active observers. Three observers are attached and each first receives the default value. Each subsequent set operation delegates the write to the store once and notifies all three observers, so every observer sees the same new value, in observer-attachment order.\",\n    \"cases\": [\n        {\n            \"input\": {\"key\": \"key\", \"default\": \"default value\", \"ops\": [\n                {\"op\": \"observe\"},\n                {\"op\": \"observe\"},\n                {\"op\": \"observe\"},\n                {\"op\": \"put\", \"value\": \"first change\"},\n                {\"op\": \"put\", \"value\": \"second change\"}\n            ]},\n            \"expected_output\": \"emit[0] default value\\nemit[1] default value\\nemit[2] default value\\nstore write key=key value=first change\\nput ok=true\\nemit[0] first change\\nemit[1] first change\\nemit[2] first change\\nstore write key=key value=second change\\nput ok=true\\nemit[0] second change\\nemit[1] second change\\nemit[2] second change\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing a persisted, observable key-value preference: a value bound to a key, a default fallback, and a backing key-value store, exposed as a stream of value changes. Its physical structure (single-file vs. multi-file repository) MUST strictly align with the \"Scale-Driven Code Organization\" constraint. The core business logic must be decoupled from standard I/O (stdin/stdout) and JSON parsing, and from any specific persistence implementation (it depends on an abstract key-value store).\n\n2. **The Execution/Test Adapter:** A runnable program (CLI script or entry point) that acts as a client to your core system — logically (and ideally physically) separated from the core domain. It reads a single JSON request (`key`, `default`, `ops`) from its input, replays the operations against one preference instance, and prints the plain-text event log described above. The `observe` operation attaches an observer (numbered from 0 in attachment order) that prints `[a specific value suffix pattern — ask the PM for the exact format]` for each value it receives; `put` and `remove` delegate to the backing store (printing `store write key=… value=…` / `store remove key=…`) and print `put ok=<bool>` / `remove ok=<bool>`; `preset` seeds the store without notifying; and an unsupported mutation prints `error=<category> op=<op> reason=<reason>`. Native exceptions thrown by the core must be translated by the adapter into these neutral error lines rather than surfaced directly.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- refer to the state update logic defined in the observer history module\n- align with the standard success signal protocol for key-value mutations\n",
+  "oracle_data": {
+    "task_id": "roughike__streaming_shared_preferences-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "null key error output",
+          "reject unsupported operation reason",
+          "silently reject null key message",
+          "error format for null key",
+          "why is no observer notified for null key"
+        ],
+        "oracle_response": "The exact error line emitted is: error=unsupported_operation op=replace_or_remove reason=null_key"
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "default emission value",
+          "observer default fallback",
+          "what does observer emit on removal",
+          "fallback value when key missing",
+          "default literal for observer emission"
+        ],
+        "oracle_response": "The exact value emitted is: emit[<i>] <DEFAULT_VALUE_STRING>"
+      },
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "emit format for observers",
+          "observer output structure",
+          "how are values emitted",
+          "exact emit string format",
+          "value emission placeholder syntax"
+        ],
+        "oracle_response": "The exact output format is: emit[<i>] <VALUE_STRING>"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "refer to the state update logic defined in the observer history module",
+        "actual_meaning": "The condition checks if the new value equals (A) the value the observer last emitted, OR (B) the value currently stored in the backing store prior to the emit of (A)."
+      },
+      {
+        "vague_reference": "align with the standard success signal protocol for key-value mutations",
+        "actual_meaning": "The specific string 'put ok=true' is emitted immediately after the store write log line for successful put operations."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_set_value_and_notify.json": {
+      "description": "Persisting a sequence of values through the value-setting operation. The store starts empty and one observer is attached, so it first receives the configured default value. Each set operation delegates the write to the backing key-value store (recording the key and the value written, in call order) and reports whether the write succeeded, and then notifies the active observer which re-reads the freshly stored value. The observer therefore sees each newly persisted value in turn.",
+      "cases": [
+        {
+          "input": {
+            "key": "key",
+            "default": "default value",
+            "ops": [
+              {
+                "op": "observe"
+              },
+              {
+                "op": "put",
+                "value": "value1"
+              },
+              {
+                "op": "put",
+                "value": "value2"
+              },
+              {
+                "op": "put",
+                "value": "value3"
+              }
+            ]
+          },
+          "expected_output": "emit[0] default value\nstore write key=key value=value1\nput ok=true\nemit[0] value1\nstore write key=key value=value2\nput ok=true\nemit[0] value2\nstore write key=key value=value3\nput ok=true\nemit[0] value3\n"
+        }
+      ]
+    },
+    "feature2_clear_value.json": {
+      "description": "Removing the stored value. The store is preset with an existing value and an observer is attached, so the observer first sees the preset value. The removal operation delegates a deletion of the key to the backing store (recorded as a remove call) and reports whether it succeeded; because the value associated with the key is now absent, the observer is notified and re-reads, seeing the configured default value.",
+      "cases": [
+        {
+          "input": {
+            "key": "key",
+            "default": "default value",
+            "ops": [
+              {
+                "op": "preset",
+                "value": "stored value"
+              },
+              {
+                "op": "observe"
+              },
+              {
+                "op": "remove"
+              }
+            ]
+          },
+          "expected_output": "emit[0] stored value\nstore remove key=key\nremove ok=true\nemit[0] default value\n"
+        }
+      ]
+    },
+    "feature3_null_key_guard.json": {
+      "description": "Guarding mutating operations on a value that has no key. When the value is constructed without a key, both the set operation and the removal operation are unsupported and must fail instead of touching the store. Each attempt produces a normalized error line naming the attempted operation and the reason, and no store mutation is recorded.",
+      "cases": [
+        {
+          "input": {
+            "key": null,
+            "default": "",
+            "ops": [
+              {
+                "op": "put",
+                "value": ""
+              },
+              {
+                "op": "remove"
+              }
+            ]
+          },
+          "expected_output": "error=unsupported_operation op=put reason=null_key\nerror=unsupported_operation op=remove reason=null_key\n"
+        }
+      ]
+    },
+    "feature4_starts_with_latest.json": {
+      "description": "A freshly attached observer immediately receives the value currently held in the backing store. Between attachments the store is updated through a side channel that does NOT notify existing observers, so each newly attached observer (and only it) emits the value present at the moment it begins observing.",
+      "cases": [
+        {
+          "input": {
+            "key": "key",
+            "default": "default value",
+            "ops": [
+              {
+                "op": "preset",
+                "value": "1"
+              },
+              {
+                "op": "observe"
+              },
+              {
+                "op": "preset",
+                "value": "2"
+              },
+              {
+                "op": "observe"
+              },
+              {
+                "op": "preset",
+                "value": "3"
+              },
+              {
+                "op": "observe"
+              }
+            ]
+          },
+          "expected_output": "emit[0] 1\nemit[1] 2\nemit[2] 3\n"
+        }
+      ]
+    },
+    "feature5_no_duplicate_consecutive.json": {
+      "description": "A single observer never receives the same value twice in a row. After the initial default emission, repeated set operations that write the same value still delegate every write to the store, but the observer only emits when the re-read value actually differs from the last value it emitted; consecutive identical writes produce no new emission, while each genuinely changed value is emitted once.",
+      "cases": [
+        {
+          "input": {
+            "key": "key",
+            "default": "default value",
+            "ops": [
+              {
+                "op": "observe"
+              },
+              {
+                "op": "put",
+                "value": "new value"
+              },
+              {
+                "op": "put",
+                "value": "new value"
+              },
+              {
+                "op": "put",
+                "value": "new value"
+              },
+              {
+                "op": "put",
+                "value": "another value 1"
+              },
+              {
+                "op": "put",
+                "value": "another value 2"
+              },
+              {
+                "op": "put",
+                "value": "another value 3"
+              }
+            ]
+          },
+          "expected_output": "emit[0] default value\nstore write key=key value=new value\nput ok=true\nemit[0] new value\nstore write key=key value=new value\nput ok=true\nstore write key=key value=new value\nput ok=true\nstore write key=key value=another value 1\nput ok=true\nemit[0] another value 1\nstore write key=key value=another value 2\nput ok=true\nemit[0] another value 2\nstore write key=key value=another value 3\nput ok=true\nemit[0] another value 3\n"
+        }
+      ]
+    },
+    "feature6_broadcasts_to_all_listeners.json": {
+      "description": "Every value change is delivered to all active observers. Three observers are attached and each first receives the default value. Each subsequent set operation delegates the write to the store once and notifies all three observers, so every observer sees the same new value, in observer-attachment order.",
+      "cases": [
+        {
+          "input": {
+            "key": "key",
+            "default": "default value",
+            "ops": [
+              {
+                "op": "observe"
+              },
+              {
+                "op": "observe"
+              },
+              {
+                "op": "observe"
+              },
+              {
+                "op": "put",
+                "value": "first change"
+              },
+              {
+                "op": "put",
+                "value": "second change"
+              }
+            ]
+          },
+          "expected_output": "emit[0] default value\nemit[1] default value\nemit[2] default value\nstore write key=key value=first change\nput ok=true\nemit[0] first change\nemit[1] first change\nemit[2] first change\nstore write key=key value=second change\nput ok=true\nemit[0] second change\nemit[1] second change\nemit[2] second change\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Observer Initialization",
+      "input_condition": "An operation 'observe' is executed.",
+      "output_rule": "The observer immediately emits a value equal to the current backing store value if present, or the configured 'default' value if the store is empty. This output precedes any subsequent operations.",
+      "exact_values": [
+        "emit[<i>] <value>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Store Persistence",
+      "input_condition": "An operation 'put' is executed with a 'value' field.",
+      "output_rule": "The system must execute a single 'store write' operation, output 'put ok=true', and trigger notifications to all currently active observers. The backing store must be updated.",
+      "exact_values": [
+        "store write key=<k> value=<v>",
+        "put ok=true",
+        "emit[<i>] <value>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Value Mutation Filtering",
+      "input_condition": "A 'put' operation sets a value that is identical to the value currently held in the observer's last known view (or the store value prior to the emit that caused the transition).",
+      "output_rule": "The system must trigger the 'store write' and 'put ok=true' commands, but it must NOT emit a new value to that specific observer, even though they are getting the new value from the store. The behavior depends on the last value the observer itself emitted for this observer instance.",
+      "exact_values": [
+        "store write key=key value=<v>",
+        "put ok=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Store Removal",
+      "input_condition": "An operation 'remove' is executed with a 'key' field (handling both string keys and null keys).",
+      "output_rule": "The system must execute a 'store remove' operation, output 'remove ok=true', and trigger notifications to all currently active observers. Observers should emit their 'default' value.",
+      "exact_values": [
+        "store remove key=<k>",
+        "remove ok=true",
+        "emit[<i>] <default>"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Null Key Mutation Rejection",
+      "input_condition": "An operation ('put' or 'remove') is attempted where the value's 'key' is null (or undefined).",
+      "output_rule": "The operation must be silently rejected. No 'store' commands are executed. The system outputs an error line identifying the operation and the reason (null_key). No observers are notified.",
+      "exact_values": [
+        "error=unsupported_operation op=<op> reason=null_key"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Direct Store Side-Channel",
+      "input_condition": "An operation 'preset' is executed with a 'value' field.",
+      "output_rule": "The value is written directly to the backing store immediately. NO observers are notified or emitted. This effectively models a write that happened outside the stream before this lifecycle event.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Multi-Observer Broadcast",
+      "input_condition": "A 'put' or 'remove' operation occurs while multiple observers are active.",
+      "output_rule": "The notification event (emission of values) must be replayed to each active observer exactly once per notification event, following the chronological order of observer attachment (lowest index first).",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Line Ordering in Output",
+      "input_condition": "Multiple operations occur in a single request or replay sequence.",
+      "output_rule": "The strict output sequence must follow the execution order of operations. Stores and ignores must appear where defined: Output = [ops...]\n1. store action\n2. put/remove ok status\n3. emit[<i>] values (for all active observers).",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Default Fallback Logic",
+      "input_condition": "The request specifies a 'default' field.",
+      "output_rule": "If the backing store does not contain the 'key', the simulation MUST use the provided 'default' value for emissions. If no 'default' is specified and store is empty, the value is treated as absent, and behavior may vary based on specific test constraints, but the API relies on the explicit 'default' definition.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Observer Indexing",
+      "input_condition": "An observer is attached via 'observe'.",
+      "output_rule": "The system must assign the observer an index starting from 0. Each new 'observe' increments the index by 1. The output format for emission is strictly 'emit[<index>] <value>'.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Store Write Success Signal",
+      "input_condition": "A 'put' operation delegates to the store.",
+      "output_rule": "The system MUST emit exactly 'put ok=true' immediately after the store write log line.",
+      "exact_values": [
+        "put ok=true"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Store Remove Success Signal",
+      "input_condition": "A 'remove' operation delegates to the store.",
+      "output_rule": "The system MUST emit exactly 'remove ok=true' immediately after the store remove log line.",
+      "exact_values": [
+        "remove ok=true"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C005",
+        "replacement": "a specific error format string — ask the PM for the exact text",
+        "exact_values_to_replace": [
+          "error=unsupported_operation op=<op> reason=null_key"
+        ],
+        "trigger_keywords": [
+          "null key error output",
+          "reject unsupported operation reason",
+          "silently reject null key message",
+          "error format for null key",
+          "why is no observer notified for null key"
+        ],
+        "oracle_response": "The exact error line emitted is: error=unsupported_operation op=replace_or_remove reason=null_key"
+      },
+      {
+        "constraint_id": "C004",
+        "replacement": "a specific default emission value — ask the PM for the exact string",
+        "exact_values_to_replace": [
+          "emit[<i>] <default>"
+        ],
+        "trigger_keywords": [
+          "default emission value",
+          "observer default fallback",
+          "what does observer emit on removal",
+          "fallback value when key missing",
+          "default literal for observer emission"
+        ],
+        "oracle_response": "The exact value emitted is: emit[<i>] <DEFAULT_VALUE_STRING>"
+      },
+      {
+        "constraint_id": "C001",
+        "replacement": "a specific value suffix pattern — ask the PM for the exact format",
+        "exact_values_to_replace": [
+          "emit[<i>] <value>"
+        ],
+        "trigger_keywords": [
+          "emit format for observers",
+          "observer output structure",
+          "how are values emitted",
+          "exact emit string format",
+          "value emission placeholder syntax"
+        ],
+        "oracle_response": "The exact output format is: emit[<i>] <VALUE_STRING>"
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C003",
+        "vague_phrase": "refer to the state update logic defined in the observer history module",
+        "actual_meaning": "The condition checks if the new value equals (A) the value the observer last emitted, OR (B) the value currently stored in the backing store prior to the emit of (A)."
+      },
+      {
+        "constraint_id": "C011",
+        "vague_phrase": "align with the standard success signal protocol for key-value mutations",
+        "actual_meaning": "The specific string 'put ok=true' is emitted immediately after the store write log line for successful put operations."
+      }
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the GraphQL subgraph federation transformer library. The core idea is that backend teams hand us their raw subgraph SDL and we give them back everything they need to plug into the supergraph gateway — no manual plumbing. Basically same pattern we followed for that schema stitching utility we built last quarter, just applied to the federation spec here.
+
+There are a few operations we need to support: one that returns the SDL the gateway actually fetches during service discovery (the 'trimmed' view that hides internal plumbing), one that returns the full executable schema with all the injected bits visible, one that just tells you which types are resolvable entities, and one that handles bad input gracefully with meaningful error categories instead of blowing up.
+
+The tricky part is we need to support both the old-style subgraphs (no explicit import, directives just assumed available) and the new-style ones that use the link import mechanism. The way fields and types get sorted and rendered matters a lot because the gateway does string comparisons on the SDL. Also we need to be careful about which federation version is being referenced — some features only exist in certain versions and we should reject anything we can't safely handle. Error cases should produce simple machine-readable output, not stack traces. Let me know if anything is unclear, I'll try to dig up the old spec notes.

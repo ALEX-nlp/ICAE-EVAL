@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, following up on the distributed tracing initiative we discussed last sprint. We need to build something that basically wraps all the usual stuff our microservice framework does — handling web requests, talking to downstream services, hitting the database, running things in the background, the scheduler stuff, the message bus, and the circuit breaker thing — and automatically produces tracing data without developers having to touch their business logic at all. Think of it like the logging approach we used for that auth module rollout: plug it in, it just works.
+
+The big pain point from ops right now is that when something goes wrong in production, we have no visibility into which hop in the chain failed or where the latency is coming from. Support tickets are piling up because engineers have to manually grep logs across five services to piece together what happened.
+
+We also need a way to verify this works — some kind of test runner that can go through a directory of test scenarios and tell us pass/fail. The output format needs to be totally deterministic so we can do automated checking, no random IDs or anything environment-specific leaking into the results. There are also some edge cases around skipping certain paths and handling unreachable backends that need to be covered. The rendering for the gateway and message channel scenarios is slightly different from the others — check how we did something similar before for the format details.

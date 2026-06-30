@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need to build that in-memory filesystem thing we talked about in the last planning session. Basically developers are super frustrated with tests that write to real disk — things are slow, there's leftover temp garbage everywhere, and some of the weirder edge cases (you know, the loop stuff, the empty-vs-not-empty situations) are basically impossible to reproduce reliably on CI. We want a clean engine that lives entirely in memory so tests are fast and deterministic.
+
+The engine needs to handle all the usual suspects: directories (create, list, delete, move, navigate), files (read/write in different modes, copy, rename, measure size), symbolic links, and seekable file handles. It should behave like a real POSIX filesystem would, including the error categories — we want those normalized the same way we did for the error handling in that storage abstraction layer from the config module.
+
+Important: this can't be one giant file. Split it up properly, separate the I/O adapter from the actual logic. The adapter reads a JSON program from stdin and writes results line by line to stdout. Refer to how we structured the path resolution piece in the existing navigation utilities — same separation idea applies here.
+
+There are a few tricky bits around temp directory naming, how trailing newlines behave on line reads, and what happens when you follow a link that loops back on itself. Make sure those are handled correctly.
+
+One quick follow-up from the questions that came in. For temp dirs, they should live under `/.tmp_rand0` at the root, and the actual name is just the provided prefix plus a counter suffix like `rand0`, `rand1`, etc. So if somebody calls create_temp with prefix `foo` twice, that should produce `/.tmp_rand0/foorand0` and then `/.tmp_rand0/foorand1`. That counter is per-prefix and keeps incrementing on each successive call with the same prefix.
+
+Also on line behavior, we want line splitting to be trailing-newline agnostic. A file containing `a\nb\nc\n` should give exactly 3 lines, so the final newline does not create an extra empty trailing line. And a zero-byte file should yield `line_count=0` with no line entries. For `raf_read`, the output is always two lines: `read_length=<n>` and then `read_text=<json-quoted-content>`. `read_length=<n>` is the number of bytes actually read, so it can be smaller than what was requested if there are fewer bytes left. If the cursor is already at EOF, emit `read_length=0` and `read_text=""`.
+
+One more small path detail: the parent of `/` is `/`, so the `parent` operation on `/` emits exactly `parent=/`. That’s just path math and does not depend on whether anything exists there. And for symlink cycles, if following links loops back on itself, like `/foo -> /bar` and `/bar -> /foo`, then `type` with `follow_links=true` should return `type=not_found` instead of erroring or spinning.
+
+On the error side, please keep everything normalized as `error=<category>` and only use these exact category strings: `no_such_file_or_directory`, `is_a_directory`, `not_a_directory`, `file_exists`, `directory_not_empty`, `unknown_operation`. Same deal as the error normalization contract from Feature 7, with all failures surfacing as `error=<category>` using those stable strings exactly, as specified in `feature7_error_normalization.json`.
+
+And just reaffirming the code organization piece since that came up too: we do want a dedicated path-resolution component, separate from the public operations layer and the execution adapter, and that piece should own POSIX path traversal, symlink following, and normalization, in line with the Scale-Driven Code Organization and SRP guidance in `start.md`.

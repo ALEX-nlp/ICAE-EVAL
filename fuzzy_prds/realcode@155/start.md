@@ -1,0 +1,3 @@
+## Product Requirement Document
+
+We need the full unidirectional state-container and stream demo surface covered by the tests: reducer-driven Kaskade state updates, flow/live/replay stream behavior, single-event buffering, clear/reset operations, normalized errors, and the sample media-player state machine. The player scenario has a fixed playlist and deterministic play/pause/next/previous/stop transitions; its output is part of the same black-box contract as the lower-level stream scenarios.

@@ -1,0 +1,1052 @@
+{
+  "fuzzy_prd": "# Code Coverage Toolkit — Instrumentation Support, Hit Aggregation & Reporting Configuration\n\n## Project Goal\n\nBuild a code-coverage toolkit core that lets developers measure which lines of their compiled code actually run during a test suite, and configure how coverage is collected and reported, without hand-writing the bookkeeping that coverage measurement normally requires. The toolkit owns the supporting machinery around instrumentation: pruning a call graph to the code under test, aggregating per-line hit counts gathered at runtime, persisting and reloading coverage records, deriving the companion file names involved in rewriting binaries, discovering extra assembly lookup directories, and parsing the command-line options that drive the whole flow.\n\n---\n\n## Background & Problem\n\nWithout a toolkit like this, developers measuring coverage are forced to manually splice tracking instructions into their binaries, invent an ad-hoc on-disk format to record which lines were hit, merge the counts coming from many test methods by hand, and remember which backup/symbol files belong to which assembly. They must also reimplement the same option parsing (default file names, glob defaults, percentage thresholds, verbosity levels, working-directory switching) for every project. This is repetitive, error-prone boilerplate that is easy to get subtly wrong — a mis-merged count or a wrong default path silently corrupts a coverage report.\n\nWith this toolkit, the supporting behavior is provided as small, composable, well-specified operations: feed in raw data (a graph, a set of hit records, raw bytes, a config string, an option value) and get back a precise, deterministic result. The instrumentation engine and the report writers build on top of these primitives, and the command-line surface is reduced to declarative option definitions with predictable defaults and resolution rules.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility system (graph algorithms, runtime hit aggregation, binary serialization, file-name derivation, configuration document parsing, and a command-line option layer). It MUST NOT be a single \"god file\". Output a clear, multi-file directory tree separating the core measurement primitives, the configuration/option layer, and the execution adapter. Do not over-engineer the individual leaf operations, but keep each responsibility in its own cohesive module.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output test cases below are a black-box contract for an execution adapter, NOT the internal data model. The core logic must be decoupled from stdin/stdout and JSON. The adapter is solely responsible for translating JSON commands into idiomatic calls to the core and rendering results as the stdout contract.\n\n3. **Adherence to SOLID Design Principles:**\n   - **SRP:** Keep parsing, validation, core computation, and output formatting in distinct units.\n   - **OCP:** New report-output options, glob options, or graph node types should extend the system without modifying the core engine.\n   - **LSP:** All option kinds that share a category (file path, directory path, glob list) must be substitutable behind a common abstraction.\n   - **ISP:** Keep option/abstraction interfaces small and focused (single-value vs. multi-value options, file vs. directory options).\n   - **DIP:** The core must depend on a file-system abstraction, not directly on the physical disk, so behavior is deterministic and testable.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public surface must be elegant and idiomatic to the target language, hiding internal complexity.\n   - **Resilience:** Edge cases (cycles in the graph, duplicate hit records, empty/blank config documents, missing files, unparseable option values) must be handled deterministically. Invalid input must be surfaced as a modeled validation error, not a generic crash, and the error rendered as a neutral, language-independent category.\n\n---\n\n## Core Features\n\n### Feature 1: Call Graph Filtering\n\n**As a developer**, I want to prune a directed call graph down to only the nodes I care about while preserving reachability through removed nodes, so I can focus a coverage view on the code under test without losing the structural links between kept nodes.\n\n**Expected Behavior / Usage:**\n\nThe input is a directed graph described by an adjacency map (`children`: parent value -> list of child values, in declared order), a `root` value, and an `allowed` set of values. A node whose value is in the allowed set is kept. A node whose value is not allowed is removed, and each of its children is re-attached to the removed node's parent position, so paths through removed nodes are preserved. If the root itself is removed, its surviving descendants become the new top-level set. The result is rendered as a nested text form: `v` is a kept node, `v[...]` lists that node's retained children, and `*v` marks a back-reference to a node already shown earlier on the path (i.e. a cycle / shared node). Cycles and self-references must terminate (no infinite recursion). Children at each level are listed in ascending value order so the rendering is deterministic.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_call_graph_filtering.json`\n\n```json\n{\n    \"description\": \"Filters a directed call graph down to a whitelist of allowed node values. Nodes whose value is allowed are kept; nodes whose value is not allowed are spliced out, with their children re-attached to the removed node's parent. The result is rendered as a nested text form where `v[..]` lists a node's retained children and `*v` marks a back-reference to an already-visited node (a cycle). Children at each level are listed in ascending value order.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"filter_graph\", \"children\": {\"1\": [2], \"2\": [3], \"3\": [2]}, \"root\": 1, \"allowed\": [1, 2, 3]}, \"expected_output\": \"1[2[3[*2]]]\\n\"},\n        {\"input\": {\"op\": \"filter_graph\", \"children\": {\"1\": [2], \"2\": [3], \"3\": [2]}, \"root\": 1, \"allowed\": [1]}, \"expected_output\": \"1\\n\"},\n        {\"input\": {\"op\": \"filter_graph\", \"children\": {\"1\": [2], \"2\": [2]}, \"root\": 1, \"allowed\": [1, 2]}, \"expected_output\": \"1[2[*2]]\\n\"},\n        {\"input\": {\"op\": \"filter_graph\", \"children\": {\"1\": [2], \"2\": [2]}, \"root\": 1, \"allowed\": [1]}, \"expected_output\": \"1\\n\"},\n        {\"input\": {\"op\": \"filter_graph\", \"children\": {\"1\": [2, 3]}, \"root\": 1, \"allowed\": [2, 3]}, \"expected_output\": \"2,3\\n\"},\n        {\"input\": {\"op\": \"filter_graph\", \"children\": {\"1\": [2, 3], \"2\": [1, 7, 8], \"3\": [4, 5, 6], \"4\": [5], \"5\": [4], \"6\": [7, 8, 6, 3]}, \"root\": 1, \"allowed\": [1, 2, 3, 8]}, \"expected_output\": \"1[2[*1,8],3[*3,*8]]\\n\"},\n        {\"input\": {\"op\": \"filter_graph\", \"children\": {\"1\": [2, 3], \"2\": [4], \"3\": [4], \"4\": [5]}, \"root\": 1, \"allowed\": [1, 5]}, \"expected_output\": \"1[5]\\n\"},\n        {\"input\": {\"op\": \"filter_graph\", \"children\": {\"1\": [2, 3], \"2\": [5], \"3\": [4], \"4\": [5], \"5\": [6]}, \"root\": 1, \"allowed\": [1, 2, 3, 6]}, \"expected_output\": \"1[2[6],3[*6]]\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 2: Hit Aggregation\n\n**As a developer**, I want per-line hit counts gathered independently by many test executions to be merged into one coherent picture, so I can ask how many times a line ran in total and from how many distinct execution contexts.\n\n**Expected Behavior / Usage:**\n\nThe input is a list of recording `contexts`, each identified by an `(assembly, class, method)` triple and carrying a `hits` map of line id -> count, plus a `query` list of line ids. Contexts that share the same identity triple are first merged into a single context whose per-line counts are the element-wise sums. For each queried line id the result reports, on one line, the total hit count summed across all contexts and the number of distinct contexts that recorded that line; then, one line per contributing context, that context's hit count for the queried id. Contexts are reported in stable first-seen order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_hit_aggregation.json`\n\n```json\n{\n    \"description\": \"Aggregates per-line hit counts collected from many recording contexts. Each context is identified by an (assembly, class, method) triple and carries a map of line id -> hit count. Contexts that share the same triple are merged into one (their per-line counts summed). For each queried line id the aggregate reports the total hit count across all contexts and how many distinct contexts touched that line, followed by the per-context hit count for that line.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"merge_hits\", \"contexts\": [{\"assembly\": \"A\", \"class\": \"C\", \"method\": \"XUnitTest2\", \"hits\": {\"17\": 2500000}}, {\"assembly\": \"A\", \"class\": \"C\", \"method\": \"NUnitTest2\", \"hits\": {\"17\": 2500000}}], \"query\": [17]}, \"expected_output\": \"id=17 total=5000000 contexts=2\\ncontext[0] hits=2500000\\ncontext[1] hits=2500000\\n\"},\n        {\"input\": {\"op\": \"merge_hits\", \"contexts\": [{\"assembly\": \"A\", \"class\": \"C\", \"method\": \"XUnitTest2\", \"hits\": {\"8\": 1}}, {\"assembly\": \"A\", \"class\": \"C\", \"method\": \"XUnitTest2\", \"hits\": {\"8\": 1}}], \"query\": [8]}, \"expected_output\": \"id=8 total=2 contexts=1\\ncontext[0] hits=2\\n\"},\n        {\"input\": {\"op\": \"merge_hits\", \"contexts\": [{\"assembly\": \"A\", \"class\": \"C\", \"method\": \"M1\", \"hits\": {\"8\": 1, \"9\": 1}}, {\"assembly\": \"A\", \"class\": \"C\", \"method\": \"M2\", \"hits\": {\"8\": 1}}], \"query\": [8, 9]}, \"expected_output\": \"id=8 total=2 contexts=2\\ncontext[0] hits=1\\ncontext[1] hits=1\\nid=9 total=1 contexts=1\\ncontext[0] hits=1\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 3: Coverage Record Serialization\n\n**As a developer**, I want a coverage recording context to be written to a compact binary form and read back without loss, so collected coverage can be persisted to disk during a test run and reloaded later for reporting.\n\n**Expected Behavior / Usage:**\n\nThe input is a single recording context: the `(assembly, class, method)` identity and a `hits` map of line id -> count. The operation serializes the context to a binary stream and immediately deserializes it back. The recovered data must equal the original in every field. The result reports the number of records recovered (one), the three identity strings, and the recovered line/hit pairs in ascending line-id order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_coverage_record_serialization.json`\n\n```json\n{\n    \"description\": \"Serializes a coverage recording context (assembly, class and method identity plus a map of line id -> hit count) into a compact binary stream and reads it back. The round trip must preserve every field exactly: the number of recovered records, the three identity strings, and all line/hit pairs. Recovered hit pairs are reported in ascending line-id order.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"roundtrip_hit_context\", \"assembly\": \"Asm\", \"class\": \"Ns.Type\", \"method\": \"DoWork\", \"hits\": {\"1\": 15}}, \"expected_output\": \"count=1\\nassembly=Asm\\nclass=Ns.Type\\nmethod=DoWork\\nhits=1:15\\n\"},\n        {\"input\": {\"op\": \"roundtrip_hit_context\", \"assembly\": \"Sample.UnitTests\", \"class\": \"Sample.UnitTests.UnitTest1\", \"method\": \"Test\", \"hits\": {\"8\": 1, \"19\": 50, \"23\": 2500050}}, \"expected_output\": \"count=1\\nassembly=Sample.UnitTests\\nclass=Sample.UnitTests.UnitTest1\\nmethod=Test\\nhits=8:1,19:50,23:2500050\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 4: Artifact File Utilities\n\n**As a developer**, I want small, reliable helpers for fingerprinting binaries and deriving the companion file names involved in rewriting them, so the instrumentation flow can detect changes and manage backups/symbols safely.\n\n**Expected Behavior / Usage:**\n\n*4.1 Content Hash — fingerprint raw bytes*\n\nGiven the raw bytes of an artifact, produce a stable content fingerprint: the MD5 digest rendered as an uppercase hexadecimal string with no separators.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_content_hash.json`\n\n```json\n{\n    \"description\": \"Computes a stable content fingerprint for a binary artifact, given its raw bytes. The fingerprint is the MD5 digest rendered as an uppercase hexadecimal string with no separators.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"file_hash\", \"bytes\": [1, 2, 3, 4, 5]}, \"expected_output\": \"7CFDD07889B3295D6A550914AB35E068\\n\"}\n    ]\n}\n```\n\n*4.2 Debug-Symbol Path — derive the symbols file path*\n\nGiven a compiled assembly path, derive its companion debug-symbols path by replacing the assembly extension with the debug-symbols extension (`pdb`), keeping the directory and base name unchanged.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_debug_symbol_path.json`\n\n```json\n{\n    \"description\": \"Derives the companion debug-symbols file path for a compiled assembly path by replacing the assembly's extension with the debug-symbols extension (`pdb`), keeping the directory and base name unchanged.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"pdb_path\", \"path\": \"/test/ACME.Something.dll\"}, \"expected_output\": \"path=/test/ACME.Something.pdb\\n\"}\n    ]\n}\n```\n\n*4.3 Backup Path — derive the backup file path*\n\nGiven an assembly path, derive the backup path used to preserve the original (unmodified) copy before rewriting. The backup name inserts an `uninstrumented` marker before the original extension, keeping the directory and base name unchanged.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_backup_path.json`\n\n```json\n{\n    \"description\": \"Derives the backup file path used to preserve the original, unmodified copy of an assembly before it is rewritten. The backup name inserts an `uninstrumented` marker before the original extension, keeping the directory and base name unchanged.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"backup_path\", \"path\": \"/test/ACME.Something.dll\"}, \"expected_output\": \"path=/test/ACME.Something.uninstrumented.dll\\n\"}\n    ]\n}\n```\n\n*4.4 Backup Detection — recognize a backup file*\n\nGiven a file path, decide whether it refers to a backup (original, unmodified) artifact by detecting the `uninstrumented` marker in the file name. Report the bare file name and the boolean verdict.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_4_backup_detection.json`\n\n```json\n{\n    \"description\": \"Decides whether a given file path refers to a backup (original, unmodified) artifact by detecting the `uninstrumented` marker in the file name. Reports the bare file name and the boolean verdict.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"is_backup\", \"path\": \"/test/ACME.Something.dll\"}, \"expected_output\": \"name=ACME.Something.dll\\nbackup=false\\n\"},\n        {\"input\": {\"op\": \"is_backup\", \"path\": \"/test/ACME.Something.uninstrumented.dll\"}, \"expected_output\": \"name=ACME.Something.uninstrumented.dll\\nbackup=true\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 5: Runtime Probing Path Extraction\n\n**As a developer**, I want to discover the extra directories where dependencies may be located, declared in a runtime configuration document, so the instrumentation engine can resolve assemblies that are not next to the main binary.\n\n**Expected Behavior / Usage:**\n\nThe input is a runtime configuration document as a JSON string. Read the `runtimeOptions.additionalProbingPaths` array and return every concrete path, skipping any entry that contains a templated placeholder (a `|...|` macro such as an architecture/framework token). The result reports the count of returned paths followed by each path in order. An empty string, the literal `null`, or a document lacking the relevant section yields zero paths.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_probing_paths.json`\n\n```json\n{\n    \"description\": \"Extracts extra assembly probing directories from a runtime configuration document (JSON). It reads `runtimeOptions.additionalProbingPaths` and returns every concrete path, skipping any entry that contains a templated placeholder (a `|...|` token such as an architecture/framework macro). Reports the number of returned paths followed by each path. Empty input, the literal `null`, or a document without the relevant section yield zero paths.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"probing_paths\", \"runtime_config\": \"{\\\"runtimeOptions\\\":{\\\"additionalProbingPaths\\\":[\\\"/root/.dotnet/store/|arch|/|tfm|\\\",\\\"/api/.nuget/packages\\\",\\\"/usr/share/dotnet/sdk/NuGetFallbackFolder\\\"]}}\"}, \"expected_output\": \"count=2\\n/api/.nuget/packages\\n/usr/share/dotnet/sdk/NuGetFallbackFolder\\n\"},\n        {\"input\": {\"op\": \"probing_paths\", \"runtime_config\": \"\"}, \"expected_output\": \"count=0\\n\"},\n        {\"input\": {\"op\": \"probing_paths\", \"runtime_config\": \"null\"}, \"expected_output\": \"count=0\\n\"},\n        {\"input\": {\"op\": \"probing_paths\", \"runtime_config\": \"{}\"}, \"expected_output\": \"count=0\\n\"}\n    ]\n}\n```\n\n---\n\n### Feature 6: Command-Line Option Parsing\n\n**As a developer**, I want the toolkit's command-line options to resolve to predictable values with sensible defaults, so the coverage flow behaves consistently and surfaces bad input clearly.\n\n**Expected Behavior / Usage:**\n\n*6.1 Output File Path — default fallback and resolution*\n\nAn output-file option resolves a path. With no value it falls back to a per-report default file name placed in the working directory; with a (possibly relative) value it resolves to an absolute path against the working directory. The `role` selects the default: `coverage`->`[standard format expressions for the specified roles — reference the role list]`, `clover`->`[standard format expressions for the specified roles — reference the role list]`, `cobertura`->`[standard format expressions for the specified roles — reference the role list]`, `ncover`->`[standard format expressions for the specified roles — reference the role list]`, `opencover`->`opencover[standard format expressions for the specified roles — reference the role list]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_1_output_file_path.json`\n\n```json\n{\n    \"description\": \"Resolves the output file path for a report. When no value is supplied the option falls back to a per-report default file name placed in the working directory. When a (possibly relative) value is supplied it is resolved to an absolute path against the working directory. The `role` selects which report's default name applies: coverage->[standard format expressions for the specified roles — reference the role list], clover->[standard format expressions for the specified roles — reference the role list], cobertura->[standard format expressions for the specified roles — reference the role list], ncover->[standard format expressions for the specified roles — reference the role list], opencover->opencover[standard format expressions for the specified roles — reference the role list].\",\n    \"cases\": [\n        {\"input\": {\"op\": \"resolve_file_path\", \"role\": \"coverage\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory/[standard format expressions for the specified roles — reference the role list]\\n\"},\n        {\"input\": {\"op\": \"resolve_file_path\", \"role\": \"clover\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory/[standard format expressions for the specified roles — reference the role list]\\n\"},\n        {\"input\": {\"op\": \"resolve_file_path\", \"role\": \"cobertura\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory/[standard format expressions for the specified roles — reference the role list]\\n\"},\n        {\"input\": {\"op\": \"resolve_file_path\", \"role\": \"ncover\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory/[standard format expressions for the specified roles — reference the role list]\\n\"},\n        {\"input\": {\"op\": \"resolve_file_path\", \"role\": \"opencover\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory/opencover[standard format expressions for the specified roles — reference the role list]\\n\"},\n        {\"input\": {\"op\": \"resolve_file_path\", \"role\": \"clover\", \"workdir\": \"/current-directory\", \"value\": \"folder/file.xml\"}, \"expected_output\": \"path=/current-directory/folder/file.xml\\n\"}\n    ]\n}\n```\n\n*6.2 Output Directory Path — default fallback and resolution*\n\nA directory option resolves a path. With no value it falls back to a per-role default folder in the working directory; with a value it resolves to an absolute path against the working directory. Defaults: `hits`->`coverage-hits`, `html`->`coverage-html`, `parent`->the working directory itself.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_2_output_directory_path.json`\n\n```json\n{\n    \"description\": \"Resolves an output directory path. When no value is supplied the option falls back to a per-role default folder placed in the working directory. When a (possibly relative) value is supplied it is resolved to an absolute path against the working directory. The `role` selects the default: hits->coverage-hits, html->coverage-html, parent->the working directory itself.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"resolve_directory_path\", \"role\": \"hits\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory/coverage-hits\\n\"},\n        {\"input\": {\"op\": \"resolve_directory_path\", \"role\": \"html\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory/coverage-html\\n\"},\n        {\"input\": {\"op\": \"resolve_directory_path\", \"role\": \"parent\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory\\n\"},\n        {\"input\": {\"op\": \"resolve_directory_path\", \"role\": \"parent\", \"workdir\": \"/current-directory\", \"value\": \"folder\"}, \"expected_output\": \"path=/current-directory/folder\\n\"}\n    ]\n}\n```\n\n*6.3 Working Directory Switch — resolve and change*\n\nThe working-directory option resolves the supplied value (or the default `./`) against the current working directory. If the resolved directory differs from the current one it is created and becomes the new working directory; if it equals the current one nothing changes. Reports the resolved directory and the resulting current working directory.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_3_working_directory.json`\n\n```json\n{\n    \"description\": \"Switches the process working directory. The supplied value (or the default `./`) is resolved against the current working directory. If the resolved directory differs from the current one it is created and becomes the new working directory; if it equals the current one nothing changes. Reports the resolved directory and the resulting current working directory.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"working_directory\", \"workdir\": \"/current-directory\", \"value\": null}, \"expected_output\": \"path=/current-directory\\ncwd=/current-directory\\n\"},\n        {\"input\": {\"op\": \"working_directory\", \"workdir\": \"/current-directory\", \"value\": \"folder\"}, \"expected_output\": \"path=/current-directory/folder\\ncwd=/current-directory/folder\\n\"}\n    ]\n}\n```\n\n*6.4 Glob Patterns — defaults and overrides*\n\nA multi-valued glob option yields its role's default glob list when given a null or empty value, and takes a non-empty value as-is (dropping empty entries). Reports the count of patterns followed by each pattern. Defaults per role: `include-sources`->`[src/**/*.cs]`, `exclude-sources`->`[**/bin/**/*.cs, **/obj/**/*.cs]`, `include-tests`->`[tests/**/*.cs, test/**/*.cs]`, `exclude-tests`->`[**/bin/**/*.cs, **/obj/**/*.cs]`, `include-assemblies`->`[**/*.dll]`, `exclude-assemblies`->`[**/obj/**/*.dll]`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_4_glob_patterns.json`\n\n```json\n{\n    \"description\": \"Resolves a multi-valued glob option. A null or empty value yields the role's default glob list; a non-empty value is taken as-is (with empty entries dropped). Reports the number of patterns followed by each pattern. Defaults per role: include-sources->[src/**/*.cs], exclude-sources->[**/bin/**/*.cs, **/obj/**/*.cs], include-tests->[tests/**/*.cs, test/**/*.cs], exclude-tests->[**/bin/**/*.cs, **/obj/**/*.cs], include-assemblies->[**/*.dll], exclude-assemblies->[**/obj/**/*.dll].\",\n    \"cases\": [\n        {\"input\": {\"op\": \"resolve_globs\", \"role\": \"include-sources\", \"value\": null}, \"expected_output\": \"count=1\\nsrc/**/*.cs\\n\"},\n        {\"input\": {\"op\": \"resolve_globs\", \"role\": \"include-tests\", \"value\": null}, \"expected_output\": \"count=2\\ntests/**/*.cs\\ntest/**/*.cs\\n\"},\n        {\"input\": {\"op\": \"resolve_globs\", \"role\": \"exclude-sources\", \"value\": null}, \"expected_output\": \"count=2\\n**/bin/**/*.cs\\n**/obj/**/*.cs\\n\"},\n        {\"input\": {\"op\": \"resolve_globs\", \"role\": \"include-assemblies\", \"value\": null}, \"expected_output\": \"count=1\\n**/*.dll\\n\"},\n        {\"input\": {\"op\": \"resolve_globs\", \"role\": \"exclude-assemblies\", \"value\": null}, \"expected_output\": \"count=1\\n**/obj/**/*.dll\\n\"},\n        {\"input\": {\"op\": \"resolve_globs\", \"role\": \"include-tests\", \"value\": []}, \"expected_output\": \"count=2\\ntests/**/*.cs\\ntest/**/*.cs\\n\"},\n        {\"input\": {\"op\": \"resolve_globs\", \"role\": \"include-sources\", \"value\": [\"a.cs\", \"**/a.cs\"]}, \"expected_output\": \"count=2\\na.cs\\n**/a.cs\\n\"}\n    ]\n}\n```\n\n*6.5 Coverage Threshold — percentage parsing*\n\nThe threshold option parses a percentage string into a 0..1 fraction by dividing by 100. A missing or unparseable value falls back to a default of 90 percent.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_5_threshold.json`\n\n```json\n{\n    \"description\": \"Parses the coverage threshold option, supplied as a percentage string, into a 0..1 fraction. A missing or unparseable value falls back to the default of 90 percent. The value is divided by 100.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"parse_threshold\", \"value\": null}, \"expected_output\": \"threshold=0.9\\n\"},\n        {\"input\": {\"op\": \"parse_threshold\", \"value\": \"80.51\"}, \"expected_output\": \"threshold=0.8051\\n\"}\n    ]\n}\n```\n\n*6.6 Verbosity Level — parsing and validation*\n\nThe verbosity option changes the minimum log level. A null value leaves the current level unchanged. A recognized level name (case-insensitive, e.g. `debug` or `Debug`) sets that level. An unrecognized name is rejected with a normalized validation error that echoes the offending value. Recognized names: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_6_verbosity.json`\n\n```json\n{\n    \"description\": \"Parses the verbosity option, which changes the minimum log level. A null value leaves the current level unchanged. A recognized level name (case-insensitive, e.g. `debug` or `Debug`) sets that level. An unrecognized name is rejected with a normalized validation error that echoes the offending value. Recognized names: Trace, Debug, Information, Warning, Error, Critical.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"parse_verbosity\", \"value\": null, \"current\": \"Information\"}, \"expected_output\": \"level=Information\\n\"},\n        {\"input\": {\"op\": \"parse_verbosity\", \"value\": \"debug\", \"current\": \"Information\"}, \"expected_output\": \"level=Debug\\n\"},\n        {\"input\": {\"op\": \"parse_verbosity\", \"value\": \"Debug\", \"current\": \"Information\"}, \"expected_output\": \"level=Debug\\n\"},\n        {\"input\": {\"op\": \"parse_verbosity\", \"value\": \"InvalidLevel\", \"current\": \"Information\"}, \"expected_output\": \"error=invalid_verbosity\\nvalue=InvalidLevel\\n\"}\n    ]\n}\n```\n\n*6.7 Coverage Manifest Loading — read back and validate*\n\nThe coverage-manifest option resolves a file path against the working directory (defaulting to `[standard format expressions for the specified roles — reference the role list]`). When the file exists its JSON content is parsed and the embedded source path is read back. When the file does not exist the operation fails with a normalized error reporting the resolved path that was expected.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_7_coverage_manifest.json`\n\n```json\n{\n    \"description\": \"Loads a previously written coverage manifest file (JSON). The path is resolved against the working directory (defaulting to [standard format expressions for the specified roles — reference the role list] when no value is given). When the file exists its content is parsed and the embedded source path is read back. When the file does not exist the operation fails with a normalized error that reports the resolved path that was expected.\",\n    \"cases\": [\n        {\"input\": {\"op\": \"load_coverage_manifest\", \"workdir\": \"/current-directory\", \"value\": null, \"exists\": true, \"content\": \"{\\\"SourcePath\\\": \\\"/source-path\\\"}\"}, \"expected_output\": \"path=/current-directory/[standard format expressions for the specified roles — reference the role list]\\nsource_path=/source-path\\n\"},\n        {\"input\": {\"op\": \"load_coverage_manifest\", \"workdir\": \"/current-directory\", \"value\": \"folder/file.json\", \"exists\": false}, \"expected_output\": \"error=coverage_file_not_found\\npath=/current-directory/folder/file.json\\n\"}\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the features above — the graph-filtering primitive, the hit-aggregation engine, the coverage-record serializer, the artifact file utilities, the runtime-config probing-path extractor, and the command-line option layer — each in its own cohesive module, decoupled from I/O behind a file-system abstraction.\n\n2. **The Execution/Test Adapter:** A runnable entry point that acts as a client to the core. It reads a single JSON command from stdin, dispatches on the `op` field, invokes the appropriate core logic, and prints the result to stdout exactly matching the per-leaf-feature contracts above. Native exceptions raised by the core are translated by this adapter into the neutral error categories shown in the contracts; the core itself is never coupled to stdout or JSON.\n\n3. **Automated test harness.** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` (e.g. the first case in `feature1_call_graph_filtering.json` run with `--cases-dir public_test_cases` → `rcb_tests/stdout/public_test_cases/feature1_call_graph_filtering@000.txt`). Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- follow the output schema of the raw module\n",
+  "oracle_data": {
+    "task_id": "lucaslorentz__minicover-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "specific line IDs",
+          "hit serialization",
+          "timing values",
+          "serialized hits format",
+          "exact literal replacement"
+        ],
+        "oracle_response": "The recovered hits must be listed in ascending line-id order as a comma-separated list of 'line_id:timestamp' strings (e.g., '1:15,19:50,23:2500050')."
+      },
+      {
+        "constraint_id": "C015",
+        "trigger_keywords": [
+          "extension names",
+          "output file patterns",
+          "role defaults",
+          "filename matching",
+          "serializer filenames"
+        ],
+        "oracle_response": "The default file extensions for the specified roles are: 'coverage' for coverage, 'clover' for clover, 'cobertura' for cobertura, 'coverage' for ncover, and 'opencovercoverage' for opencover."
+      },
+      {
+        "constraint_id": "TC_feature3_coverage_record_serialization",
+        "trigger_keywords": [
+          "test cases for feature3 coverage record serialization",
+          "show me feature3 coverage record serialization test cases",
+          "what are the feature3 coverage record serialization inputs and outputs",
+          "give me the feature3_coverage_record_serialization test file",
+          "feature3 coverage record serialization expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_coverage_record_serialization:\n{\n  \"description\": \"Serializes a coverage recording context (assembly, class and method identity plus a map of line id -> hit count) into a compact binary stream and reads it back. The round trip must preserve every field exactly: the number of recovered records, the three identity strings, and all line/hit pairs. Recovered hit pairs are reported in ascending line-id order.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"roundtrip_hit_context\",\n        \"assembly\": \"Asm\",\n        \"class\": \"Ns.Type\",\n        \"method\": \"DoWork\",\n        \"hits\": {\n          \"1\": 15\n        }\n      },\n      \"expected_output\": \"count=1\\nassembly=Asm\\nclass=Ns.Type\\nmethod=DoWork\\nhits=1:15\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"roundtrip_hit_context\",\n        \"assembly\": \"Sample.UnitTests\",\n        \"class\": \"Sample.UnitTests.UnitTest1\",\n        \"method\": \"Test\",\n        \"hits\": {\n          \"8\": 1,\n          \"19\": 50,\n          \"23\": 2500050\n        }\n      },\n      \"expected_output\": \"count=1\\nassembly=Sample.UnitTests\\nclass=Sample.UnitTests.UnitTest1\\nmethod=Test\\nhits=8:1,19:50,23:2500050\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_1_output_file_path",
+        "trigger_keywords": [
+          "test cases for feature6 1 output file path",
+          "show me feature6 1 output file path test cases",
+          "what are the feature6 1 output file path inputs and outputs",
+          "give me the feature6_1_output_file_path test file",
+          "feature6 1 output file path expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_1_output_file_path:\n{\n  \"description\": \"Resolves the output file path for a report. When no value is supplied the option falls back to a per-report default file name placed in the working directory. When a (possibly relative) value is supplied it is resolved to an absolute path against the working directory. The `role` selects which report's default name applies: coverage->coverage.json, clover->clover.xml, cobertura->cobertura.xml, ncover->coverage.xml, opencover->opencovercoverage.xml.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"op\": \"resolve_file_path\",\n        \"role\": \"coverage\",\n        \"workdir\": \"/current-directory\",\n        \"value\": null\n      },\n      \"expected_output\": \"path=/current-directory/coverage.json\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_file_path\",\n        \"role\": \"clover\",\n        \"workdir\": \"/current-directory\",\n        \"value\": null\n      },\n      \"expected_output\": \"path=/current-directory/clover.xml\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_file_path\",\n        \"role\": \"cobertura\",\n        \"workdir\": \"/current-directory\",\n        \"value\": null\n      },\n      \"expected_output\": \"path=/current-directory/cobertura.xml\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_file_path\",\n        \"role\": \"ncover\",\n        \"workdir\": \"/current-directory\",\n        \"value\": null\n      },\n      \"expected_output\": \"path=/current-directory/coverage.xml\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_file_path\",\n        \"role\": \"opencover\",\n        \"workdir\": \"/current-directory\",\n        \"value\": null\n      },\n      \"expected_output\": \"path=/current-directory/opencovercoverage.xml\\n\"\n    },\n    {\n      \"input\": {\n        \"op\": \"resolve_file_path\",\n        \"role\": \"clover\",\n        \"workdir\": \"/current-directory\",\n        \"value\": \"folder/file.xml\"\n      },\n      \"expected_output\": \"path=/current-directory/folder/file.xml\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "follow the output schema of the raw module",
+        "actual_meaning": "Return the bare filename in 'name' and the boolean backup status in 'backup'."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_call_graph_filtering.json": {
+      "description": "Filters a directed call graph down to a whitelist of allowed node values. Nodes whose value is allowed are kept; nodes whose value is not allowed are spliced out, with their children re-attached to the removed node's parent. The result is rendered as a nested text form where `v[..]` lists a node's retained children and `*v` marks a back-reference to an already-visited node (a cycle). Children at each level are listed in ascending value order.",
+      "cases": [
+        {
+          "input": {
+            "op": "filter_graph",
+            "children": {
+              "1": [
+                2
+              ],
+              "2": [
+                3
+              ],
+              "3": [
+                2
+              ]
+            },
+            "root": 1,
+            "allowed": [
+              1,
+              2,
+              3
+            ]
+          },
+          "expected_output": "1[2[3[*2]]]\n"
+        },
+        {
+          "input": {
+            "op": "filter_graph",
+            "children": {
+              "1": [
+                2
+              ],
+              "2": [
+                3
+              ],
+              "3": [
+                2
+              ]
+            },
+            "root": 1,
+            "allowed": [
+              1
+            ]
+          },
+          "expected_output": "1\n"
+        },
+        {
+          "input": {
+            "op": "filter_graph",
+            "children": {
+              "1": [
+                2
+              ],
+              "2": [
+                2
+              ]
+            },
+            "root": 1,
+            "allowed": [
+              1,
+              2
+            ]
+          },
+          "expected_output": "1[2[*2]]\n"
+        },
+        {
+          "input": {
+            "op": "filter_graph",
+            "children": {
+              "1": [
+                2
+              ],
+              "2": [
+                2
+              ]
+            },
+            "root": 1,
+            "allowed": [
+              1
+            ]
+          },
+          "expected_output": "1\n"
+        },
+        {
+          "input": {
+            "op": "filter_graph",
+            "children": {
+              "1": [
+                2,
+                3
+              ]
+            },
+            "root": 1,
+            "allowed": [
+              2,
+              3
+            ]
+          },
+          "expected_output": "2,3\n"
+        },
+        {
+          "input": {
+            "op": "filter_graph",
+            "children": {
+              "1": [
+                2,
+                3
+              ],
+              "2": [
+                1,
+                7,
+                8
+              ],
+              "3": [
+                4,
+                5,
+                6
+              ],
+              "4": [
+                5
+              ],
+              "5": [
+                4
+              ],
+              "6": [
+                7,
+                8,
+                6,
+                3
+              ]
+            },
+            "root": 1,
+            "allowed": [
+              1,
+              2,
+              3,
+              8
+            ]
+          },
+          "expected_output": "1[2[*1,8],3[*3,*8]]\n"
+        },
+        {
+          "input": {
+            "op": "filter_graph",
+            "children": {
+              "1": [
+                2,
+                3
+              ],
+              "2": [
+                4
+              ],
+              "3": [
+                4
+              ],
+              "4": [
+                5
+              ]
+            },
+            "root": 1,
+            "allowed": [
+              1,
+              5
+            ]
+          },
+          "expected_output": "1[5]\n"
+        },
+        {
+          "input": {
+            "op": "filter_graph",
+            "children": {
+              "1": [
+                2,
+                3
+              ],
+              "2": [
+                5
+              ],
+              "3": [
+                4
+              ],
+              "4": [
+                5
+              ],
+              "5": [
+                6
+              ]
+            },
+            "root": 1,
+            "allowed": [
+              1,
+              2,
+              3,
+              6
+            ]
+          },
+          "expected_output": "1[2[6],3[*6]]\n"
+        }
+      ]
+    },
+    "feature2_hit_aggregation.json": {
+      "description": "Aggregates per-line hit counts collected from many recording contexts. Each context is identified by an (assembly, class, method) triple and carries a map of line id -> hit count. Contexts that share the same triple are merged into one (their per-line counts summed). For each queried line id the aggregate reports the total hit count across all contexts and how many distinct contexts touched that line, followed by the per-context hit count for that line.",
+      "cases": [
+        {
+          "input": {
+            "op": "merge_hits",
+            "contexts": [
+              {
+                "assembly": "A",
+                "class": "C",
+                "method": "XUnitTest2",
+                "hits": {
+                  "17": 2500000
+                }
+              },
+              {
+                "assembly": "A",
+                "class": "C",
+                "method": "NUnitTest2",
+                "hits": {
+                  "17": 2500000
+                }
+              }
+            ],
+            "query": [
+              17
+            ]
+          },
+          "expected_output": "id=17 total=5000000 contexts=2\ncontext[0] hits=2500000\ncontext[1] hits=2500000\n"
+        },
+        {
+          "input": {
+            "op": "merge_hits",
+            "contexts": [
+              {
+                "assembly": "A",
+                "class": "C",
+                "method": "XUnitTest2",
+                "hits": {
+                  "8": 1
+                }
+              },
+              {
+                "assembly": "A",
+                "class": "C",
+                "method": "XUnitTest2",
+                "hits": {
+                  "8": 1
+                }
+              }
+            ],
+            "query": [
+              8
+            ]
+          },
+          "expected_output": "id=8 total=2 contexts=1\ncontext[0] hits=2\n"
+        },
+        {
+          "input": {
+            "op": "merge_hits",
+            "contexts": [
+              {
+                "assembly": "A",
+                "class": "C",
+                "method": "M1",
+                "hits": {
+                  "8": 1,
+                  "9": 1
+                }
+              },
+              {
+                "assembly": "A",
+                "class": "C",
+                "method": "M2",
+                "hits": {
+                  "8": 1
+                }
+              }
+            ],
+            "query": [
+              8,
+              9
+            ]
+          },
+          "expected_output": "id=8 total=2 contexts=2\ncontext[0] hits=1\ncontext[1] hits=1\nid=9 total=1 contexts=1\ncontext[0] hits=1\n"
+        }
+      ]
+    },
+    "feature3_coverage_record_serialization.json": {
+      "description": "Serializes a coverage recording context (assembly, class and method identity plus a map of line id -> hit count) into a compact binary stream and reads it back. The round trip must preserve every field exactly: the number of recovered records, the three identity strings, and all line/hit pairs. Recovered hit pairs are reported in ascending line-id order.",
+      "cases": [
+        {
+          "input": {
+            "op": "roundtrip_hit_context",
+            "assembly": "Asm",
+            "class": "Ns.Type",
+            "method": "DoWork",
+            "hits": {
+              "1": 15
+            }
+          },
+          "expected_output": "count=1\nassembly=Asm\nclass=Ns.Type\nmethod=DoWork\nhits=1:15\n"
+        },
+        {
+          "input": {
+            "op": "roundtrip_hit_context",
+            "assembly": "Sample.UnitTests",
+            "class": "Sample.UnitTests.UnitTest1",
+            "method": "Test",
+            "hits": {
+              "8": 1,
+              "19": 50,
+              "23": 2500050
+            }
+          },
+          "expected_output": "count=1\nassembly=Sample.UnitTests\nclass=Sample.UnitTests.UnitTest1\nmethod=Test\nhits=8:1,19:50,23:2500050\n"
+        }
+      ]
+    },
+    "feature4_1_content_hash.json": {
+      "description": "Computes a stable content fingerprint for a binary artifact, given its raw bytes. The fingerprint is the MD5 digest rendered as an uppercase hexadecimal string with no separators.",
+      "cases": [
+        {
+          "input": {
+            "op": "file_hash",
+            "bytes": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ]
+          },
+          "expected_output": "7CFDD07889B3295D6A550914AB35E068\n"
+        }
+      ]
+    },
+    "feature4_2_debug_symbol_path.json": {
+      "description": "Derives the companion debug-symbols file path for a compiled assembly path by replacing the assembly's extension with the debug-symbols extension (`pdb`), keeping the directory and base name unchanged.",
+      "cases": [
+        {
+          "input": {
+            "op": "pdb_path",
+            "path": "/test/ACME.Something.dll"
+          },
+          "expected_output": "path=/test/ACME.Something.pdb\n"
+        }
+      ]
+    },
+    "feature4_3_backup_path.json": {
+      "description": "Derives the backup file path used to preserve the original, unmodified copy of an assembly before it is rewritten. The backup name inserts an `uninstrumented` marker before the original extension, keeping the directory and base name unchanged.",
+      "cases": [
+        {
+          "input": {
+            "op": "backup_path",
+            "path": "/test/ACME.Something.dll"
+          },
+          "expected_output": "path=/test/ACME.Something.uninstrumented.dll\n"
+        }
+      ]
+    },
+    "feature4_4_backup_detection.json": {
+      "description": "Decides whether a given file path refers to a backup (original, unmodified) artifact by detecting the `uninstrumented` marker in the file name. Reports the bare file name and the boolean verdict.",
+      "cases": [
+        {
+          "input": {
+            "op": "is_backup",
+            "path": "/test/ACME.Something.dll"
+          },
+          "expected_output": "name=ACME.Something.dll\nbackup=false\n"
+        },
+        {
+          "input": {
+            "op": "is_backup",
+            "path": "/test/ACME.Something.uninstrumented.dll"
+          },
+          "expected_output": "name=ACME.Something.uninstrumented.dll\nbackup=true\n"
+        }
+      ]
+    },
+    "feature5_probing_paths.json": {
+      "description": "Extracts extra assembly probing directories from a runtime configuration document (JSON). It reads `runtimeOptions.additionalProbingPaths` and returns every concrete path, skipping any entry that contains a templated placeholder (a `|...|` token such as an architecture/framework macro). Reports the number of returned paths followed by each path. Empty input, the literal `null`, or a document without the relevant section yield zero paths.",
+      "cases": [
+        {
+          "input": {
+            "op": "probing_paths",
+            "runtime_config": "{\"runtimeOptions\":{\"additionalProbingPaths\":[\"/root/.dotnet/store/|arch|/|tfm|\",\"/api/.nuget/packages\",\"/usr/share/dotnet/sdk/NuGetFallbackFolder\"]}}"
+          },
+          "expected_output": "count=2\n/api/.nuget/packages\n/usr/share/dotnet/sdk/NuGetFallbackFolder\n"
+        },
+        {
+          "input": {
+            "op": "probing_paths",
+            "runtime_config": ""
+          },
+          "expected_output": "count=0\n"
+        },
+        {
+          "input": {
+            "op": "probing_paths",
+            "runtime_config": "null"
+          },
+          "expected_output": "count=0\n"
+        },
+        {
+          "input": {
+            "op": "probing_paths",
+            "runtime_config": "{}"
+          },
+          "expected_output": "count=0\n"
+        }
+      ]
+    },
+    "feature6_1_output_file_path.json": {
+      "description": "Resolves the output file path for a report. When no value is supplied the option falls back to a per-report default file name placed in the working directory. When a (possibly relative) value is supplied it is resolved to an absolute path against the working directory. The `role` selects which report's default name applies: coverage->coverage.json, clover->clover.xml, cobertura->cobertura.xml, ncover->coverage.xml, opencover->opencovercoverage.xml.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve_file_path",
+            "role": "coverage",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory/coverage.json\n"
+        },
+        {
+          "input": {
+            "op": "resolve_file_path",
+            "role": "clover",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory/clover.xml\n"
+        },
+        {
+          "input": {
+            "op": "resolve_file_path",
+            "role": "cobertura",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory/cobertura.xml\n"
+        },
+        {
+          "input": {
+            "op": "resolve_file_path",
+            "role": "ncover",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory/coverage.xml\n"
+        },
+        {
+          "input": {
+            "op": "resolve_file_path",
+            "role": "opencover",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory/opencovercoverage.xml\n"
+        },
+        {
+          "input": {
+            "op": "resolve_file_path",
+            "role": "clover",
+            "workdir": "/current-directory",
+            "value": "folder/file.xml"
+          },
+          "expected_output": "path=/current-directory/folder/file.xml\n"
+        }
+      ]
+    },
+    "feature6_2_output_directory_path.json": {
+      "description": "Resolves an output directory path. When no value is supplied the option falls back to a per-role default folder placed in the working directory. When a (possibly relative) value is supplied it is resolved to an absolute path against the working directory. The `role` selects the default: hits->coverage-hits, html->coverage-html, parent->the working directory itself.",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve_directory_path",
+            "role": "hits",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory/coverage-hits\n"
+        },
+        {
+          "input": {
+            "op": "resolve_directory_path",
+            "role": "html",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory/coverage-html\n"
+        },
+        {
+          "input": {
+            "op": "resolve_directory_path",
+            "role": "parent",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory\n"
+        },
+        {
+          "input": {
+            "op": "resolve_directory_path",
+            "role": "parent",
+            "workdir": "/current-directory",
+            "value": "folder"
+          },
+          "expected_output": "path=/current-directory/folder\n"
+        }
+      ]
+    },
+    "feature6_3_working_directory.json": {
+      "description": "Switches the process working directory. The supplied value (or the default `./`) is resolved against the current working directory. If the resolved directory differs from the current one it is created and becomes the new working directory; if it equals the current one nothing changes. Reports the resolved directory and the resulting current working directory.",
+      "cases": [
+        {
+          "input": {
+            "op": "working_directory",
+            "workdir": "/current-directory",
+            "value": null
+          },
+          "expected_output": "path=/current-directory\ncwd=/current-directory\n"
+        },
+        {
+          "input": {
+            "op": "working_directory",
+            "workdir": "/current-directory",
+            "value": "folder"
+          },
+          "expected_output": "path=/current-directory/folder\ncwd=/current-directory/folder\n"
+        }
+      ]
+    },
+    "feature6_4_glob_patterns.json": {
+      "description": "Resolves a multi-valued glob option. A null or empty value yields the role's default glob list; a non-empty value is taken as-is (with empty entries dropped). Reports the number of patterns followed by each pattern. Defaults per role: include-sources->[src/**/*.cs], exclude-sources->[**/bin/**/*.cs, **/obj/**/*.cs], include-tests->[tests/**/*.cs, test/**/*.cs], exclude-tests->[**/bin/**/*.cs, **/obj/**/*.cs], include-assemblies->[**/*.dll], exclude-assemblies->[**/obj/**/*.dll].",
+      "cases": [
+        {
+          "input": {
+            "op": "resolve_globs",
+            "role": "include-sources",
+            "value": null
+          },
+          "expected_output": "count=1\nsrc/**/*.cs\n"
+        },
+        {
+          "input": {
+            "op": "resolve_globs",
+            "role": "include-tests",
+            "value": null
+          },
+          "expected_output": "count=2\ntests/**/*.cs\ntest/**/*.cs\n"
+        },
+        {
+          "input": {
+            "op": "resolve_globs",
+            "role": "exclude-sources",
+            "value": null
+          },
+          "expected_output": "count=2\n**/bin/**/*.cs\n**/obj/**/*.cs\n"
+        },
+        {
+          "input": {
+            "op": "resolve_globs",
+            "role": "include-assemblies",
+            "value": null
+          },
+          "expected_output": "count=1\n**/*.dll\n"
+        },
+        {
+          "input": {
+            "op": "resolve_globs",
+            "role": "exclude-assemblies",
+            "value": null
+          },
+          "expected_output": "count=1\n**/obj/**/*.dll\n"
+        },
+        {
+          "input": {
+            "op": "resolve_globs",
+            "role": "include-tests",
+            "value": []
+          },
+          "expected_output": "count=2\ntests/**/*.cs\ntest/**/*.cs\n"
+        },
+        {
+          "input": {
+            "op": "resolve_globs",
+            "role": "include-sources",
+            "value": [
+              "a.cs",
+              "**/a.cs"
+            ]
+          },
+          "expected_output": "count=2\na.cs\n**/a.cs\n"
+        }
+      ]
+    },
+    "feature6_5_threshold.json": {
+      "description": "Parses the coverage threshold option, supplied as a percentage string, into a 0..1 fraction. A missing or unparseable value falls back to the default of 90 percent. The value is divided by 100.",
+      "cases": [
+        {
+          "input": {
+            "op": "parse_threshold",
+            "value": null
+          },
+          "expected_output": "threshold=0.9\n"
+        },
+        {
+          "input": {
+            "op": "parse_threshold",
+            "value": "80.51"
+          },
+          "expected_output": "threshold=0.8051\n"
+        }
+      ]
+    },
+    "feature6_6_verbosity.json": {
+      "description": "Parses the verbosity option, which changes the minimum log level. A null value leaves the current level unchanged. A recognized level name (case-insensitive, e.g. `debug` or `Debug`) sets that level. An unrecognized name is rejected with a normalized validation error that echoes the offending value. Recognized names: Trace, Debug, Information, Warning, Error, Critical.",
+      "cases": [
+        {
+          "input": {
+            "op": "parse_verbosity",
+            "value": null,
+            "current": "Information"
+          },
+          "expected_output": "level=Information\n"
+        },
+        {
+          "input": {
+            "op": "parse_verbosity",
+            "value": "debug",
+            "current": "Information"
+          },
+          "expected_output": "level=Debug\n"
+        },
+        {
+          "input": {
+            "op": "parse_verbosity",
+            "value": "Debug",
+            "current": "Information"
+          },
+          "expected_output": "level=Debug\n"
+        },
+        {
+          "input": {
+            "op": "parse_verbosity",
+            "value": "InvalidLevel",
+            "current": "Information"
+          },
+          "expected_output": "error=invalid_verbosity\nvalue=InvalidLevel\n"
+        }
+      ]
+    },
+    "feature6_7_coverage_manifest.json": {
+      "description": "Loads a previously written coverage manifest file (JSON). The path is resolved against the working directory (defaulting to coverage.json when no value is given). When the file exists its content is parsed and the embedded source path is read back. When the file does not exist the operation fails with a normalized error that reports the resolved path that was expected.",
+      "cases": [
+        {
+          "input": {
+            "op": "load_coverage_manifest",
+            "workdir": "/current-directory",
+            "value": null,
+            "exists": true,
+            "content": "{\"SourcePath\": \"/source-path\"}"
+          },
+          "expected_output": "path=/current-directory/coverage.json\nsource_path=/source-path\n"
+        },
+        {
+          "input": {
+            "op": "load_coverage_manifest",
+            "workdir": "/current-directory",
+            "value": "folder/file.json",
+            "exists": false
+          },
+          "expected_output": "error=coverage_file_not_found\npath=/current-directory/folder/file.json\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "feature1_call_graph_filtering",
+      "input_condition": "op=filter_graph with children, root, allowed",
+      "output_rule": "Render filtered graph as nested text. Nodes not in 'allowed' are removed. Children of removed nodes re-attach to removed node's parent. Kept nodes shown as 'v'. Back-references (cycles) shown as '*v'. Children sorted ascending. Output ends with newline.",
+      "exact_values": [
+        "*v",
+        "v[...]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "feature1_call_graph_filtering",
+      "input_condition": "filter_graph root is removed",
+      "output_rule": "If root is not in allowed, output surviving descendants as top-level list (comma-separated for leaves, nested as needed for structure implied by children logic, but test cases show direct listing or nested). Note: Test case 6 shows nested structure even if root 1 is removed, 2 becomes root 2[...], 3 becomes root 3[...]. The rendering logic recursively applies to the new subgraph starting at allowed descendants.",
+      "exact_values": [
+        "*v"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "feature1_call_graph_filtering",
+      "input_condition": "filter_graph children values not in allowed",
+      "output_rule": "Nodes not in 'allowed' are removed. Their children are spliced under their removed parent's position.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "feature2_hit_aggregation",
+      "input_condition": "op=merge_hits with multiple contexts",
+      "output_rule": "1. Merge contexts with identical (assembly, class, method) triples by summing hit counts. 2. For each query id: Report 'id=X total=Y contexts=Z'. 3. Then report per-context hits: 'context[N] hits=X'.",
+      "exact_values": [
+        "context[0]",
+        "context[1]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "feature2_hit_aggregation",
+      "input_condition": "merge_hits query has multiple ids",
+      "output_rule": "Report aggregate and per-context breakdown for each query id separately, in the order they appear in 'query'. Order of contexts remains 'first-seen' order.",
+      "exact_values": [
+        "id=X",
+        "context[N]"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "feature3_coverage_record_serialization",
+      "input_condition": "op=roundtrip_hit_context",
+      "output_rule": "Round-trip b.ms (write-read-deserialize). Output count=1, then identity strings (assembly, class, method), then hits. Hits sorted by line-id ascending.",
+      "exact_values": [
+        "count=1",
+        "hits=X:Y"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "feature3_coverage_record_serialization",
+      "input_condition": "roundtrip_hit_context with multiple hits",
+      "output_rule": "Recovered hits must be listed in ascending line-id order.",
+      "exact_values": [
+        "1:15,19:50,23:2500050"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "feature4_1_content_hash",
+      "input_condition": "op=file_hash",
+      "output_rule": "Compute MD5 of bytes. Output uppercase hex string with no separators, ending with newline.",
+      "exact_values": [
+        "7CFDD07889B3295D6A550914AB35E068"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "feature4_2_debug_symbol_path",
+      "input_condition": "op=pdb_path",
+      "output_rule": "Replace assembly extension (.dll) with .pdb. Path = directory + base + .pdb.",
+      "exact_values": [
+        ".pdb"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "feature4_3_backup_path",
+      "input_condition": "op=backup_path",
+      "output_rule": "Insert 'uninstrumented' before the original extension. e.g. .dll -> .uninstrumented.dll.",
+      "exact_values": [
+        ".uninstrumented.dll"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "feature4_4_backup_detection",
+      "input_condition": "op=is_backup",
+      "output_rule": "Check if 'uninstrumented' exists immediately before the extension. Reports bare filename and boolean 'backup'.",
+      "exact_values": [
+        "backup=true",
+        "backup=false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "feature4_4_backup_detection",
+      "input_condition": "is_backup raw path",
+      "output_rule": "Output 'name' (bare filename) and 'backup' (boolean).",
+      "exact_values": [
+        "name=",
+        "backup="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "feature5_probing_paths",
+      "input_condition": "op=probing_paths with JSON string",
+      "output_rule": "Parse JSON. Find 'runtimeOptions.additionalProbingPaths'. Filter out strings containing '|...|' placeholders. Output count then paths. Handle null, empty string, missing key by returning 0.",
+      "exact_values": [
+        "count=0"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "feature5_probing_paths",
+      "input_condition": "probing_paths value contains |...|",
+      "output_rule": "Skip entries containing templated placeholders (e.g. '|arch|').",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "feature6_1_output_file_path",
+      "input_condition": "op=resolve_file_path with role=...",
+      "output_rule": "If value=null, use role default (coverage->coverage.json, clover->clover.xml, cobertura->cobertura.xml, ncover->coverage.xml, opencover->opencovercoverage.xml). Else, resolve relative path against workdir.",
+      "exact_values": [
+        "coverage.json",
+        "clover.xml",
+        "cobertura.xml",
+        "coverage.xml",
+        "opencovercoverage.xml"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "feature6_2_output_directory_path",
+      "input_condition": "op=resolve_directory_path with role=...",
+      "output_rule": "If value=null, use role default (hits->coverage-hits, html->coverage-html, parent->workdir). Else, resolve relative path against workdir.",
+      "exact_values": [
+        "coverage-hits",
+        "coverage-html",
+        ""
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "feature6_3_working_directory",
+      "input_condition": "op=working_directory",
+      "output_rule": "Resolve path (or ./ if null) against current cwd. If res != cwd, create/resolution becomes new cwd. Report resolved path and new cwd.",
+      "exact_values": [
+        "/",
+        ".//"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "feature6_4_glob_patterns",
+      "input_condition": "op=resolve_globs with role=...",
+      "output_rule": "If value=null, use role default list. If value=[], use default. If value is list, use provided list (drop empty strings). Output count then patterns.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "feature6_5_threshold",
+      "input_condition": "op=parse_threshold",
+      "output_rule": "If value=null, return 0.9. If value is string, parse as %, divide by 100.0. Unparseable defaults to 0.9 (implied by 'missing' handling, though test shows specific string '80.51' -> 0.8051).",
+      "exact_values": [
+        "0.9",
+        "0.8051"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "feature6_6_verbosity",
+      "input_condition": "op=parse_verbosity",
+      "output_rule": "If value=null, keep current. If value in [Trace, Debug, Info, Warning, Error, Critical] (case-insensitive), set to that. Else, error=invalid_verbosity, value=<offending>. Current is preserved unless changed.",
+      "exact_values": [
+        "Trace",
+        "Debug",
+        "Warning",
+        "Error"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "feature6_7_coverage_manifest",
+      "input_condition": "op=load_coverage_manifest",
+      "output_rule": "Resolve path (or coverage.json if null) against workdir. If exists and valid JSON, output path and parse 'SourcePath'. If not exists, error=coverage_file_not_found, output path.",
+      "exact_values": [
+        "coverage_file_not_found",
+        "SourcePath="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "feature2_hit_aggregation",
+      "input_condition": "merge_hits contexts with same triple",
+      "output_rule": "Distinct context counts in aggregate (contexts=N) are based on merged uniques. Per-context breakdown shows only the unique merged context.",
+      "exact_values": [
+        "contexts=1"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "feature3_coverage_record_serialization",
+      "input_condition": "roundtrip_hit_context empty hits",
+      "output_rule": "Hits line format 'hits=X:Y'. If no hits provided in test, likely empty or handled implicitly. Test cases show at least one hit.",
+      "exact_values": []
+    },
+    {
+      "id": "C024",
+      "feature": "feature1_call_graph_filtering",
+      "input_condition": "filter_graph children sorted",
+      "output_rule": "Children at each level listed in ascending value order.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "feature6_2_output_directory_path",
+      "input_condition": "resolve_directory_path role=parent value=null",
+      "output_rule": "Result is the workdir itself.",
+      "exact_values": [
+        "/current-directory"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C026",
+      "feature": "feature6_4_glob_patterns",
+      "input_condition": "resolve_globs value=[]",
+      "output_rule": "Yields role's default list.",
+      "exact_values": []
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C007",
+        "replacement": "a specific line-id/timing tuple — ask the PM for the exact format string",
+        "exact_values_to_replace": [
+          "1:15,19:50,23:2500050"
+        ],
+        "trigger_keywords": [
+          "specific line IDs",
+          "hit serialization",
+          "timing values",
+          "serialized hits format",
+          "exact literal replacement"
+        ],
+        "oracle_response": "The recovered hits must be listed in ascending line-id order as a comma-separated list of 'line_id:timestamp' strings (e.g., '1:15,19:50,23:2500050')."
+      },
+      {
+        "constraint_id": "C015",
+        "replacement": "standard format expressions for the specified roles — reference the role list",
+        "exact_values_to_replace": [
+          "coverage.json",
+          "clover.xml",
+          "cobertura.xml",
+          "coverage.xml",
+          "opencovercoverage.xml"
+        ],
+        "trigger_keywords": [
+          "extension names",
+          "output file patterns",
+          "role defaults",
+          "filename matching",
+          "serializer filenames"
+        ],
+        "oracle_response": "The default file extensions for the specified roles are: 'coverage' for coverage, 'clover' for clover, 'cobertura' for cobertura, 'coverage' for ncover, and 'opencovercoverage' for opencover."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "follow the output schema of the raw module",
+        "actual_meaning": "Return the bare filename in 'name' and the boolean backup status in 'backup'."
+      }
+    ]
+  }
+}

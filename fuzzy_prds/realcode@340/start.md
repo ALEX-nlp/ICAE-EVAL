@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to wrap up the schema annotation tool we've been building. The core idea is that developers waste a ton of time manually keeping database schema comments up to date in their model files — they go stale the moment someone runs a migration and nobody notices until something breaks in code review. We want a CLI tool that can read a table description and spit out a nicely formatted comment block, then insert or remove it from source files automatically.
+
+A few things I want to make sure we nail: the comment blocks should support a few different documentation styles — I remember we talked about at least three or four of these in the last planning session, including that one Markdown style and the two Ruby doc formats we use internally. Also the route file annotation side of things needs to work too, not just the schema side.
+
+One thing I'm fuzzy on is the exact alignment logic — like how wide should the name column be versus the type column, and how does that change when someone adds column comments? Also I keep hearing about the 'auto-generated foreign key name abbreviation' behavior, can someone confirm exactly how that works? And what happens when someone passes --pc before -p in the CLI args vs after? That ordering behavior tripped us up in the login module refactor last quarter. The file structure should definitely not be a single giant file.

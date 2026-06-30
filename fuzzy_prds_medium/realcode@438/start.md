@@ -1,0 +1,13 @@
+## Product Requirement Document
+
+We need the full Kubernetes discovery/observation behavior covered by the tests: refreshing namespaces, applying namespace watch events, refreshing served resources with selectors and capability filters, and applying resource-definition change events. Resource-definition events are one feature, not the entire task. The adapter should route by action and emit deterministic namespace/resource readiness, notification, ambiguity, warnings, and API-call traces.
+
+One other thing the team asked about: when an event comes in with the type field null (absent), that’s just the initial list phase and we should fully ignore it. That means no waiter notification, no served-resource update, and no API discovery calls at all. So the output in that case is exactly notified=no, resources unchanged (empty if initial_resources is empty), core_namespaces_ready=no, api_calls= . That same ignore-vs-apply pattern is the one we want in both apply_namespace_event and apply_resource_definition_event: null-type events are ignored with notified=no and no state change, and non-null-type events do the normal state update and notify with notified=yes.
+
+Also, the output needs to spell out discovery traffic with api_calls=<comma-separated list of API path strings> in the exact order the calls happened during the rescan. For an extension group rescan, that includes /apis and /apis/<group>/<version> for each version of the affected group. For a core API rescan, it’s /api and /api/v1. If nothing was fetched, like on an initial-list event, then it stays empty as api_calls=.
+
+For the group-removal case, if we rescan /apis and the affected group is no longer in the groups list, we should treat that group as now having zero resources and remove any previously served resources from that group out of the catalog. Resources from other groups stay as they were.
+
+On the core side, the backbone resources for group='' use their own discovery path, /api and /api/v1, and the output should always carry core_namespaces_ready=yes|no. That flag is no for an initial-list event, when no core API rescan happened, or when the core API response does not include namespaces. It only flips to yes after a later event triggers a core API rescan and that resource list includes namespaces.
+
+Last piece was the capability filter behavior in feature 3.3: to be watchable, a resource needs list+watch verbs. If handler_mode is background_task or timer, it also needs patch. If those checks fail, we should emit non_watchable_resource or non_patchable_resource warnings respectively.

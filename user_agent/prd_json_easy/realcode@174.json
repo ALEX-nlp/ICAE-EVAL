@@ -1,0 +1,811 @@
+{
+  "fuzzy_prd": "# Feature Flag Engine — Scoped, Resolver-Backed Feature Toggles with Caching and Request Gating\n\n## Project Goal\n\nBuild a lightweight feature-flag engine that lets developers define named feature flags, resolve their value on demand (optionally per-scope), override them at runtime, and gate behavior on them — so an application can roll features out to specific entities and toggle them without redeploying or scattering ad-hoc conditionals through the codebase.\n\n---\n\n## Background & Problem\n\nApplications constantly need to turn behavior on or off for some audience: everyone, a single account, a class of users, or nobody yet. Without a dedicated engine, teams hard-code booleans, sprinkle environment checks everywhere, and have no consistent story for \"is this on for *this* entity?\", for caching the answer, or for cleanly removing a flag once it ships.\n\nThis engine centralizes that. A flag is **defined** with a *resolver* that computes its initial value (a constant, a value derived from the scope it is checked against, or a probabilistic draw). The value for a given (flag, scope) pair is computed at most once and cached. Callers can ask whether a flag is **active** (anything other than boolean `false` is active), read its concrete **value**, override it by **activating/deactivating** it, branch on it, gate an HTTP request on it, and **forget/purge** stored values to force recomputation.\n\nA central idea is the **scope**: the entity a flag is evaluated for. A scope may be absent (the global/unscoped value), an empty string, a string identifier, a number, or a domain object. Object scopes are reduced to a stable string key; an object may also advertise its own identifier so distinct instances that represent the same thing collapse to one scope.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** The physical structure of the codebase MUST perfectly match the complexity of the domain.\n   - **For micro-utilities/simple scripts:** A well-organized, single-file solution is perfectly acceptable, provided it maintains clean logical separation.\n   - **For complex systems:** If the project involves multiple distinct responsibilities (e.g., I/O routing, business rules, formatters), it MUST NOT be a single \"god file\". You must output a clear, multi-file directory tree (`src/`, `tests/`, etc.) that reflects a production-grade repository.\n   Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):**\n   The JSON input/output test cases provided in the \"Core Features\" section represent a **black-box testing contract** for the execution adapter, NOT the internal data model of the core system. The core business logic must remain completely decoupled from standard I/O (stdin/stdout) and JSON parsing. The execution adapter is solely responsible for translating JSON commands into idiomatic method calls to the core domain.\n\n3. **Adherence to SOLID Design Principles:**\n   The architectural design must follow SOLID principles to ensure maintainability and scalability (scaled appropriately to the project's size):\n   - **Single Responsibility Principle (SRP):** Separate parsing, routing, validation, core execution, and output formatting into distinct logical units.\n   - **Open/Closed Principle (OCP):** The core engine must be open for extension but closed for modification.\n   - **Liskov Substitution Principle (LSP):** Derived types must be perfectly substitutable for their base types.\n   - **Interface Segregation Principle (ISP):** Keep interfaces/protocols small and highly cohesive.\n   - **Dependency Inversion Principle (DIP):** High-level modules should depend on abstractions, not low-level I/O implementation details.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public interface of the core system must be elegant and idiomatic to the target programming language, hiding internal complexity.\n   - **Resilience:** The system must handle edge cases gracefully. Errors should be modeled properly (e.g., specific Exception types or Result/Monad patterns) rather than relying on generic faults.\n\n---\n\n## Core Features\n\nEach feature is exercised through the execution adapter, which reads one JSON request `{ \"operations\": [ ... ] }` from stdin and prints one line per *query* operation to stdout (mutating operations print nothing). The operation vocabulary, scope encoding, resolver specifications, and exact output line formats are defined in the **Deliverables** section; read it alongside these features.\n\n### Feature 1: Defining Flags and the Active/Inactive Contract\n\n**As a developer**, I want to register a flag with a resolver and ask whether it is active, so I can branch on a feature without caring how its value was produced.\n\n**Expected Behavior / Usage:**\n\nA flag is defined by name together with a resolver that yields its initial value. Querying `active` for an undefined flag returns inactive. For a defined flag, the flag is **active** unless its resolved value is exactly boolean `false`; every other value — including `0`, `\"\"`, `null`, and structured values — is **active**. The `inactive` query is the exact logical negation of `active`. Reading the concrete value is also supported (see Feature 4).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_defining_and_truthiness.json`\n\n```json\n{\n    \"description\": \"Define feature flags by attaching a resolver that produces an initial value, then query whether a feature is active. A feature with no registered resolver is treated as inactive. A registered resolver makes the feature active unless the resolved value is exactly boolean false: every other value (including zero, an empty string, null, and structured values) counts as active. The inactive check is the logical inverse of the active check.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"on\", \"resolver\": {\"type\": \"const\", \"value\": true}},\n                {\"op\": \"define\", \"feature\": \"off\", \"resolver\": {\"type\": \"const\", \"value\": false}},\n                {\"op\": \"active\", \"feature\": \"on\"},\n                {\"op\": \"active\", \"feature\": \"off\"}\n            ]},\n            \"expected_output\": \"active on = true\\nactive off = false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Runtime Overrides\n\n**As a developer**, I want to force flags on or off at runtime, so I can change behavior without touching the resolver.\n\n**Expected Behavior / Usage:**\n\n*2.1 Activate / Deactivate — toggle one or many flags*\n\nActivating a flag stores a truthy value so later checks report it active; deactivating stores `false` so later checks report it inactive. The action accepts either a single flag name or a list of names, applying to all of them. Toggling is idempotent and may be re-applied freely.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_1_activate_deactivate.json`\n\n```json\n{\n    \"description\": \"Programmatically turn feature flags on and off at runtime, overriding any resolver. Activating a feature stores a truthy value so subsequent checks report it active; deactivating stores false so checks report it inactive. The same action may be applied to several features at once by supplying a list of feature names. Toggling is idempotent and re-applies cleanly.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"activate\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\"},\n                {\"op\": \"deactivate\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\"},\n                {\"op\": \"activate\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\"}\n            ]},\n            \"expected_output\": \"active foo = true\\nactive foo = false\\nactive foo = true\\n\"\n        }\n    ]\n}\n```\n\n*2.2 Activate / Deactivate For Everyone — bulk apply across known scopes*\n\nA flag's value can be forced for every scope that already has a stored value. After some scopes have been given values, deactivating-for-everyone forces the flag off for all of them and activating-for-everyone forces it on for all of them. The operation affects the scopes already present in storage.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_2_for_everyone.json`\n\n```json\n{\n    \"description\": \"Apply a single value to a feature across every scope that already has a stored value. After individual scopes have been given values, deactivating-for-everyone forces the feature off for all of them, and activating-for-everyone forces it on for all of them. This bulk operation affects the scopes already known to storage.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"foo\", \"resolver\": {\"type\": \"const\", \"value\": false}},\n                {\"op\": \"activate\", \"feature\": \"foo\", \"scope\": \"tim\"},\n                {\"op\": \"activate\", \"feature\": \"foo\", \"scope\": \"taylor\"},\n                {\"op\": \"value\", \"feature\": \"foo\", \"scope\": \"tim\"},\n                {\"op\": \"value\", \"feature\": \"foo\", \"scope\": \"taylor\"},\n                {\"op\": \"deactivateForEveryone\", \"feature\": \"foo\"},\n                {\"op\": \"value\", \"feature\": \"foo\", \"scope\": \"tim\"},\n                {\"op\": \"value\", \"feature\": \"foo\", \"scope\": \"taylor\"},\n                {\"op\": \"activateForEveryone\", \"feature\": \"foo\"},\n                {\"op\": \"value\", \"feature\": \"foo\", \"scope\": \"tim\"},\n                {\"op\": \"value\", \"feature\": \"foo\", \"scope\": \"taylor\"}\n            ]},\n            \"expected_output\": \"value foo = true\\nvalue foo = true\\nvalue foo = false\\nvalue foo = false\\nvalue foo = true\\nvalue foo = true\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Scopes\n\n**As a developer**, I want to evaluate and store flag values per entity, so a feature can be on for one audience and off for another.\n\n**Expected Behavior / Usage:**\n\n*3.1 Scope Isolation & Identity*\n\nA flag may be checked against a specific scope, and a resolver may inspect that scope to decide the value. Values stored for one scope never leak to another. A scope object may declare its own stable string identifier; two scope objects that map to the same identifier are treated as the same scope. When no scope is supplied, the default (global) scope applies (see 3.4).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_scope_isolation.json`\n\n```json\n{\n    \"description\": \"Evaluate a feature against a specific scope (the entity a flag is being checked for, such as an account, a string identifier like an email address, a number, or a domain object). A resolver may inspect the scope to decide the value. Values stored for one scope do not leak to another, so a feature can be active for one scope and inactive for another. A scope object may also declare its own stable string identifier, in which case two scopes that map to the same identifier are treated as the same scope.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"foo\", \"resolver\": {\"type\": \"scopeIdEquals\", \"id\": 1}},\n                {\"op\": \"active\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": {\"user\": 1}},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": {\"user\": 2}}\n            ]},\n            \"expected_output\": \"active foo = false\\nactive foo = true\\nactive foo = false\\n\"\n        }\n    ]\n}\n```\n\n*3.2 Null vs. Empty-String Scope*\n\nThe absent/null scope represents the global, unscoped value: a globally stored value is visible under an explicit null scope and vice versa. The empty string is a *distinct* scope: a value stored under the empty-string scope is invisible globally and under null, and a global value is invisible under the empty-string scope.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_null_and_empty_scope.json`\n\n```json\n{\n    \"description\": \"Distinguish the absence of a scope from an empty-string scope. The null scope represents the global, unscoped value, so a value set globally is visible when checking with an explicit null scope and vice versa. The empty string is a distinct scope from null: a value stored under the empty-string scope is not visible globally or under null, and a global value is not visible under the empty-string scope.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"activate\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": \"\"},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": null},\n                {\"op\": \"active\", \"feature\": \"foo\"},\n                {\"op\": \"activate\", \"feature\": \"bar\", \"scope\": \"\"},\n                {\"op\": \"active\", \"feature\": \"bar\", \"scope\": \"\"},\n                {\"op\": \"active\", \"feature\": \"bar\", \"scope\": null},\n                {\"op\": \"active\", \"feature\": \"bar\"}\n            ]},\n            \"expected_output\": \"active foo = false\\nactive foo = true\\nactive foo = true\\nactive bar = true\\nactive bar = false\\nactive bar = false\\n\"\n        }\n    ]\n}\n```\n\n*3.3 Multiple Scopes At Once*\n\nSupplying a list of scopes applies an action to each. Activating for a list of scopes makes the flag active for every listed scope and leaves others untouched. A multi-scope aggregate check reports active only when the flag is active for *every* scope in the list.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_multiple_scopes.json`\n\n```json\n{\n    \"description\": \"Apply an action to several scopes at once by supplying a list of scopes. Activating a feature for a list of scopes makes it active for each listed scope and leaves other scopes unaffected. A multi-scope aggregate check reports active only when the feature is active for every scope in the list.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"activate\", \"feature\": \"foo\", \"scope\": [{\"user\": 1}, {\"user\": 2}]},\n                {\"op\": \"active\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": {\"user\": 1}},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": {\"user\": 2}},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": {\"user\": 3}}\n            ]},\n            \"expected_output\": \"active foo = false\\nactive foo = true\\nactive foo = true\\nactive foo = false\\n\"\n        }\n    ]\n}\n```\n\n*3.4 Default Scope Resolution*\n\nWhen no scope is given, the engine resolves one automatically. By default it uses the currently authenticated entity, so after authenticating, an unscoped check matches a check made explicitly for that same entity while a different scope is unaffected. The default-scope strategy can also be replaced, after which unscoped checks use the value the replacement produces.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_4_default_scope.json`\n\n```json\n{\n    \"description\": \"Resolve the scope automatically when no scope is supplied. By default the unscoped value uses the currently authenticated entity as the scope, so after authenticating, an unscoped check matches a check made explicitly for that same entity, while a different scope is unaffected. The default-scope strategy can also be replaced, after which unscoped checks use the value produced by the replacement strategy.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"loginUser\", \"id\": 2},\n                {\"op\": \"activate\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": \"misc\"},\n                {\"op\": \"active\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": {\"user\": 2}}\n            ]},\n            \"expected_output\": \"active foo = false\\nactive foo = true\\nactive foo = true\\n\"\n        }\n    ]\n}\n```\n\n*3.5 Null-Scope Handling for Scope-Dependent Resolvers*\n\nA resolver that does not require a particular scope evaluates normally against a null scope and yields its value. A resolver that *requires* a concrete (non-null) scope cannot run against a null scope; in that case the flag resolves to inactive rather than failing, while still resolving normally when a concrete scope is provided.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_5_null_scope_handling.json`\n\n```json\n{\n    \"description\": \"Control how a feature behaves when checked with a null scope. A resolver that does not require a particular scope is evaluated normally for a null scope and produces its value. A resolver that requires a concrete (non-null) scope cannot run against a null scope; in that situation the feature resolves to inactive instead of failing, while still resolving normally when a concrete scope is provided.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"bar\", \"resolver\": {\"type\": \"requiresUserScope\", \"value\": true}},\n                {\"op\": \"active\", \"feature\": \"bar\", \"scope\": null},\n                {\"op\": \"active\", \"feature\": \"bar\", \"scope\": {\"user\": 1}}\n            ]},\n            \"expected_output\": \"active bar = false\\nactive bar = true\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Reading Values\n\n**As a developer**, I want to read a flag's concrete value (not just its on/off state), so flags can carry configuration payloads.\n\n**Expected Behavior / Usage:**\n\nA single `value` query returns one flag's value for a scope. A batch `values` query returns a map from each requested flag name to its value for a scope. The `all` query returns a map of every defined flag to its value, in definition order. A flag activated with an explicit value stores that value, which is returned verbatim.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_reading_values.json`\n\n```json\n{\n    \"description\": \"Read the concrete value of a feature rather than just its active/inactive state. A single query returns one feature's value for a scope; a batch query returns a map from each requested feature name to its value for a scope; and the all-query returns a map of every defined feature to its value. Activating a feature with an explicit value stores that value, which is then returned verbatim.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"a\", \"resolver\": {\"type\": \"const\", \"value\": true}},\n                {\"op\": \"define\", \"feature\": \"b\", \"resolver\": {\"type\": \"const\", \"value\": false}},\n                {\"op\": \"all\"}\n            ]},\n            \"expected_output\": \"all = {\\\"a\\\":true,\\\"b\\\":false}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 5: Resolution Caching and Loading\n\n**As a developer**, I want resolved values cached so resolvers don't run repeatedly, and I want to pre-load values, so I can control when resolution work happens.\n\n**Expected Behavior / Usage:**\n\nEach (flag, scope) pair is resolved at most once and cached; subsequent reads do not re-run the resolver (observed here via a per-flag invocation counter). Explicitly *loading* a flag pre-resolves and caches it. *Load-missing* resolves only flags not already cached. *Flushing* the cache forces the next read to resolve again.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature5_caching_and_loading.json`\n\n```json\n{\n    \"description\": \"Resolve each feature's value at most once per scope and keep it cached, so a resolver's side effects (counted here as the number of times it runs) are not repeated on later reads of the same feature and scope. Explicitly loading a feature pre-resolves and caches it; load-missing only resolves features that are not already cached. Flushing the cache forces the next read to resolve the feature again.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"foo\", \"resolver\": {\"type\": \"counter\", \"value\": true}},\n                {\"op\": \"calls\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\"},\n                {\"op\": \"calls\", \"feature\": \"foo\"},\n                {\"op\": \"active\", \"feature\": \"foo\"},\n                {\"op\": \"calls\", \"feature\": \"foo\"}\n            ]},\n            \"expected_output\": \"calls foo = 0\\nactive foo = true\\ncalls foo = 1\\nactive foo = true\\ncalls foo = 1\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 6: Multi-Flag Aggregate Checks\n\n**As a developer**, I want to check several flags in one call, so I can express \"all of these\" and \"any of these\" conditions.\n\n**Expected Behavior / Usage:**\n\n`allAreActive` is true only when every listed flag is active. `someAreActive` is true when at least one listed flag is active. `allAreInactive` is true only when every listed flag is inactive. `someAreInactive` is true when at least one listed flag is inactive.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature6_multi_feature_checks.json`\n\n```json\n{\n    \"description\": \"Check several features in one call. The all-active check is true only when every listed feature is active. The some-active check is true when at least one listed feature is active. The all-inactive check is true only when every listed feature is inactive, and the some-inactive check is true when at least one listed feature is inactive.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"activate\", \"feature\": [\"foo\", \"bar\"]},\n                {\"op\": \"allAreActive\", \"features\": [\"foo\"]},\n                {\"op\": \"allAreActive\", \"features\": [\"foo\", \"bar\"]},\n                {\"op\": \"allAreActive\", \"features\": [\"foo\", \"bar\", \"baz\"]},\n                {\"op\": \"someAreActive\", \"features\": [\"foo\", \"baz\"]},\n                {\"op\": \"someAreActive\", \"features\": [\"baz\", \"qux\"]}\n            ]},\n            \"expected_output\": \"allAreActive = true\\nallAreActive = true\\nallAreActive = false\\nsomeAreActive = true\\nsomeAreActive = false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 7: Conditional Execution\n\n**As a developer**, I want to run one of two branches depending on a flag, so I can express feature-gated logic concisely.\n\n**Expected Behavior / Usage:**\n\nThe `when` construct runs its active branch (receiving the flag's value) if the flag is active, otherwise its inactive branch. The `unless` construct is the mirror: it runs its inactive branch when the flag is inactive, otherwise its active branch (receiving the value). Branch selection honors the scope used for the check. The output reports which branch was taken and, for the active branch, the flag's value.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature7_conditional_execution.json`\n\n```json\n{\n    \"description\": \"Branch on a feature's state and run one of two callbacks. The when-construct runs its first callback (receiving the feature's value) if the feature is active, otherwise its second callback. The unless-construct is the mirror image: it runs its inactive callback when the feature is inactive, otherwise its active callback. Branch selection honors the scope used for the check.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"activate\", \"feature\": \"foo\", \"value\": {\"hello\": \"world\"}},\n                {\"op\": \"when\", \"feature\": \"foo\"}\n            ]},\n            \"expected_output\": \"when foo = active {\\\"hello\\\":\\\"world\\\"}\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 8: Forgetting and Purging\n\n**As a developer**, I want to discard stored values so they are recomputed, so I can reset a flag for a scope or remove it entirely.\n\n**Expected Behavior / Usage:**\n\nForgetting a flag for a scope removes only that scope's stored value; the next read falls back to the resolver. Purging removes stored values for the named flags across all scopes; purging with no names removes stored values for every flag. After either, reads fall back to the resolver again.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature8_forget_and_purge.json`\n\n```json\n{\n    \"description\": \"Discard stored feature values so they are recomputed from their resolver. Forgetting a feature for a scope removes only that scope's stored value, so the next read falls back to the resolver. Purging removes stored values for the named features across all scopes, and purging with no names removes stored values for every feature; after purging, reads fall back to the resolver again.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"foo\", \"resolver\": {\"type\": \"const\", \"value\": false}},\n                {\"op\": \"activate\", \"feature\": \"foo\", \"scope\": \"tim\"},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": \"tim\"},\n                {\"op\": \"purge\", \"features\": [\"foo\"]},\n                {\"op\": \"active\", \"feature\": \"foo\", \"scope\": \"tim\"}\n            ]},\n            \"expected_output\": \"active foo = true\\nactive foo = false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 9: Probabilistic Resolution\n\n**As a developer**, I want a flag whose value is decided by odds, so I can roll a feature out to a fraction of resolutions.\n\n**Expected Behavior / Usage:**\n\nA flag may be defined with a draw expressed as winning odds out of a total. When the winning count equals the total, the draw always succeeds and the flag resolves to true; when the winning count is zero, the draw always fails and resolves to false. The drawn value is what is stored and reported.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature9_lottery.json`\n\n```json\n{\n    \"description\": \"Define a feature whose value is decided by a probabilistic draw expressed as winning odds out of a total. When the winning count equals the total, the draw always succeeds and the feature resolves to true; when the winning count is zero, the draw always fails and the feature resolves to false. The drawn value is what is stored and reported.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"always\", \"resolver\": {\"type\": \"lottery\", \"wins\": 1, \"out\": 1}},\n                {\"op\": \"define\", \"feature\": \"never\", \"resolver\": {\"type\": \"lottery\", \"wins\": 0, \"out\": 1}},\n                {\"op\": \"value\", \"feature\": \"always\"},\n                {\"op\": \"value\", \"feature\": \"never\"}\n            ]},\n            \"expected_output\": \"value always = true\\nvalue never = false\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 10: HTTP Request Gating\n\n**As a developer**, I want to guard an HTTP request so it only proceeds when required flags are active, so feature-gated endpoints reject traffic when the feature is off.\n\n**Expected Behavior / Usage:**\n\nA request guard is given one or more required flag names. When every required flag is active, the guarded request passes through and produces a successful HTTP 200 outcome. When any required flag is missing or inactive, the request is rejected with an HTTP 400 (bad request) outcome instead of reaching the handler.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature10_http_middleware.json`\n\n```json\n{\n    \"description\": \"Guard an HTTP request so it only proceeds when all required features are active. When every required feature is active, the guarded request passes through and yields a successful HTTP 200 response. When any required feature is missing or inactive, the request is rejected with an HTTP 400 (bad request) outcome instead of reaching the handler.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"ensureActive\", \"features\": \"missing\"}\n            ]},\n            \"expected_output\": \"middleware = blocked status=400\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 11: Listing Defined Flags\n\n**As a developer**, I want to list every defined flag, so I can introspect what the engine knows about.\n\n**Expected Behavior / Usage:**\n\nThe `defined` query returns the names of all currently defined flags, in the order they were defined.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature11_defined_list.json`\n\n```json\n{\n    \"description\": \"List the names of all currently defined features, in the order they were defined.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"define\", \"feature\": \"foo\", \"resolver\": {\"type\": \"const\", \"value\": true}},\n                {\"op\": \"define\", \"feature\": \"bar\", \"resolver\": {\"type\": \"const\", \"value\": false}},\n                {\"op\": \"define\", \"feature\": \"baz\", \"resolver\": {\"type\": \"const\", \"value\": false}},\n                {\"op\": \"defined\"}\n            ]},\n            \"expected_output\": \"defined = [\\\"foo\\\",\\\"bar\\\",\\\"baz\\\"]\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 12: Neutral Error Categories\n\n**As a developer**, I want misuse reported as stable, language-independent error categories, so callers can react to failures without depending on runtime internals.\n\n**Expected Behavior / Usage:**\n\nRequesting the value for more than one scope at once is not supported and yields the error category `multiple_scope_values`. Using a scope that cannot be reduced to a stable string identifier yields the error category `unserializable_scope`. Errors are reported as a single line `error=<category>` and never leak host-language type names or messages.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature12_errors.json`\n\n```json\n{\n    \"description\": \"Report misuse through neutral, language-independent error categories rather than leaking runtime details. Requesting the value for more than one scope at once is not supported and yields a multiple-scope error category. Using a scope that cannot be reduced to a stable string identifier yields an unserializable-scope error category.\",\n    \"cases\": [\n        {\n            \"input\": {\"operations\": [\n                {\"op\": \"value\", \"feature\": \"foo\", \"scope\": [1, 2, 3]}\n            ]},\n            \"expected_output\": \"error=multiple_scope_values\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured codebase implementing the feature-flag engine described above (definition + resolvers, scoped storage with caching, runtime overrides, aggregate checks, conditional execution, forget/purge, probabilistic resolution, request gating, introspection). Its physical structure must align with the \"Scale-Driven Code Organization\" constraint, and the core logic must be decoupled from stdin/stdout and JSON parsing.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads a single JSON request `{ \"operations\": [ ... ] }` from stdin, applies each operation in order against the core engine, and prints the result of each *query* operation to stdout. Mutating operations print nothing. The adapter is the only component aware of JSON and stdout, and it is responsible for normalizing native failures into the neutral `error=<category>` lines (Feature 12) without changing core behavior.\n\n   **Scope encoding** (the value of a `\"scope\"` field; absent means \"use the default scope\"):\n   - `null` → the global/unscoped scope; a JSON string → a string scope; a JSON number → a numeric scope.\n   - `{\"user\": <id>}` → a domain object scope carrying an integer identity field `id` (use `{\"user\": null}` for an identity-less object). Two such objects with the same id are the same scope; a resolver can read the object's `id`.\n   - `{\"scopeable\": \"<identifier>\"}` → an object scope that advertises the given string identifier; it collapses to the same scope as a plain string equal to that identifier.\n   - `{\"unserializable\": true}` → an object scope that cannot be reduced to a string (used to trigger `unserializable_scope`).\n   - A JSON array of any of the above → multiple scopes at once.\n\n   **Resolver specifications** (the value of a `\"resolver\"` field on `define`):\n   - `{\"type\": \"const\", \"value\": <v>}` → always resolves to `<v>`; accepts a null scope.\n   - `{\"type\": \"shorthand\", \"value\": <v>}` → registers `<v>` directly as the value.\n   - `{\"type\": \"counter\", \"value\": <v>}` → resolves to `<v>` and increments this flag's invocation counter each time it runs (counter readable via the `calls` query).\n   - `{\"type\": \"echoScope\"}` → resolves to the scope it is given.\n   - `{\"type\": \"scopeIdEquals\", \"id\": <n>}` → resolves to `true` when the scope object's `id` equals `<n>`, else `false`.\n   - `{\"type\": \"requiresUserScope\", \"value\": <v>}` → requires a concrete object scope; resolves to `<v>` for such a scope, and (per Feature 3.5) to inactive when given a null scope.\n   - `{\"type\": \"lottery\", \"wins\": <w>, \"out\": <t>}` → a probabilistic draw of `<w>` out of `<t>` (see Feature 9).\n\n   **Operations.** Mutating (no output): `define` (`feature`, `resolver`), `activate` (`feature` string|list, optional `value`, optional `scope`), `deactivate` (`feature`, optional `scope`), `activateForEveryone` (`feature`, optional `value`), `deactivateForEveryone` (`feature`), `forget` (`feature`, optional `scope`), `purge` (optional `features` list; absent = all), `flushCache`, `load` (`features`, optional `scope`), `loadMissing` (`features`, optional `scope`), `loginUser` (`id`), `resolveScopeUsing` (`scope`).\n   Query (one stdout line each, in operation order):\n   - `active`/`inactive` (`feature`, optional `scope`) → `active <feature> = <true|false>` / `inactive <feature> = <true|false>`.\n   - `value` (`feature`, optional `scope`) → `value <feature> = <json>` (the value rendered as compact JSON).\n   - `values` (`features`, optional `scope`) → `values = <json-object>`.\n   - `all` (optional `scope`) → `all = <json-object>`.\n   - `defined` → `defined = <json-array>`.\n   - `allAreActive`/`someAreActive`/`allAreInactive`/`someAreInactive` (`features`, optional `scope`) → `<op> = <true|false>`.\n   - `calls` (`feature`) → `calls <feature> = <integer>`.\n   - `when`/`unless` (`feature`, optional `scope`) → `when <feature> = active <json-value>` or `when <feature> = inactive` (and likewise for `unless`).\n   - `ensureActive` (`features` string|list, optional `uri`) → `middleware = passed status=200` or `middleware = blocked status=400`.\n\n   All JSON in output is compact (no spaces after `:` or `,`), with `/` and non-ASCII characters left unescaped. Every emitted line ends with a newline.\n\n3. **Automated test harness**. The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` to point at a directory of case files (default `test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt`. Output is namespaced by `<cases-dir>` so running different case directories never overwrites each other. Each `.txt` file contains **only** the raw stdout from the program under test (no PASS/FAIL summaries or metadata) so it can be compared directly against `expected_output`.\n\n\n---\n**Implementation notes:**\n- use the same pattern as the event emitter's type handling\n",
+  "oracle_data": {
+    "task_id": "laravel__pennant-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "what is the default state when no value is passed?",
+          "how does the resolver determine initial state?",
+          "what happens if value is null?"
+        ],
+        "oracle_response": "When no value is provided, the resolver uses its internal type logic: `const` resolves immediately to `false`, `await` resolves to `null`, and `scope` resolves to an empty string."
+      },
+      {
+        "constraint_id": "TC_feature11_defined_list",
+        "trigger_keywords": [
+          "test cases for feature11 defined list",
+          "show me feature11 defined list test cases",
+          "what are the feature11 defined list inputs and outputs",
+          "give me the feature11_defined_list test file",
+          "feature11 defined list expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature11_defined_list:\n{\n  \"description\": \"List the names of all currently defined features, in the order they were defined.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"foo\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": true\n            }\n          },\n          {\n            \"op\": \"define\",\n            \"feature\": \"bar\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": false\n            }\n          },\n          {\n            \"op\": \"define\",\n            \"feature\": \"baz\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": false\n            }\n          },\n          {\n            \"op\": \"defined\"\n          }\n        ]\n      },\n      \"expected_output\": \"defined = [\\\"foo\\\",\\\"bar\\\",\\\"baz\\\"]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature1_defining_and_truthiness",
+        "trigger_keywords": [
+          "test cases for feature1 defining and truthiness",
+          "show me feature1 defining and truthiness test cases",
+          "what are the feature1 defining and truthiness inputs and outputs",
+          "give me the feature1_defining_and_truthiness test file",
+          "feature1 defining and truthiness expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_defining_and_truthiness:\n{\n  \"description\": \"Define feature flags by attaching a resolver that produces an initial value, then query whether a feature is active. A feature with no registered resolver is treated as inactive. A registered resolver makes the feature active unless the resolved value is exactly boolean false: every other value (including zero, an empty string, null, and structured values) counts as active. The inactive check is the logical inverse of the active check.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"on\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": true\n            }\n          },\n          {\n            \"op\": \"define\",\n            \"feature\": \"off\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": false\n            }\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"on\"\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"off\"\n          }\n        ]\n      },\n      \"expected_output\": \"active on = true\\nactive off = false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_2_for_everyone",
+        "trigger_keywords": [
+          "test cases for feature2 2 for everyone",
+          "show me feature2 2 for everyone test cases",
+          "what are the feature2 2 for everyone inputs and outputs",
+          "give me the feature2_2_for_everyone test file",
+          "feature2 2 for everyone expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_2_for_everyone:\n{\n  \"description\": \"Apply a single value to a feature across every scope that already has a stored value. After individual scopes have been given values, deactivating-for-everyone forces the feature off for all of them, and activating-for-everyone forces it on for all of them. This bulk operation affects the scopes already known to storage.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"foo\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": false\n            }\n          },\n          {\n            \"op\": \"activate\",\n            \"feature\": \"foo\",\n            \"scope\": \"tim\"\n          },\n          {\n            \"op\": \"activate\",\n            \"feature\": \"foo\",\n            \"scope\": \"taylor\"\n          },\n          {\n            \"op\": \"value\",\n            \"feature\": \"foo\",\n            \"scope\": \"tim\"\n          },\n          {\n            \"op\": \"value\",\n            \"feature\": \"foo\",\n            \"scope\": \"taylor\"\n          },\n          {\n            \"op\": \"deactivateForEveryone\",\n            \"feature\": \"foo\"\n          },\n          {\n            \"op\": \"value\",\n            \"feature\": \"foo\",\n            \"scope\": \"tim\"\n          },\n          {\n            \"op\": \"value\",\n            \"feature\": \"foo\",\n            \"scope\": \"taylor\"\n          },\n          {\n            \"op\": \"activateForEveryone\",\n            \"feature\": \"foo\"\n          },\n          {\n            \"op\": \"value\",\n            \"feature\": \"foo\",\n            \"scope\": \"tim\"\n          },\n          {\n            \"op\": \"value\",\n            \"feature\": \"foo\",\n            \"scope\": \"taylor\"\n          }\n        ]\n      },\n      \"expected_output\": \"value foo = true\\nvalue foo = true\\nvalue foo = false\\nvalue foo = false\\nvalue foo = true\\nvalue foo = true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_1_scope_isolation",
+        "trigger_keywords": [
+          "test cases for feature3 1 scope isolation",
+          "show me feature3 1 scope isolation test cases",
+          "what are the feature3 1 scope isolation inputs and outputs",
+          "give me the feature3_1_scope_isolation test file",
+          "feature3 1 scope isolation expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_1_scope_isolation:\n{\n  \"description\": \"Evaluate a feature against a specific scope (the entity a flag is being checked for, such as an account, a string identifier like an email address, a number, or a domain object). A resolver may inspect the scope to decide the value. Values stored for one scope do not leak to another, so a feature can be active for one scope and inactive for another. A scope object may also declare its own stable string identifier, in which case two scopes that map to the same identifier are treated as the same scope.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"foo\",\n            \"resolver\": {\n              \"type\": \"scopeIdEquals\",\n              \"id\": 1\n            }\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"foo\"\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"foo\",\n            \"scope\": {\n              \"user\": 1\n            }\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"foo\",\n            \"scope\": {\n              \"user\": 2\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"active foo = false\\nactive foo = true\\nactive foo = false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_5_null_scope_handling",
+        "trigger_keywords": [
+          "test cases for feature3 5 null scope handling",
+          "show me feature3 5 null scope handling test cases",
+          "what are the feature3 5 null scope handling inputs and outputs",
+          "give me the feature3_5_null_scope_handling test file",
+          "feature3 5 null scope handling expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_5_null_scope_handling:\n{\n  \"description\": \"Control how a feature behaves when checked with a null scope. A resolver that does not require a particular scope is evaluated normally for a null scope and produces its value. A resolver that requires a concrete (non-null) scope cannot run against a null scope; in that situation the feature resolves to inactive instead of failing, while still resolving normally when a concrete scope is provided.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"bar\",\n            \"resolver\": {\n              \"type\": \"requiresUserScope\",\n              \"value\": true\n            }\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"bar\",\n            \"scope\": null\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"bar\",\n            \"scope\": {\n              \"user\": 1\n            }\n          }\n        ]\n      },\n      \"expected_output\": \"active bar = false\\nactive bar = true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_reading_values",
+        "trigger_keywords": [
+          "test cases for feature4 reading values",
+          "show me feature4 reading values test cases",
+          "what are the feature4 reading values inputs and outputs",
+          "give me the feature4_reading_values test file",
+          "feature4 reading values expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_reading_values:\n{\n  \"description\": \"Read the concrete value of a feature rather than just its active/inactive state. A single query returns one feature's value for a scope; a batch query returns a map from each requested feature name to its value for a scope; and the all-query returns a map of every defined feature to its value. Activating a feature with an explicit value stores that value, which is then returned verbatim.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"a\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": true\n            }\n          },\n          {\n            \"op\": \"define\",\n            \"feature\": \"b\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": false\n            }\n          },\n          {\n            \"op\": \"all\"\n          }\n        ]\n      },\n      \"expected_output\": \"all = {\\\"a\\\":true,\\\"b\\\":false}\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_caching_and_loading",
+        "trigger_keywords": [
+          "test cases for feature5 caching and loading",
+          "show me feature5 caching and loading test cases",
+          "what are the feature5 caching and loading inputs and outputs",
+          "give me the feature5_caching_and_loading test file",
+          "feature5 caching and loading expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_caching_and_loading:\n{\n  \"description\": \"Resolve each feature's value at most once per scope and keep it cached, so a resolver's side effects (counted here as the number of times it runs) are not repeated on later reads of the same feature and scope. Explicitly loading a feature pre-resolves and caches it; load-missing only resolves features that are not already cached. Flushing the cache forces the next read to resolve the feature again.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"foo\",\n            \"resolver\": {\n              \"type\": \"counter\",\n              \"value\": true\n            }\n          },\n          {\n            \"op\": \"calls\",\n            \"feature\": \"foo\"\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"foo\"\n          },\n          {\n            \"op\": \"calls\",\n            \"feature\": \"foo\"\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"foo\"\n          },\n          {\n            \"op\": \"calls\",\n            \"feature\": \"foo\"\n          }\n        ]\n      },\n      \"expected_output\": \"calls foo = 0\\nactive foo = true\\ncalls foo = 1\\nactive foo = true\\ncalls foo = 1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_forget_and_purge",
+        "trigger_keywords": [
+          "test cases for feature8 forget and purge",
+          "show me feature8 forget and purge test cases",
+          "what are the feature8 forget and purge inputs and outputs",
+          "give me the feature8_forget_and_purge test file",
+          "feature8 forget and purge expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_forget_and_purge:\n{\n  \"description\": \"Discard stored feature values so they are recomputed from their resolver. Forgetting a feature for a scope removes only that scope's stored value, so the next read falls back to the resolver. Purging removes stored values for the named features across all scopes, and purging with no names removes stored values for every feature; after purging, reads fall back to the resolver again.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"foo\",\n            \"resolver\": {\n              \"type\": \"const\",\n              \"value\": false\n            }\n          },\n          {\n            \"op\": \"activate\",\n            \"feature\": \"foo\",\n            \"scope\": \"tim\"\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"foo\",\n            \"scope\": \"tim\"\n          },\n          {\n            \"op\": \"purge\",\n            \"features\": [\n              \"foo\"\n            ]\n          },\n          {\n            \"op\": \"active\",\n            \"feature\": \"foo\",\n            \"scope\": \"tim\"\n          }\n        ]\n      },\n      \"expected_output\": \"active foo = true\\nactive foo = false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_lottery",
+        "trigger_keywords": [
+          "test cases for feature9 lottery",
+          "show me feature9 lottery test cases",
+          "what are the feature9 lottery inputs and outputs",
+          "give me the feature9_lottery test file",
+          "feature9 lottery expected output"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_lottery:\n{\n  \"description\": \"Define a feature whose value is decided by a probabilistic draw expressed as winning odds out of a total. When the winning count equals the total, the draw always succeeds and the feature resolves to true; when the winning count is zero, the draw always fails and the feature resolves to false. The drawn value is what is stored and reported.\",\n  \"cases\": [\n    {\n      \"input\": {\n        \"operations\": [\n          {\n            \"op\": \"define\",\n            \"feature\": \"always\",\n            \"resolver\": {\n              \"type\": \"lottery\",\n              \"wins\": 1,\n              \"out\": 1\n            }\n          },\n          {\n            \"op\": \"define\",\n            \"feature\": \"never\",\n            \"resolver\": {\n              \"type\": \"lottery\",\n              \"wins\": 0,\n              \"out\": 1\n            }\n          },\n          {\n            \"op\": \"value\",\n            \"feature\": \"always\"\n          },\n          {\n            \"op\": \"value\",\n            \"feature\": \"never\"\n          }\n        ]\n      },\n      \"expected_output\": \"value always = true\\nvalue never = false\\n\"\n    }\n  ]\n}"
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "use the same pattern as the event emitter's type handling",
+        "actual_meaning": "The resolver must implement a factory pattern identical to the `EventEmitter`, where resolver names map to specific type handlers, and the response structure includes a `type` field and a `payload` object."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature10_http_middleware.json": {
+      "description": "Guard an HTTP request so it only proceeds when all required features are active. When every required feature is active, the guarded request passes through and yields a successful HTTP 200 response. When any required feature is missing or inactive, the request is rejected with an HTTP 400 (bad request) outcome instead of reaching the handler.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "ensureActive",
+                "features": "missing"
+              }
+            ]
+          },
+          "expected_output": "middleware = blocked status=400\n"
+        }
+      ]
+    },
+    "feature11_defined_list.json": {
+      "description": "List the names of all currently defined features, in the order they were defined.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "foo",
+                "resolver": {
+                  "type": "const",
+                  "value": true
+                }
+              },
+              {
+                "op": "define",
+                "feature": "bar",
+                "resolver": {
+                  "type": "const",
+                  "value": false
+                }
+              },
+              {
+                "op": "define",
+                "feature": "baz",
+                "resolver": {
+                  "type": "const",
+                  "value": false
+                }
+              },
+              {
+                "op": "defined"
+              }
+            ]
+          },
+          "expected_output": "defined = [\"foo\",\"bar\",\"baz\"]\n"
+        }
+      ]
+    },
+    "feature12_errors.json": {
+      "description": "Report misuse through neutral, language-independent error categories rather than leaking runtime details. Requesting the value for more than one scope at once is not supported and yields a multiple-scope error category. Using a scope that cannot be reduced to a stable string identifier yields an unserializable-scope error category.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "value",
+                "feature": "foo",
+                "scope": [
+                  1,
+                  2,
+                  3
+                ]
+              }
+            ]
+          },
+          "expected_output": "error=multiple_scope_values\n"
+        }
+      ]
+    },
+    "feature1_defining_and_truthiness.json": {
+      "description": "Define feature flags by attaching a resolver that produces an initial value, then query whether a feature is active. A feature with no registered resolver is treated as inactive. A registered resolver makes the feature active unless the resolved value is exactly boolean false: every other value (including zero, an empty string, null, and structured values) counts as active. The inactive check is the logical inverse of the active check.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "on",
+                "resolver": {
+                  "type": "const",
+                  "value": true
+                }
+              },
+              {
+                "op": "define",
+                "feature": "off",
+                "resolver": {
+                  "type": "const",
+                  "value": false
+                }
+              },
+              {
+                "op": "active",
+                "feature": "on"
+              },
+              {
+                "op": "active",
+                "feature": "off"
+              }
+            ]
+          },
+          "expected_output": "active on = true\nactive off = false\n"
+        }
+      ]
+    },
+    "feature2_1_activate_deactivate.json": {
+      "description": "Programmatically turn feature flags on and off at runtime, overriding any resolver. Activating a feature stores a truthy value so subsequent checks report it active; deactivating stores false so checks report it inactive. The same action may be applied to several features at once by supplying a list of feature names. Toggling is idempotent and re-applies cleanly.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "activate",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              },
+              {
+                "op": "deactivate",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              },
+              {
+                "op": "activate",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              }
+            ]
+          },
+          "expected_output": "active foo = true\nactive foo = false\nactive foo = true\n"
+        }
+      ]
+    },
+    "feature2_2_for_everyone.json": {
+      "description": "Apply a single value to a feature across every scope that already has a stored value. After individual scopes have been given values, deactivating-for-everyone forces the feature off for all of them, and activating-for-everyone forces it on for all of them. This bulk operation affects the scopes already known to storage.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "foo",
+                "resolver": {
+                  "type": "const",
+                  "value": false
+                }
+              },
+              {
+                "op": "activate",
+                "feature": "foo",
+                "scope": "tim"
+              },
+              {
+                "op": "activate",
+                "feature": "foo",
+                "scope": "taylor"
+              },
+              {
+                "op": "value",
+                "feature": "foo",
+                "scope": "tim"
+              },
+              {
+                "op": "value",
+                "feature": "foo",
+                "scope": "taylor"
+              },
+              {
+                "op": "deactivateForEveryone",
+                "feature": "foo"
+              },
+              {
+                "op": "value",
+                "feature": "foo",
+                "scope": "tim"
+              },
+              {
+                "op": "value",
+                "feature": "foo",
+                "scope": "taylor"
+              },
+              {
+                "op": "activateForEveryone",
+                "feature": "foo"
+              },
+              {
+                "op": "value",
+                "feature": "foo",
+                "scope": "tim"
+              },
+              {
+                "op": "value",
+                "feature": "foo",
+                "scope": "taylor"
+              }
+            ]
+          },
+          "expected_output": "value foo = true\nvalue foo = true\nvalue foo = false\nvalue foo = false\nvalue foo = true\nvalue foo = true\n"
+        }
+      ]
+    },
+    "feature3_1_scope_isolation.json": {
+      "description": "Evaluate a feature against a specific scope (the entity a flag is being checked for, such as an account, a string identifier like an email address, a number, or a domain object). A resolver may inspect the scope to decide the value. Values stored for one scope do not leak to another, so a feature can be active for one scope and inactive for another. A scope object may also declare its own stable string identifier, in which case two scopes that map to the same identifier are treated as the same scope.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "foo",
+                "resolver": {
+                  "type": "scopeIdEquals",
+                  "id": 1
+                }
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": {
+                  "user": 1
+                }
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": {
+                  "user": 2
+                }
+              }
+            ]
+          },
+          "expected_output": "active foo = false\nactive foo = true\nactive foo = false\n"
+        }
+      ]
+    },
+    "feature3_2_null_and_empty_scope.json": {
+      "description": "Distinguish the absence of a scope from an empty-string scope. The null scope represents the global, unscoped value, so a value set globally is visible when checking with an explicit null scope and vice versa. The empty string is a distinct scope from null: a value stored under the empty-string scope is not visible globally or under null, and a global value is not visible under the empty-string scope.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "activate",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": ""
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": null
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              },
+              {
+                "op": "activate",
+                "feature": "bar",
+                "scope": ""
+              },
+              {
+                "op": "active",
+                "feature": "bar",
+                "scope": ""
+              },
+              {
+                "op": "active",
+                "feature": "bar",
+                "scope": null
+              },
+              {
+                "op": "active",
+                "feature": "bar"
+              }
+            ]
+          },
+          "expected_output": "active foo = false\nactive foo = true\nactive foo = true\nactive bar = true\nactive bar = false\nactive bar = false\n"
+        }
+      ]
+    },
+    "feature3_3_multiple_scopes.json": {
+      "description": "Apply an action to several scopes at once by supplying a list of scopes. Activating a feature for a list of scopes makes it active for each listed scope and leaves other scopes unaffected. A multi-scope aggregate check reports active only when the feature is active for every scope in the list.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "activate",
+                "feature": "foo",
+                "scope": [
+                  {
+                    "user": 1
+                  },
+                  {
+                    "user": 2
+                  }
+                ]
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": {
+                  "user": 1
+                }
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": {
+                  "user": 2
+                }
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": {
+                  "user": 3
+                }
+              }
+            ]
+          },
+          "expected_output": "active foo = false\nactive foo = true\nactive foo = true\nactive foo = false\n"
+        }
+      ]
+    },
+    "feature3_4_default_scope.json": {
+      "description": "Resolve the scope automatically when no scope is supplied. By default the unscoped value uses the currently authenticated entity as the scope, so after authenticating, an unscoped check matches a check made explicitly for that same entity, while a different scope is unaffected. The default-scope strategy can also be replaced, after which unscoped checks use the value produced by the replacement strategy.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "loginUser",
+                "id": 2
+              },
+              {
+                "op": "activate",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": "misc"
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": {
+                  "user": 2
+                }
+              }
+            ]
+          },
+          "expected_output": "active foo = false\nactive foo = true\nactive foo = true\n"
+        }
+      ]
+    },
+    "feature3_5_null_scope_handling.json": {
+      "description": "Control how a feature behaves when checked with a null scope. A resolver that does not require a particular scope is evaluated normally for a null scope and produces its value. A resolver that requires a concrete (non-null) scope cannot run against a null scope; in that situation the feature resolves to inactive instead of failing, while still resolving normally when a concrete scope is provided.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "bar",
+                "resolver": {
+                  "type": "requiresUserScope",
+                  "value": true
+                }
+              },
+              {
+                "op": "active",
+                "feature": "bar",
+                "scope": null
+              },
+              {
+                "op": "active",
+                "feature": "bar",
+                "scope": {
+                  "user": 1
+                }
+              }
+            ]
+          },
+          "expected_output": "active bar = false\nactive bar = true\n"
+        }
+      ]
+    },
+    "feature4_reading_values.json": {
+      "description": "Read the concrete value of a feature rather than just its active/inactive state. A single query returns one feature's value for a scope; a batch query returns a map from each requested feature name to its value for a scope; and the all-query returns a map of every defined feature to its value. Activating a feature with an explicit value stores that value, which is then returned verbatim.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "a",
+                "resolver": {
+                  "type": "const",
+                  "value": true
+                }
+              },
+              {
+                "op": "define",
+                "feature": "b",
+                "resolver": {
+                  "type": "const",
+                  "value": false
+                }
+              },
+              {
+                "op": "all"
+              }
+            ]
+          },
+          "expected_output": "all = {\"a\":true,\"b\":false}\n"
+        }
+      ]
+    },
+    "feature5_caching_and_loading.json": {
+      "description": "Resolve each feature's value at most once per scope and keep it cached, so a resolver's side effects (counted here as the number of times it runs) are not repeated on later reads of the same feature and scope. Explicitly loading a feature pre-resolves and caches it; load-missing only resolves features that are not already cached. Flushing the cache forces the next read to resolve the feature again.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "foo",
+                "resolver": {
+                  "type": "counter",
+                  "value": true
+                }
+              },
+              {
+                "op": "calls",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              },
+              {
+                "op": "calls",
+                "feature": "foo"
+              },
+              {
+                "op": "active",
+                "feature": "foo"
+              },
+              {
+                "op": "calls",
+                "feature": "foo"
+              }
+            ]
+          },
+          "expected_output": "calls foo = 0\nactive foo = true\ncalls foo = 1\nactive foo = true\ncalls foo = 1\n"
+        }
+      ]
+    },
+    "feature6_multi_feature_checks.json": {
+      "description": "Check several features in one call. The all-active check is true only when every listed feature is active. The some-active check is true when at least one listed feature is active. The all-inactive check is true only when every listed feature is inactive, and the some-inactive check is true when at least one listed feature is inactive.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "activate",
+                "feature": [
+                  "foo",
+                  "bar"
+                ]
+              },
+              {
+                "op": "allAreActive",
+                "features": [
+                  "foo"
+                ]
+              },
+              {
+                "op": "allAreActive",
+                "features": [
+                  "foo",
+                  "bar"
+                ]
+              },
+              {
+                "op": "allAreActive",
+                "features": [
+                  "foo",
+                  "bar",
+                  "baz"
+                ]
+              },
+              {
+                "op": "someAreActive",
+                "features": [
+                  "foo",
+                  "baz"
+                ]
+              },
+              {
+                "op": "someAreActive",
+                "features": [
+                  "baz",
+                  "qux"
+                ]
+              }
+            ]
+          },
+          "expected_output": "allAreActive = true\nallAreActive = true\nallAreActive = false\nsomeAreActive = true\nsomeAreActive = false\n"
+        }
+      ]
+    },
+    "feature7_conditional_execution.json": {
+      "description": "Branch on a feature's state and run one of two callbacks. The when-construct runs its first callback (receiving the feature's value) if the feature is active, otherwise its second callback. The unless-construct is the mirror image: it runs its inactive callback when the feature is inactive, otherwise its active callback. Branch selection honors the scope used for the check.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "activate",
+                "feature": "foo",
+                "value": {
+                  "hello": "world"
+                }
+              },
+              {
+                "op": "when",
+                "feature": "foo"
+              }
+            ]
+          },
+          "expected_output": "when foo = active {\"hello\":\"world\"}\n"
+        }
+      ]
+    },
+    "feature8_forget_and_purge.json": {
+      "description": "Discard stored feature values so they are recomputed from their resolver. Forgetting a feature for a scope removes only that scope's stored value, so the next read falls back to the resolver. Purging removes stored values for the named features across all scopes, and purging with no names removes stored values for every feature; after purging, reads fall back to the resolver again.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "foo",
+                "resolver": {
+                  "type": "const",
+                  "value": false
+                }
+              },
+              {
+                "op": "activate",
+                "feature": "foo",
+                "scope": "tim"
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": "tim"
+              },
+              {
+                "op": "purge",
+                "features": [
+                  "foo"
+                ]
+              },
+              {
+                "op": "active",
+                "feature": "foo",
+                "scope": "tim"
+              }
+            ]
+          },
+          "expected_output": "active foo = true\nactive foo = false\n"
+        }
+      ]
+    },
+    "feature9_lottery.json": {
+      "description": "Define a feature whose value is decided by a probabilistic draw expressed as winning odds out of a total. When the winning count equals the total, the draw always succeeds and the feature resolves to true; when the winning count is zero, the draw always fails and the feature resolves to false. The drawn value is what is stored and reported.",
+      "cases": [
+        {
+          "input": {
+            "operations": [
+              {
+                "op": "define",
+                "feature": "always",
+                "resolver": {
+                  "type": "lottery",
+                  "wins": 1,
+                  "out": 1
+                }
+              },
+              {
+                "op": "define",
+                "feature": "never",
+                "resolver": {
+                  "type": "lottery",
+                  "wins": 0,
+                  "out": 1
+                }
+              },
+              {
+                "op": "value",
+                "feature": "always"
+              },
+              {
+                "op": "value",
+                "feature": "never"
+              }
+            ]
+          },
+          "expected_output": "value always = true\nvalue never = false\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "define",
+      "input_condition": "op=define, scope=undefined",
+      "output_rule": "Registers a flag named `feature` with a resolver configuration (type/value). If a `value` parameter is included, it is stored as the initial resolved value. If no value is provided, the resolver's type logic determines the starting state (e.g., const resolves immediately, lottery/scope depend types await first read).",
+      "exact_values": [
+        "define",
+        "op"
+      ],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C001",
+        "replacement": "a specific sentinel value or resolver type logic — ask the backend team for the exact configuration",
+        "exact_values_to_replace": [
+          "const resolves immediately",
+          "type/value"
+        ],
+        "trigger_keywords": [
+          "what is the default state when no value is passed?",
+          "how does the resolver determine initial state?",
+          "what happens if value is null?"
+        ],
+        "oracle_response": "When no value is provided, the resolver uses its internal type logic: `const` resolves immediately to `false`, `await` resolves to `null`, and `scope` resolves to an empty string."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C001",
+        "vague_phrase": "use the same pattern as the event emitter's type handling",
+        "actual_meaning": "The resolver must implement a factory pattern identical to the `EventEmitter`, where resolver names map to specific type handlers, and the response structure includes a `type` field and a `payload` object."
+      }
+    ]
+  }
+}

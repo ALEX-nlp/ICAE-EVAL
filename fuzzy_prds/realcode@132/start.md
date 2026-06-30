@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+hey team, we need a small bridge utility that takes background job configs and spits out the right payload for the native scheduler side. basically devs keep hand-rolling these wire maps and getting field names wrong or doing the time unit conversions incorrectly (seconds vs milliseconds is a constant source of bugs). we had something similar in the old login module's compatibility layer — same idea, just adapt that pattern here.
+
+the tool should read a JSON blob from stdin and print the result to stdout. there are two main scenarios: one is an app startup handshake thing (involves a handle and a mode flag), the other is the actual work scheduling case which has a bunch of optional stuff like repeat intervals, network/device conditions, collision behavior, and retry settings. oh and user-provided data should get bundled into the payload in a specific way.
+
+if something required is missing we should NOT crash with a stack trace — it needs to output a clean machine-readable error so downstream tooling can parse it reliably. the test harness should dump raw stdout into per-case files under a namespaced folder so we can diff them easily. don't overcomplicate the structure but also don't throw everything into one god file. we'll probably add more policy types later so keep that in mind.

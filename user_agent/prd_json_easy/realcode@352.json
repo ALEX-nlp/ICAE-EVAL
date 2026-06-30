@@ -1,0 +1,502 @@
+{
+  "fuzzy_prd": "# Embedded-Device Application Build Pipeline — Artifact Assembly & Packaging Contract\n\n## Project Goal\n\nBuild a staged build pipeline that turns a compiled cross-platform UI application and its native plugins into the layout and package format required by an embedded-device target, so application developers can produce a runnable, signable on-device package without hand-copying engine binaries, snapshots, headers, and plugin libraries into the exact directory structure the device runtime expects.\n\n---\n\n## Background & Problem\n\nA cross-platform UI application that targets an embedded device is not a single artifact: at install time the device runtime expects a precise on-disk layout — the engine runtime shared object, a platform embedder shared object, an interpreter/ICU data blob, the application's compiled snapshot, an asset bundle, generated plugin-registration glue, and every native plugin compiled and linked in the correct form. Without a pipeline, developers must manually compile the C++ embedding and each native plugin, decide which shipped prebuilt libraries are valid for the target architecture and api level, lay everything out under runtime-specific paths, and finally drive the platform packaging/signing tool. This is repetitive, easy to get subtly wrong (a misplaced or wrong-variant `.so` only fails on-device), and must differ between a *managed-runtime* application and a *native* application, and again between producing a final installable package versus an add-to-app module.\n\nWith this pipeline, each concern becomes an independently invokable stage with a deterministic, inspectable output contract: given a prepared workspace, a stage runs the corresponding build step and reports exactly which output artifacts were produced at which relative paths, or a normalized error category when a precondition (such as a signing certificate) is missing.\n\n---\n\n## Architecture & Engineering Constraints\n\nTo ensure this project is delivered as a maintainable software artifact, the following architectural and non-functional requirements (NFRs) MUST be strictly observed:\n\n1. **Scale-Driven Code Organization:** This is a multi-responsibility domain (asset bundling, native compilation, plugin selection, packaging, signing, error normalization). It MUST NOT be a single \"god file\". Separate the build stages, the workspace/process abstractions, and the output rendering into distinct logical units with a clear directory tree.\n\n2. **Strict Separation of Concerns (Anti-Overfitting):** The JSON input/output cases below are a **black-box contract** for an execution adapter, NOT the internal data model. The core build-stage logic must be decoupled from stdin/stdout and JSON parsing. A thin adapter translates a JSON command into an idiomatic call into a build stage and renders the produced artifacts (or a normalized error) into the line-oriented contract.\n\n3. **Adherence to SOLID Design Principles:**\n   - **SRP:** Keep command parsing, workspace setup, stage execution, artifact probing, and output formatting in distinct units.\n   - **OCP:** Adding a new build stage must not require modifying existing stages.\n   - **LSP:** The device-SDK and process abstractions must be substitutable by test doubles without changing stage logic.\n   - **ISP:** Keep the device-SDK / process interfaces small and cohesive.\n   - **DIP:** Stages depend on filesystem, process, and device-SDK abstractions, not concrete I/O.\n\n4. **Robustness & Interface Design:**\n   - **Idiomatic Usage:** The public stage interface must be elegant and idiomatic to the target language.\n   - **Resilience:** Missing preconditions (e.g. no signing certificate) must surface as a modeled, normalized error category — never as a raw runtime fault leaking host-language detail.\n\n---\n\n## Core Features\n\nThe execution adapter reads one JSON command object from stdin. The command selects a build `stage` and, for stages with variants, a `scenario`. The adapter renders a line-oriented report: each probed output is emitted as an `artifact=<relative path>` header immediately followed by a `present=true|false` line; stages that emit linkage metadata add domain fields such as `user_libs=<value>`; and a rejected precondition produces a single normalized `error=<category>` line.\n\n### Feature 1: Debug Asset Bundle Assembly\n\n**As a developer**, I want a stage that assembles the debug-mode runtime asset bundle, so I can ship the interpreter snapshots and JIT kernel needed to run an unoptimized build on device.\n\n**Expected Behavior / Usage:**\n\nGiven a build workspace where the compiled kernel (`app.dill`) and the shared VM/isolate snapshot data already exist, the stage produces the asset bundle directory. For a debug build the bundle MUST contain the two interpreter snapshot blobs (`[a specific set of debug artifacts listed in the PRD]`, `[a specific set of debug artifacts listed in the PRD]`) and the JIT kernel blob (`[a specific set of debug artifacts listed in the PRD]`). The output reports each expected entry with its presence flag, in order.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature1_debug_asset_bundle.json`\n\n```json\n{\n    \"description\": \"Debug-mode asset bundling stage. Given a build environment whose kernel snapshot (app.dill) and the shared VM/isolate snapshot data have already been produced, the stage assembles the runtime asset bundle. The output is a line-oriented report listing each expected bundle entry as an `artifact=<relative path>` header followed by a `present=true|false` line indicating whether it was emitted under the bundle directory. For a debug build, the bundle must contain the two interpreter snapshot blobs plus the JIT kernel blob.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"debug_application\"},\n            \"expected_output\": \"artifact=[a specific set of debug artifacts listed in the PRD]\\npresent=true\\nartifact=[a specific set of debug artifacts listed in the PRD]\\npresent=true\\nartifact=[a specific set of debug artifacts listed in the PRD]\\npresent=true\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 2: Native C++ Embedding Compilation\n\n**As a developer**, I want a stage that compiles the native C++ embedding into a static archive and stages its public headers, so the native application package can link against the embedding.\n\n**Expected Behavior / Usage:**\n\nGiven an embedding source tree that declares a static-library project and ships public C++ headers, the stage compiles the embedding into a static archive and copies the public headers into the embedding output directory. The output reports the staged header (`include/flutter.h`) and the produced static archive (`libembedding_cpp.a`), each with its presence flag.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature2_cpp_embedding.json`\n\n```json\n{\n    \"description\": \"Native C++ embedding compilation stage. Given an embedding source tree that declares a static-library project and ships public C++ headers, the stage compiles the embedding into a static archive and stages the public headers into the build output. The report lists the staged header and the produced static archive, each as an `artifact=<relative path>` / `present=true|false` pair under the embedding output directory.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"native_embedding\"},\n            \"expected_output\": \"artifact=include/flutter.h\\npresent=true\\nartifact=libembedding_cpp.a\\npresent=true\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 3: Native Plugin Compilation\n\n**As a developer**, I want a stage that compiles a project's native plugins and selects only the prebuilt libraries valid for my target, so the packaged app links the right native code for the device.\n\n**Expected Behavior / Usage:**\n\n*3.1 Static-Library Plugin — a plugin declared as a static library is folded into one combined plugin shared object*\n\nWhen a project depends on a native plugin whose platform manifest declares a plugin class and a public header, and whose build descriptor marks it as a static library, the stage compiles it and aggregates all static-library plugins into a single combined plugin shared object. The plugin's public header is staged into the plugin include directory, and the combined shared object (`lib/libflutter_plugins.so`) is produced.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_1_plugin_static_library.json`\n\n```json\n{\n    \"description\": \"Native plugin compilation — static-library plugin. A project depends on one native plugin whose platform manifest declares a plugin class and a public header, and whose build descriptor marks it as a static library. The stage compiles the plugin and aggregates all static-library plugins into a single combined shared object. The report shows the plugin's public header is staged into the plugin include directory and that the combined plugin shared object is produced.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"native_plugins\", \"scenario\": \"static_lib\"},\n            \"expected_output\": \"artifact=include/some_native_plugin.h\\npresent=true\\nartifact=lib/libflutter_plugins.so\\npresent=true\\n\"\n        }\n    ]\n}\n```\n\n*3.2 Shared-Library Plugin — a plugin declared as a shared library keeps its own object and is not folded in*\n\nWhen the plugin's build descriptor marks it as a shared library (and it ships its own shared object), the stage does NOT fold it into the combined static-plugin object. The combined aggregate (`lib/libflutter_plugins.so`) is absent, while the plugin's own shared object and its shipped side-car shared object are present.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_2_plugin_shared_library.json`\n\n```json\n{\n    \"description\": \"Native plugin compilation — shared-library plugin. When a plugin's build descriptor marks it as a shared library (and ships its own shared object), the stage does NOT fold it into the combined static-plugin shared object; instead it emits the plugin's own shared object plus any side-car shared objects it provides. The report shows the combined aggregate object is absent while the plugin's individual shared object and its shipped shared object are present.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"native_plugins\", \"scenario\": \"shared_lib\"},\n            \"expected_output\": \"artifact=lib/libflutter_plugins.so\\npresent=false\\nartifact=lib/libsome_native_plugin.so\\npresent=true\\nartifact=[the specific signed library build order for shared profiles]\\npresent=true\\n\"\n        }\n    ]\n}\n```\n\n*3.3 Resource Staging — a plugin's resource tree is copied recursively under a per-plugin namespace*\n\nA plugin that ships a resource tree under its platform resource directory has those resources copied recursively into a per-plugin resource sub-directory of the plugin build output, preserving nested paths. A nested resource file appears at its mirrored path namespaced under the plugin's name.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_3_plugin_resource_copy.json`\n\n```json\n{\n    \"description\": \"Native plugin compilation — resource staging. A plugin that ships a resource tree under its platform resource directory has those resources copied recursively into a per-plugin resource sub-directory of the plugin build output, preserving nested paths. The report confirms a nested resource file is present at its mirrored path namespaced under the plugin's name.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"native_plugins\", \"scenario\": \"resources\"},\n            \"expected_output\": \"artifact=res/some_native_plugin/a/b.txt\\npresent=true\\n\"\n        }\n    ]\n}\n```\n\n*3.4 User Library Selection — only architecture/api-matching prebuilt libraries are copied, and linkage metadata is recorded*\n\nA plugin may ship a mix of prebuilt libraries: a top-level static archive, a top-level shared object, architecture-specific shared objects (one matching the target architecture, one not), and api-version-specific shared objects (one at or below the project's api level, one above). The stage copies only the libraries valid for the target architecture and api version: top-level shared objects and matching arch/api shared objects are copied; the static archive and non-matching arch/api objects are skipped. It also records the selected user libraries by bare base name (dropping the `lib` prefix and the extension) in a `user_libs=` linkage field — which additionally carries the toolchain default `pthread`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature3_4_plugin_user_libraries.json`\n\n```json\n{\n    \"description\": \"Native plugin compilation — user library selection and linkage metadata. A plugin ships a mix of prebuilt libraries under its platform lib directory: a top-level static archive, a top-level shared object, architecture-specific shared objects (one matching the target architecture, one not), and api-version-specific shared objects (one at or below the project's api level, one above). The stage copies only the libraries relevant to the target architecture and api version: top-level shared objects and matching arch/api shared objects are copied; the static archive and non-matching arch/api objects are skipped. It also records the selected user libraries (by bare base name, minus the `lib` prefix and extension) in a linkage metadata field. The report lists presence for each candidate library and a `user_libs=` line carrying the space-separated selected library names (which also includes the toolchain default `pthread`).\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"native_plugins\", \"scenario\": \"user_libraries\"},\n            \"expected_output\": \"artifact=[the specific signed library build order for shared profiles]\\npresent=false\\nartifact=[the specific signed library build order for shared profiles]\\npresent=true\\nartifact=[the specific signed library build order for shared profiles]\\npresent=true\\nartifact=[the specific signed library build order for shared profiles]\\npresent=false\\nartifact=[the specific signed library build order for shared profiles]\\npresent=true\\nartifact=[the specific signed library build order for shared profiles]\\npresent=false\\nuser_libs=pthread some_native_plugin static shared shared_arm shared_40\\n\"\n        }\n    ]\n}\n```\n\n---\n\n### Feature 4: Application Packaging & Module Layout\n\n**As a developer**, I want stages that lay out the full runtime and either produce a signed on-device package or a flat add-to-app module, for both managed-runtime and native applications, so I can ship whichever artifact my deployment needs.\n\n**Expected Behavior / Usage:**\n\nAll packaging stages stage a common runtime set — the engine runtime shared object (`lib/libflutter_engine.so`), a platform embedder shared object, the ICU data (`res/icudtl.dat`), the AOT app snapshot (`lib/libapp.so`), the asset bundle (`res/flutter_assets`), and the combined plugin objects. The *managed-runtime* variants stage the embedder as `lib/libflutter_tizen.so`; the *native* variants stage it as `lib/libflutter_tizen_common.so`. A *package* stage additionally drives the platform packaging/signing tool and emits a final installable package, reported under `artifact=tpk` with its presence flag. A *module* stage instead lays the runtime out flat into an output directory for embedding into a host application.\n\n*4.1 Managed-Runtime Package — produce a signed installable package, requiring a certificate profile*\n\nStages the managed-runtime runtime set (including the asset bundle's runtime dependency manifest `res/flutter_assets/.app.deps.json`) into an ephemeral tree, then drives the packaging tool to produce the signed package and copies it to the output directory. Packaging requires a configured signing certificate profile: when present, the package is produced (`artifact=tpk` → `present=true`) and all staged inputs are present; when absent, the build is rejected with `error=no_certificate_profile`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_1_managed_tpk.json`\n\n```json\n{\n    \"description\": \"Managed-runtime application packaging into the platform package (TPK). Given a project that produces a managed-runtime application, the stage stages the engine runtime, the platform embedder shared object, the ICU data, the AOT app snapshot, the asset bundle (including the runtime dependency manifest), and the combined plugin objects into an ephemeral staging tree, then drives the platform packaging tool to produce the signed package and copies it to the output directory. Packaging requires a valid signing certificate profile: when one is configured the package is produced and the staged inputs are present; when none is configured the build is rejected with a normalized `error=no_certificate_profile` line. The `present=true` line under `artifact=tpk` indicates the final package was emitted.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"dotnet_tpk\", \"scenario\": \"build_succeeds\"},\n            \"expected_output\": \"artifact=tpk\\npresent=true\\nartifact=res/flutter_assets\\npresent=true\\nartifact=lib/libflutter_engine.so\\npresent=true\\nartifact=lib/libflutter_tizen.so\\npresent=true\\nartifact=res/icudtl.dat\\npresent=true\\nartifact=res/flutter_assets/.app.deps.json\\npresent=true\\nartifact=lib/libapp.so\\npresent=true\\nartifact=lib/libflutter_plugins.so\\npresent=true\\nartifact=[the specific signed library build order for shared profiles]\\npresent=true\\n\"\n        },\n        {\n            \"input\": {\"stage\": \"dotnet_tpk\", \"scenario\": \"no_profile\"},\n            \"expected_output\": \"error=no_certificate_profile\\n\"\n        }\n    ]\n}\n```\n\n*4.2 Native Package — produce a signed installable package for a native application, requiring a certificate profile*\n\nSame packaging contract as 4.1 but for a native application (declaring a native build descriptor); the embedder is staged as the native-common object `lib/libflutter_tizen_common.so`. A valid certificate profile is required, otherwise `error=no_certificate_profile`.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_2_native_tpk.json`\n\n```json\n{\n    \"description\": \"Native application packaging into the platform package (TPK). Given a project that produces a native application (declaring a native build descriptor), the stage stages the engine runtime, the native-common platform embedder shared object, the ICU data, the AOT app snapshot, the asset bundle (including the runtime dependency manifest), and the combined plugin objects into an ephemeral staging tree, then builds and signs the package and copies it to the output directory. Packaging requires a valid signing certificate profile: when one is configured the package is produced and the staged inputs are present; when none is configured the build is rejected with a normalized `error=no_certificate_profile` line. Note the native package stages the native-common embedder object, distinguishing it from the managed-runtime package.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"native_tpk\", \"scenario\": \"build_succeeds\"},\n            \"expected_output\": \"artifact=tpk\\npresent=true\\nartifact=res/flutter_assets\\npresent=true\\nartifact=lib/libflutter_engine.so\\npresent=true\\nartifact=lib/libflutter_tizen_common.so\\npresent=true\\nartifact=res/icudtl.dat\\npresent=true\\nartifact=res/flutter_assets/.app.deps.json\\npresent=true\\nartifact=lib/libapp.so\\npresent=true\\nartifact=lib/libflutter_plugins.so\\npresent=true\\nartifact=[the specific signed library build order for shared profiles]\\npresent=true\\n\"\n        },\n        {\n            \"input\": {\"stage\": \"native_tpk\", \"scenario\": \"no_profile\"},\n            \"expected_output\": \"error=no_certificate_profile\\n\"\n        }\n    ]\n}\n```\n\n*4.3 Managed-Runtime Module — lay out a flat add-to-app directory for a managed-runtime host*\n\nInstead of producing a final package, the stage lays out the engine runtime, the managed embedder (`lib/libflutter_tizen.so`), the ICU data, the AOT app snapshot, the generated managed plugin-registrant source (`src/GeneratedPluginRegistrant.cs`), the asset bundle, and the combined plugin objects directly into a flat output directory consumable by a host application.\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_3_managed_module.json`\n\n```json\n{\n    \"description\": \"Managed-runtime module packaging (add-to-app). Instead of producing a final package, the stage lays out the engine runtime, the platform embedder shared object, the ICU data, the AOT app snapshot, the generated managed plugin registrant source, the asset bundle, and the combined plugin objects directly into a flat output directory consumable by a host application. The report lists each emitted artifact under the output directory.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"dotnet_module\"},\n            \"expected_output\": \"artifact=res/flutter_assets\\npresent=true\\nartifact=lib/libflutter_engine.so\\npresent=true\\nartifact=lib/libflutter_tizen.so\\npresent=true\\nartifact=res/icudtl.dat\\npresent=true\\nartifact=lib/libapp.so\\npresent=true\\nartifact=src/GeneratedPluginRegistrant.cs\\npresent=true\\nartifact=lib/libflutter_plugins.so\\npresent=true\\n\"\n        }\n    ]\n}\n```\n\n*4.4 Native Module — lay out a flat add-to-app directory for a native host, including the embedding artifacts*\n\nThe stage lays out, into a flat output directory consumable by a host native application, the engine runtime, the native-common embedder (`lib/libflutter_tizen_common.so`), the ICU data, the AOT app snapshot, the generated native plugin-registrant header (`inc/generated_plugin_registrant.h`), the combined plugin objects, and the staged native embedding header (`inc/flutter.h`) and embedding static archive (`Release/libembedding_cpp.a`).\n\n**Test Cases:** `rcb_tests/public_test_cases/feature4_4_native_module.json`\n\n```json\n{\n    \"description\": \"Native module packaging (add-to-app). The stage lays out, into a flat output directory consumable by a host native application, the engine runtime, the native-common platform embedder shared object, the ICU data, the AOT app snapshot, the generated native plugin registrant header, the combined plugin objects, and the staged native embedding header and static archive. The report lists each emitted artifact under the output directory, including the embedding header staged into the include directory and the embedding archive staged into the configuration output directory.\",\n    \"cases\": [\n        {\n            \"input\": {\"stage\": \"native_module\"},\n            \"expected_output\": \"artifact=res/flutter_assets\\npresent=true\\nartifact=lib/libflutter_engine.so\\npresent=true\\nartifact=lib/libflutter_tizen_common.so\\npresent=true\\nartifact=res/icudtl.dat\\npresent=true\\nartifact=lib/libapp.so\\npresent=true\\nartifact=inc/generated_plugin_registrant.h\\npresent=true\\nartifact=lib/libflutter_plugins.so\\npresent=true\\nartifact=inc/flutter.h\\npresent=true\\nartifact=Release/libembedding_cpp.a\\npresent=true\\n\"\n        }\n    ]\n}\n```\n\n---\n\n## Deliverables\n\n1. **The Core System:** A cleanly structured, multi-file codebase implementing the build stages above (asset bundling, native embedding compilation, native plugin compilation with library selection, and managed/native package & module layout), with the device-SDK, process, and filesystem concerns behind abstractions.\n\n2. **The Execution/Test Adapter:** A runnable entry point that reads one JSON command from stdin, invokes the selected stage in a prepared workspace, and prints the line-oriented report (`artifact=`/`present=` pairs, `user_libs=` metadata, or a normalized `error=` category) to stdout, strictly matching the per-leaf-feature contracts above. The adapter is logically separated from the core stages and is the only component aware of JSON and stdin/stdout.\n\n3. **Automated test harness:** The cases embedded in this PRD live under `rcb_tests/public_test_cases/`. A single entry point `bash rcb_tests/test.sh` reads every `*.json` case file from a case directory and runs the full suite; it accepts `--cases-dir <subdir>` (default `public_test_cases`). For each case it writes one file to `rcb_tests/stdout/<cases-dir>/{filename.stem}@{case_index.zfill(3)}.txt` containing **only** the raw stdout of the program under test, so it can be compared directly against `expected_output`. Output is namespaced by `<cases-dir>` so different case directories never overwrite each other.\n\n\n---\n**Implementation notes:**\n- ensure the threading component has its namespace prepended before serialization\n- respect the release build directory structure for the C++ embedding artifact\n",
+  "oracle_data": {
+    "task_id": "flutter-tizen__flutter-tizen-001",
+    "golden_api_signature": "",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "what artifacts are generated for debug_application",
+          "list kernel_blob.bin presence",
+          "remove isolate_snapshot_data constraint",
+          "C014 JSON output_schema",
+          "debug_application trailer only"
+        ],
+        "oracle_response": "For stage=debug_application, the adapter reports the presence of three specific artifacts: vm_snapshot_data, isolate_snapshot_data, and kernel_blob.bin."
+      },
+      {
+        "constraint_id": "C019",
+        "trigger_keywords": [
+          "C019 user_libraries absence",
+          "binary_libs_40_50 location",
+          "list libshared_arm_so absence",
+          "what is libstatic_a constraint",
+          "native_plugins scenario user_libraries library names"
+        ],
+        "oracle_response": "For stage=native_plugins, scenario=user_libraries, the adapter reports the absence of lib/libstatic.a and lib/libshared_x86.so/lib/libshared_50.so. It reports the presence of lib/libshared.so, lib/libshared_arm.so, and lib/libshared_40.so."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "ensure the threading component has its namespace prepended before serialization",
+        "actual_meaning": "The string 'pthread' (representing the pthread library) must always be the first term in the space-separated list output by C010."
+      },
+      {
+        "vague_reference": "respect the release build directory structure for the C++ embedding artifact",
+        "actual_meaning": "The file Release/libembedding_cpp.a must exist in the output structure for native_module stages."
+      }
+    ],
+    "fallback_response": "I don't have more detail on that — check the codebase or the existing test cases for the exact behavior."
+  },
+  "public_test_cases": {
+    "feature1_debug_asset_bundle.json": {
+      "description": "Debug-mode asset bundling stage. Given a build environment whose kernel snapshot (app.dill) and the shared VM/isolate snapshot data have already been produced, the stage assembles the runtime asset bundle. The output is a line-oriented report listing each expected bundle entry as an `artifact=<relative path>` header followed by a `present=true|false` line indicating whether it was emitted under the bundle directory. For a debug build, the bundle must contain the two interpreter snapshot blobs plus the JIT kernel blob.",
+      "cases": [
+        {
+          "input": {
+            "stage": "debug_application"
+          },
+          "expected_output": "artifact=vm_snapshot_data\npresent=true\nartifact=isolate_snapshot_data\npresent=true\nartifact=kernel_blob.bin\npresent=true\n"
+        }
+      ]
+    },
+    "feature2_cpp_embedding.json": {
+      "description": "Native C++ embedding compilation stage. Given an embedding source tree that declares a static-library project and ships public C++ headers, the stage compiles the embedding into a static archive and stages the public headers into the build output. The report lists the staged header and the produced static archive, each as an `artifact=<relative path>` / `present=true|false` pair under the embedding output directory.",
+      "cases": [
+        {
+          "input": {
+            "stage": "native_embedding"
+          },
+          "expected_output": "artifact=include/flutter.h\npresent=true\nartifact=libembedding_cpp.a\npresent=true\n"
+        }
+      ]
+    },
+    "feature3_1_plugin_static_library.json": {
+      "description": "Native plugin compilation — static-library plugin. A project depends on one native plugin whose platform manifest declares a plugin class and a public header, and whose build descriptor marks it as a static library. The stage compiles the plugin and aggregates all static-library plugins into a single combined shared object. The report shows the plugin's public header is staged into the plugin include directory and that the combined plugin shared object is produced.",
+      "cases": [
+        {
+          "input": {
+            "stage": "native_plugins",
+            "scenario": "static_lib"
+          },
+          "expected_output": "artifact=include/some_native_plugin.h\npresent=true\nartifact=lib/libflutter_plugins.so\npresent=true\n"
+        }
+      ]
+    },
+    "feature3_2_plugin_shared_library.json": {
+      "description": "Native plugin compilation — shared-library plugin. When a plugin's build descriptor marks it as a shared library (and ships its own shared object), the stage does NOT fold it into the combined static-plugin shared object; instead it emits the plugin's own shared object plus any side-car shared objects it provides. The report shows the combined aggregate object is absent while the plugin's individual shared object and its shipped shared object are present.",
+      "cases": [
+        {
+          "input": {
+            "stage": "native_plugins",
+            "scenario": "shared_lib"
+          },
+          "expected_output": "artifact=lib/libflutter_plugins.so\npresent=false\nartifact=lib/libsome_native_plugin.so\npresent=true\nartifact=lib/libshared.so\npresent=true\n"
+        }
+      ]
+    },
+    "feature3_3_plugin_resource_copy.json": {
+      "description": "Native plugin compilation — resource staging. A plugin that ships a resource tree under its platform resource directory has those resources copied recursively into a per-plugin resource sub-directory of the plugin build output, preserving nested paths. The report confirms a nested resource file is present at its mirrored path namespaced under the plugin's name.",
+      "cases": [
+        {
+          "input": {
+            "stage": "native_plugins",
+            "scenario": "resources"
+          },
+          "expected_output": "artifact=res/some_native_plugin/a/b.txt\npresent=true\n"
+        }
+      ]
+    },
+    "feature3_4_plugin_user_libraries.json": {
+      "description": "Native plugin compilation — user library selection and linkage metadata. A plugin ships a mix of prebuilt libraries under its platform lib directory: a top-level static archive, a top-level shared object, architecture-specific shared objects (one matching the target architecture, one not), and api-version-specific shared objects (one at or below the project's api level, one above). The stage copies only the libraries relevant to the target architecture and api version: top-level shared objects and matching arch/api shared objects are copied; the static archive and non-matching arch/api objects are skipped. It also records the selected user libraries (by bare base name, minus the `lib` prefix and extension) in a linkage metadata field. The report lists presence for each candidate library and a `user_libs=` line carrying the space-separated selected library names (which also includes the toolchain default `pthread`).",
+      "cases": [
+        {
+          "input": {
+            "stage": "native_plugins",
+            "scenario": "user_libraries"
+          },
+          "expected_output": "artifact=lib/libstatic.a\npresent=false\nartifact=lib/libshared.so\npresent=true\nartifact=lib/libshared_arm.so\npresent=true\nartifact=lib/libshared_x86.so\npresent=false\nartifact=lib/libshared_40.so\npresent=true\nartifact=lib/libshared_50.so\npresent=false\nuser_libs=pthread some_native_plugin static shared shared_arm shared_40\n"
+        }
+      ]
+    },
+    "feature4_1_managed_tpk.json": {
+      "description": "Managed-runtime application packaging into the platform package (TPK). Given a project that produces a managed-runtime application, the stage stages the engine runtime, the platform embedder shared object, the ICU data, the AOT app snapshot, the asset bundle (including the runtime dependency manifest), and the combined plugin objects into an ephemeral staging tree, then drives the platform packaging tool to produce the signed package and copies it to the output directory. Packaging requires a valid signing certificate profile: when one is configured the package is produced and the staged inputs are present; when none is configured the build is rejected with a normalized `error=no_certificate_profile` line. The `present=true` line under `artifact=tpk` indicates the final package was emitted.",
+      "cases": [
+        {
+          "input": {
+            "stage": "dotnet_tpk",
+            "scenario": "build_succeeds"
+          },
+          "expected_output": "artifact=tpk\npresent=true\nartifact=res/flutter_assets\npresent=true\nartifact=lib/libflutter_engine.so\npresent=true\nartifact=lib/libflutter_tizen.so\npresent=true\nartifact=res/icudtl.dat\npresent=true\nartifact=res/flutter_assets/.app.deps.json\npresent=true\nartifact=lib/libapp.so\npresent=true\nartifact=lib/libflutter_plugins.so\npresent=true\nartifact=lib/libshared.so\npresent=true\n"
+        },
+        {
+          "input": {
+            "stage": "dotnet_tpk",
+            "scenario": "no_profile"
+          },
+          "expected_output": "error=no_certificate_profile\n"
+        }
+      ]
+    },
+    "feature4_2_native_tpk.json": {
+      "description": "Native application packaging into the platform package (TPK). Given a project that produces a native application (declaring a native build descriptor), the stage stages the engine runtime, the native-common platform embedder shared object, the ICU data, the AOT app snapshot, the asset bundle (including the runtime dependency manifest), and the combined plugin objects into an ephemeral staging tree, then builds and signs the package and copies it to the output directory. Packaging requires a valid signing certificate profile: when one is configured the package is produced and the staged inputs are present; when none is configured the build is rejected with a normalized `error=no_certificate_profile` line. Note the native package stages the native-common embedder object, distinguishing it from the managed-runtime package.",
+      "cases": [
+        {
+          "input": {
+            "stage": "native_tpk",
+            "scenario": "build_succeeds"
+          },
+          "expected_output": "artifact=tpk\npresent=true\nartifact=res/flutter_assets\npresent=true\nartifact=lib/libflutter_engine.so\npresent=true\nartifact=lib/libflutter_tizen_common.so\npresent=true\nartifact=res/icudtl.dat\npresent=true\nartifact=res/flutter_assets/.app.deps.json\npresent=true\nartifact=lib/libapp.so\npresent=true\nartifact=lib/libflutter_plugins.so\npresent=true\nartifact=lib/libshared.so\npresent=true\n"
+        },
+        {
+          "input": {
+            "stage": "native_tpk",
+            "scenario": "no_profile"
+          },
+          "expected_output": "error=no_certificate_profile\n"
+        }
+      ]
+    },
+    "feature4_3_managed_module.json": {
+      "description": "Managed-runtime module packaging (add-to-app). Instead of producing a final package, the stage lays out the engine runtime, the platform embedder shared object, the ICU data, the AOT app snapshot, the generated managed plugin registrant source, the asset bundle, and the combined plugin objects directly into a flat output directory consumable by a host application. The report lists each emitted artifact under the output directory.",
+      "cases": [
+        {
+          "input": {
+            "stage": "dotnet_module"
+          },
+          "expected_output": "artifact=res/flutter_assets\npresent=true\nartifact=lib/libflutter_engine.so\npresent=true\nartifact=lib/libflutter_tizen.so\npresent=true\nartifact=res/icudtl.dat\npresent=true\nartifact=lib/libapp.so\npresent=true\nartifact=src/GeneratedPluginRegistrant.cs\npresent=true\nartifact=lib/libflutter_plugins.so\npresent=true\n"
+        }
+      ]
+    },
+    "feature4_4_native_module.json": {
+      "description": "Native module packaging (add-to-app). The stage lays out, into a flat output directory consumable by a host native application, the engine runtime, the native-common platform embedder shared object, the ICU data, the AOT app snapshot, the generated native plugin registrant header, the combined plugin objects, and the staged native embedding header and static archive. The report lists each emitted artifact under the output directory, including the embedding header staged into the include directory and the embedding archive staged into the configuration output directory.",
+      "cases": [
+        {
+          "input": {
+            "stage": "native_module"
+          },
+          "expected_output": "artifact=res/flutter_assets\npresent=true\nartifact=lib/libflutter_engine.so\npresent=true\nartifact=lib/libflutter_tizen_common.so\npresent=true\nartifact=res/icudtl.dat\npresent=true\nartifact=lib/libapp.so\npresent=true\nartifact=inc/generated_plugin_registrant.h\npresent=true\nartifact=lib/libflutter_plugins.so\npresent=true\nartifact=inc/flutter.h\npresent=true\nartifact=Release/libembedding_cpp.a\npresent=true\n"
+        }
+      ]
+    }
+  },
+  "_constraints": [
+    {
+      "id": "C001",
+      "feature": "Input Command Structure",
+      "input_condition": "The execution adapter accepts input from stdin.",
+      "output_rule": "The adapter reads a single JSON object containing `stage` and optional `scenario` fields.",
+      "exact_values": [
+        "scene",
+        "scenario"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C002",
+      "feature": "Input Field: `stage`",
+      "input_condition": "Stage selection",
+      "output_rule": "The string value determines which build stage logic is invoked.",
+      "exact_values": [
+        "debug_application",
+        "native_embedding",
+        "native_plugins",
+        "dotnet_tpk",
+        "native_tpk",
+        "dotnet_module",
+        "native_module"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C003",
+      "feature": "Input Field: `scenario`",
+      "input_condition": "Scenario selection for stages supporting variants (e.g., `native_plugins`, `dotnet_tpk`, `native_tpk`).",
+      "output_rule": "The string value determines the sub-logic path for the stage.",
+      "exact_values": [
+        "static_lib",
+        "shared_lib",
+        "resources",
+        "user_libraries",
+        "build_succeeds",
+        "no_profile"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C004",
+      "feature": "Error Handling: Missing Signing Profile",
+      "input_condition": "Stage is `dotnet_tpk` or `native_tpk` AND a signing certificate profile is missing.",
+      "output_rule": "Reject with a normalized error line containing the category string.",
+      "exact_values": [
+        "error=no_certificate_profile"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C005",
+      "feature": "Output Format: Success Lines - Basic",
+      "input_condition": "Stage execution succeeds.",
+      "output_rule": "Every physical artifact produced is reported on two consecutive lines in a specific order.",
+      "exact_values": [
+        "artifact=",
+        "present="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C006",
+      "feature": "Output Format: Success Lines - Literal Strings",
+      "input_condition": "Output format definition.",
+      "output_rule": "The presence flag must be either 'true' or 'false'.",
+      "exact_values": [
+        "true",
+        "false"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C007",
+      "feature": "Output Format: Artifact Path Order",
+      "input_condition": "Success output generation.",
+      "output_rule": "For a given artifact at `path`, the line `artifact=path` MUST precede the line `present=value`.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C008",
+      "feature": "Line Termination",
+      "input_condition": "Output generation.",
+      "output_rule": "Every line, including the last line of a multi-line report block, must end with a newline character `\\n`.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C009",
+      "feature": "Error Output Line",
+      "input_condition": "Rejection or missing precondition.",
+      "output_rule": "Output a single line with `error=<category>` followed by a newline.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C010",
+      "feature": "Linkage Metadata Output",
+      "input_condition": "Stage outputs linkage metadata (e.g., `native_plugins` scenario `user_libraries`).",
+      "output_rule": "Include a line starting with `user_libs=` containing space-separated library names.",
+      "exact_values": [
+        "user_libs="
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C011",
+      "feature": "Linkage Metadata Content",
+      "input_condition": "Linkage metadata output.",
+      "output_rule": "Library names must be stripped of the `lib` prefix and the file extension.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C012",
+      "feature": "Default Halting Library",
+      "input_condition": "Linkage metadata naming.",
+      "output_rule": "The string `pthread` must always be included in the `user_libs` list.",
+      "exact_values": [
+        "pthread"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C013",
+      "feature": "Scenario `static_lib` (native_plugins)",
+      "input_condition": "stage=native_plugins AND scenario=static_lib.",
+      "output_rule": "Report plugin header present. Report combined shared object present.",
+      "exact_values": [],
+      "ambiguous": false
+    },
+    {
+      "id": "C014",
+      "feature": "Expected Artifacts: feature1",
+      "input_condition": "stage=debug_application.",
+      "output_rule": "Report `vm_snapshot_data` present, `isolate_snapshot_data` present, `kernel_blob.bin` present.",
+      "exact_values": [
+        "vm_snapshot_data",
+        "isolate_snapshot_data",
+        "kernel_blob.bin"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C015",
+      "feature": "Expected Artifacts: feature2",
+      "input_condition": "stage=native_embedding.",
+      "output_rule": "Report `include/flutter.h` present, `libembedding_cpp.a` present.",
+      "exact_values": [
+        "include/flutter.h",
+        "libembedding_cpp.a"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C016",
+      "feature": "Expected Artifacts: feature3 `static_lib`",
+      "input_condition": "stage=native_plugins, scenario=static_lib.",
+      "output_rule": "Report `include/some_native_plugin.h` present, `lib/libflutter_plugins.so` present.",
+      "exact_values": [
+        "include/some_native_plugin.h",
+        "lib/libflutter_plugins.so"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C017",
+      "feature": "Expected Artifacts: feature3 `shared_lib`",
+      "input_condition": "stage=native_plugins, scenario=shared_lib.",
+      "output_rule": "Report `lib/libflutter_plugins.so` absent. Report `lib/libsome_native_plugin.so` present. Report `lib/libshared.so` present.",
+      "exact_values": [
+        "lib/libflutter_plugins.so",
+        "lib/libsome_native_plugin.so",
+        "lib/libshared.so"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C018",
+      "feature": "Expected Artifacts: feature3 `resources`",
+      "input_condition": "stage=native_plugins, scenario=resources.",
+      "output_rule": "Report `res/some_native_plugin/a/b.txt` present.",
+      "exact_values": [
+        "res/some_native_plugin/a/b.txt"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C019",
+      "feature": "Expected Artifacts: feature3 `user_libraries`",
+      "input_condition": "stage=native_plugins, scenario=user_libraries.",
+      "output_rule": "Report `lib/libstatic.a` absent. Report `lib/libshared.so`, `lib/libshared_arm.so`, `lib/libshared_40.so` present. Report `lib/libshared_x86.so` and `lib/libshared_50.so` absent.",
+      "exact_values": [
+        "lib/libstatic.a",
+        "lib/libshared.so",
+        "lib/libshared_arm.so",
+        "lib/libshared_x86.so",
+        "lib/libshared_40.so",
+        "lib/libshared_50.so"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C020",
+      "feature": "Expected Artifacts: feature3 `user_libraries` metadata",
+      "input_condition": "stage=native_plugins, scenario=user_libraries.",
+      "output_rule": "Report `user_libs=pthread some_native_plugin static shared shared_arm shared_40`.",
+      "exact_values": [
+        "user_libs=pthread some_native_plugin static shared shared_arm shared_40"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C021",
+      "feature": "Expected Artifacts: feature4 (Managed)",
+      "input_condition": "stage=dotnet_tpk, scenario=build_succeeds.",
+      "output_rule": "Report `tpk`, `res/flutter_assets`, `lib/libflutter_engine.so`, `lib/libflutter_tizen.so`, `res/icudtl.dat`, `res/flutter_assets/.app.deps.json`, `lib/libapp.so`, `lib/libflutter_plugins.so`, `lib/libshared.so` present.",
+      "exact_values": [
+        "tpk",
+        "res/flutter_assets",
+        "lib/libflutter_engine.so",
+        "lib/libflutter_tizen.so",
+        "res/icudtl.dat",
+        "res/flutter_assets/.app.deps.json",
+        "lib/libapp.so",
+        "lib/libflutter_plugins.so",
+        "lib/libshared.so"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C022",
+      "feature": "Expected Artifacts: feature3 (Native)",
+      "input_condition": "stage=native_tpk, scenario=build_succeeds.",
+      "output_rule": "Report same artifacts as managed, but replace `lib/libflutter_tizen.so` with `lib/libflutter_tizen_common.so`.",
+      "exact_values": [
+        "lib/libflutter_tizen_common.so"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C023",
+      "feature": "Managed Module Artifacts",
+      "input_condition": "stage=dotnet_module.",
+      "output_rule": "Report `res/flutter_assets`, `lib/libflutter_engine.so`, `lib/libflutter_tizen.so`, `res/icudtl.dat`, `lib/libapp.so`, `src/GeneratedPluginRegistrant.cs`, `lib/libflutter_plugins.so` present.",
+      "exact_values": [
+        "res/GeneratedPluginRegistrant.cs"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C024",
+      "feature": "Native Module Artifacts",
+      "input_condition": "stage=native_module.",
+      "output_rule": "Report `res/flutter_assets`, `lib/libflutter_engine.so`, `lib/libflutter_tizen_common.so`, `res/icudtl.dat`, `lib/libapp.so`, `inc/generated_plugin_registrant.h`, `lib/libflutter_plugins.so`, `inc/flutter.h`, `Release/libembedding_cpp.a` present.",
+      "exact_values": [
+        "inc/generated_plugin_registrant.h",
+        "inc/flutter.h",
+        "Release/libembedding_cpp.a"
+      ],
+      "ambiguous": false
+    },
+    {
+      "id": "C025",
+      "feature": "Staging Artifacts",
+      "input_condition": "Any successful packaging/module stage.",
+      "output_rule": "Artifacts listed in output must reflect the complete set of staged items from ephemeral trees.",
+      "exact_values": [],
+      "ambiguous": false
+    }
+  ],
+  "_plan": {
+    "hide": [
+      {
+        "constraint_id": "C014",
+        "replacement": "a specific set of debug artifacts listed in the PRD",
+        "exact_values_to_replace": [
+          "vm_snapshot_data",
+          "isolate_snapshot_data",
+          "kernel_blob.bin"
+        ],
+        "trigger_keywords": [
+          "what artifacts are generated for debug_application",
+          "list kernel_blob.bin presence",
+          "remove isolate_snapshot_data constraint",
+          "C014 JSON output_schema",
+          "debug_application trailer only"
+        ],
+        "oracle_response": "For stage=debug_application, the adapter reports the presence of three specific artifacts: vm_snapshot_data, isolate_snapshot_data, and kernel_blob.bin."
+      },
+      {
+        "constraint_id": "C019",
+        "replacement": "the specific signed library build order for shared profiles",
+        "exact_values_to_replace": [
+          "lib/libstatic.a",
+          "lib/libshared.so",
+          "lib/libshared_arm.so",
+          "lib/libshared_x86.so",
+          "lib/libshared_40.so",
+          "lib/libshared_50.so"
+        ],
+        "trigger_keywords": [
+          "C019 user_libraries absence",
+          "binary_libs_40_50 location",
+          "list libshared_arm_so absence",
+          "what is libstatic_a constraint",
+          "native_plugins scenario user_libraries library names"
+        ],
+        "oracle_response": "For stage=native_plugins, scenario=user_libraries, the adapter reports the absence of lib/libstatic.a and lib/libshared_x86.so/lib/libshared_50.so. It reports the presence of lib/libshared.so, lib/libshared_arm.so, and lib/libshared_40.so."
+      }
+    ],
+    "vague_refs": [
+      {
+        "constraint_id": "C012",
+        "vague_phrase": "ensure the threading component has its namespace prepended before serialization",
+        "actual_meaning": "The string 'pthread' (representing the pthread library) must always be the first term in the space-separated list output by C010."
+      },
+      {
+        "constraint_id": "C024",
+        "vague_phrase": "respect the release build directory structure for the C++ embedding artifact",
+        "actual_meaning": "The file Release/libembedding_cpp.a must exist in the output structure for native_module stages."
+      }
+    ]
+  }
+}

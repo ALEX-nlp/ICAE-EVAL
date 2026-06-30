@@ -1,0 +1,491 @@
+{
+  "fuzzy_prd": "Hey team, we need to build out this Bitcoin chain-state and transaction indexing toolkit we've been talking about. The core idea is that developers should be able to plug in their block/transaction observations and get back clean, queryable results without having to write all that painful reconciliation code themselves. Think of it like the wallet-sync plumbing we did for the Lightning stuff last quarter — same philosophy, just applied to UTXO tracking and chain state.\n\nThe main things we need covered: handling chain tip updates including when blocks get reorganized out, inserting individual checkpoints, figuring out how much value is flowing in/out for scripts we care about, tracking whether a script has been 'used' yet, computing fees, resolving conflicts when we have both a loose output record and a full transaction for the same coin, tracking which tx spent which output, deriving scripts in a lookahead window, and finally filtering down to just the canonical transaction history when there are conflicting spends — confirmed vs mempool, newer vs older, that kind of thing.\n\nOne important thing: the I/O adapter layer that reads commands and writes results should stay completely separate from the actual business logic — we burned ourselves last time by mixing those together. Also please keep the file structure sensible, not everything crammed into one giant file. Language is Rust. Tests are in the rcb_tests folder if you need to cross-reference expected behavior.",
+  "oracle_data": {
+    "task_id": "bitcoindevkit__bdk__chain_indexing_toolkit",
+    "golden_api_signature": "fn run_command(input: &str) -> String",
+    "hidden_constraints": [
+      {
+        "constraint_id": "C001",
+        "trigger_keywords": [
+          "cannot connect error format",
+          "what does the update return when blocks are missing",
+          "disconnected chain update output"
+        ],
+        "oracle_response": "When a chain update cannot be connected because required intermediate checkpoints are missing, the output must be exactly two lines: 'error=cannot_connect' followed by 'try_include_height=<N>' where N is the lowest height that must be present to make the update connectable. For example, a disjoint update starting at height 3 when the chain is empty returns try_include_height=0."
+      },
+      {
+        "constraint_id": "C002",
+        "trigger_keywords": [
+          "reorg changeset format",
+          "how to represent removed checkpoints",
+          "transitive invalidation output"
+        ],
+        "oracle_response": "When a chain update causes a reorganization, the changeset must include both new checkpoints and removed ones. Removed checkpoints are represented as '<height>:<removed>' (literally the string '<removed>' as the hash placeholder). New or replaced checkpoints appear as '<height>:<hash>'. All entries are comma-separated inside square brackets, ordered by height ascending. The final 'chain=' line reflects only the surviving checkpoints after removal."
+      },
+      {
+        "constraint_id": "C003",
+        "trigger_keywords": [
+          "conflicting block insert behavior",
+          "same height different hash insertion",
+          "insert conflict error format"
+        ],
+        "oracle_response": "When inserting a single checkpoint at a height that already exists with a different hash, the system must NOT modify the chain and must output: 'error=conflicting_block', 'height=<N>', 'original_hash=<existing_hash>', 'update_hash=<attempted_hash>', and 'chain=[<unchanged>]'. The chain state is fully preserved."
+      },
+      {
+        "constraint_id": "C004",
+        "trigger_keywords": [
+          "script value sent received net calculation",
+          "how is sent calculated for a spending transaction",
+          "value accounting for tracked scripts"
+        ],
+        "oracle_response": "For script value accounting: 'received' is the sum of all outputs in the transaction that pay to a tracked script. 'sent' is the sum of all previously-scanned tracked outputs that this transaction spends as inputs. 'net' is received minus sent. A transaction that only receives (no tracked inputs) has sent=0. A transaction spending a previously-scanned tracked output counts that output's full value as sent, even if the transaction also pays back to a tracked script."
+      },
+      {
+        "constraint_id": "C005",
+        "trigger_keywords": [
+          "script usage unmark with scanned output",
+          "can you unmark a script that has an indexed outpoint",
+          "scanned output prevents unused"
+        ],
+        "oracle_response": "A script that has been made 'used' by a scanned/indexed output cannot be returned to 'unused' state via manual unmark. Attempting to unmark such a script returns changed=false and the script remains used. The 'indexed_outpoints' count reflects how many on-chain outputs are associated with the script. Manual mark/unmark only works freely when no scanned output has touched the script."
+      },
+      {
+        "constraint_id": "C006",
+        "trigger_keywords": [
+          "negative fee error format",
+          "missing previous output error",
+          "coinbase fee result"
+        ],
+        "oracle_response": "Fee calculation has three distinct outcomes: (1) valid fee outputs 'fee=<satoshis>'; (2) if known inputs sum to less than outputs, output 'error=negative_fee' then 'amount=<negative_number>' (the signed difference); (3) if any input references an unknown previous output, output 'error=missing_previous_output' then 'missing_count=<N>'. Coinbase transactions (null/empty inputs) produce fee=0 and no error."
+      },
+      {
+        "constraint_id": "C007",
+        "trigger_keywords": [
+          "floating output vs full transaction precedence",
+          "which record wins when there is a conflict",
+          "full transaction authoritative over floating"
+        ],
+        "oracle_response": "When the same outpoint is described by both a floating output record and a full transaction record, the full transaction record is always authoritative regardless of insertion order. If the full transaction does not have a vout1 but a floating record claims it exists, vout1 is absent. The reported value for vout0 must always match what the full transaction says, never the floating record's value."
+      },
+      {
+        "constraint_id": "C008",
+        "trigger_keywords": [
+          "coinbase spend edge",
+          "null outpoint spend tracking",
+          "coinbase input should not create spender"
+        ],
+        "oracle_response": "Coinbase inputs (null previous outpoints, i.e. all-zeros txid with index 0xFFFFFFFF) must NOT be recorded as spend edges in the spend graph. Querying spenders of the null outpoint must return 0. Only non-coinbase inputs create spend edges. Spend edges are insertion-order independent: whether the spending transaction is inserted before or after the funding transaction, the spender count must be identical."
+      },
+      {
+        "constraint_id": "C009",
+        "trigger_keywords": [
+          "lookahead scan limit behavior",
+          "when does scanning extend the revealed window",
+          "scan index beyond lookahead does not extend"
+        ],
+        "oracle_response": "Lookahead scanning extends the revealed window only when the scanned index falls within the current lookahead range (i.e., index <= last_revealed + lookahead). If the scanned index is beyond that range, the window does not extend and changed=0. The lookahead is a fixed constant (10 in the test cases). Scanning index 41 when last_revealed=30 and lookahead=10 produces changed=0 and leaves last_revealed=30."
+      },
+      {
+        "constraint_id": "C010",
+        "trigger_keywords": [
+          "non wildcard descriptor script count",
+          "fixed single script template reveal behavior",
+          "reveal to 200 on non-wildcard descriptor"
+        ],
+        "oracle_response": "Non-wildcard (fixed) descriptors produce exactly one script total and never derive additional scripts regardless of how high a target reveal index is requested. Calling reveal_to_target(200) on a non-wildcard descriptor returns changed_count=0 and the total script count remains 1. next_unused returns index=0 with is_new=false once the single script has been revealed. Attempting a second reveal returns 0 changes."
+      },
+      {
+        "constraint_id": "C011",
+        "trigger_keywords": [
+          "canonical conflict resolution rules",
+          "confirmed vs unconfirmed conflict winner",
+          "descendant makes older branch canonical"
+        ],
+        "oracle_response": "Canonical conflict resolution follows these priority rules: (1) A confirmed transaction on the active chain always overrides any conflicting unconfirmed transaction. (2) Among unconfirmed conflicting transactions, the more recently-seen one wins. (3) A transaction that has unconfirmed descendants is treated as the canonical branch even if it is older than the conflicting transaction without descendants. Non-canonical transactions and their descendants are excluded from chain_txs, chain_txouts, unspents, and balance calculations."
+      },
+      {
+        "constraint_id": "C012",
+        "trigger_keywords": [
+          "balance categories immature trusted untrusted confirmed",
+          "how are balance buckets defined",
+          "what goes in trusted_pending vs untrusted_pending"
+        ],
+        "oracle_response": "Balances are split into four buckets: 'balance_immature' for coinbase outputs not yet matured, 'balance_trusted_pending' for unconfirmed outputs from transactions we sent ourselves (change), 'balance_untrusted_pending' for unconfirmed outputs from external unconfirmed transactions, and 'balance_confirmed' for outputs in confirmed blocks. Only canonical (non-conflicted) unspent outputs contribute to any balance bucket."
+      },
+      {
+        "constraint_id": "C013",
+        "trigger_keywords": [
+          "two points of agreement chain update",
+          "how does the chain look after merging checkpoints",
+          "applying update with partial overlap"
+        ],
+        "oracle_response": "When applying an update that has two agreement points with the existing chain (e.g., both chains share the genesis and tip), the changeset reports only the newly added checkpoints. The final chain includes ALL checkpoints — pre-existing ones that were not in the changeset plus the newly applied ones — sorted by height. Checkpoints already present that match the update are not re-listed in the changeset."
+      },
+      {
+        "constraint_id": "C014",
+        "trigger_keywords": [
+          "wildcard unused next index selection",
+          "next unused fills gaps before deriving new",
+          "gap filling in script derivation"
+        ],
+        "oracle_response": "When selecting the next unused script index, the system must prefer the lowest unused gap index before deriving a new one. If indices 0-15 are used, 16 is unused, and 17-26 are used, next_unused returns index=16 with is_new=false and changed=0 (no new derivation needed). Only after all previously revealed indices are used does next_unused derive a new script, returning is_new=true and changed=1."
+      },
+      {
+        "constraint_id": "ARCH001",
+        "trigger_keywords": [
+          "how should I organize the code",
+          "single file or multiple files",
+          "project structure",
+          "directory layout",
+          "should I split into multiple files",
+          "monolithic or modular",
+          "how complex is the codebase",
+          "what files should I create",
+          "how to structure the implementation",
+          "should I separate business logic from IO",
+          "decouple core from IO",
+          "should business logic touch stdin stdout",
+          "how to separate parsing from logic",
+          "SOLID principles",
+          "separation of concerns",
+          "adapter pattern"
+        ],
+        "oracle_response": "Scale-driven code organization: match physical structure to domain complexity. For micro-utilities or simple scripts a single well-organized file is fine. For systems with multiple distinct responsibilities (I/O routing, business rules, formatters, etc.) you MUST use a multi-file layout (e.g. src/, tests/) — never a single god file. Do not over-engineer simple problems, but strictly avoid monolithic files for complex domains. Strict separation of concerns is mandatory: core business logic must be completely decoupled from stdin/stdout and JSON parsing. The JSON test cases are a black-box contract for the execution adapter only — NOT the internal data model. Follow SOLID: SRP (separate parsing, routing, core execution, output formatting); OCP (core engine open for extension, closed for modification); DIP (high-level modules depend on abstractions, not I/O details). The public interface must be idiomatic. Errors must be modeled properly (typed exceptions or Result/Monad patterns), not generic faults."
+      },
+      {
+        "constraint_id": "HARNESS003",
+        "trigger_keywords": [
+          "do you have test cases",
+          "are there public test cases",
+          "what test cases are provided",
+          "can I see the test inputs",
+          "what features have test cases",
+          "show me the test cases",
+          "what test files exist"
+        ],
+        "oracle_response": "Yes, public test cases are provided, one file per feature. Ask me for a specific feature by name and I will give you the full test case JSON."
+      },
+      {
+        "constraint_id": "EXECUTION_CONTRACT",
+        "trigger_keywords": [
+          "bdk raw string command stdin",
+          "not json action"
+        ],
+        "oracle_response": "The public adapter input is a raw string command from stdin, such as local_chain_update:add_first_tip, fee:positive_fee, derivation:set_targets, or conflict:newer_unconfirmed_wins. Do not require JSON or a top-level action field for these cases; parse the command group and scenario from the raw input string and emit the exact expected stdout."
+      },
+      {
+        "constraint_id": "TC_feature1_local_chain_updates",
+        "trigger_keywords": [
+          "test cases for feature1 local chain updates",
+          "show me feature1 local chain updates test cases",
+          "what are the feature1 local chain updates test inputs",
+          "give me the feature1_local_chain_updates test file",
+          "test cases for feature 1",
+          "feature1 local chain updates expected output",
+          "what does feature1 local chain updates expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature1_local_chain_updates:\n{\n  \"description\": \"Apply checkpoint-chain updates to an existing chain, reporting either the exact applied checkpoint changes and final chain or a normalized connection error.\",\n  \"cases\": [\n    {\n      \"input\": \"local_chain_update:add_first_tip\",\n      \"expected_output\": \"result=applied\\nchangeset=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c]\\nchain=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c]\\n\"\n    },\n    {\n      \"input\": \"local_chain_update:two_points_of_agreement\",\n      \"expected_output\": \"result=applied\\nchangeset=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c,3:2e52efc7b8cab2e0ca3f688ae090febff94be0eaa3ce666301985b287fc6e178]\\nchain=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c,1:01517aea572935ff9eb1455bc1147f98fb60957f4f9f868f06824ede3bb0550b,2:ea3f6455fc84430d6f2db40d708a046caab99ad8207d14e43b2f1ffd68894fca,3:2e52efc7b8cab2e0ca3f688ae090febff94be0eaa3ce666301985b287fc6e178]\\n\"\n    },\n    {\n      \"input\": \"local_chain_update:transitive_invalidation\",\n      \"expected_output\": \"result=applied\\nchangeset=[2:4a05b7aa85ed877a8f60fa1e7f3a3d914a9927f5f6502010bef0a769f9be6b7f,3:118102ef170982195e8fef18d5963365af29e6111f56434a4d860d09f9dedea9,4:2e52efc7b8cab2e0ca3f688ae090febff94be0eaa3ce666301985b287fc6e178,5:<removed>]\\nchain=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c,2:4a05b7aa85ed877a8f60fa1e7f3a3d914a9927f5f6502010bef0a769f9be6b7f,3:118102ef170982195e8fef18d5963365af29e6111f56434a4d860d09f9dedea9,4:2e52efc7b8cab2e0ca3f688ae090febff94be0eaa3ce666301985b287fc6e178]\\n\"\n    },\n    {\n      \"input\": \"local_chain_update:disjoint_short\",\n      \"expected_output\": \"error=cannot_connect\\ntry_include_height=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature2_local_chain_insertions",
+        "trigger_keywords": [
+          "test cases for feature2 local chain insertions",
+          "show me feature2 local chain insertions test cases",
+          "what are the feature2 local chain insertions test inputs",
+          "give me the feature2_local_chain_insertions test file",
+          "test cases for feature 2",
+          "feature2 local chain insertions expected output",
+          "what does feature2 local chain insertions expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature2_local_chain_insertions:\n{\n  \"description\": \"Insert one checkpoint into a local chain, preserving the chain on conflicts and reporting the exact accepted change or normalized conflict details.\",\n  \"cases\": [\n    {\n      \"input\": \"local_chain_insert:empty_at_height_5\",\n      \"expected_output\": \"result=inserted\\nchangeset=[5:43a3981aeb4807c76222f6d84f5ba371f1b5158dd49d3f28a958bb1f270558e1]\\nchain=[5:43a3981aeb4807c76222f6d84f5ba371f1b5158dd49d3f28a958bb1f270558e1]\\n\"\n    },\n    {\n      \"input\": \"local_chain_insert:conflicting_same_height\",\n      \"expected_output\": \"error=conflicting_block\\nheight=2\\noriginal_hash=cf2bb50677d427c231a0b22bf60fceb3a2716b78c6abae0a1e948b8f1812c3ff\\nupdate_hash=d6531d1c9bbc6d9d6771f1c2be3c7ed6341e731a6c1ebc1e9978198013fd3889\\nchain=[2:cf2bb50677d427c231a0b22bf60fceb3a2716b78c6abae0a1e948b8f1812c3ff]\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature3_script_value_accounting",
+        "trigger_keywords": [
+          "test cases for feature3 script value accounting",
+          "show me feature3 script value accounting test cases",
+          "what are the feature3 script value accounting test inputs",
+          "give me the feature3_script_value_accounting test file",
+          "test cases for feature 3",
+          "feature3 script value accounting expected output",
+          "what does feature3 script value accounting expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature3_script_value_accounting:\n{\n  \"description\": \"Track registered locking scripts and report sent, received, and net value for transactions before and after scanning prior outputs.\",\n  \"cases\": [\n    {\n      \"input\": \"script_value:incoming_before_scan\",\n      \"expected_output\": \"sent=0\\nreceived=42000\\nnet=42000\\n\"\n    },\n    {\n      \"input\": \"script_value:spend_after_scan\",\n      \"expected_output\": \"sent=42000\\nreceived=50000\\nnet=8000\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature4_script_usage_state",
+        "trigger_keywords": [
+          "test cases for feature4 script usage state",
+          "show me feature4 script usage state test cases",
+          "what are the feature4 script usage state test inputs",
+          "give me the feature4_script_usage_state test file",
+          "test cases for feature 4",
+          "feature4 script usage state expected output",
+          "what does feature4 script usage state expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature4_script_usage_state:\n{\n  \"description\": \"Maintain whether tracked locking scripts are unused, manually used, or made permanently used by scanned outputs.\",\n  \"cases\": [\n    {\n      \"input\": \"script_usage:manual_marking\",\n      \"expected_output\": \"initial_used=false\\nmark_changed=true\\nafter_mark_used=true\\nunmark_changed=true\\nafter_unmark_used=false\\n\"\n    },\n    {\n      \"input\": \"script_usage:scanned_output_stays_used\",\n      \"expected_output\": \"unmark_changed=false\\nused_after_unmark=true\\nindexed_outpoints=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature5_transaction_fee_calculation",
+        "trigger_keywords": [
+          "test cases for feature5 transaction fee calculation",
+          "show me feature5 transaction fee calculation test cases",
+          "what are the feature5 transaction fee calculation test inputs",
+          "give me the feature5_transaction_fee_calculation test file",
+          "test cases for feature 5",
+          "feature5 transaction fee calculation expected output",
+          "what does feature5 transaction fee calculation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature5_transaction_fee_calculation:\n{\n  \"description\": \"Calculate transaction fee from known previous outputs and normalize negative-fee or missing-input conditions.\",\n  \"cases\": [\n    {\n      \"input\": \"fee:positive_fee\",\n      \"expected_output\": \"fee=100\\n\"\n    },\n    {\n      \"input\": \"fee:negative_fee\",\n      \"expected_output\": \"error=negative_fee\\namount=-200\\n\"\n    },\n    {\n      \"input\": \"fee:missing_input\",\n      \"expected_output\": \"error=missing_previous_output\\nmissing_count=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature6_output_precedence",
+        "trigger_keywords": [
+          "test cases for feature6 output precedence",
+          "show me feature6 output precedence test cases",
+          "what are the feature6 output precedence test inputs",
+          "give me the feature6_output_precedence test file",
+          "test cases for feature 6",
+          "feature6 output precedence expected output",
+          "what does feature6 output precedence expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature6_output_precedence:\n{\n  \"description\": \"Resolve conflicts between floating output records and full transaction records by giving the full transaction output authoritative value.\",\n  \"cases\": [\n    {\n      \"input\": \"txout_precedence:full_replaces_floating\",\n      \"expected_output\": \"vout0_value=42000\\nvout1_present=false\\n\"\n    },\n    {\n      \"input\": \"txout_precedence:floating_does_not_replace_full\",\n      \"expected_output\": \"vout0_value=42000\\nvout1_present=false\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature7_spend_tracking",
+        "trigger_keywords": [
+          "test cases for feature7 spend tracking",
+          "show me feature7 spend tracking test cases",
+          "what are the feature7 spend tracking test inputs",
+          "give me the feature7_spend_tracking test file",
+          "test cases for feature 7",
+          "feature7 spend tracking expected output",
+          "what does feature7 spend tracking expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature7_spend_tracking:\n{\n  \"description\": \"Track transaction spends independently from insertion order while ignoring coinbase null inputs as spend edges.\",\n  \"cases\": [\n    {\n      \"input\": \"spend_tracking:coinbase_not_spent\",\n      \"expected_output\": \"null_outpoint_spenders=0\\nzero_tx_spends=0\\n\"\n    },\n    {\n      \"input\": \"spend_tracking:insertion_order_independent\",\n      \"expected_output\": \"graph1_spenders=1\\ngraph2_spenders=1\\nsame_spenders=true\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature8_script_derivation",
+        "trigger_keywords": [
+          "test cases for feature8 script derivation",
+          "show me feature8 script derivation test cases",
+          "what are the feature8 script derivation test inputs",
+          "give me the feature8_script_derivation test file",
+          "test cases for feature 8",
+          "feature8 script derivation expected output",
+          "what does feature8 script derivation expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature8_script_derivation:\n{\n  \"description\": \"Reveal and scan deterministic script derivations with target indices, lookahead windows, unused-script selection, and non-wildcard descriptors.\",\n  \"cases\": [\n    {\n      \"input\": \"derivation:set_targets\",\n      \"expected_output\": \"external_last=12\\ninternal_last=24\\nfirst_changes=2\\nsecond_changes_empty=true\\n\"\n    },\n    {\n      \"input\": \"derivation:lookahead_scan_limit\",\n      \"expected_output\": \"scan_0_changed=1\\nscan_0_last_revealed=0\\nscan_0_last_used=0\\nscan_10_changed=1\\nscan_10_last_revealed=10\\nscan_10_last_used=10\\nscan_20_changed=1\\nscan_20_last_revealed=20\\nscan_20_last_used=20\\nscan_30_changed=1\\nscan_30_last_revealed=30\\nscan_30_last_used=30\\nscan_41_changed=0\\nlast_revealed=30\\nlast_used=30\\n\"\n    },\n    {\n      \"input\": \"derivation:wildcard_unused\",\n      \"expected_output\": \"initial_next_index=0\\ninitial_next_is_new=true\\ninitial_reveal_changes=1\\ninitial_unused_changes=0\\nnext_after_reveal_to_25=26\\nnext_after_reveal_to_25_is_new=true\\nreveal_26_changes=1\\nnext_unused_after_gaps=16\\nnext_unused_after_gaps_changes=0\\nnext_unused_after_all_used=27\\nnext_unused_after_all_used_changes=1\\n\"\n    },\n    {\n      \"input\": \"derivation:non_wildcard\",\n      \"expected_output\": \"initial_next_index=0\\ninitial_next_is_new=true\\nfirst_reveal_changes=1\\nfirst_unused_changes=0\\nnext_after_reveal_index=0\\nnext_after_reveal_is_new=false\\nsecond_reveal_changes=0\\nsecond_unused_changes=0\\nreveal_to_200_count=0\\nreveal_to_200_changes_empty=true\\ntotal_scripts=1\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "TC_feature9_chain_conflict_filtering",
+        "trigger_keywords": [
+          "test cases for feature9 chain conflict filtering",
+          "show me feature9 chain conflict filtering test cases",
+          "what are the feature9 chain conflict filtering test inputs",
+          "give me the feature9_chain_conflict_filtering test file",
+          "test cases for feature 9",
+          "feature9 chain conflict filtering expected output",
+          "what does feature9 chain conflict filtering expect"
+        ],
+        "oracle_response": "Here are the public test cases for feature9_chain_conflict_filtering:\n{\n  \"description\": \"Filter transaction histories to canonical chain-visible transactions, outputs, unspents, and balances across confirmed and unconfirmed conflicts.\",\n  \"cases\": [\n    {\n      \"input\": \"conflict:coinbase_and_confirmed_conflict\",\n      \"expected_output\": \"chain_txs=[confirmed_conflict,confirmed_genesis]\\nchain_txouts=[confirmed_conflict:0,confirmed_genesis:0]\\nunspents=[confirmed_conflict:0]\\nbalance_immature=0\\nbalance_trusted_pending=0\\nbalance_untrusted_pending=0\\nbalance_confirmed=20000\\nexpected_chain_txs=[confirmed_conflict,confirmed_genesis]\\nexpected_chain_txouts=[confirmed_conflict:0,confirmed_genesis:0]\\nexpected_unspents=[confirmed_conflict:0]\\nbalance_immature=0\\nbalance_trusted_pending=0\\nbalance_untrusted_pending=0\\nbalance_confirmed=20000\\n\"\n    },\n    {\n      \"input\": \"conflict:newer_unconfirmed_wins\",\n      \"expected_output\": \"chain_txs=[tx1,tx_conflict_2]\\nchain_txouts=[tx1:0,tx1:1,tx_conflict_2:0]\\nunspents=[tx_conflict_2:0]\\nbalance_immature=0\\nbalance_trusted_pending=30000\\nbalance_untrusted_pending=0\\nbalance_confirmed=0\\nexpected_chain_txs=[tx1,tx_conflict_2]\\nexpected_chain_txouts=[tx1:0,tx1:1,tx_conflict_2:0]\\nexpected_unspents=[tx_conflict_2:0]\\nbalance_immature=0\\nbalance_trusted_pending=30000\\nbalance_untrusted_pending=0\\nbalance_confirmed=0\\n\"\n    },\n    {\n      \"input\": \"conflict:confirmed_wins_over_mempool\",\n      \"expected_output\": \"chain_txs=[tx1,tx_confirmed_conflict]\\nchain_txouts=[tx1:0,tx_confirmed_conflict:0]\\nunspents=[tx_confirmed_conflict:0]\\nbalance_immature=0\\nbalance_trusted_pending=0\\nbalance_untrusted_pending=0\\nbalance_confirmed=50000\\nexpected_chain_txs=[tx1,tx_confirmed_conflict]\\nexpected_chain_txouts=[tx1:0,tx_confirmed_conflict:0]\\nexpected_unspents=[tx_confirmed_conflict:0]\\nbalance_immature=0\\nbalance_trusted_pending=0\\nbalance_untrusted_pending=0\\nbalance_confirmed=50000\\n\"\n    },\n    {\n      \"input\": \"conflict:descendant_can_make_older_branch_canonical\",\n      \"expected_output\": \"chain_txs=[A,B,C]\\nchain_txouts=[A:0,B:0,C:0]\\nunspents=[C:0]\\nbalance_immature=0\\nbalance_trusted_pending=30000\\nbalance_untrusted_pending=0\\nbalance_confirmed=0\\nexpected_chain_txs=[A,B,C]\\nexpected_chain_txouts=[A:0,B:0,C:0]\\nexpected_unspents=[C:0]\\nbalance_immature=0\\nbalance_trusted_pending=30000\\nbalance_untrusted_pending=0\\nbalance_confirmed=0\\n\"\n    }\n  ]\n}"
+      },
+      {
+        "constraint_id": "HARNESS001",
+        "trigger_keywords": [
+          "how does the dispatcher work",
+          "how is the program invoked",
+          "stdin stdout interface",
+          "execution adapter",
+          "how to read input",
+          "how does the test harness call my code",
+          "what is the entry point for testing",
+          "how does the runner call the program"
+        ],
+        "oracle_response": "You must implement an execution adapter (dispatcher) that is logically and ideally physically separate from the core domain. It reads a single JSON object from stdin, inspects the 'action' field to route to the correct core function, then prints the result to stdout matching the per-feature output contract. All policy durations in inputs are in seconds; all time points are epoch milliseconds. The adapter must not contain any business logic — every numeric result and boolean decision is delegated to the core domain."
+      },
+      {
+        "constraint_id": "HARNESS002",
+        "trigger_keywords": [
+          "how to write test.sh",
+          "test harness scaffold",
+          "automated test script",
+          "how should test.sh work",
+          "cases-dir parameter",
+          "where does test output go",
+          "output file naming format",
+          "how are test outputs named",
+          "rcb_tests structure",
+          "test scaffold deliverable"
+        ],
+        "oracle_response": "Deliver a bash test harness at rcb_tests/test.sh. It must accept --cases-dir <subdir> (default: test_cases) to point at a directory of *.json case files under rcb_tests/. For each case file it runs every case in the 'cases' array against the dispatcher, writing raw stdout (no PASS/FAIL metadata) to: rcb_tests/stdout/<cases-dir>/{filename_stem}@{case_index_zero_padded_3}.txt Example: rcb_tests/stdout/public_test_cases/feature1_next_retry_at@000.txt Output is namespaced by <cases-dir> so different directories never overwrite each other. A single entry point 'bash rcb_tests/test.sh' runs the full suite with the default dir."
+      }
+    ],
+    "context_pointers": [
+      {
+        "vague_reference": "the compatibility logic from that login module we did last time",
+        "actual_meaning": "The I/O adapter separation pattern described in Architecture Constraint #2: the execution adapter in src/adapter/ (or equivalent) must translate JSON/string commands into idiomatic Rust method calls on the core domain, keeping stdin/stdout parsing completely decoupled from business logic in src/domain/ or src/core/"
+      },
+      {
+        "vague_reference": "the Lightning stuff last quarter — same philosophy",
+        "actual_meaning": "The SOLID design principles outlined in start.md Architecture section, specifically the Dependency Inversion Principle: high-level chain/tx modules must depend on abstractions (traits) not on concrete I/O implementations, mirroring how BDK's existing chain-source abstraction works"
+      },
+      {
+        "vague_reference": "Tests are in the rcb_tests folder if you need to cross-reference expected behavior",
+        "actual_meaning": "The JSON files under rcb_tests/public_test_cases/ (feature1 through feature9) each define the exact string format of adapter-layer outputs; these are the black-box contracts for the execution adapter, not for the core domain model itself"
+      },
+      {
+        "vague_reference": "keep the file structure sensible, not everything crammed into one giant file",
+        "actual_meaning": "Architecture NFR #1 in start.md: the project MUST use a multi-file directory structure (src/, tests/, etc.) with distinct modules for parsing, routing, validation, core execution, and output formatting — a single-file solution is explicitly prohibited for this domain complexity"
+      }
+    ],
+    "fallback_response": "I don't have specific details on that constraint in the current requirements. Please check the rcb_tests/public_test_cases/ directory for the relevant feature's JSON file, which defines the exact expected output format as the authoritative black-box contract. If you need clarification on business intent rather than format, feel free to rephrase your question."
+  },
+  "public_test_cases": {
+    "feature1_local_chain_updates.json": {
+      "description": "Apply checkpoint-chain updates to an existing chain, reporting either the exact applied checkpoint changes and final chain or a normalized connection error.",
+      "cases": [
+        {
+          "input": "local_chain_update:add_first_tip",
+          "expected_output": "result=applied\nchangeset=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c]\nchain=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c]\n"
+        },
+        {
+          "input": "local_chain_update:two_points_of_agreement",
+          "expected_output": "result=applied\nchangeset=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c,3:2e52efc7b8cab2e0ca3f688ae090febff94be0eaa3ce666301985b287fc6e178]\nchain=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c,1:01517aea572935ff9eb1455bc1147f98fb60957f4f9f868f06824ede3bb0550b,2:ea3f6455fc84430d6f2db40d708a046caab99ad8207d14e43b2f1ffd68894fca,3:2e52efc7b8cab2e0ca3f688ae090febff94be0eaa3ce666301985b287fc6e178]\n"
+        },
+        {
+          "input": "local_chain_update:transitive_invalidation",
+          "expected_output": "result=applied\nchangeset=[2:4a05b7aa85ed877a8f60fa1e7f3a3d914a9927f5f6502010bef0a769f9be6b7f,3:118102ef170982195e8fef18d5963365af29e6111f56434a4d860d09f9dedea9,4:2e52efc7b8cab2e0ca3f688ae090febff94be0eaa3ce666301985b287fc6e178,5:<removed>]\nchain=[0:425ea523fee4a4451246a49a08174424ee3fdc03d40926ad46ffe0e671efd61c,2:4a05b7aa85ed877a8f60fa1e7f3a3d914a9927f5f6502010bef0a769f9be6b7f,3:118102ef170982195e8fef18d5963365af29e6111f56434a4d860d09f9dedea9,4:2e52efc7b8cab2e0ca3f688ae090febff94be0eaa3ce666301985b287fc6e178]\n"
+        },
+        {
+          "input": "local_chain_update:disjoint_short",
+          "expected_output": "error=cannot_connect\ntry_include_height=0\n"
+        }
+      ]
+    },
+    "feature2_local_chain_insertions.json": {
+      "description": "Insert one checkpoint into a local chain, preserving the chain on conflicts and reporting the exact accepted change or normalized conflict details.",
+      "cases": [
+        {
+          "input": "local_chain_insert:empty_at_height_5",
+          "expected_output": "result=inserted\nchangeset=[5:43a3981aeb4807c76222f6d84f5ba371f1b5158dd49d3f28a958bb1f270558e1]\nchain=[5:43a3981aeb4807c76222f6d84f5ba371f1b5158dd49d3f28a958bb1f270558e1]\n"
+        },
+        {
+          "input": "local_chain_insert:conflicting_same_height",
+          "expected_output": "error=conflicting_block\nheight=2\noriginal_hash=cf2bb50677d427c231a0b22bf60fceb3a2716b78c6abae0a1e948b8f1812c3ff\nupdate_hash=d6531d1c9bbc6d9d6771f1c2be3c7ed6341e731a6c1ebc1e9978198013fd3889\nchain=[2:cf2bb50677d427c231a0b22bf60fceb3a2716b78c6abae0a1e948b8f1812c3ff]\n"
+        }
+      ]
+    },
+    "feature3_script_value_accounting.json": {
+      "description": "Track registered locking scripts and report sent, received, and net value for transactions before and after scanning prior outputs.",
+      "cases": [
+        {
+          "input": "script_value:incoming_before_scan",
+          "expected_output": "sent=0\nreceived=42000\nnet=42000\n"
+        },
+        {
+          "input": "script_value:spend_after_scan",
+          "expected_output": "sent=42000\nreceived=50000\nnet=8000\n"
+        }
+      ]
+    },
+    "feature4_script_usage_state.json": {
+      "description": "Maintain whether tracked locking scripts are unused, manually used, or made permanently used by scanned outputs.",
+      "cases": [
+        {
+          "input": "script_usage:manual_marking",
+          "expected_output": "initial_used=false\nmark_changed=true\nafter_mark_used=true\nunmark_changed=true\nafter_unmark_used=false\n"
+        },
+        {
+          "input": "script_usage:scanned_output_stays_used",
+          "expected_output": "unmark_changed=false\nused_after_unmark=true\nindexed_outpoints=1\n"
+        }
+      ]
+    },
+    "feature5_transaction_fee_calculation.json": {
+      "description": "Calculate transaction fee from known previous outputs and normalize negative-fee or missing-input conditions.",
+      "cases": [
+        {
+          "input": "fee:positive_fee",
+          "expected_output": "fee=100\n"
+        },
+        {
+          "input": "fee:negative_fee",
+          "expected_output": "error=negative_fee\namount=-200\n"
+        },
+        {
+          "input": "fee:missing_input",
+          "expected_output": "error=missing_previous_output\nmissing_count=1\n"
+        }
+      ]
+    },
+    "feature6_output_precedence.json": {
+      "description": "Resolve conflicts between floating output records and full transaction records by giving the full transaction output authoritative value.",
+      "cases": [
+        {
+          "input": "txout_precedence:full_replaces_floating",
+          "expected_output": "vout0_value=42000\nvout1_present=false\n"
+        },
+        {
+          "input": "txout_precedence:floating_does_not_replace_full",
+          "expected_output": "vout0_value=42000\nvout1_present=false\n"
+        }
+      ]
+    },
+    "feature7_spend_tracking.json": {
+      "description": "Track transaction spends independently from insertion order while ignoring coinbase null inputs as spend edges.",
+      "cases": [
+        {
+          "input": "spend_tracking:coinbase_not_spent",
+          "expected_output": "null_outpoint_spenders=0\nzero_tx_spends=0\n"
+        },
+        {
+          "input": "spend_tracking:insertion_order_independent",
+          "expected_output": "graph1_spenders=1\ngraph2_spenders=1\nsame_spenders=true\n"
+        }
+      ]
+    },
+    "feature8_script_derivation.json": {
+      "description": "Reveal and scan deterministic script derivations with target indices, lookahead windows, unused-script selection, and non-wildcard descriptors.",
+      "cases": [
+        {
+          "input": "derivation:set_targets",
+          "expected_output": "external_last=12\ninternal_last=24\nfirst_changes=2\nsecond_changes_empty=true\n"
+        },
+        {
+          "input": "derivation:lookahead_scan_limit",
+          "expected_output": "scan_0_changed=1\nscan_0_last_revealed=0\nscan_0_last_used=0\nscan_10_changed=1\nscan_10_last_revealed=10\nscan_10_last_used=10\nscan_20_changed=1\nscan_20_last_revealed=20\nscan_20_last_used=20\nscan_30_changed=1\nscan_30_last_revealed=30\nscan_30_last_used=30\nscan_41_changed=0\nlast_revealed=30\nlast_used=30\n"
+        },
+        {
+          "input": "derivation:wildcard_unused",
+          "expected_output": "initial_next_index=0\ninitial_next_is_new=true\ninitial_reveal_changes=1\ninitial_unused_changes=0\nnext_after_reveal_to_25=26\nnext_after_reveal_to_25_is_new=true\nreveal_26_changes=1\nnext_unused_after_gaps=16\nnext_unused_after_gaps_changes=0\nnext_unused_after_all_used=27\nnext_unused_after_all_used_changes=1\n"
+        },
+        {
+          "input": "derivation:non_wildcard",
+          "expected_output": "initial_next_index=0\ninitial_next_is_new=true\nfirst_reveal_changes=1\nfirst_unused_changes=0\nnext_after_reveal_index=0\nnext_after_reveal_is_new=false\nsecond_reveal_changes=0\nsecond_unused_changes=0\nreveal_to_200_count=0\nreveal_to_200_changes_empty=true\ntotal_scripts=1\n"
+        }
+      ]
+    },
+    "feature9_chain_conflict_filtering.json": {
+      "description": "Filter transaction histories to canonical chain-visible transactions, outputs, unspents, and balances across confirmed and unconfirmed conflicts.",
+      "cases": [
+        {
+          "input": "conflict:coinbase_and_confirmed_conflict",
+          "expected_output": "chain_txs=[confirmed_conflict,confirmed_genesis]\nchain_txouts=[confirmed_conflict:0,confirmed_genesis:0]\nunspents=[confirmed_conflict:0]\nbalance_immature=0\nbalance_trusted_pending=0\nbalance_untrusted_pending=0\nbalance_confirmed=20000\nexpected_chain_txs=[confirmed_conflict,confirmed_genesis]\nexpected_chain_txouts=[confirmed_conflict:0,confirmed_genesis:0]\nexpected_unspents=[confirmed_conflict:0]\nbalance_immature=0\nbalance_trusted_pending=0\nbalance_untrusted_pending=0\nbalance_confirmed=20000\n"
+        },
+        {
+          "input": "conflict:newer_unconfirmed_wins",
+          "expected_output": "chain_txs=[tx1,tx_conflict_2]\nchain_txouts=[tx1:0,tx1:1,tx_conflict_2:0]\nunspents=[tx_conflict_2:0]\nbalance_immature=0\nbalance_trusted_pending=30000\nbalance_untrusted_pending=0\nbalance_confirmed=0\nexpected_chain_txs=[tx1,tx_conflict_2]\nexpected_chain_txouts=[tx1:0,tx1:1,tx_conflict_2:0]\nexpected_unspents=[tx_conflict_2:0]\nbalance_immature=0\nbalance_trusted_pending=30000\nbalance_untrusted_pending=0\nbalance_confirmed=0\n"
+        },
+        {
+          "input": "conflict:confirmed_wins_over_mempool",
+          "expected_output": "chain_txs=[tx1,tx_confirmed_conflict]\nchain_txouts=[tx1:0,tx_confirmed_conflict:0]\nunspents=[tx_confirmed_conflict:0]\nbalance_immature=0\nbalance_trusted_pending=0\nbalance_untrusted_pending=0\nbalance_confirmed=50000\nexpected_chain_txs=[tx1,tx_confirmed_conflict]\nexpected_chain_txouts=[tx1:0,tx_confirmed_conflict:0]\nexpected_unspents=[tx_confirmed_conflict:0]\nbalance_immature=0\nbalance_trusted_pending=0\nbalance_untrusted_pending=0\nbalance_confirmed=50000\n"
+        },
+        {
+          "input": "conflict:descendant_can_make_older_branch_canonical",
+          "expected_output": "chain_txs=[A,B,C]\nchain_txouts=[A:0,B:0,C:0]\nunspents=[C:0]\nbalance_immature=0\nbalance_trusted_pending=30000\nbalance_untrusted_pending=0\nbalance_confirmed=0\nexpected_chain_txs=[A,B,C]\nexpected_chain_txouts=[A:0,B:0,C:0]\nexpected_unspents=[C:0]\nbalance_immature=0\nbalance_trusted_pending=30000\nbalance_untrusted_pending=0\nbalance_confirmed=0\n"
+        }
+      ]
+    }
+  }
+}

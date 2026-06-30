@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we've been getting complaints from our backend devs that they have zero visibility into what's happening with our Kafka messaging layer. Right now if something goes wrong between a producer and a consumer, there's no way to trace the flow end-to-end without manually adding logging everywhere — which is a nightmare to maintain and people keep forgetting to do it consistently. We need to build some kind of auto-instrumentation wrapper around our Kafka client so that spans get created automatically whenever someone publishes or consumes a message, without the dev having to write any tracing code themselves.
+
+The context propagation piece is really important — similar to what we did with the HTTP middleware tracing last quarter, we need trace IDs to flow through message headers so a consumer can pick up where the producer left off. There's also a question about batches — the PM from the data pipeline team mentioned their batch consumers work differently from per-message ones and the parent/child relationships should reflect that.
+
+Also a few edge cases we've been burned by before: hooks that crash shouldn't break the whole trace, failed sends should still emit spans, and error messages in our observability tooling should be normalized category labels rather than raw exception strings. We also want to support some kind of version tagging on spans for future compatibility auditing. The adapter needs to read scenarios from stdin and write results to stdout for our test harness.

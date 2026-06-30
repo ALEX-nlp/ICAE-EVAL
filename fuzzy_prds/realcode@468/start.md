@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to build out that content utilities library we've been talking about. Basically a collection of small helper functions for the file management front end — things like parsing user-pasted lists, handling collaborator emails (including that external-check logic we discussed, similar to what the sharing module does), formatting file sizes in different languages, abbreviating big numbers on dashboards, fuzzy search matching, network identifier validators, hex encoding, and sorting items in collections plus activity feeds.
+
+The tricky parts are: the size formatting needs to work for at least Russian, French, and German in addition to English — each with their own decimal separators and unit labels. The number abbreviation should handle edge cases like booleans, null, objects, and strings being passed in, and there's some locale-specific behavior for German, Russian, and Japanese that we need to get right (including Russian pluralization rules). The item sorting must group folders before files before links, and there's some error handling that should output clean category strings rather than anything internal.
+
+For the adapter layer, refer to the same pattern we used on that previous parsing pipeline — stdin/stdout JSON dispatch, no business logic in the adapter itself. Each utility should be its own small module. The output format is line-oriented labeled key=value pairs. Let me know if anything is unclear, but most of the edge case behavior should be self-evident from the existing test fixtures.

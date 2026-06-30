@@ -1,0 +1,7 @@
+## Product Requirement Document
+
+Hey team, we need to get that UML diagram toolkit shipped. The basic idea is that devs are wasting a ton of time hand-translating those XML diagram files into entity configs and then re-typing the same stuff in like three different formats. Super error-prone and nobody wants to do it. We want a tool that can read those diagram files and spit out something usable downstream — basically the same pattern we used for the config export pipeline in the auth module last quarter, you know the one.
+
+The tool needs to handle a few things: reading field/type info from diagrams, checking whether field types are actually valid for whichever storage backend someone is using, and then producing both a JSON config format and a plain-text model definition. There should also be some way to put together the command you'd actually run to kick off generation for a given entity, and we need it to understand the CLI flags people typically pass.
+
+One thing that keeps biting us is that some relationship types just don't work with certain storage setups — we need that to come back as a proper structured error, not just blow up. Same goes for reserved names or anything malformed. Oh also the editor detection thing — when we open a diagram we should know which tool produced it. Should work for at least the main editor we use internally (you know which one). Make sure the whole thing is tested end-to-end.

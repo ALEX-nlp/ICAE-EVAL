@@ -1,0 +1,19 @@
+## Product Requirement Document
+
+Hey team, we need to build out that database adapter layer we've been talking about. Basically developers are spending way too much time writing boilerplate to talk to our distributed SQL backend — things like manually constructing requests, figuring out schema stuff, and keeping track of transaction state. It's causing a ton of bugs and wasted engineering time.
+
+The adapter needs to handle the full lifecycle: connecting to databases, running queries and schema changes, managing transactions without leaking internal errors to callers, and doing all the ORM-style read/write mapping. We also need it to handle the metadata introspection stuff the same way we did for that session/service mock layer — you know, the approach we used for the gRPC service simulation.
+
+One big thing: schema changes should be batchable so we don't end up with partial migrations. And the column type system needs to handle the variable-length vs fixed-length distinction correctly, especially when no size is specified — refer to how the existing type formatting logic works in the schema module.
+
+Also we need the SQL literal decoding to cover all the quoting styles people actually use in practice. The transaction error handling should surface clean category names rather than raw exceptions. Make sure the whole thing is properly structured — no giant single files please. Should be production-grade layout.
+
+A couple extra specifics from the questions that came back. For column descriptors, unless somebody explicitly sets them, nullable defaults to true and primary_key defaults to false. On the type side, when a STRING or BYTES column has no limit provided, the db_type must default to STRING(MAX) or BYTES(MAX) respectively. Fixed scalar types like INT64, BOOL, FLOAT64, etc. ignore any supplied limit entirely and do not append a size suffix. That should follow the same column type formatting behavior we already called out before: STRING and BYTES default to MAX when no limit is given; all other scalar types ignore limits entirely.
+
+For sessions, the created resource name needs to be built off the database path that came in on the request, so it should look like projects/p/instances/i/databases/d/sessions/<id> when that was the requested database. The check people asked about is session_prefix=matched, which just confirms the session name starts with the requested database path. This should line up with the same mock service/session behavior from feature8_mock_service_sessions.json and feature9_mock_service_sql.json, specifically the MockSpannerService/session handler and SQL result registration pattern.
+
+A few behavior details on execution too. If a query hits a table that does not exist, the output should be error=not_found followed by resource=<table_name>, and we should normalize that category to 'not_found' no matter what the lower-level gRPC status looked like. Also, simple ORM reads like loading all records or finding by id should not open a transaction at all, so the output needs to show transaction_used=false and begin_requests=0.
+
+For bound params, keep the output format as p<n>:<value>:<DB_TYPE> comma-separated. For integer id lookups, both the id param and the LIMIT param need to be typed as INT64, so the example to match is p1:1:INT64,p2:1:INT64. On insert_returning_mutation, the mutation columns list should include all attribute columns first and then the id column, like first_name,last_name,id. The generated id also needs to be numeric, so generated_id_numeric=true, and it has to be the same value returned to the caller, so generated_id_matches_returned=true.
+
+One last thing on metadata output: when we produce columns_by_position for indexes, sort the index columns by ordinal_position ascending. And in the orders output, the per-column directions should be lowercased, for example col2:asc,col1:desc.
