@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-# Task: evaluate ONE model under the base-language environment (lite, conc 4).
-#   env-mode base -> docker_lang_official/<repo-language>.tar
-#   (no project source / no detailed PRD; the agent works from the fuzzy PRD)
+# Task: evaluate ONE model under the fixed release environment (lite, conc 4).
+# The release always uses the base-language image and fuzzy PRD.
 #
 # Usage:
 #   bash scripts/run_lite_base.sh <model-name> [extra orchestrator args...]
@@ -19,9 +18,7 @@ CONCURRENCY="${CONCURRENCY:-4}"
 
 run_orchestrator run \
     --model-name      "$MODEL_NAME" \
-    --env-mode        base \
     --eval-mode       lite \
-    --prd-type        "$PRD_TYPE" \
     --user-model-name "$USER_MODEL_NAME" \
     --critic-model-name "$CRITIC_MODEL_NAME" \
     --query-count     "$QUERY_COUNT" \

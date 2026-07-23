@@ -6,12 +6,12 @@ Entry point. Two subcommands:
         PRD-only container, run the agent-under-test (Claude Code CLI via
         claude-agent-sdk) in results/<append_id>/<repo>, optionally score it.
 
-  eval  re-run the objective pass-rate scoring over an existing
-        results/<append_id> (reuses the per-repo image recorded in settings).
+  eval  re-run all scoring groups over an existing results/<append_id>
+        (reuses the recorded run config, repositories, and container images).
 
 Usage examples:
   python -m harness.orchestrator run \
-      --model-name Opus-4.8 --env-mode base --prd-type fuzzy \
+      --model-name Opus-4.8 \
       --user-model-name DeepSeek-V3.2 --query-count 16 \
       --user-host 127.0.0.1 --repos realcode@001
   python -m harness.orchestrator eval --append-id <id>
@@ -100,7 +100,8 @@ def available_repos(prd_type: str, difficulty: str = "normal") -> list[str]:
 def select_repos(args) -> list[str]:
     """Resolve the requested aliases. --repos/--repo-file accept either an alias
     ('realcode@001') or a real repo key (auto-translated). eval_mode=lite keeps the
-    first 50 (smallest golden code); --limit further truncates."""
+    first 50 (smallest golden code); --limit further truncates. An eval-only run
+    defaults to the successfully generated repos recorded under its append_id."""
     repos = available_repos(args.prd_type, getattr(args, "difficulty", "normal"))
     if args.repos:
         want = [r.strip() for r in args.repos.split(",") if r.strip()]
@@ -110,6 +111,17 @@ def select_repos(args) -> list[str]:
         want = [l.strip() for l in Path(args.repo_file).read_text().splitlines() if l.strip()]
         want = [_to_alias(r) for r in want]
         repos = [r for r in want if r in repos] or want
+    elif getattr(args, "only_eval", False) and args.append_id:
+        recorded = ua.load_run_record(args.append_id).get("repos", {})
+        successful = [
+            alias for alias, status in recorded.items()
+            if status.get("generation") == "success"
+        ]
+        # Older run records may predate the generation-status field. Fall back
+        # to their persisted code paths only when no explicit successes exist.
+        repos = successful or [
+            alias for alias, status in recorded.items() if status.get("code_path")
+        ]
     elif getattr(args, "eval_mode", "full") == "lite":
         repos = repos[:50]
     if getattr(args, "resume_fill", False):
@@ -117,6 +129,49 @@ def select_repos(args) -> list[str]:
     if args.limit:
         repos = repos[: args.limit]
     return repos
+
+
+def _hydrate_eval_args(args) -> dict:
+    """Load immutable run context for `eval` without overwriting it with defaults."""
+    run = ua.load_run_record(args.append_id)
+    if not run:
+        raise SystemExit(
+            f"no per-run settings found for append_id {args.append_id} "
+            f"({C.run_settings_path(args.append_id)})")
+    cfg = run.get("config", {})
+
+    # Evaluation reuses the generation context. The three values exposed on the
+    # eval CLI remain overridable for migrations to another Oracle/Critic host.
+    fixed = {
+        "model_name": "",
+        "env_mode": "base",
+        "eval_mode": "full",
+        "prd_type": "fuzzy",
+        "difficulty": "normal",
+        "user_model_name": "",
+        "query_count": 16,
+        "agent_framework": "claude-code",
+    }
+    for key, fallback in fixed.items():
+        setattr(args, key, cfg.get(key, fallback))
+
+    overridable = {
+        "critic_model_name": "Deepseek-V4-Flash",
+        "user_host": "127.0.0.1",
+        "user_init_port": 50001,
+        "user_query_port": 50002,
+        "user_eval_port": 50003,
+    }
+    for key, fallback in overridable.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, cfg.get(key, fallback))
+
+    # Generation-only flags are referenced by shared control flow but must never
+    # affect an eval-only pass.
+    args.force = False
+    args.resume_fill = False
+    args.scaffold = False
+    return run
 
 
 def _resume_fill(repos: list[str], append_id: str | None) -> list[str]:
@@ -454,19 +509,24 @@ async def _eval_only(alias: str, args, append_id: str, prior: dict) -> None:
 # ── driver ────────────────────────────────────────────────────────────────────
 
 async def run_async(args) -> None:
+    existing_run = _hydrate_eval_args(args) if args.only_eval else None
     framework = getattr(args, "agent_framework", "claude-code")
-    model_entries = C.resolve_model(args.model_name)
-    # Keep only the endpoints meant for this framework: openhands wants the
-    # OPENHANDS_*-routed (litellm) variants; claude-code wants the plain Anthropic
-    # gateway variants. Fall back to the whole pool when a model only ships the
-    # other kind (the runner then derives the missing fields itself).
-    if framework == "openhands":
-        picked = [e for e in model_entries if "OPENHANDS_MODEL" in e]
+    model_entries = []
+    if args.only_eval:
+        print(f"[eval] loaded run config for append_id={args.append_id}")
     else:
-        picked = [e for e in model_entries if "OPENHANDS_MODEL" not in e]
-    model_entries = picked or model_entries
-    print(f"[model] '{args.model_name}': pool of {len(model_entries)} endpoint(s) "
-          f"(framework={framework})")
+        model_entries = C.resolve_model(args.model_name)
+        # Keep only the endpoints meant for this framework: openhands wants the
+        # OPENHANDS_*-routed (litellm) variants; claude-code wants plain Anthropic
+        # gateway variants. Fall back to the whole pool when OpenHands can derive
+        # its routing from an Anthropic entry.
+        if framework == "openhands":
+            picked = [e for e in model_entries if "OPENHANDS_MODEL" in e]
+        else:
+            picked = [e for e in model_entries if "OPENHANDS_MODEL" not in e]
+        model_entries = picked or model_entries
+        print(f"[model] '{args.model_name}': pool of {len(model_entries)} endpoint(s) "
+              f"(framework={framework})")
 
     # Resolve the Critic Model for metric group (c). Tolerate a missing entry so a
     # run without agentic eval still proceeds (the (c) step is skipped instead).
@@ -526,22 +586,43 @@ async def run_async(args) -> None:
             print(f"[warn] could not verify append_id with the Oracle "
                   f"({args.user_host}:{args.user_query_port}); proceeding anyway.")
 
-    ua.init_settings(append_id, {
-        "model_name": args.model_name, "env_mode": args.env_mode,
-        "eval_mode": getattr(args, "eval_mode", "full"),
-        "prd_type": args.prd_type, "user_model_name": args.user_model_name,
-        "difficulty": getattr(args, "difficulty", "normal"),
-        "critic_model_name": args.critic_model_name,
-        "query_count": args.query_count, "user_host": args.user_host,
-        "user_init_port": args.user_init_port, "user_query_port": args.user_query_port,
-        "user_eval_port": args.user_eval_port,
-        "anthropic_model": model_entries[0].get("ANTHROPIC_MODEL"),
-        "agent_framework": getattr(args, "agent_framework", "claude-code"),
-    })
-
     repos = select_repos(args)
     if not repos:
-        raise SystemExit("no repos selected (check --prd-type / --repos / --repo-file)")
+        if args.only_eval and existing_run is not None:
+            raise SystemExit(
+                f"run {append_id} has no successfully generated repos to evaluate")
+        raise SystemExit("no repos selected (check --repos / --repo-file)")
+
+    if not args.only_eval:
+        # Persist enough context to reproduce or resume the run. Secrets and
+        # proxy URLs are intentionally excluded.
+        ua.init_settings(append_id, {
+            "model_name": args.model_name, "env_mode": args.env_mode,
+            "eval_mode": getattr(args, "eval_mode", "full"),
+            "prd_type": args.prd_type, "user_model_name": args.user_model_name,
+            "difficulty": getattr(args, "difficulty", "normal"),
+            "critic_model_name": args.critic_model_name,
+            "query_count": args.query_count, "user_host": args.user_host,
+            "user_init_port": args.user_init_port, "user_query_port": args.user_query_port,
+            "user_eval_port": args.user_eval_port,
+            "anthropic_model": model_entries[0].get("ANTHROPIC_MODEL"),
+            "endpoint_model": (
+                model_entries[0].get("OPENHANDS_MODEL")
+                or model_entries[0].get("ANTHROPIC_MODEL")
+            ),
+            "agent_framework": getattr(args, "agent_framework", "claude-code"),
+            "selected_repos": repos,
+            "requested_repos": args.repos,
+            "repo_file": args.repo_file,
+            "limit": args.limit,
+            "concurrency": args.concurrency,
+            "max_turns": args.max_turns,
+            "timeout": args.timeout,
+            "scaffold": args.scaffold,
+            "evaluation_enabled": args.eval,
+            "proxy_enabled": bool(args.proxy),
+            "proxy_fallback_enabled": bool(args.proxy_fallback_file),
+        })
     print(f"selected {len(repos)} repo(s); concurrency={args.concurrency}")
 
     sem = asyncio.Semaphore(args.concurrency)
@@ -562,12 +643,20 @@ async def run_async(args) -> None:
             print(f"[reap] removed {reaped} leftover container(s) for this run")
     run_seconds = round(time.time() - t_start, 1)
 
-    ua.init_settings(append_id, {
-        "run_seconds": run_seconds,
-        "run_repos": len(repos),
-        "run_concurrency": args.concurrency,
-        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    if args.only_eval:
+        ua.init_settings(append_id, {
+            "last_eval_seconds": run_seconds,
+            "last_eval_repos": len(repos),
+            "last_eval_concurrency": args.concurrency,
+            "last_evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    else:
+        ua.init_settings(append_id, {
+            "run_seconds": run_seconds,
+            "run_repos": len(repos),
+            "run_concurrency": args.concurrency,
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
     print(f"\nDONE. append_id={append_id}  wall_time={run_seconds}s "
           f"({len(repos)} repos, concurrency={args.concurrency})")
 
@@ -578,46 +667,39 @@ async def run_async(args) -> None:
         print(f"summary: {out}")
     except Exception as e:  # noqa: BLE001
         print(f"[warn] summary generation failed: {e}")
-    print(f"settings: {C.SETTINGS_FILE}")
+    print(f"settings: {C.run_settings_path(append_id)}")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="ICAE-Bench evaluation harness")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def common(sp):
-        sp.add_argument("--env-mode", required=True,
-                        help="base (this release ships base-language images only)")
-        sp.add_argument("--eval-mode", default="full", choices=["lite", "full"],
-                        help="lite = first 50 aliases (smallest golden code); full = all")
-        sp.add_argument("--prd-type", default="fuzzy", choices=["fuzzy", "detailed"])
-        sp.add_argument("--difficulty", default="normal",
-                        choices=["normal", "easy", "medium"],
-                        help="fuzzy PRD difficulty: normal = fuzzy_prds/, "
-                             "easy = fuzzy_prds_easy/ (simplified PRDs), "
-                             "medium = fuzzy_prds_medium/ (mid-detail PRDs)")
-        sp.add_argument("--user-host", default="127.0.0.1")
-        sp.add_argument("--user-init-port", type=int, default=50001)
-        sp.add_argument("--user-query-port", type=int, default=50002)
-        sp.add_argument("--user-eval-port", type=int, default=50003,
+    def common(sp, *, eval_only: bool = False):
+        # Fixed release scope. These are internal settings rather than CLI
+        # choices because this release only supports base images + fuzzy PRDs.
+        sp.set_defaults(env_mode="base", prd_type="fuzzy")
+        if not eval_only:
+            sp.add_argument("--eval-mode", default="full", choices=["lite", "full"],
+                            help="lite = first 50 aliases (smallest golden code); full = all")
+            sp.add_argument("--difficulty", default="normal",
+                            choices=["normal", "easy", "medium"],
+                            help="fuzzy PRD difficulty: normal = fuzzy_prds/, "
+                                 "easy = fuzzy_prds_easy/ (simplified PRDs), "
+                                 "medium = fuzzy_prds_medium/ (mid-detail PRDs)")
+        sp.add_argument("--user-host", default=None if eval_only else "127.0.0.1")
+        sp.add_argument("--user-init-port", type=int, default=None if eval_only else 50001)
+        sp.add_argument("--user-query-port", type=int, default=None if eval_only else 50002)
+        sp.add_argument("--user-eval-port", type=int, default=None if eval_only else 50003,
                         help="User Agent stats port for Interaction Quality (d)")
-        sp.add_argument("--critic-model-name", default="Deepseek-V4-Flash",
+        sp.add_argument("--critic-model-name",
+                        default=None if eval_only else "Deepseek-V4-Flash",
                         help="key in model_list.json['Critic Model'] for Agentic eval (c)")
         sp.add_argument("--append-id", default=None)
-        sp.add_argument("--query-count", type=int, default=16)
         sp.add_argument("--repos", default=None,
                         help="comma-separated aliases (realcode@NNN) or real repo keys")
         sp.add_argument("--repo-file", default=None,
                         help="file with one alias or real repo key per line")
         sp.add_argument("--limit", type=int, default=None)
-        sp.add_argument("--resume-fill", action="store_true",
-                        help="single-phase resume: from the selected repos run ONLY "
-                             "the unfinished ones (never generated, or generation="
-                             "'running'); if there are none, run ONLY the failures "
-                             "(generation in 'error'/'skipped'). Already-'success' "
-                             "repos are excluded entirely (never re-evaluated). "
-                             "Requires --append-id and that no other orchestrator is "
-                             "live on this id.")
         sp.add_argument("--concurrency", type=int, default=10)
         sp.add_argument("--proxy", default=None, help="http(s) proxy for in-container installs")
         sp.add_argument("--no-proxy", default=None,
@@ -626,25 +708,28 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--proxy-fallback-file", default=None,
                         help="shell file exporting http(s)_proxy; used ONLY as a "
                              "one-shot retry when a direct (no-proxy) install fails")
-        sp.add_argument("--max-turns", type=int, default=200)
-        sp.add_argument("--timeout", type=float, default=7200)
-        sp.add_argument("--force", action="store_true", help="re-generate even if already done")
-        sp.add_argument("--reimage", action="store_true",
-                        help="eval-only: ignore the image tag recorded at generation "
-                             "time and re-derive it from the env-mode tar (under the "
-                             "tar-keyed anon tag). Use to RECOMPUTE pass rates for runs "
-                             "minted before the tag-collision fix, whose stored 'image' "
-                             "may resolve to the wrong (base) image on the host.")
-        sp.add_argument("--scaffold", action="store_true",
-                        help="also place the repo's public_test_cases/ folder at "
-                             "rcb_tests/public_test_cases in the agent's workdir "
-                             "(default off; off = identical to prior experiments)")
-        sp.add_argument("--agent-framework", default="claude-code",
-                        choices=["claude-code", "openhands"],
-                        help="agent engine for generation (default: claude-code)")
+        if eval_only:
+            sp.add_argument("--reimage", action="store_true",
+                            help="ignore the image tag recorded at generation time and "
+                                 "reload the fixed base-image tar")
+        else:
+            sp.add_argument("--query-count", type=int, default=16)
+            sp.add_argument("--resume-fill", action="store_true",
+                            help="run only unfinished repos; if none remain, retry failures "
+                                 "(requires --append-id)")
+            sp.add_argument("--max-turns", type=int, default=200)
+            sp.add_argument("--timeout", type=float, default=7200)
+            sp.add_argument("--force", action="store_true",
+                            help="re-generate even if already done")
+            sp.add_argument("--scaffold", action="store_true",
+                            help="place public test cases in the agent workdir")
+            sp.add_argument("--agent-framework", default="claude-code",
+                            choices=["claude-code", "openhands"],
+                            help="agent engine for generation (default: claude-code)")
+            sp.set_defaults(reimage=False)
 
     r = sub.add_parser("run", help="generate (and optionally evaluate)")
-    common(r)
+    common(r, eval_only=False)
     r.add_argument("--model-name", required=True, help="key in model_list.json")
     r.add_argument("--user-model-name", default="DeepSeek-V3.2",
                    choices=["Qwen3.5-4B", "Gemini-3.1-Flash-Lite", "DeepSeek-V3.2"],
@@ -653,10 +738,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--no-eval", dest="eval", action="store_false")
     r.set_defaults(eval=True, only_eval=False)
 
-    e = sub.add_parser("eval", help="objective eval over an existing append_id")
-    common(e)
-    e.add_argument("--model-name", default="Opus-4.8", help="(unused for eval, kept for symmetry)")
-    e.add_argument("--user-model-name", default="", help="(unused for eval)")
+    e = sub.add_parser("eval", help="re-score an existing append_id")
+    common(e, eval_only=True)
     e.set_defaults(eval=True, only_eval=True)
     return p
 

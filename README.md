@@ -1,240 +1,324 @@
-# ICAE-Bench
+<p align="center">
+  <img src="images/icon.png" alt="ICAE-Bench" width="160">
+</p>
 
-An **interactive** code-generation benchmark. Each task hands the agent-under-test a deliberately **fuzzy** Product Requirement Document (PRD). To fill the gaps the agent must hold a multi-turn conversation with a **User Agent (Oracle)** that answers clarifying questions strictly from a hidden ground-truth spec. The agent then implements the feature inside a language-specific Docker container, and the harness scores the result along four metric groups (dynamic tests, structural similarity, agentic review, and interaction quality).
+<h1 align="center">ICAE-Bench</h1>
 
-- **480 real-world tasks** across 12 languages (C#, C++, Dart, Go, Java, JavaScript, Kotlin, PHP, Python, Ruby, Rust, TypeScript). A `lite` subset of 50 is provided for quick runs.
-- **Anonymized**: the agent only ever sees an opaque alias `realcode@NNN`, never the real repository name or the golden source.
-- **Two agent frameworks**: `claude-code` (default, via `claude-agent-sdk`) and `openhands` (via the OpenHands SDK).
-- **Three PRD difficulties**: `normal`, `medium`, `easy`.
+<p align="center">
+  An interactive benchmark for evaluating coding agents under incomplete requirements.
+</p>
 
----
+<p align="center">
+  <a href="">
+    <img src="https://img.shields.io/badge/Paper-arXiv-B31B1B.svg" alt="Paper">
+  </a>
+  <a href="">
+    <img src="https://img.shields.io/badge/License-Apache%202.0-green.svg" alt="License">
+  </a>
+  <img alt="Tasks" src="https://img.shields.io/badge/tasks-480-4C8BF5?style=flat-square">
+  <img alt="Languages" src="https://img.shields.io/badge/languages-12-7B61FF?style=flat-square">
+</p>
 
-## 1. Repository layout
+## 🔥 What's News
 
-```
-icae_eval_anonymous/
-├── README.md
-├── requirements.txt              # core deps (claude-code framework)
-├── requirements-openhands.txt    # extra deps for --agent-framework openhands
-├── download_scaffold.sh          # pull base-language Docker images + data tars
-├── model_list.json               # TEMPLATE — fill in your gateways/tokens (SUT + Critic)
-├── repo_alias.json               # realcode@NNN -> {real key, language, LOC, ...}
-├── task.md                       # parameter + metric reference
-├── harness/                      # the evaluation engine
-│   ├── orchestrator.py           # CLI entry point (run | eval)
-│   ├── config.py                 # all paths + model_list lookup (relative + env-overridable)
-│   ├── agent_runner.py           # claude-code runner
-│   ├── openhands_runner.py       # openhands runner
-│   ├── docker_env.py             # per-repo container provisioning
-│   ├── evaluate.py               # (a) dynamic test execution
-│   ├── structural.py             # (b) structural assessment
-│   ├── agentic.py                # (c) agentic (critic) evaluation
-│   ├── summarize.py              # per-run report -> results/<id>/summary.md
-│   ├── analyze.py + repos.yaml   # vendored language extractors used by (b)
-│   └── prompt_templates/         # task_docker.md, task_agentic.md
-├── scripts/                      # convenience launchers (base env, lite)
-│   ├── _common.sh                # shared defaults + run_orchestrator wrapper
-│   ├── run_lite_base.sh          # one model, lite, base env
-│   └── run_all_lite_base.sh      # all models in parallel
-├── tools/
-│   └── write_fuzzy_prds.py       # (re)generate fuzzy_prds*/ from user_agent/prd_json*
-├── user_agent/                   # the Oracle service (separate from the harness)
-│   ├── main.py                   # 3-port FastAPI service (50001/50002/50003)
-│   ├── user_agent.py             # Oracle core (Messages API, oracle_data only)
-│   ├── user_model.json           # TEMPLATE — Oracle model endpoints
-│   ├── init.md                   # Oracle persona + interaction rules
-│   ├── fuzzy_suffix.md           # clarification block appended to every fuzzy PRD
-│   ├── example_client.py         # how the harness drives the three ports
-│   ├── prd_json/                 # 480 task specs (normal)   — fuzzy_prd + oracle_data + tests
-│   ├── prd_json_medium/          # 480 task specs (medium)
-│   └── prd_json_easy/            # 480 task specs (easy)
-├── fuzzy_prds/                   # generated raw PRDs (normal)  — start.md per alias
-├── fuzzy_prds_medium/            # generated raw PRDs (medium)
-└── fuzzy_prds_easy/              # generated raw PRDs (easy)
-```
+- **July 2026** — Released ICAE-Bench with 480 anonymized tasks, 12 programming languages, an interactive Oracle, and a four-part evaluation pipeline.
 
-Two large data artifacts are **not** bundled and must be downloaded (see §2):
+## 💡 Introduction
 
-| Artifact | Default unpack location | Env override | Used by |
-|---|---|---|---|
-| Base-language Docker images | `docker_lang_official/` | `ICAE_DOCKER_LANG_DIR` | container provisioning |
-| Golden original source (`realcode_repos.tar.lz4`) | `realcode_repos/<key>/` | `ICAE_GOLDEN_REPOS_DIR` | structural + agentic scoring |
-| Authoritative tests (`rcb_tests` tar) | `rcb_tests_repos/<key>/rcb_tests/` | `ICAE_RCB_TESTS_DIR` | dynamic test execution |
+ICAE-Bench gives a coding agent a deliberately fuzzy Product Requirement Document (PRD). The agent must clarify missing requirements with a hidden-spec **User Agent (Oracle)**, implement the project inside a language-specific container, and then face four groups of evaluation.
 
-All other paths are derived **relative to the repo root**, so you can clone/unzip this directory anywhere.
+- **Real-world scope:** 480 anonymized tasks across 12 programming languages.
+- **Interactive requirements:** answers come from hidden ground truth rather than improvised model responses.
+- **Multiple agent runtimes:** Claude Code by default, with optional OpenHands support.
+- **Four-part scoring:** dynamic tests, structural similarity, critic review, and interaction quality.
 
----
 
-## 2. Download the data
+<p align="center">
+  <img src="images/vibe_coding_overview.png" alt="Overview of the interactive requirement clarification setting of ICAE-Bench." width="75%">
+</p>
 
-> If your network needs a proxy for the public internet (Docker Hub / Zenodo), enable it first, e.g. `source ~/proxy.sh`.
+
+
+## 🚀 Quick Start
+
+Run all commands from the repository root.
+
+### 1. Install and download
 
 ```bash
-bash download_scaffold.sh
+bash setup.sh
 ```
 
-This script:
+The setup script:
 
-1. `docker pull` + `docker save` the 12 base-language images into `docker_lang_official/` (Python 3.11, Node 20, Go 1.22, Java 17, … plus the Kotlin image fetched from Zenodo).
-2. Downloads and unpacks the **golden source** tar `realcode_repos.tar.lz4` into `realcode_repos/<username>__<repo>/`.
-3. Downloads and unpacks the **authoritative tests** tar into `rcb_tests_repos/<username>__<repo>/rcb_tests/`.
+1. selects an installed Python 3.11 or newer;
+2. creates `.venv` and installs the Python dependencies;
+3. downloads the language images, golden repositories, and authoritative tests.
 
-> The two data-tar download URLs are filled in at the bottom of `download_scaffold.sh` (the Zenodo records). If you unpack them elsewhere, point `ICAE_GOLDEN_REPOS_DIR` / `ICAE_RCB_TESTS_DIR` at those locations instead.
+It is safe to run again: completed downloads are reused and interrupted downloads resume when possible.
 
-Docker must be installed and runnable by the current user.
+| Option | Purpose |
+|---|---|
+| `bash setup.sh --skip-download` | Install Python dependencies only |
+| `bash setup.sh --openhands` | Also install OpenHands; requires Python 3.12+ |
+| `PYTHON=/path/to/python bash setup.sh` | Use a specific Python interpreter |
 
----
+### 2. Configure the models
 
-## 3. Install
+Replace the `<...>` placeholders only for the models you plan to use.
 
-```bash
-python -m venv .venv && source .venv/bin/activate   # Python >= 3.11
-pip install -r requirements.txt
+| Configuration | Role |
+|---|---|
+| `model_list.json` → `Tested Model` | Coding agent being evaluated |
+| `model_list.json` → `Critic Model` | Reviewer used by agentic scoring |
+| `user_agent/user_model.json` | Oracle that answers clarification questions |
 
-# Only if you intend to run --agent-framework openhands (Python >= 3.12):
-pip install -r requirements-openhands.txt
+Model names passed to the runner are the JSON keys, such as `Opus-4.8`, `GLM-5.1`, or `GPT-5.5`.
+
+#### Claude Code user settings
+
+The default runner loads Claude Code’s user and project settings. Create or merge `~/.claude/settings.json`:
+
+```json
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "<your-token>",
+    "ANTHROPIC_BASE_URL": "<https://your-anthropic-gateway>",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "<provider-opus-model-id>",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "<provider-sonnet-model-id>",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "<provider-haiku-model-id>",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_THINKING_TYPE": "adaptive",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    "CLAUDE_CODE_EXTRA_BODY": "{\"thinking\":{\"type\":\"adaptive\"}}"
+  },
+  "skipDangerousModePermissionPrompt": true
+}
 ```
 
-You also need the **Claude Code CLI** on your `$PATH` for the default `claude-code` framework. If it lives at a custom path, set:
+`model_list.json` remains the source of the tested endpoint for each experiment. Its model ID, base URL, and token are injected into the runner process; the user settings above provide machine-wide Claude Code defaults and behavior.
+
+`CLAUDE_CODE_THINKING_TYPE` is gateway/version specific and may be removed when the deployment does not use it. `skipDangerousModePermissionPrompt` belongs in the user settings file, not a project settings file.
+
+> This configuration enables unattended permission bypass. Use it only on a dedicated benchmark machine or in a properly isolated environment. Never commit real credentials.
 
 ```bash
-export ICAE_CLAUDE_CLI=/path/to/claude
+chmod 600 ~/.claude/settings.json
 ```
 
----
-
-## 4. Configure model endpoints
-
-Both registries ship as **templates** with `<...>` placeholders — fill in your own gateway URLs and tokens. Nothing in this repo contains real credentials.
-
-- **`model_list.json`** — the agent-under-test (`Tested Model`) and the Critic reviewer (`Critic Model`). Each model name maps to one endpoint dict or a list of interchangeable endpoints (load-balanced round-robin). An endpoint carries `ANTHROPIC_*` (for the claude-code runner) and/or `OPENHANDS_*` (for openhands).
-- **`user_agent/user_model.json`** — the Oracle's own model(s), keyed by `user_model_name` (e.g. `DeepSeek-V3.2`, `Gemini-3.1-Flash-Lite`).
-
----
-
-## 5. Start the User Agent (Oracle)
-
-The Oracle is a standalone 3-port FastAPI service that runs in **one process**:
-
-| Port | Service | Purpose |
-|---|---|---|
-| 50001 | Init | validate the secret key, mint an `append_id` |
-| 50002 | Interaction | answer clarifying questions for `{append_id, task_id}` |
-| 50003 | Stats | report interaction-quality metrics for an `append_id` |
+### 3. Run
 
 ```bash
-# Do NOT route this through a github proxy — it binds local ports.
-python user_agent/main.py
+./run.sh
 ```
 
-It listens on `0.0.0.0:50001/50002/50003`. The secret init key is the demo constant `INIT_KEY` in `user_agent/main.py` (and mirrored in `harness/config.py`); change both for a real deployment. See `user_agent/README.md` for the full API contract and `user_agent/example_client.py` for a worked client example.
+The default command performs a one-repository smoke test with `Opus-4.8`. It uses `.venv`, starts the local Oracle when needed, waits for all three Oracle ports, runs the evaluation, and stops only the Oracle process it started.
 
-> **Model choice matters.** The Oracle relies on the caller-supplied `system` prompt to take on the reviewer persona. A gateway that bakes in a fixed identity and ignores/overrides `system` will not work — pick a clean pass-through deployment that respects `system`.
+| Goal | Command |
+|---|---|
+| Smoke test with another model | `./run.sh GLM-5.1` |
+| Run all 50 lite tasks | `RUN_LIMIT=50 ./run.sh Opus-4.8` |
+| Use an easier PRD set | `./run.sh Opus-4.8 --difficulty easy` |
+| Use a different Oracle model | `USER_MODEL_NAME=Gemini-3.1-Flash-Lite ./run.sh Opus-4.8` |
+| Use a remote Oracle | `USER_HOST=10.0.0.8 ./run.sh Opus-4.8` |
+| Run with OpenHands | `AGENT_FRAMEWORK=openhands ./run.sh GPT-5.5` |
 
----
+> A 50-task run can make many model calls and take a long time. Start with the default smoke test.
 
-## 6. Generate the raw fuzzy PRDs (one-time)
+## 🔍 How It Works
 
-The `fuzzy_prds*/` trees are already populated, but you can regenerate them from the authoritative task specs in `user_agent/prd_json*` at any time:
+1. The harness selects an anonymized task such as `realcode@001`.
+2. The coding agent receives a fuzzy PRD and a clean language container.
+3. The agent asks the Oracle for missing requirements, up to the configured query budget.
+4. The implementation is generated without exposing the real repository or golden source.
+5. Host-side evaluators run tests and compare the result with the hidden reference.
 
-```bash
-python tools/write_fuzzy_prds.py --difficulty all   # or: normal | medium | easy
+The benchmark covers C#, C++, Dart, Go, Java, JavaScript, Kotlin, PHP, Python, Ruby, Rust, and TypeScript.
+
+## 📊 Evaluation
+
+| Group | What is measured |
+|---|---|
+| Dynamic test execution | Public, hidden/native, and enhanced test pass rates |
+| Structural assessment | File count, LOC, class similarity, and method similarity |
+| Agentic evaluation | Semantic similarity, API similarity, and design quality |
+| Interaction quality | Constraint coverage, fallback rate, and query-budget usage |
+
+Each run writes its generated code, logs, scores, and reproducibility settings under one `append_id`:
+
+```text
+results/
+├── settings.json
+└── <append_id>/
+    ├── settings.json
+    ├── summary.md
+    ├── _logs/
+    ├── _eval/
+    └── <alias>/
 ```
 
----
+The main report is:
 
-## 7. Run an evaluation
-
-### Quick start (convenience scripts)
-
-```bash
-# One model, lite (50 repos), base env, concurrency 4:
-bash scripts/run_lite_base.sh Opus-4.8
-
-# All default models in parallel (each gets its own append_id):
-bash scripts/run_all_lite_base.sh
-
-# Override Oracle host / model via env:
-USER_HOST=127.0.0.1 USER_MODEL_NAME=DeepSeek-V3.2 bash scripts/run_lite_base.sh GLM-5.1
-```
-
-### Direct invocation
-
-```bash
-python -m harness.orchestrator run \
-    --model-name        Opus-4.8 \
-    --env-mode          base \
-    --eval-mode         lite \
-    --prd-type          fuzzy \
-    --difficulty        normal \
-    --agent-framework   claude-code \
-    --user-model-name   DeepSeek-V3.2 \
-    --critic-model-name Deepseek-V4-Flash \
-    --query-count       16 \
-    --concurrency       4 \
-    --user-host         127.0.0.1
+```text
+results/<append_id>/summary.md
 ```
 
 Re-score an existing run without regenerating code:
 
 ```bash
-python -m harness.orchestrator eval --append-id <append_id>
+.venv/bin/python -m harness.orchestrator eval --append-id <append_id>
 ```
 
-### Key parameters
+The command reuses the run configuration and generated repository list saved in `results/<append_id>/settings.json`. Add `--repos` or `--limit` to evaluate a smaller subset.
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--model-name` | (required) | key in `model_list.json["Tested Model"]` |
-| `--env-mode` | (required) | `base` (this release ships base-language images only) |
-| `--eval-mode` | `lite` | `lite` = first 50 repos, `full` = all 480 |
-| `--prd-type` | `fuzzy` | `fuzzy` (Oracle interaction) — the mode shipped in this release |
-| `--difficulty` | `normal` | `normal` / `medium` / `easy` PRD detail level |
-| `--agent-framework` | `claude-code` | `claude-code` or `openhands` |
-| `--user-model-name` | `DeepSeek-V3.2` | Oracle model (key in `user_model.json`: DeepSeek-V3.2 / Gemini-3.1-Flash-Lite / Qwen3.5-4B) |
-| `--critic-model-name` | `Deepseek-V4-Flash` | reviewer for the agentic metric |
-| `--query-count` | `16` | max clarifying questions per repo |
-| `--append-id` | — | resume an existing run; omit to mint a fresh one |
-| `--concurrency` | `10` | repos generated in parallel |
-| `--user-host` / `--user-*-port` | `127.0.0.1` / `50001-3` | Oracle endpoint |
-| `--repos` | all in scope | restrict to specific aliases, e.g. `realcode@001` |
+## 🛠️ Advanced Usage
 
-A fresh run (no `--append-id`) mints a new id from the Oracle and writes:
+<details>
+<summary><strong>Direct harness invocation</strong></summary>
 
-```
-results/settings.json              # registry: append_id -> config
-results/<append_id>/settings.json  # this run's config + per-repo results
-results/<append_id>/<alias>/       # the agent's working tree (bind-mounted)
-results/<append_id>/_eval/<alias>/ # structural.json / subjective.json / objective.json
-```
-
-Generate a human-readable report:
+Start the Oracle separately, then run:
 
 ```bash
-python -m harness.summarize <append_id>   # -> results/<append_id>/summary.md
+.venv/bin/python -m harness.orchestrator run \
+  --model-name Opus-4.8 \
+  --eval-mode lite \
+  --difficulty normal \
+  --agent-framework claude-code \
+  --user-model-name DeepSeek-V3.2 \
+  --critic-model-name Deepseek-V4-Flash \
+  --query-count 16 \
+  --concurrency 4 \
+  --user-host 127.0.0.1
 ```
 
----
+Useful selectors:
 
-## 8. Metrics
+| Flag | Meaning |
+|---|---|
+| `--eval-mode lite` | First 50 tasks |
+| `--eval-mode full` | All 480 tasks |
+| `--difficulty normal\|medium\|easy` | Select PRD detail level |
+| `--repos realcode@001,realcode@002` | Select explicit tasks |
+| `--limit N` | Truncate the selected task list |
+| `--append-id ID` | Resume an existing run |
 
-| Group | Source | Metrics |
+</details>
+
+<details>
+<summary><strong>Run the Oracle manually</strong></summary>
+
+```bash
+.venv/bin/python user_agent/main.py
+```
+
+The service listens on three ports in one process:
+
+| Port | Service | Purpose |
 |---|---|---|
-| (a) Dynamic Test Execution | container run, host-side stdout compare | Public / Native (hidden) / Enhanced pass rate |
-| (b) Structural Assessment | host-side AST/regex over golden vs generated | File Count / LOC, Class Similarity, Method Similarity |
-| (c) Agentic Evaluation | Critic Model, single forced-tool call | Semantic Similarity, API Similarity, Design Quality |
-| (d) Interaction Quality | Oracle stats endpoint (50003) | Constraint Coverage, Fallback Rate, Budget Usage Rate |
+| `50001` | Init | Mint and register an `append_id` |
+| `50002` | Interaction | Answer clarification questions |
+| `50003` | Stats | Return interaction-quality metrics |
 
-Canonical column mapping in `summarize.py`: `public_visible → Public`, `hidden → Native`, `enhanced → Enhanced`. Overall is the case-micro pass rate over hidden + enhanced cases.
+The Oracle must use a model deployment that respects the caller-supplied `system` prompt. See [`user_agent/README.md`](user_agent/README.md) for its API and behavior.
 
----
+</details>
 
-## 9. Environment variables
+<details>
+<summary><strong>Download or repair data only</strong></summary>
+
+```bash
+bash download_scaffold.sh
+```
+
+The script prepares:
+
+| Artifact | Default location |
+|---|---|
+| 11 language images for 12 languages | `docker_lang_official/` |
+| Golden source repositories | `realcode_repos/` |
+| Authoritative test repositories | `rcb_tests_repos/` |
+
+JavaScript and TypeScript share the Node.js image. Data directories may be relocated with `ICAE_DOCKER_LANG_DIR`, `ICAE_GOLDEN_REPOS_DIR`, and `ICAE_RCB_TESTS_DIR`.
+
+</details>
+
+<details>
+<summary><strong>Lower-level convenience scripts</strong></summary>
+
+These scripts expect the Oracle to be managed separately:
+
+```bash
+# One configured model over the 50-task lite set
+bash scripts/run_lite_base.sh Opus-4.8
+
+# All configured models compatible with the selected framework
+bash scripts/run_all_lite_base.sh
+```
+
+The all-model command runs models in parallel and can multiply load on Docker, the Oracle, the Critic, and shared API quotas.
+
+</details>
+
+<details>
+<summary><strong>Regenerate fuzzy PRDs</strong></summary>
+
+The generated PRD trees are already included. To rebuild them from the authoritative task JSON:
+
+```bash
+.venv/bin/python tools/write_fuzzy_prds.py --difficulty all
+```
+
+Use `normal`, `medium`, or `easy` instead of `all` to regenerate one tree.
+
+</details>
+
+## ⚙️ Environment Variables
 
 | Variable | Purpose |
 |---|---|
-| `ICAE_GOLDEN_REPOS_DIR` | golden original-source root (`realcode_repos.tar.lz4`) |
-| `ICAE_RCB_TESTS_DIR` | authoritative test root (`rcb_tests` tar) |
-| `ICAE_DOCKER_LANG_DIR` | base-image tar directory |
-| `ICAE_CLAUDE_CLI` | path to the `claude` CLI binary |
-| `PROXY` / `PROXY_FALLBACK_FILE` | in-container dependency-install proxy (see `scripts/_common.sh`) |
+| `PYTHON` | Interpreter used by `setup.sh` |
+| `MODEL_NAME` | Default tested-model key used by `run.sh` |
+| `RUN_LIMIT` | Repository limit used by `run.sh`; defaults to `1` |
+| `CONCURRENCY` | Parallel repository count |
+| `AGENT_FRAMEWORK` | `claude-code` or `openhands` |
+| `USER_HOST` | Oracle host |
+| `USER_MODEL_NAME` | Oracle model key |
+| `CRITIC_MODEL_NAME` | Critic model key |
+| `ICAE_CLAUDE_CLI` | Custom path to the Claude Code CLI |
+| `ICAE_DOCKER_LANG_DIR` | Language-image directory |
+| `ICAE_GOLDEN_REPOS_DIR` | Golden-source directory |
+| `ICAE_RCB_TESTS_DIR` | Authoritative-test directory |
+| `PROXY` | Proxy injected into evaluation containers |
+| `PROXY_FALLBACK_FILE` | Shell file providing the one-shot fallback proxy |
+
+## 🗂️ Project Map
+
+| Path | Purpose |
+|---|---|
+| `harness/` | Generation, container provisioning, evaluation, and reporting |
+| `user_agent/` | Oracle service and hidden task specifications |
+| `scripts/` | Lower-level experiment launchers |
+| `tools/` | PRD generation utilities |
+| `fuzzy_prds*/` | Generated fuzzy PRD trees |
+| `model_list.json` | Tested-model and Critic endpoints |
+| `repo_alias.json` | Anonymous task-to-repository metadata |
+| `setup.sh` | Environment and data bootstrap |
+| `run.sh` | Recommended experiment entry point |
+
+---
+
+<a id="citation"></a>
+
+## 📖 Citation
+
+If you find **ICAE-Bench** useful for your research, please consider citing our paper:
+
+```bibtex
+@article{icae2026,
+  title={ICAE-Bench: Evaluating Coding Agents as Interactive Project Builders},
+  author={Zhongyuan Peng, Dan Huang, Chuyu Zhang, Caijun Xu, Changyi Xiao, Shibo Hong, David Lo, Lin Qiu, Xuezhi Cao, Jiyuan He, Yixin Cao},
+  journal={arXiv preprint arXiv:2607.xxxxx},
+  year={2026}
+}
+```

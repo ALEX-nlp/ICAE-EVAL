@@ -9,8 +9,6 @@ An interactive code-generation evaluation platform built on `claude-agent-sdk` (
 - `model_name`: maps the agent-under-test's endpoint from `model_list.json` `"Tested Model"`.
 - `critic_model_name` (optional, default `"Deepseek-V4-Flash"`): the reviewer model for Agentic evaluation, mapped from `model_list.json` `"Critic Model"`.
 - `eval_mode`: `["lite", "full"]`. `lite` evaluates only the first 50 repos (`realcode@001–050`); `full` evaluates all 480.
-- `env_mode`: `base` in this release — the PRD is placed into the base image of the repo's programming language (`docker_lang_official/<lang>.tar`, downloaded by `download_scaffold.sh`).
-- `prd_type`: `fuzzy` — reads `fuzzy_prds*/<alias>/start.md` and goes through Oracle interaction.
 - `difficulty`: `["normal", "easy", "medium"]`, corresponding to `fuzzy_prds/`, `fuzzy_prds_easy/`, and `fuzzy_prds_medium/` (increasing PRD detail).
 - `user_host` (optional, default `"127.0.0.1"`): host running the User Agent.
 - `user_init_port` / `user_query_port` / `user_eval_port` (optional, default 50001/50002/50003): init / question / interaction-quality-stats ports. See `user_agent/example_client.py`.

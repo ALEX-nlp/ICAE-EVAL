@@ -1,66 +1,129 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Download the base-language Docker images and benchmark data. The script is
+# restart-safe: completed files/directories are skipped and partial HTTP
+# downloads are resumed.
+#
+set -euo pipefail
 
-# Classic stable base images for 12 programming languages (prefer LTS / most-used versions from mainstream repos)
-images=(
-  "mcr.microsoft.com/dotnet/sdk:8.0"     # C#         (.NET 8 LTS, supported until 2026/11)
-  "gcc:12"                               # C++        (default gcc on Debian bookworm, mainstream compiler version)
-  "dart:3.5"                             # Dart       (stable Dart bundled with Flutter 3.24)
-  "golang:1.22"                          # Go         (widely used stable release, best go.mod compatibility)
-  "eclipse-temurin:17"                   # Java       (Java 17 LTS, the most common production version)
-  "node:20"                              # JavaScript & TypeScript (Node 20 LTS, shared environment)
-  "php:8.2"                              # PHP        (PHP 8.2, best framework compatibility)
-  "python:3.11"                          # Python     (3.11 has the widest compatibility and library support)
-  "ruby:3.2"                             # Ruby       (Ruby 3.2 stable, mainstream Rails pairing)
-  "rust:1.81"                            # Rust       (recent stable release, edition 2021 compatible)
-)
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
 
-# Output directory: docker_lang_official under the current folder
-output_dir="docker_lang_official"
-mkdir -p "$output_dir"
-
-echo "Starting batch download and export of classic stable Docker images..."
-
-for img in "${images[@]}"; do
-  echo "======================================"
-  echo "Pulling: $img"
-  docker pull "$img"
-
-  # Format file name: replace slashes and colons with underscores to avoid breaking the file path
-  # Special case: strip the mcr.microsoft.com/ prefix to keep the generated .tar name short and clean
-  clean_name=$(echo "$img" | sed 's|mcr.microsoft.com/||g' | tr '/:' '_')
-  filename="${output_dir}/${clean_name}.tar"
-
-  echo "Exporting to: $filename"
-  docker save -o "$filename" "$img"
+for command_name in docker curl tar lz4; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "[download] missing command: $command_name" >&2
+        exit 1
+    fi
 done
 
-# The Kotlin image is not pulled from Docker Hub; download the pre-exported .tar anonymously from Zenodo
-zenodo_url="https://zenodo.org/records/21058690/files/kotlin_1.9.25.tar?download=1"
-kotlin_file="${output_dir}/kotlin_1.9.25.tar"
-echo "======================================"
-echo "Downloading anonymously from Zenodo: kotlin_1.9.25.tar"
-curl -L -o "$kotlin_file" "$zenodo_url"
-echo "Saved to: $kotlin_file"
+if ! docker info >/dev/null 2>&1; then
+    echo "[download] Docker is installed but the daemon is not available." >&2
+    echo "[download] Start Docker and make sure the current user can run 'docker info'." >&2
+    exit 1
+fi
 
-echo "======================================"
-echo "All done! All classic stable .tar files are saved in the $output_dir directory."
+download_file() {
+    local url="$1"
+    local target="$2"
+    local partial="${target}.part"
 
-# Download the RealCode repositories dataset anonymously from Zenodo
-repos_url="https://zenodo.org/records/21071802/files/realcode_repos.tar.lz4?download=1"
-repos_file="realcode_repos.tar.lz4"
-echo "======================================"
-echo "Downloading anonymously from Zenodo: realcode_repos.tar.lz4"
-curl -L -o "$repos_file" "$repos_url"
-echo "Saved to: $repos_file"
-# Decompress with: lz4 -d realcode_repos.tar.lz4 | tar -xf -
+    if [ -s "$target" ]; then
+        echo "[download] exists, skipping: $target"
+        return
+    fi
 
-# Download the RCB test repositories dataset anonymously from Zenodo
-rcb_url="https://zenodo.org/records/21076652/files/rcb_tests_repos.tar.gz?download=1"
-rcb_file="rcb_tests_repos.tar.gz"
-echo "======================================"
-echo "Downloading anonymously from Zenodo: rcb_tests_repos.tar.gz"
-curl -L -o "$rcb_file" "$rcb_url"
-echo "Saved to: $rcb_file"
-# Extract with: tar -xzf rcb_tests_repos.tar.gz
+    echo "[download] fetching: $target"
+    curl --fail --location --retry 3 --continue-at - --output "$partial" "$url"
+    mv "$partial" "$target"
+}
 
+dataset_ready() {
+    local directory="$1"
+    local marker="$directory/.icae-download-complete"
+    local directory_count
 
+    [ -f "$marker" ] && return 0
+    [ -d "$directory" ] || return 1
+
+    # Both published datasets contain one top-level directory for each of the
+    # 480 benchmark repositories. This also recognizes complete directories
+    # unpacked by older versions of this script that did not write a marker.
+    directory_count="$(
+        find "$directory" -mindepth 1 -maxdepth 1 -type d -print |
+            awk 'END { print NR + 0 }'
+    )"
+    if [ "$directory_count" -ge 480 ]; then
+        touch "$marker"
+        return 0
+    fi
+    return 1
+}
+
+# Eleven images cover the twelve benchmark languages (JavaScript and TypeScript
+# share Node.js). Kotlin is distributed as a pre-exported tar below.
+images=(
+    "mcr.microsoft.com/dotnet/sdk:8.0"
+    "gcc:12"
+    "dart:3.5"
+    "golang:1.22"
+    "eclipse-temurin:17"
+    "node:20"
+    "php:8.2"
+    "python:3.11"
+    "ruby:3.2"
+    "rust:1.81"
+)
+
+output_dir="$ROOT/docker_lang_official"
+mkdir -p "$output_dir"
+
+for image in "${images[@]}"; do
+    clean_name="$(printf '%s' "$image" | sed 's|mcr.microsoft.com/||g' | tr '/:' '_')"
+    target="$output_dir/${clean_name}.tar"
+    if [ -s "$target" ]; then
+        echo "[download] exists, skipping: ${target#$ROOT/}"
+        continue
+    fi
+
+    echo "[download] pulling Docker image: $image"
+    docker pull "$image"
+    echo "[download] exporting: ${target#$ROOT/}"
+    docker save --output "${target}.part" "$image"
+    mv "${target}.part" "$target"
+done
+
+download_file \
+    "https://zenodo.org/records/21058690/files/kotlin_1.9.25.tar?download=1" \
+    "$output_dir/kotlin_1.9.25.tar"
+
+repos_file="$ROOT/realcode_repos.tar.lz4"
+download_file \
+    "https://zenodo.org/records/21071802/files/realcode_repos.tar.lz4?download=1" \
+    "$repos_file"
+if dataset_ready "$ROOT/realcode_repos"; then
+    echo "[download] already unpacked: realcode_repos/"
+else
+    echo "[download] unpacking: realcode_repos.tar.lz4"
+    lz4 --decompress --stdout "$repos_file" | tar -xf - -C "$ROOT"
+    if ! dataset_ready "$ROOT/realcode_repos"; then
+        echo "[download] realcode_repos/ is incomplete after extraction." >&2
+        exit 1
+    fi
+fi
+
+rcb_file="$ROOT/rcb_tests_repos.tar.gz"
+download_file \
+    "https://zenodo.org/records/21076652/files/rcb_tests_repos.tar.gz?download=1" \
+    "$rcb_file"
+if dataset_ready "$ROOT/rcb_tests_repos"; then
+    echo "[download] already unpacked: rcb_tests_repos/"
+else
+    echo "[download] unpacking: rcb_tests_repos.tar.gz"
+    tar -xzf "$rcb_file" -C "$ROOT"
+    if ! dataset_ready "$ROOT/rcb_tests_repos"; then
+        echo "[download] rcb_tests_repos/ is incomplete after extraction." >&2
+        exit 1
+    fi
+fi
+
+echo "[download] all language images and benchmark data are ready."
