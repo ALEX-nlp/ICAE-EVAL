@@ -9,8 +9,6 @@
 - `model_name`：从 `model_list.json` 的 "Tested Model" 映射被测模型的端点参数。
 - `critic_model_name`（选填，default="Deepseek-V4-Flash"）：用于 Agentic 评估的评审模型，从 `model_list.json` 的 "Critic Model" 映射。
 - `eval_mode`：["lite", "full"]。lite 只评测前 50 个仓库（realcode@001–050），full 全量 480。
-- `env_mode`：本发布版为 `base`：把 PRD 放进仓库对应编程语言的基础镜像（`docker_lang_official/<lang>.tar`，由 `download_scaffold.sh` 下载）。
-- `prd_type`：`fuzzy`，读 `fuzzy_prds*/<alias>/start.md` 并走 Oracle 交互。
 - `difficulty`：["normal", "easy", "medium"]，分别对应 `fuzzy_prds/`、`fuzzy_prds_easy/`、`fuzzy_prds_medium/`（PRD 详略程度递增）。
 - `user_host`（选填，default="127.0.0.1"）：User Agent 所在主机。
 - `user_init_port` / `user_query_port` / `user_eval_port`（选填，默认 50001/50002/50003）：初始化 / 提问 / 交互质量统计端口。参考 `user_agent/example_client.py`。

@@ -5,11 +5,16 @@
 # wrapper.
 # ============================================================
 
-# Python interpreter (must have claude_agent_sdk / anthropic installed).
-PYTHON="${PYTHON:-$(command -v python3)}"
-
 # Repo root (this file lives at <root>/scripts/).
 ICAE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Python interpreter (must have claude_agent_sdk / anthropic installed). Prefer
+# the environment created by setup.sh so callers do not need to activate it.
+if [ -z "${PYTHON:-}" ] && [ -x "$ICAE_ROOT/.venv/bin/python" ]; then
+    PYTHON="$ICAE_ROOT/.venv/bin/python"
+else
+    PYTHON="${PYTHON:-$(command -v python3)}"
+fi
 
 # http(s) proxy used INSIDE containers when installing dependencies. Disabled by
 # default (direct download); the eval layer does a single proxied retry only if a
@@ -31,7 +36,6 @@ USER_EVAL_PORT="${USER_EVAL_PORT:-50003}"
 # Experiment defaults (task scripts may override).
 USER_MODEL_NAME="${USER_MODEL_NAME:-DeepSeek-V3.2}"
 CRITIC_MODEL_NAME="${CRITIC_MODEL_NAME:-Deepseek-V4-Flash}"
-PRD_TYPE="${PRD_TYPE:-fuzzy}"
 QUERY_COUNT="${QUERY_COUNT:-16}"
 
 # Agent-under-test framework: claude-code (default) | openhands
@@ -41,14 +45,24 @@ AGENT_FRAMEWORK="${AGENT_FRAMEWORK:-claude-code}"
 # the rest is passed through verbatim.
 run_orchestrator() {
     local subcmd="$1"; shift
+    local launcher_args=(
+        --user-host "$USER_HOST"
+        --user-init-port "$USER_INIT_PORT"
+        --user-query-port "$USER_QUERY_PORT"
+        --user-eval-port "$USER_EVAL_PORT"
+    )
+    if [ "$subcmd" = "run" ]; then
+        launcher_args+=(--agent-framework "$AGENT_FRAMEWORK")
+    fi
+    if [ -n "$PROXY" ]; then
+        launcher_args+=(--proxy "$PROXY")
+    fi
+    if [ -n "$PROXY_FALLBACK_FILE" ]; then
+        launcher_args+=(--proxy-fallback-file "$PROXY_FALLBACK_FILE")
+    fi
+
     cd "$ICAE_ROOT"
     exec "$PYTHON" -m harness.orchestrator "$subcmd" \
-        --user-host       "$USER_HOST" \
-        --user-init-port  "$USER_INIT_PORT" \
-        --user-query-port "$USER_QUERY_PORT" \
-        --user-eval-port  "$USER_EVAL_PORT" \
-        --agent-framework "$AGENT_FRAMEWORK" \
-        ${PROXY:+--proxy "$PROXY"} \
-        ${PROXY_FALLBACK_FILE:+--proxy-fallback-file "$PROXY_FALLBACK_FILE"} \
+        "${launcher_args[@]}" \
         "$@"
 }
