@@ -2,14 +2,11 @@
   <img src="images/icon.png" alt="ICAE-Bench" width="160">
 </p>
 
-<h1 align="center">ICAE-Bench</h1>
+<h1 align="center">ICAE-Bench: Evaluating Coding Agents as Interactive Project Builders</h1>
+
 
 <p align="center">
-  An interactive benchmark for evaluating coding agents under incomplete requirements.
-</p>
-
-<p align="center">
-  <a href="">
+  <a href="https://arxiv.org/pdf/2607.21217">
     <img src="https://img.shields.io/badge/Paper-arXiv-B31B1B.svg" alt="Paper">
   </a>
   <a href="">
@@ -318,7 +315,7 @@ If you find **ICAE-Bench** useful for your research, please consider citing our 
 @article{icae2026,
   title={ICAE-Bench: Evaluating Coding Agents as Interactive Project Builders},
   author={Zhongyuan Peng, Dan Huang, Chuyu Zhang, Caijun Xu, Changyi Xiao, Shibo Hong, David Lo, Lin Qiu, Xuezhi Cao, Jiyuan He, Yixin Cao},
-  journal={arXiv preprint arXiv:2607.xxxxx},
+  journal={arXiv preprint arXiv:2607.21217},
   year={2026}
 }
 ```
