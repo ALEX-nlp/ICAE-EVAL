@@ -188,6 +188,9 @@ def provision(alias: str, code_path: Path, prd_text: str, tar_path: Path, *,
            "--name", name,
            "-v", f"{code_path}:{WORKDIR}",
            "-w", WORKDIR]
+    # Blackhole the published-dataset hosts so the agent cannot download the
+    # benchmark ground truth (expected_output / golden source) at gen time.
+    cmd += C.docker_egress_args()
     if proxy:
         cmd += ["-e", f"http_proxy={proxy}", "-e", f"https_proxy={proxy}",
                 "-e", f"HTTP_PROXY={proxy}", "-e", f"HTTPS_PROXY={proxy}"]

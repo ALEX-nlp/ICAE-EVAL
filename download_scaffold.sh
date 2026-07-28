@@ -126,4 +126,29 @@ else
     fi
 fi
 
+# Gated PRD / oracle / alias bundle. These are deliberately NOT committed to the
+# public GitHub repo so an agent-under-test cannot read the full PRDs (all fuzz
+# levels), the oracle prd_json, or the alias->repo mapping. They live on Zenodo
+# and extract back to their original repo-root paths; eval/gen containers also
+# blackhole zenodo.org so the answers are unreachable at run time either way.
+prd_bundle="$ROOT/icae_prd_bundle.tar.gz"
+prd_marker="$ROOT/.icae-prd-bundle-complete"
+download_file \
+    "https://zenodo.org/records/21639512/files/icae_prd_bundle.tar.gz?download=1" \
+    "$prd_bundle"
+if [ -f "$prd_marker" ]; then
+    echo "[download] already unpacked: PRD/oracle/alias bundle"
+else
+    echo "[download] unpacking: icae_prd_bundle.tar.gz"
+    tar -xzf "$prd_bundle" -C "$ROOT"
+    # Sanity-check a representative extracted path before writing the marker.
+    if [ -f "$ROOT/repo_alias.json" ] && [ -d "$ROOT/fuzzy_prds" ] \
+       && [ -d "$ROOT/user_agent/prd_json" ]; then
+        touch "$prd_marker"
+    else
+        echo "[download] PRD bundle is incomplete after extraction." >&2
+        exit 1
+    fi
+fi
+
 echo "[download] all language images and benchmark data are ready."

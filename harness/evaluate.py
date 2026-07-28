@@ -6,11 +6,13 @@ generation image:
   1. stage the generated code,
   2. run a fresh container from the SAME image used for generation, inject the
      three authoritative case dirs (public_test_cases / test_cases /
-     enhanced_test_cases) from <REPOS_DIR>/<repo>/rcb_tests,
+     enhanced_test_cases) from <REPOS_DIR>/<repo>/rcb_tests WITH expected_output
+     STRIPPED (the untrusted test.sh only ever sees inputs, never the answers),
   3. run the agent's own `rcb_tests/test.sh --cases-dir <sub>`, capture each
      case's stdout,
   4. byte-compare captured stdout against the authoritative `expected_output`
-     (host side, so we never trust the agent's self-reported PASS/FAIL),
+     (host side, from the UNSTRIPPED cases, so we never trust the agent's
+     self-reported PASS/FAIL nor let it read the answers it is graded on),
   5. write objective.json (public_visible / hidden / enhanced  P/T + rates).
 
 PRDs and tests are language-agnostic (JSON stdin -> stdout), so this works
@@ -189,7 +191,9 @@ cp -r /gen/. /eval/ 2>&1 | tail -3
 cd /eval
 rm -rf rcb_tests/stdout
 # Inject the AUTHORITATIVE cases for this tier, replacing whatever the agent
-# shipped under rcb_tests/__SUB__ (so the agent cannot grade itself).
+# shipped under rcb_tests/__SUB__. These are INPUT-ONLY (expected_output was
+# stripped host-side before mounting at /auth), so the agent can neither grade
+# itself nor read the answers it is graded against.
 rm -rf rcb_tests/__SUB__ && mkdir -p rcb_tests/__SUB__
 cp -r /auth/. rcb_tests/__SUB__/ 2>&1 | tail -3
 if [ -f rcb_tests/test.sh ]; then
@@ -203,14 +207,45 @@ cp -r rcb_tests/stdout/__SUB__/. /rcb-out/ 2>/dev/null || true
 """
 
 
+def _sanitize_cases(src: Path, dst: Path) -> None:
+    """Copy authoritative case JSONs into dst WITH each case's expected_output removed.
+
+    The eval protocol only needs the INPUT of each case to drive the program under
+    test; the expected_output is used solely host-side in _host_compare. The raw
+    authoritative files bundle input+expected_output together, so injecting them
+    verbatim into the eval container would hand the answers to the very script we
+    are grading (a malicious test.sh could copy expected_output straight into the
+    stdout files, passing every hidden/enhanced case without running the code).
+    Stripping expected_output before the untrusted script ever sees the cases
+    closes that hole while staying transparent to a correct test.sh.
+
+    Fail-closed: a file we cannot parse is emitted as an empty case set rather than
+    copied verbatim, so a malformed authoritative file can never leak an answer we
+    were unable to scrub.
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in sorted(src.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            for case in data.get("cases", []):
+                if isinstance(case, dict):
+                    case.pop("expected_output", None)
+            payload = json.dumps(data, ensure_ascii=False)
+        except Exception:
+            payload = json.dumps({"cases": []})
+        (dst / f.name).write_text(payload, encoding="utf-8")
+
+
 def _run_subdir_once(image_tag: str, gen_dir: Path, cases_dir: Path, sub: str,
                      build_log: Path, proxy: str | None, timeout: float,
                      no_proxy: str | None = None,
                      container_name: str | None = None) -> Path:
     """Run one cases-dir inside a fresh container; return the host outcap dir.
 
-    The authoritative `cases_dir` is bind-mounted read-only at /auth and copied
-    over the agent's own rcb_tests/<sub> before test.sh runs.
+    The authoritative `cases_dir` is sanitized (expected_output stripped) into a
+    temp dir, bind-mounted read-only at /auth, and copied over the agent's own
+    rcb_tests/<sub> before test.sh runs — so the untrusted script sees only the
+    inputs, never the answers it is graded on.
 
     The container is given a run-scoped `--name` and force-removed in a `finally`.
     `--rm` alone is NOT enough: on a `timeout` (or if this process is killed / the
@@ -225,11 +260,18 @@ def _run_subdir_once(image_tag: str, gen_dir: Path, cases_dir: Path, sub: str,
     outcap = staging / "outcap"
     outcap.mkdir()
     try:
+        # Inject INPUT-ONLY cases: strip expected_output so the untrusted test.sh
+        # cannot read (or copy in) the answers it is graded against.
+        auth_safe = staging / "auth"
+        _sanitize_cases(cases_dir, auth_safe)
         cmd = ["docker", "run", "--rm"]
         if container_name:
             cmd += ["--name", container_name]
+        # Blackhole the published-dataset hosts so a malicious test.sh cannot pull
+        # the ground truth over the network at eval time either.
+        cmd += C.docker_egress_args()
         cmd += ["-v", f"{gen_dir}:/gen:ro",
-                "-v", f"{cases_dir}:/auth:ro",
+                "-v", f"{auth_safe}:/auth:ro",
                 "-v", f"{outcap}:/rcb-out"]
         if proxy:
             cmd += ["-e", f"http_proxy={proxy}", "-e", f"https_proxy={proxy}",

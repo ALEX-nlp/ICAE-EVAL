@@ -220,6 +220,44 @@ def docker_safe(alias: str) -> str:
     return alias.replace("@", "_")
 
 
+# ── egress hardening (anti-contamination) ────────────────────────────────────
+# Now that the benchmark is published, its ground truth is reachable on the
+# public internet: the expected_output test cases (rcb_tests_repos.tar.gz) and
+# the golden source (realcode_repos.tar.lz4) are both hosted on Zenodo. An
+# agent-under-test (generation phase) or an untrusted rcb_tests/test.sh (eval
+# phase) runs WITH network, so without a guard it could simply download the
+# answers instead of solving the task. We blackhole those hosts at the DNS layer
+# on every agent-facing `docker run` (`--add-host <h>:0.0.0.0`), so name
+# resolution yields a dead address and curl/git fail.
+#
+# This is defense-in-depth at the name-resolution layer, NOT an airtight
+# sandbox: a determined agent could still reach a hardcoded IP or a mirror. For
+# strict isolation, additionally run these containers behind an allowlist egress
+# proxy (package registries only) or a locked-down `--network`. The default
+# blocklist contains only the Zenodo dataset host, which no package manager
+# legitimately needs (zero build collateral). Extend or override it with
+# ICAE_EGRESS_BLOCKLIST (comma-separated hostnames) — e.g. add the upstream
+# source hosts (github.com, codeload.github.com, ...) if your build toolchains
+# do not fetch dependencies from them.
+_DEFAULT_EGRESS_BLOCKLIST = ["zenodo.org"]
+
+
+def egress_blocklist() -> list[str]:
+    """Hostnames to blackhole in agent-facing containers (see module note above)."""
+    v = os.environ.get("ICAE_EGRESS_BLOCKLIST")
+    if v is None:
+        return list(_DEFAULT_EGRESS_BLOCKLIST)
+    return [h.strip() for h in v.split(",") if h.strip()]
+
+
+def docker_egress_args() -> list[str]:
+    """`docker run` args that DNS-blackhole every host in egress_blocklist()."""
+    args: list[str] = []
+    for host in egress_blocklist():
+        args += ["--add-host", f"{host}:0.0.0.0"]
+    return args
+
+
 # ── model_list.json (SUT + Critic models) ───────────────────────────────────
 # Structure (per task.md): each model name maps to ONE endpoint dict OR a LIST of
 # interchangeable endpoint dicts (a pool of same-model variants):
