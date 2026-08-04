@@ -6,6 +6,7 @@ Adapted from agent_env/scripts/pipeline_sdk/sdk_runner.py. Differences:
   - includes watchdog timeouts and rate-limit / refusal classification.
 """
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,6 +83,30 @@ def _block_to_text(block) -> str:
     return ""
 
 
+def _block_to_record(block) -> dict:
+    """Full-fidelity structured form of one content block (NO truncation).
+
+    Used for the per-round JSONL transcript so every model input/output round
+    is preserved verbatim (unlike _block_to_text, which truncates for the
+    human-readable .log).
+    """
+    if isinstance(block, TextBlock):
+        return {"kind": "text", "text": block.text or ""}
+    if isinstance(block, ThinkingBlock):
+        return {"kind": "thinking",
+                "thinking": getattr(block, "thinking", "") or "",
+                "signature": getattr(block, "signature", None)}
+    if isinstance(block, ToolUseBlock):
+        return {"kind": "tool_use", "id": getattr(block, "id", None),
+                "name": block.name, "input": block.input}
+    if isinstance(block, ToolResultBlock):
+        return {"kind": "tool_result",
+                "tool_use_id": getattr(block, "tool_use_id", None),
+                "content": block.content,
+                "is_error": getattr(block, "is_error", None)}
+    return {"kind": block.__class__.__name__, "repr": repr(block)}
+
+
 def build_env(model_entry: dict) -> dict:
     """ANTHROPIC_* overrides for the CLI subprocess from a model_list.json entry."""
     env = {}
@@ -111,16 +136,32 @@ async def run_agent(prompt: str, cwd: Path, log_path: Path, model_entry: dict,
 
     started = time.time()
     last_text = ""
+    turn = 0
     result_obj: AgentResult | None = None
     saw_ratelimit = False
 
-    with open(log_path, "a", encoding="utf-8") as log:
+    transcript_path = log_path.with_suffix(".jsonl")
+    with open(log_path, "a", encoding="utf-8") as log, \
+            open(transcript_path, "a", encoding="utf-8") as tf:
         def w(line: str):
             log.write(line.rstrip("\n") + "\n")
             log.flush()
 
+        def emit(rec: dict):
+            """Append one full-fidelity round record to the JSONL transcript.
+            Never let transcript I/O break the run."""
+            try:
+                rec.setdefault("ts", time.time())
+                tf.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                tf.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
         w(f"\n===== run_agent @ {time.strftime('%Y-%m-%d %H:%M:%S')} cwd={cwd} "
           f"model={opts.model} (overall={timeout}s inactivity={INACTIVITY_TIMEOUT}s) =====")
+        # round 0 input: the initial task prompt handed to the model
+        emit({"type": "prompt", "model": opts.model, "cwd": str(cwd),
+              "started": time.strftime('%Y-%m-%d %H:%M:%S'), "prompt": prompt})
         agen = query(prompt=prompt, options=opts).__aiter__()
         try:
             while True:
@@ -142,6 +183,11 @@ async def run_agent(prompt: str, cwd: Path, log_path: Path, model_entry: dict,
                     return AgentResult(status="error", is_error=True,
                                        detail="timeout_inactivity", tail=last_text[-2000:])
                 if isinstance(msg, AssistantMessage):
+                    turn += 1
+                    emit({"type": "assistant", "turn": turn,
+                          "model": getattr(msg, "model", None),
+                          "content": [_block_to_record(b) for b in msg.content],
+                          "error": getattr(msg, "error", None)})
                     for b in msg.content:
                         t = _block_to_text(b)
                         if t:
@@ -153,11 +199,31 @@ async def run_agent(prompt: str, cwd: Path, log_path: Path, model_entry: dict,
                         if _contains(str(msg.error), RATELIMIT_MARKERS):
                             saw_ratelimit = True
                 elif isinstance(msg, (SystemMessage, UserMessage)):
-                    pass
+                    # UserMessage carries the tool_result blocks fed back into the
+                    # model as the NEXT round's input; SystemMessage carries init/
+                    # config. Persist both verbatim so every input round is stored.
+                    if isinstance(msg, UserMessage):
+                        content = getattr(msg, "content", None)
+                        if isinstance(content, list):
+                            rec_content = [_block_to_record(b) for b in content]
+                        else:
+                            rec_content = content
+                        emit({"type": "user", "turn": turn, "content": rec_content})
+                    else:
+                        emit({"type": "system",
+                              "subtype": getattr(msg, "subtype", None),
+                              "data": getattr(msg, "data", None)})
                 elif isinstance(msg, ResultMessage):
                     txt = msg.result or ""
                     api_status = getattr(msg, "api_error_status", None)
                     errs = getattr(msg, "errors", None)
+                    usage = getattr(msg, "usage", None) or {}
+                    emit({"type": "result", "subtype": str(msg.subtype),
+                          "is_error": bool(msg.is_error),
+                          "num_turns": int(msg.num_turns or 0),
+                          "total_cost_usd": float(msg.total_cost_usd or 0.0),
+                          "api_error_status": api_status,
+                          "usage": usage, "result_text": txt})
                     w(f"[result] subtype={msg.subtype} is_error={msg.is_error} "
                       f"turns={msg.num_turns} cost={msg.total_cost_usd} "
                       f"api_error_status={api_status}")
@@ -167,7 +233,6 @@ async def run_agent(prompt: str, cwd: Path, log_path: Path, model_entry: dict,
                     if _contains(blob, RATELIMIT_MARKERS) or saw_ratelimit:
                         raise RateLimited(blob[:300])
                     refused = _contains(txt, REFUSAL_MARKERS) or msg.subtype == "refusal"
-                    usage = getattr(msg, "usage", None) or {}
                     result_obj = AgentResult(
                         status="refused" if refused else ("error" if msg.is_error else "success"),
                         is_error=bool(msg.is_error),

@@ -150,7 +150,7 @@ results/
 └── <append_id>/
     ├── settings.json
     ├── summary.md
-    ├── _logs/
+    ├── trajectory/
     ├── _eval/
     └── <alias>/
 ```

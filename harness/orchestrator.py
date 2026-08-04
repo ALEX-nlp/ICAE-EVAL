@@ -237,12 +237,49 @@ def _other_live_orchestrators(append_id: str) -> list[str]:
 
 # ── per-repo pipeline ─────────────────────────────────────────────────────────
 
+def _reset_trajectory(log_path: Path, prior: dict) -> None:
+    """Give this (re)generation a clean transcript.
+
+    Overwrite semantics: the live ``<alias>.log`` / ``<alias>.jsonl`` always hold
+    ONLY the current attempt. If the previous attempt ended in ``generation ==
+    "error"`` (a casualty), its transcript is first moved to
+    ``trajectory/_failed/<alias>.failN.{jsonl,log}`` so it stays available for
+    post-mortem; otherwise the stale files are simply removed. ``run_agent`` then
+    recreates them in append mode, so a generation's internal backoff retries still
+    accumulate into the one fresh file. Transcript bookkeeping must never break the
+    run, so every filesystem op is best-effort.
+    """
+    jsonl = log_path.with_suffix(".jsonl")
+    try:
+        archive = (prior.get("generation") == "error"
+                   and jsonl.exists() and jsonl.stat().st_size > 0)
+        if archive:
+            fail_dir = log_path.parent / "_failed"
+            fail_dir.mkdir(parents=True, exist_ok=True)
+            n = 1
+            while (fail_dir / f"{log_path.stem}.fail{n}.jsonl").exists():
+                n += 1
+            jsonl.replace(fail_dir / f"{log_path.stem}.fail{n}.jsonl")
+            if log_path.exists():
+                log_path.replace(fail_dir / f"{log_path.stem}.fail{n}.log")
+    except Exception:  # noqa: BLE001
+        pass
+    # clean slate for the current attempt (run_agent reopens in append mode)
+    for p in (log_path, jsonl):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def process_repo(alias: str, args, model_entries: list, append_id: str,
                        sem: asyncio.Semaphore, entry_idx: int = 0) -> None:
     async with sem:
         t0 = time.time()
         code_path = C.code_path(append_id, alias)
-        log_path = C.RESULTS / append_id / "_logs" / f"{C.docker_safe(alias)}.log"
+        log_path = C.RESULTS / append_id / "trajectory" / f"{C.docker_safe(alias)}.log"
         lang = C.prompt_language(args.env_mode, alias)
         print(f"[{alias}] start (env_mode={args.env_mode} lang={lang})")
 
@@ -321,6 +358,11 @@ async def process_repo(alias: str, args, model_entries: list, append_id: str,
         #    memory (the failure mode behind the 2026-06-20 hang).
         image_tag = container.image_tag
         prompt = render_task_prompt(alias, docker_id=container.container_id, lang=lang)
+        # Fresh trajectory per (re)generation: overwrite this repo's transcript so it
+        # reflects only the current attempt. If the PRIOR attempt ended in error, its
+        # trajectory is archived under trajectory/_failed/ first (post-mortem for
+        # casualties), never silently lost.
+        _reset_trajectory(log_path, prior)
         try:
             result = await _run_with_backoff(prompt, code_path, log_path,
                                              model_entries, args, start_idx=entry_idx)
